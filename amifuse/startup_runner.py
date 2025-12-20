@@ -36,8 +36,21 @@ from .handler_stub import build_entry_stub  # type: ignore
 ACTION_STARTUP = 0
 ACTION_DISK_INFO = 25
 ACTION_READ = ord("R")
+ACTION_WRITE = ord("W")
 ACTION_SEEK = 1008
 ACTION_END = 1007
+ACTION_SET_FILE_SIZE = 1022
+ACTION_FREE_LOCK = 15
+ACTION_FINDUPDATE = 1004
+ACTION_FINDINPUT = 1005
+ACTION_FINDOUTPUT = 1006
+ACTION_DELETE_OBJECT = 16
+ACTION_RENAME_OBJECT = 17
+ACTION_CREATE_DIR = 22
+ACTION_FLUSH = 27
+OFFSET_BEGINNING = -1
+OFFSET_CURRENT = 0
+OFFSET_END = 1
 
 
 @dataclass
@@ -70,6 +83,11 @@ class HandlerLauncher:
         self.exec_base_addr = self.mem.r32(4)
         self.boot = boot_info
         self.handler_entry_addr = handler_entry_addr
+        # Scratch packet buffers to avoid unbounded allocs (we serialize requests).
+        self._stdpkt_ring = []
+        self._stdpkt_sizes = []
+        self._stdpkt_index = 0
+        self._stdpkt_ring_size = 8
 
     # ---- low-level helpers ----
 
@@ -181,10 +199,20 @@ class HandlerLauncher:
     ) -> Tuple[int, int]:
         """Allocate contiguous StandardPacket = Message + DosPacket."""
         total = MessageStruct.get_size() + DosPacketStruct.get_size()
-        sp_mem = self.alloc.alloc_memory(total, label=f"stdpkt_{pkt_type}")
-        self.mem.w_block(sp_mem.addr, b"\x00" * total)
-        msg = AccessStruct(self.mem, MessageStruct, sp_mem.addr)
-        pkt = AccessStruct(self.mem, DosPacketStruct, sp_mem.addr + MessageStruct.get_size())
+        if not self._stdpkt_ring:
+            self._stdpkt_ring = [None] * self._stdpkt_ring_size
+            self._stdpkt_sizes = [0] * self._stdpkt_ring_size
+        idx = self._stdpkt_index
+        self._stdpkt_index = (idx + 1) % self._stdpkt_ring_size
+        sp_mem = self._stdpkt_ring[idx]
+        if sp_mem is None or total > self._stdpkt_sizes[idx]:
+            sp_mem = self.alloc.alloc_memory(total, label=f"stdpkt_scratch_{idx}")
+            self._stdpkt_ring[idx] = sp_mem
+            self._stdpkt_sizes[idx] = total
+        sp_addr = sp_mem.addr
+        self.mem.w_block(sp_addr, b"\x00" * total)
+        msg = AccessStruct(self.mem, MessageStruct, sp_addr)
+        pkt = AccessStruct(self.mem, DosPacketStruct, sp_addr + MessageStruct.get_size())
         # message
         msg.w_s("mn_Node.ln_Type", NodeType.NT_MESSAGE)
         msg.w_s("mn_Node.ln_Succ", 0)
@@ -192,16 +220,16 @@ class HandlerLauncher:
         msg.w_s("mn_ReplyPort", reply_port_addr)
         msg.w_s("mn_Length", total)
         # packet
-        pkt.w_s("dp_Link", sp_mem.addr)  # BPTR to message in StandardPacket
+        pkt.w_s("dp_Link", sp_addr)  # BPTR to message in StandardPacket
         pkt.w_s("dp_Port", reply_port_addr)
         pkt.w_s("dp_Type", pkt_type)
         for i, val in enumerate(args[:7], start=1):
             pkt.w_s(f"dp_Arg{i}", val)
         # link message name to packet
-        msg.w_s("mn_Node.ln_Name", sp_mem.addr + MessageStruct.get_size())
+        msg.w_s("mn_Node.ln_Name", sp_addr + MessageStruct.get_size())
         # queue message to destination port
-        self.exec_impl.port_mgr.put_msg(dest_port_addr, sp_mem.addr)
-        return sp_mem.addr + MessageStruct.get_size(), sp_mem.addr
+        self.exec_impl.port_mgr.put_msg(dest_port_addr, sp_addr)
+        return sp_addr + MessageStruct.get_size(), sp_addr
 
     # ---- public orchestration ----
 
@@ -251,13 +279,28 @@ class HandlerLauncher:
         """Run the handler from its current PC/SP for a limited number of cycles."""
         cpu = self.vh.machine.cpu
         mem = self.vh.alloc.get_mem()
-        set_regs = None
+        ram_end = self.vh.machine.get_ram_total()
+
+        def _pc_valid(pc: int) -> bool:
+            # 0x800 is the minimum valid code address; below this is Amiga system
+            # vectors, trap handlers, and reserved memory that cannot contain handler code.
+            return 0x800 <= pc < ram_end
+
+        # Always restore A6 to ExecBase before entering handler code.
+        # We can re-enter the handler after WaitPort/exit traps, and A6 may be 0.
+        set_regs = {REG_A6: self.exec_base_addr}
+        try:
+            cpu.w_reg(REG_A6, self.exec_base_addr)
+        except Exception:
+            pass
         if not state.started:
-            set_regs = {REG_A6: self.exec_base_addr}
             state.started = True
+        # machine.run always pushes a return address at SP. To avoid growing the
+        # task stack on every burst, reserve space and later undo the push.
+        run_sp = state.sp - 4
         run_state = self.vh.machine.run(
             state.pc,
-            sp=state.sp,
+            sp=run_sp,
             set_regs=set_regs,
             max_cycles=max_cycles,
             cycles_per_run=max_cycles,
@@ -265,7 +308,7 @@ class HandlerLauncher:
         )
         state.run_state = run_state
         new_pc = cpu.r_pc()
-        new_sp = cpu.r_reg(REG_A7)
+        new_sp = cpu.r_reg(REG_A7) + 4
         # Check if WaitPort blocked (saved state in ExecLibrary class variable)
         from amitools.vamos.lib.ExecLibrary import ExecLibrary
         waitport_sp = ExecLibrary._waitport_blocked_sp
@@ -277,8 +320,21 @@ class HandlerLauncher:
         # Check error first since _terminate_run sets both error and done
         if run_state.error:
             # WaitPort or other blocking call failed - handler is waiting for a message.
-            if state.initialized and state.main_loop_pc != 0:
-                # Restart from saved main loop PC
+            if waitport_sp is not None:
+                has_pending = self.exec_impl.port_mgr.has_msg(state.port_addr)
+                if has_pending:
+                    # Resume from WaitPort return address (saved on stack)
+                    ret_addr = mem.r32(waitport_sp)
+                    if _pc_valid(ret_addr):
+                        state.pc = ret_addr
+                        state.sp = waitport_sp + 4
+                    elif state.main_loop_pc and _pc_valid(state.main_loop_pc):
+                        state.pc = state.main_loop_pc
+                        state.sp = state.main_loop_sp
+                    ExecLibrary._waitport_blocked_port = None
+                    ExecLibrary._waitport_blocked_sp = None
+            elif state.initialized and state.main_loop_pc != 0:
+                # Fall back to saved main loop PC
                 state.pc = state.main_loop_pc
                 state.sp = state.main_loop_sp
             # else: keep current PC (error happened during initialization)
@@ -288,7 +344,7 @@ class HandlerLauncher:
             if waitport_sp is not None:
                 ret_addr = mem.r32(waitport_sp)
                 # Save as main loop PC if not yet initialized
-                if not state.initialized or state.main_loop_pc == 0:
+                if (not state.initialized or state.main_loop_pc == 0) and _pc_valid(ret_addr):
                     state.main_loop_pc = ret_addr
                     state.main_loop_sp = waitport_sp + 4  # Pop return address
                     state.initialized = True
@@ -298,8 +354,12 @@ class HandlerLauncher:
                 has_pending = self.exec_impl.port_mgr.has_msg(state.port_addr)
                 if has_pending:
                     # Restart from return address (where WaitPort was called)
-                    state.pc = ret_addr
-                    state.sp = waitport_sp + 4  # Pop the return address
+                    if _pc_valid(ret_addr):
+                        state.pc = ret_addr
+                        state.sp = waitport_sp + 4  # Pop the return address
+                    elif state.main_loop_pc and _pc_valid(state.main_loop_pc):
+                        state.pc = state.main_loop_pc
+                        state.sp = state.main_loop_sp
                     # Clear the blocked state
                     ExecLibrary._waitport_blocked_port = None
                     ExecLibrary._waitport_blocked_sp = None
@@ -307,8 +367,12 @@ class HandlerLauncher:
                 else:
                     # No message pending - save restart point but don't spin.
                     # Next run_burst will restart from here when a message is queued.
-                    state.pc = ret_addr
-                    state.sp = waitport_sp + 4
+                    if _pc_valid(ret_addr):
+                        state.pc = ret_addr
+                        state.sp = waitport_sp + 4
+                    elif state.main_loop_pc and _pc_valid(state.main_loop_pc):
+                        state.pc = state.main_loop_pc
+                        state.sp = state.main_loop_sp
                     # Keep blocked state so we know handler is waiting
                     # Don't clear: ExecLibrary._waitport_blocked_port/sp
             else:
@@ -330,8 +394,12 @@ class HandlerLauncher:
                         state.started = False
                 # else: No messages pending - keep old PC (caller will send message and retry)
         else:
-            state.pc = new_pc
-            state.sp = new_sp
+            if _pc_valid(new_pc):
+                state.pc = new_pc
+                state.sp = new_sp
+            elif state.main_loop_pc and _pc_valid(state.main_loop_pc):
+                state.pc = state.main_loop_pc
+                state.sp = state.main_loop_sp
         return run_state
 
     def send_disk_info(self, state: HandlerLaunchState, info_buf_addr: int):
@@ -385,6 +453,10 @@ class HandlerLauncher:
         """ACTION_EXAMINE_NEXT"""
         return self.send_packet(state, 24, [lock_bptr, fib_addr >> 2])
 
+    def send_free_lock(self, state: HandlerLaunchState, lock_bptr: int):
+        """ACTION_FREE_LOCK: release a lock returned by LOCATE."""
+        return self.send_packet(state, ACTION_FREE_LOCK, [lock_bptr])
+
     def send_findinput(
         self, state: HandlerLaunchState, name_bptr: int, dir_lock_bptr: int = 0, fh_addr: int = None
     ):
@@ -395,7 +467,7 @@ class HandlerLauncher:
             fh_addr = fh_mem.addr
         pkt_addr, msg_addr = self.send_packet(
             state,
-            1005,  # ACTION_FINDINPUT
+            ACTION_FINDINPUT,
             [
                 fh_addr >> 2,  # BPTR to FileHandle
                 dir_lock_bptr,
@@ -403,6 +475,72 @@ class HandlerLauncher:
             ],
         )
         return fh_addr, pkt_addr, msg_addr
+
+    def send_findupdate(
+        self, state: HandlerLaunchState, name_bptr: int, dir_lock_bptr: int = 0, fh_addr: int = None
+    ):
+        """ACTION_FINDUPDATE: open or create a file for read/write."""
+        if fh_addr is None:
+            fh_mem = self.alloc.alloc_struct(FileHandleStruct, label="FindUpdateFH")
+            self.mem.w_block(fh_mem.addr, b"\x00" * FileHandleStruct.get_size())
+            fh_addr = fh_mem.addr
+        pkt_addr, msg_addr = self.send_packet(
+            state,
+            ACTION_FINDUPDATE,
+            [
+                fh_addr >> 2,  # BPTR to FileHandle
+                dir_lock_bptr,
+                name_bptr,
+            ],
+        )
+        return fh_addr, pkt_addr, msg_addr
+
+    def send_findoutput(
+        self, state: HandlerLaunchState, name_bptr: int, dir_lock_bptr: int = 0, fh_addr: int = None
+    ):
+        """ACTION_FINDOUTPUT: open or create a file for output (truncate)."""
+        if fh_addr is None:
+            fh_mem = self.alloc.alloc_struct(FileHandleStruct, label="FindOutputFH")
+            self.mem.w_block(fh_mem.addr, b"\x00" * FileHandleStruct.get_size())
+            fh_addr = fh_mem.addr
+        pkt_addr, msg_addr = self.send_packet(
+            state,
+            ACTION_FINDOUTPUT,
+            [
+                fh_addr >> 2,  # BPTR to FileHandle
+                dir_lock_bptr,
+                name_bptr,
+            ],
+        )
+        return fh_addr, pkt_addr, msg_addr
+
+    def send_delete_object(self, state: HandlerLaunchState, lock_bptr: int, name_bptr: int):
+        """ACTION_DELETE_OBJECT: delete a file or directory."""
+        return self.send_packet(state, ACTION_DELETE_OBJECT, [lock_bptr, name_bptr])
+
+    def send_rename_object(
+        self,
+        state: HandlerLaunchState,
+        src_lock_bptr: int,
+        src_name_bptr: int,
+        dst_lock_bptr: int,
+        dst_name_bptr: int,
+    ):
+        """ACTION_RENAME_OBJECT: rename or move an object."""
+        return self.send_packet(
+            state,
+            ACTION_RENAME_OBJECT,
+            [
+                src_lock_bptr,
+                src_name_bptr,
+                dst_lock_bptr,
+                dst_name_bptr,
+            ],
+        )
+
+    def send_create_dir(self, state: HandlerLaunchState, lock_bptr: int, name_bptr: int):
+        """ACTION_CREATE_DIR: create a directory, returns new lock in res1."""
+        return self.send_packet(state, ACTION_CREATE_DIR, [lock_bptr, name_bptr])
 
     def send_read_handle(
         self, state: HandlerLaunchState, fh_addr: int, buf_addr: int, length_bytes: int
@@ -420,7 +558,39 @@ class HandlerLauncher:
             ],
         )
 
-    def send_seek_handle(self, state: HandlerLaunchState, fh_addr: int, offset: int, mode: int = 0):
+    def send_write_handle(
+        self, state: HandlerLaunchState, fh_addr: int, buf_addr: int, length_bytes: int
+    ):
+        """ACTION_WRITE using a FileHandle filled by FINDOUTPUT/FINDUPDATE."""
+        fh = AccessStruct(self.mem, FileHandleStruct, fh_addr)
+        fileentry_ptr = fh.r_s("fh_Args")
+        return self.send_packet(
+            state,
+            ACTION_WRITE,
+            [
+                fileentry_ptr,
+                buf_addr,
+                length_bytes,
+            ],
+        )
+
+    def send_set_file_size(
+        self, state: HandlerLaunchState, fh_addr: int, size: int, mode: int = OFFSET_BEGINNING
+    ):
+        """ACTION_SET_FILE_SIZE on a FileHandle; mode defaults to OFFSET_BEGINNING."""
+        fh = AccessStruct(self.mem, FileHandleStruct, fh_addr)
+        fileentry_ptr = fh.r_s("fh_Args")
+        return self.send_packet(
+            state,
+            ACTION_SET_FILE_SIZE,
+            [
+                fileentry_ptr,
+                size,
+                mode,
+            ],
+        )
+
+    def send_seek_handle(self, state: HandlerLaunchState, fh_addr: int, offset: int, mode: int = OFFSET_BEGINNING):
         """ACTION_SEEK on a FileHandle; mode defaults to OFFSET_BEGINNING."""
         fh = AccessStruct(self.mem, FileHandleStruct, fh_addr)
         fileentry_ptr = fh.r_s("fh_Args")
@@ -445,6 +615,10 @@ class HandlerLauncher:
                 fileentry_ptr,
             ],
         )
+
+    def send_flush(self, state: HandlerLaunchState):
+        """ACTION_FLUSH: flush filesystem buffers."""
+        return self.send_packet(state, ACTION_FLUSH, [])
 
     def _alloc_signal_bit(self) -> int:
         """Reserve a signal bit from exec's bitmap."""
