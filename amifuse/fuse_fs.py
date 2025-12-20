@@ -4,6 +4,9 @@ via our vamos bootstrap: readdir/stat/read are turned into LOCATE/EXAMINE/
 FINDINPUT/SEEK/READ packets.
 """
 
+import cProfile
+import pstats
+
 import argparse
 import errno
 import os
@@ -651,9 +654,23 @@ def main(argv=None):
     parser.add_argument(
         "--debug", action="store_true", help="Enable debug logging of FUSE operations."
     )
+    parser.add_argument(
+        "--profile", action="store_true", help="Enable profiling and write stats to profile.txt."
+    )
     args = parser.parse_args(argv)
+
+    if args.profile:
+        profiler = cProfile.Profile()
+        profiler.enable()
+
     mount_fuse(args.image, args.driver, args.mountpoint, args.block_size, args.volname, args.debug)
 
+    if args.profile:
+        profiler.disable()
+        with open("profile.txt", "w") as f:
+            stats = pstats.Stats(profiler, stream=f)
+            stats.sort_stats(pstats.SortKey.CUMULATIVE)
+            stats.print_stats()
 
 if __name__ == "__main__":
     main()
