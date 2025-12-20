@@ -35,10 +35,18 @@ from amitools.vamos.libstructs.dos import FileInfoBlockStruct, FileHandleStruct 
 
 
 def _parse_fib(mem, fib_addr: int) -> Dict:
-    """Decode a FileInfoBlock into a simple dict."""
-    fib = AccessStruct(mem, FileInfoBlockStruct, fib_addr)
-    dir_type = fib.r_s("fib_DirEntryType")
-    size = fib.r_s("fib_Size")
+    """Decode a FileInfoBlock into a simple dict.
+
+    Uses direct memory reads with known offsets from FileInfoBlockStruct:
+      fib_DiskKey: ULONG at 0
+      fib_DirEntryType: LONG at 4
+      fib_FileName: ARRAY(UBYTE,108) at 8
+      fib_Protection: LONG at 116
+      fib_EntryType: LONG at 120
+      fib_Size: ULONG at 124
+    """
+    dir_type = mem.r32s(fib_addr + 4)   # fib_DirEntryType (signed LONG)
+    size = mem.r32(fib_addr + 124)      # fib_Size (unsigned ULONG)
     name_bytes = mem.r_block(fib_addr + 8, 108)  # fib_FileName starts at offset 8
     name_len = name_bytes[0]
     name = name_bytes[1 : 1 + name_len].decode("latin-1", errors="ignore")
