@@ -68,6 +68,7 @@ class HandlerBridge:
         block_size: Optional[int] = None,
         read_only: bool = True,
         debug: bool = False,
+        partition: Optional[str] = None,
     ):
         self._lock = threading.RLock()  # Reentrant lock for thread safety
         self._debug = debug
@@ -78,7 +79,7 @@ class HandlerBridge:
         self.vh.set_scsi_backend(self.backend)
         seg_baddr = self.vh.load_handler(driver)
         # Build DeviceNode/FSSM using seglist bptr
-        ba = BootstrapAllocator(self.vh, image)
+        ba = BootstrapAllocator(self.vh, image, partition=partition)
         boot = ba.alloc_all(handler_seglist_baddr=seg_baddr, handler_seglist_bptr=seg_baddr, handler_name="DH0:")
         entry_addr = self.vh.slm.seg_loader.infos[seg_baddr].seglist.get_segment().get_addr()
         self.launcher = HandlerLauncher(self.vh, boot, entry_addr)
@@ -1130,6 +1131,7 @@ def mount_fuse(
     volname_opt: Optional[str] = None,
     debug: bool = False,
     write: bool = False,
+    partition: Optional[str] = None,
 ):
     if mountpoint.exists() and os.path.ismount(mountpoint):
         raise SystemExit(
@@ -1153,7 +1155,8 @@ def mount_fuse(
         subprocess.run(cmd, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     bridge = HandlerBridge(
-        image, driver, block_size=block_size, read_only=not write, debug=debug
+        image, driver, block_size=block_size, read_only=not write, debug=debug,
+        partition=partition
     )
 
     # Let default signal handling work - FUSE will call destroy() on unmount
@@ -1183,38 +1186,39 @@ def mount_fuse(
 __version__ = "0.1.0"
 
 
-def main(argv=None):
-    parser = argparse.ArgumentParser(
-        description=f"amifuse {__version__} - Copyright (C) 2025 by Stefan Reinauer\n\n"
-        "Mount an Amiga filesystem image via FUSE (experimental).",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    parser.add_argument("--driver", required=True, type=Path, help="Filesystem binary")
-    parser.add_argument("--image", required=True, type=Path, help="Disk image file")
-    parser.add_argument("--mountpoint", required=True, type=Path, help="Mount location")
-    parser.add_argument(
-        "--block-size", type=int, help="Override block size (defaults to auto/512)."
-    )
-    parser.add_argument(
-        "--volname", type=str, help="Override macFUSE volume name (defaults to partition name)."
-    )
-    parser.add_argument(
-        "--debug", action="store_true", help="Enable debug logging of FUSE operations."
-    )
-    parser.add_argument(
-        "--profile", action="store_true", help="Enable profiling and write stats to profile.txt."
-    )
-    parser.add_argument(
-        "--write", action="store_true", help="Enable read-write mode (experimental)."
-    )
- 
-    args = parser.parse_args(argv)
+def cmd_inspect(args):
+    """Handle the 'inspect' subcommand."""
+    from .rdb_inspect import open_rdisk, format_fs_summary
 
+    blkdev = None
+    rdisk = None
+    try:
+        blkdev, rdisk = open_rdisk(args.image, block_size=args.block_size)
+        for line in rdisk.get_info(full=args.full):
+            print(line)
+        fs_lines = format_fs_summary(rdisk)
+        if fs_lines:
+            print("\nFilesystem drivers:")
+            for line in fs_lines:
+                print(" ", line)
+    finally:
+        if rdisk is not None:
+            rdisk.close()
+        if blkdev is not None:
+            blkdev.close()
+
+
+def cmd_mount(args):
+    """Handle the 'mount' subcommand."""
     if args.profile:
         profiler = cProfile.Profile()
         profiler.enable()
 
-    mount_fuse(args.image, args.driver, args.mountpoint, args.block_size, args.volname, args.debug, args.write)
+    mount_fuse(
+        args.image, args.driver, args.mountpoint,
+        args.block_size, args.volname, args.debug, args.write,
+        partition=args.partition
+    )
 
     if args.profile:
         profiler.disable()
@@ -1222,6 +1226,58 @@ def main(argv=None):
             stats = pstats.Stats(profiler, stream=f)
             stats.sort_stats(pstats.SortKey.CUMULATIVE)
             stats.print_stats()
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        description=f"amifuse {__version__} - Copyright (C) 2025 by Stefan Reinauer\n\n"
+        "Mount Amiga filesystem images via FUSE.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    # inspect subcommand
+    inspect_parser = subparsers.add_parser(
+        "inspect", help="Inspect RDB partitions and filesystems."
+    )
+    inspect_parser.add_argument("image", type=Path, help="Disk image file")
+    inspect_parser.add_argument(
+        "--block-size", type=int, help="Override block size (defaults to auto/512)."
+    )
+    inspect_parser.add_argument(
+        "--full", action="store_true", help="Show full partition details."
+    )
+    inspect_parser.set_defaults(func=cmd_inspect)
+
+    # mount subcommand
+    mount_parser = subparsers.add_parser(
+        "mount", help="Mount an Amiga filesystem image via FUSE."
+    )
+    mount_parser.add_argument("--driver", required=True, type=Path, help="Filesystem binary")
+    mount_parser.add_argument("--image", required=True, type=Path, help="Disk image file")
+    mount_parser.add_argument("--mountpoint", required=True, type=Path, help="Mount location")
+    mount_parser.add_argument(
+        "--partition", type=str, help="Partition name (e.g. DH0) or index (defaults to first)."
+    )
+    mount_parser.add_argument(
+        "--block-size", type=int, help="Override block size (defaults to auto/512)."
+    )
+    mount_parser.add_argument(
+        "--volname", type=str, help="Override macFUSE volume name (defaults to partition name)."
+    )
+    mount_parser.add_argument(
+        "--debug", action="store_true", help="Enable debug logging of FUSE operations."
+    )
+    mount_parser.add_argument(
+        "--profile", action="store_true", help="Enable profiling and write stats to profile.txt."
+    )
+    mount_parser.add_argument(
+        "--write", action="store_true", help="Enable read-write mode (experimental)."
+    )
+    mount_parser.set_defaults(func=cmd_mount)
+
+    args = parser.parse_args(argv)
+    args.func(args)
 
 if __name__ == "__main__":
     main()

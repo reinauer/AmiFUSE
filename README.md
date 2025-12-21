@@ -72,36 +72,68 @@ Then mount with:
 
 ```bash
 mkdir -p ./mnt
-amifuse --driver pfs3aio --image pfs.hdf --mountpoint ./mnt
+amifuse mount --driver pfs3aio --image pfs.hdf --mountpoint ./mnt
 ```
 
 ## Usage
 
+amifuse uses subcommands for different operations:
+
 ```bash
-amifuse --driver pfs3aio --image /path/to/disk.hdf --mountpoint ./mnt
+amifuse inspect <image>                    # Inspect RDB partitions
+amifuse mount --driver <handler> ...       # Mount a filesystem
 ```
 
-### Arguments
+### Inspecting Disk Images
+
+View partition information and embedded filesystem drivers:
+
+```bash
+# Show partition summary
+amifuse inspect /path/to/disk.hdf
+
+# Show full partition details
+amifuse inspect --full /path/to/disk.hdf
+```
+
+| Argument | Description |
+|----------|-------------|
+| `image` | Path to the RDB image file |
+| `--block-size` | Block size in bytes (default: auto-detect or 512) |
+| `--full` | Show full partition details |
+
+### Mounting Filesystems
+
+```bash
+amifuse mount --driver pfs3aio --image /path/to/disk.hdf --mountpoint ./mnt
+```
 
 | Argument | Required | Description |
 |----------|----------|-------------|
 | `--driver` | Yes | Path to the Amiga filesystem handler binary (e.g., `pfs3aio`) |
 | `--image` | Yes | Path to the Amiga hard disk image file |
 | `--mountpoint` | Yes | Directory where the filesystem will be mounted |
+| `--partition` | No | Partition name (e.g., `DH0`) or index (default: first partition) |
 | `--block-size` | No | Override block size (default: auto-detect or 512) |
 | `--volname` | No | Override the volume name shown in Finder |
 | `--debug` | No | Enable debug logging of FUSE operations |
 | `--profile` | No | Enable cProfile profiling and write stats to `profile.txt` on exit |
 | `--write` | No | Enable read-write mode (experimental, use with caution) |
 
-### Example
+### Examples
 
 ```bash
 # Create mount point
 mkdir -p ./mnt
 
-# Mount a PFS3 formatted disk image
-amifuse --driver pfs3aio --image ~/Documents/FS-UAE/Hard\ Drives/pfs.hdf --mountpoint ./mnt
+# Mount a PFS3 formatted disk image (first partition)
+amifuse mount --driver pfs3aio --image pfs.hdf --mountpoint ./mnt
+
+# Mount a specific partition by name
+amifuse mount --driver pfs3aio --image multi-partition.hdf --partition DH0 --mountpoint ./mnt
+
+# Mount a specific partition by index
+amifuse mount --driver pfs3aio --image multi-partition.hdf --partition 2 --mountpoint ./mnt
 
 # Browse the filesystem
 ls ./mnt

@@ -13,20 +13,26 @@ from amitools.vamos.libstructs.exec_ import MsgPortStruct, ListStruct, NodeType 
 
 
 class BootstrapAllocator:
-    def __init__(self, vh, image_path: Path, block_size=512, part_idx=0):
+    def __init__(self, vh, image_path: Path, block_size=512, partition=None):
         self.vh = vh
         self.alloc = vh.alloc
         self.mem = vh.alloc.get_mem()
         self.image_path = image_path
         self.block_size = block_size
-        self.part_idx = part_idx
+        self.partition = partition  # name, index, or None for first
 
     def _read_partition_env(self):
         blk = RawBlockDevice(str(self.image_path), read_only=True, block_bytes=self.block_size)
         blk.open()
         rd = RDisk(blk)
         rd.open()
-        part = rd.get_partition(self.part_idx)
+        if self.partition is None:
+            part = rd.get_partition(0)
+        else:
+            part = rd.find_partition_by_string(str(self.partition))
+            if part is None:
+                blk.close()
+                raise ValueError(f"Partition '{self.partition}' not found")
         de = part.part_blk.dos_env
         return de, blk, rd, part
 
