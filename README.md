@@ -7,7 +7,7 @@ amifuse runs actual Amiga filesystem drivers (like PFS3) through m68k CPU emulat
 ## Requirements
 
 - **macOS**: [macFUSE](https://osxfuse.github.io/) (or FUSE for Linux)
-- **Python 3.10+**
+- **Python 3.9+**
 - **7z**: Required for `make unpack` (install via `brew install p7zip` on macOS)
 - A **filesystem handler**: e.g. [pfs3aio](https://aminet.net/package/disk/misc/pfs3aio) (or use `make download`)
 
@@ -28,17 +28,15 @@ git submodule update --init
 python3 -m venv .venv
 source .venv/bin/activate   # On Windows: .venv\Scripts\activate
 
-pip install fusepy          # FUSE Python bindings
-pip install machine68k      # m68k CPU emulator (required by amitools)
-pip install -e ./amitools[vamos]
+pip install -e ./amitools[vamos]   # Install amitools from submodule (includes machine68k)
+pip install -e .                   # Install amifuse
 ```
 
 ### Without virtual environment
 
 ```bash
-pip install --user fusepy
-pip install --user machine68k
 pip install --user -e ./amitools[vamos]
+pip install --user -e .
 ```
 
 ### macOS-specific
@@ -74,16 +72,13 @@ Then mount with:
 
 ```bash
 mkdir -p ./mnt
-python3 -m amifuse.fuse_fs --driver pfs3aio --image pfs.hdf --mountpoint ./mnt
+amifuse --driver pfs3aio --image pfs.hdf --mountpoint ./mnt
 ```
 
 ## Usage
 
 ```bash
-python3 -m amifuse.fuse_fs \
-    --driver pfs3aio \
-    --image /path/to/disk.hdf \
-    --mountpoint ./mnt
+amifuse --driver pfs3aio --image /path/to/disk.hdf --mountpoint ./mnt
 ```
 
 ### Arguments
@@ -106,10 +101,7 @@ python3 -m amifuse.fuse_fs \
 mkdir -p ./mnt
 
 # Mount a PFS3 formatted disk image
-python3 -m amifuse.fuse_fs \
-    --driver pfs3aio \
-    --image ~/Documents/FS-UAE/Hard\ Drives/pfs.hdf \
-    --mountpoint ./mnt
+amifuse --driver pfs3aio --image ~/Documents/FS-UAE/Hard\ Drives/pfs.hdf --mountpoint ./mnt
 
 # Browse the filesystem
 ls ./mnt
