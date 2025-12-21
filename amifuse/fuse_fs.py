@@ -1180,9 +1180,14 @@ def mount_fuse(
     FUSE(AmigaFuseFS(bridge, debug=debug), str(mountpoint), **fuse_kwargs)
 
 
+__version__ = "0.1.0"
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
-        description="Mount an Amiga filesystem image via FUSE (experimental)."
+        description=f"amifuse {__version__} - Copyright (C) 2025 by Stefan Reinauer\n\n"
+        "Mount an Amiga filesystem image via FUSE (experimental).",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--driver", required=True, type=Path, help="Filesystem binary")
     parser.add_argument("--image", required=True, type=Path, help="Disk image file")
