@@ -1124,8 +1124,8 @@ class AmigaFuseFS(Operations):
         print("[amifuse] Unmount complete.", flush=True)
 
 
-def get_partition_name(image: Path, block_size: Optional[int], partition: Optional[str]) -> str:
-    """Get the partition name from RDB without starting the handler."""
+def get_partition_info(image: Path, block_size: Optional[int], partition: Optional[str]) -> dict:
+    """Get partition name and dostype from RDB."""
     from .rdb_inspect import open_rdisk
     blkdev, rdisk = open_rdisk(image, block_size=block_size)
     try:
@@ -1134,8 +1134,55 @@ def get_partition_name(image: Path, block_size: Optional[int], partition: Option
         else:
             part = rdisk.find_partition_by_string(str(partition))
         if part is None:
-            return "AmigaFS"
-        return str(part.get_drive_name())
+            return {"name": "AmigaFS", "dostype": None}
+        return {
+            "name": str(part.get_drive_name()),
+            "dostype": part.part_blk.dos_env.dos_type,
+        }
+    finally:
+        rdisk.close()
+        blkdev.close()
+
+
+def get_partition_name(image: Path, block_size: Optional[int], partition: Optional[str]) -> str:
+    """Get the partition name from RDB without starting the handler."""
+    return get_partition_info(image, block_size, partition)["name"]
+
+
+def extract_embedded_driver(image: Path, block_size: Optional[int], partition: Optional[str]) -> Optional[Path]:
+    """Extract filesystem driver from RDB if available for the partition's dostype.
+
+    Returns path to temp file containing the driver, or None if not found.
+    """
+    import tempfile
+    import amitools.fs.DosType as DosType
+    from .rdb_inspect import open_rdisk
+
+    blkdev, rdisk = open_rdisk(image, block_size=block_size)
+    try:
+        # Get the partition and its dostype
+        if partition is None:
+            part = rdisk.get_partition(0)
+        else:
+            part = rdisk.find_partition_by_string(str(partition))
+        if part is None:
+            return None
+
+        target_dostype = part.part_blk.dos_env.dos_type
+        dt_str = DosType.num_to_tag_str(target_dostype)
+
+        # Search filesystem blocks for matching dostype
+        for fs in rdisk.fs:
+            if fs.fshd.dos_type == target_dostype:
+                # Found matching filesystem - extract to temp file
+                data = fs.get_data()
+                # Create temp file that persists until program exits
+                fd, temp_path = tempfile.mkstemp(suffix=f"_{dt_str}.handler", prefix="amifuse_")
+                os.write(fd, data)
+                os.close(fd)
+                return Path(temp_path), dt_str, target_dostype
+
+        return None
     finally:
         rdisk.close()
         blkdev.close()
@@ -1143,7 +1190,7 @@ def get_partition_name(image: Path, block_size: Optional[int], partition: Option
 
 def mount_fuse(
     image: Path,
-    driver: Path,
+    driver: Optional[Path],
     mountpoint: Optional[Path],
     block_size: Optional[int],
     volname_opt: Optional[str] = None,
@@ -1153,6 +1200,22 @@ def mount_fuse(
 ):
     # Get partition name for display and auto-mountpoint
     part_name = get_partition_name(image, block_size, partition)
+
+    # If no driver specified, try to extract from RDB
+    temp_driver = None
+    driver_desc = None
+    if driver is None:
+        result = extract_embedded_driver(image, block_size, partition)
+        if result is None:
+            raise SystemExit(
+                "No embedded filesystem driver found for this partition.\n"
+                "You need to specify a filesystem handler with --driver"
+            )
+        temp_driver, dt_str, dostype = result
+        driver = temp_driver
+        driver_desc = f"{dt_str}/0x{dostype:08x} (from RDB)"
+    else:
+        driver_desc = str(driver)
 
     # Auto-create mountpoint on macOS/Windows if not specified
     if mountpoint is None:
@@ -1188,6 +1251,7 @@ def mount_fuse(
     # Print startup banner
     print(f"amifuse {__version__} - Copyright (C) 2025 by Stefan Reinauer")
     print(f"Mounting partition '{part_name}' from {image}")
+    print(f"Filesystem driver: {driver_desc}")
     print(f"Mount point: {mountpoint}")
 
     if write:
@@ -1232,7 +1296,12 @@ def mount_fuse(
             "noappledouble": True,  # Disable AppleDouble ._ files
             "noapplexattr": True,  # Disable Apple extended attributes
         })
-    FUSE(AmigaFuseFS(bridge, debug=debug), str(mountpoint), **fuse_kwargs)
+    try:
+        FUSE(AmigaFuseFS(bridge, debug=debug), str(mountpoint), **fuse_kwargs)
+    finally:
+        # Clean up temp driver file if we extracted one
+        if temp_driver is not None and temp_driver.exists():
+            temp_driver.unlink()
 
 
 __version__ = "0.1.0"
@@ -1305,7 +1374,7 @@ def main(argv=None):
     mount_parser = subparsers.add_parser(
         "mount", help="Mount an Amiga filesystem image via FUSE."
     )
-    mount_parser.add_argument("--driver", required=True, type=Path, help="Filesystem binary")
+    mount_parser.add_argument("--driver", type=Path, help="Filesystem binary (default: extract from RDB if available)")
     mount_parser.add_argument("--image", required=True, type=Path, help="Disk image file")
     mount_parser.add_argument("--mountpoint", type=Path, help="Mount location (default: /Volumes/<partition> on macOS, first free drive letter on Windows)")
     mount_parser.add_argument(
