@@ -1199,13 +1199,19 @@ def mount_fuse(
     partition: Optional[str] = None,
 ):
     # Get partition name for display and auto-mountpoint
-    part_name = get_partition_name(image, block_size, partition)
+    try:
+        part_name = get_partition_name(image, block_size, partition)
+    except IOError as e:
+        raise SystemExit(f"Error: {e}")
 
     # If no driver specified, try to extract from RDB
     temp_driver = None
     driver_desc = None
     if driver is None:
-        result = extract_embedded_driver(image, block_size, partition)
+        try:
+            result = extract_embedded_driver(image, block_size, partition)
+        except IOError as e:
+            raise SystemExit(f"Error: {e}")
         if result is None:
             raise SystemExit(
                 "No embedded filesystem driver found for this partition.\n"
@@ -1314,7 +1320,10 @@ def cmd_inspect(args):
     blkdev = None
     rdisk = None
     try:
-        blkdev, rdisk = open_rdisk(args.image, block_size=args.block_size)
+        try:
+            blkdev, rdisk = open_rdisk(args.image, block_size=args.block_size)
+        except IOError as e:
+            raise SystemExit(f"Error: {e}")
         for line in rdisk.get_info(full=args.full):
             print(line)
         fs_lines = format_fs_summary(rdisk)

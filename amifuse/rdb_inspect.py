@@ -48,8 +48,24 @@ def open_rdisk(
             break
 
     if rdb_blk_num is None:
-        blkdev.close()
-        raise IOError(f"No valid RDB found in blocks 0-15 at {image}")
+        # Check for MBR or GPT before giving up
+        error_msg = f"No valid RDB found in blocks 0-15 at {image}"
+        try:
+            block0 = blkdev.read_block(0)
+            block1 = blkdev.read_block(1)
+            # MBR signature at offset 0x1FE-0x1FF
+            if len(block0) >= 512 and block0[0x1FE:0x200] == b'\x55\xAA':
+                error_msg = f"MBR partition table detected (not supported): {image}"
+            # GPT signature "EFI PART" at LBA 1
+            elif len(block1) >= 8 and block1[0:8] == b'EFI PART':
+                error_msg = f"GPT partition table detected (not supported): {image}"
+        except Exception:
+            pass
+        try:
+            blkdev.close()
+        except Exception:
+            pass
+        raise IOError(error_msg)
 
     # Create RDisk and open - need to set rdb manually since we already found it
     rdisk = RDisk(blkdev)
