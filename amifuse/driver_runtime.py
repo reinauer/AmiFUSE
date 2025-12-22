@@ -209,6 +209,11 @@ def main(argv=None):
         action="store_true",
         help="Enable verbose debug output (signature scans, extra dumps).",
     )
+    parser.add_argument(
+        "--trace",
+        action="store_true",
+        help="Enable vamos instruction tracing (very noisy).",
+    )
     args = parser.parse_args(argv)
     backend, runtime = None, None
     try:
@@ -230,6 +235,8 @@ def main(argv=None):
         if need_vamos:
             vh = VamosHandlerRuntime()
             vh.setup()
+            if args.trace:
+                vh.enable_trace()
             vh.set_scsi_backend(backend)
             seg = vh.load_handler(args.driver)
             print(f"Loaded handler into vamos memory, seglist baddr=0x{seg:x}")

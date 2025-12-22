@@ -68,6 +68,7 @@ class HandlerBridge:
         block_size: Optional[int] = None,
         read_only: bool = True,
         debug: bool = False,
+        trace: bool = False,
         partition: Optional[str] = None,
     ):
         self._lock = threading.RLock()  # Reentrant lock for thread safety
@@ -76,6 +77,8 @@ class HandlerBridge:
         self.backend.open()
         self.vh = VamosHandlerRuntime()
         self.vh.setup()
+        if trace:
+            self.vh.enable_trace()
         self.vh.set_scsi_backend(self.backend)
         seg_baddr = self.vh.load_handler(driver)
         # Build DeviceNode/FSSM using seglist bptr
@@ -1195,6 +1198,7 @@ def mount_fuse(
     block_size: Optional[int],
     volname_opt: Optional[str] = None,
     debug: bool = False,
+    trace: bool = False,
     write: bool = False,
     partition: Optional[str] = None,
 ):
@@ -1346,7 +1350,7 @@ def cmd_mount(args):
 
     mount_fuse(
         args.image, args.driver, args.mountpoint,
-        args.block_size, args.volname, args.debug, args.write,
+        args.block_size, args.volname, args.debug, args.trace, args.write,
         partition=args.partition
     )
 
@@ -1397,6 +1401,11 @@ def main(argv=None):
     )
     mount_parser.add_argument(
         "--debug", action="store_true", help="Enable debug logging of FUSE operations."
+    )
+    mount_parser.add_argument(
+        "--trace",
+        action="store_true",
+        help="Enable vamos instruction tracing (very noisy).",
     )
     mount_parser.add_argument(
         "--profile", action="store_true", help="Enable profiling and write stats to profile.txt."
