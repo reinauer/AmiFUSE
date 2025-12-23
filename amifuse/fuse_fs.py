@@ -76,7 +76,8 @@ class HandlerBridge:
         self.backend = BlockDeviceBackend(image, block_size=block_size, read_only=read_only)
         self.backend.open()
         self.vh = VamosHandlerRuntime()
-        self.vh.setup()
+        # Use 68020 CPU for compatibility with SFS and other modern handlers
+        self.vh.setup(cpu="68020")
         if trace:
             self.vh.enable_trace()
         self.vh.set_scsi_backend(self.backend)

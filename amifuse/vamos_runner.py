@@ -31,7 +31,7 @@ class VamosHandlerRuntime:
         self.seglist_baddr: Optional[int] = None
         self._temp_dir: Optional[tempfile.TemporaryDirectory] = None
 
-    def setup(self):
+    def setup(self, cpu: Optional[str] = None):
         # Use default vamos configs (bin argument required, so pass a dummy).
         mp = VamosMainParser()
         mp.parse(paths=None, args=["dummy"], cfg_dict=None)
@@ -42,6 +42,8 @@ class VamosHandlerRuntime:
         # give us enough RAM headroom for relocated handlers at 0x100000+
         if hasattr(machine_cfg, "ram_size") and machine_cfg.ram_size < 8192:
             machine_cfg.ram_size = 8192
+        if cpu:
+            machine_cfg.cpu = cpu
         trace_cfg = mp.get_trace_dict().trace
         path_cfg = mp.get_path_dict()
         # Create a temp directory for vamos path manager to avoid permission
