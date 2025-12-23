@@ -123,13 +123,17 @@ class HandlerLauncher:
         self.mem.w_block(mem_obj.addr, data)
         return mem_obj.addr
 
-    def _init_msgport(self, port_addr: int, task_addr: int):
+    def _init_msgport(self, port_addr: int, task_addr: int, sigbit: int = None):
         mp = AccessStruct(self.mem, MsgPortStruct, port_addr)
         # zero first to clear garbage
         self.mem.w_block(port_addr, b"\x00" * MsgPortStruct.get_size())
         mp.w_s("mp_Node.ln_Type", NodeType.NT_MSGPORT)
         mp.w_s("mp_Flags", MsgPortFlags.PA_SIGNAL)
-        sigbit = self._alloc_signal_bit()
+        if sigbit is None:
+            sigbit = self._alloc_signal_bit()
+        else:
+            if 0 <= sigbit < len(self.exec_impl._signals):
+                self.exec_impl._signals[sigbit] = True
         mp.w_s("mp_SigBit", sigbit)
         mp.w_s("mp_SigTask", task_addr)
         lst_off = MsgPortStruct.sdef.find_field_def_by_name("mp_MsgList").offset
@@ -202,7 +206,8 @@ class HandlerLauncher:
         proc.w_s("pr_ConsoleTask", 0)
         proc.w_s("pr_WindowPtr", 0xFFFFFFFF)
         port_addr = proc.s_get_addr("pr_MsgPort")
-        sigbit = self._init_msgport(port_addr, proc_mem.addr)
+        # FFS TaskWait uses a fixed SIGMASK (0x100), so set mp_SigBit=8.
+        sigbit = self._init_msgport(port_addr, proc_mem.addr, sigbit=8)
         # advertise signal allocation in task
         proc.w_s("pr_Task.tc_SigAlloc", 1 << sigbit)
         proc.w_s("pr_Task.tc_SigWait", 0)
