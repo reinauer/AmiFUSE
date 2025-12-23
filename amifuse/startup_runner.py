@@ -444,9 +444,16 @@ class HandlerLauncher:
             state.crashed = True
             state.last_error_pc = new_pc
             return run_state
-        # Check if WaitPort blocked (saved state in ExecLibrary class variable)
+        # Check if WaitPort or Wait blocked (saved state in ExecLibrary class variable)
         from amitools.vamos.lib.ExecLibrary import ExecLibrary
         waitport_sp = ExecLibrary._waitport_blocked_sp
+        wait_sp = ExecLibrary._wait_blocked_sp
+        waitport_ret = ExecLibrary._waitport_blocked_ret
+        wait_ret = ExecLibrary._wait_blocked_ret
+        wait_mask = ExecLibrary._wait_blocked_mask
+        # Use whichever blocking call was triggered
+        blocked_sp = waitport_sp if waitport_sp is not None else wait_sp
+        blocked_ret = waitport_ret if waitport_ret is not None else wait_ret
         # Capture updated PC/SP for the next burst, but only if the run was
         # interrupted mid-execution (cycle limit). If run_state.done is True,
         # the handler returned via the exit trap (PC would be 0x402 = hw_exc_addr,
@@ -454,20 +461,52 @@ class HandlerLauncher:
         # be at an invalid location.
         # Check error first since _terminate_run sets both error and done
         if run_state.error:
-            # WaitPort or other blocking call failed - handler is waiting for a message.
-            if waitport_sp is not None:
+            # WaitPort/Wait or other blocking call failed - handler is waiting for a message.
+            if blocked_sp is not None:
+                ret_addr = blocked_ret if blocked_ret is not None else mem.r32(blocked_sp)
+                # Save as main loop PC if not yet set - this is where handler waits for messages
+                if (not state.initialized or state.main_loop_pc == 0) and _pc_valid(ret_addr):
+                    state.main_loop_pc = ret_addr
+                    state.main_loop_sp = blocked_sp + 4
+                    state.initialized = True
                 has_pending = self.exec_impl.port_mgr.has_msg(state.port_addr)
                 if has_pending:
-                    # Resume from WaitPort return address (saved on stack)
-                    ret_addr = mem.r32(waitport_sp)
+                    # Resume from blocking call return address (saved on stack)
                     if _pc_valid(ret_addr):
                         state.pc = ret_addr
-                        state.sp = waitport_sp + 4
+                        state.sp = blocked_sp + 4
                     elif state.main_loop_pc and _pc_valid(state.main_loop_pc):
                         state.pc = state.main_loop_pc
                         state.sp = state.main_loop_sp
+                    # CRITICAL: Set D0 before resuming from Wait() or WaitPort()
+                    if wait_mask is not None:
+                        # Wait() resume - set D0 to pending signals
+                        if wait_mask == 0:
+                            pending = self._compute_pending_signals(0xFFFFFFFF)
+                        else:
+                            pending = self._compute_pending_signals(wait_mask)
+                        cpu.w_reg(REG_D0, pending)
+                    elif waitport_sp is not None:
+                        # WaitPort() resume - set D0 to message address
+                        waitport_port = ExecLibrary._waitport_blocked_port
+                        if waitport_port is not None:
+                            msg_addr = self.exec_impl.port_mgr.peek_msg(waitport_port)
+                            cpu.w_reg(REG_D0, msg_addr if msg_addr else 0)
+                    # Clear both blocking states
                     ExecLibrary._waitport_blocked_port = None
                     ExecLibrary._waitport_blocked_sp = None
+                    ExecLibrary._waitport_blocked_ret = None
+                    ExecLibrary._wait_blocked_mask = None
+                    ExecLibrary._wait_blocked_sp = None
+                    ExecLibrary._wait_blocked_ret = None
+                else:
+                    # No message pending - save restart point for later
+                    if _pc_valid(ret_addr):
+                        state.pc = ret_addr
+                        state.sp = blocked_sp + 4
+                    elif state.main_loop_pc and _pc_valid(state.main_loop_pc):
+                        state.pc = state.main_loop_pc
+                        state.sp = state.main_loop_sp
             elif state.initialized and state.main_loop_pc != 0:
                 # Fall back to saved main loop PC
                 state.pc = state.main_loop_pc
@@ -475,41 +514,59 @@ class HandlerLauncher:
             # else: keep current PC (error happened during initialization)
         elif run_state.done:
             # Handler exited via exit trap.
-            # Check if WaitPort blocked - if so, we can get the return address from the saved SP
-            if waitport_sp is not None:
-                ret_addr = mem.r32(waitport_sp)
+            # Check if WaitPort/Wait blocked - if so, we can get the return address from the saved SP
+            if blocked_sp is not None:
+                ret_addr = blocked_ret if blocked_ret is not None else mem.r32(blocked_sp)
                 # Save as main loop PC if not yet initialized
                 if (not state.initialized or state.main_loop_pc == 0) and _pc_valid(ret_addr):
                     state.main_loop_pc = ret_addr
-                    state.main_loop_sp = waitport_sp + 4  # Pop return address
+                    state.main_loop_sp = blocked_sp + 4  # Pop return address
                     state.initialized = True
                 # Only restart immediately if there's a message pending.
-                # Otherwise, leave state pointing to WaitPort return - caller
+                # Otherwise, leave state pointing to Wait/WaitPort return - caller
                 # will queue a message before calling run_burst again.
                 has_pending = self.exec_impl.port_mgr.has_msg(state.port_addr)
                 if has_pending:
-                    # Restart from return address (where WaitPort was called)
+                    # Restart from return address (where Wait/WaitPort was called)
                     if _pc_valid(ret_addr):
                         state.pc = ret_addr
-                        state.sp = waitport_sp + 4  # Pop the return address
+                        state.sp = blocked_sp + 4  # Pop the return address
                     elif state.main_loop_pc and _pc_valid(state.main_loop_pc):
                         state.pc = state.main_loop_pc
                         state.sp = state.main_loop_sp
-                    # Clear the blocked state
+                    # CRITICAL: Set D0 before resuming from Wait() or WaitPort()
+                    if wait_mask is not None:
+                        # Wait() resume - set D0 to pending signals
+                        if wait_mask == 0:
+                            pending = self._compute_pending_signals(0xFFFFFFFF)
+                        else:
+                            pending = self._compute_pending_signals(wait_mask)
+                        cpu.w_reg(REG_D0, pending)
+                    elif waitport_sp is not None:
+                        # WaitPort() resume - set D0 to message address
+                        waitport_port = ExecLibrary._waitport_blocked_port
+                        if waitport_port is not None:
+                            msg_addr = self.exec_impl.port_mgr.peek_msg(waitport_port)
+                            cpu.w_reg(REG_D0, msg_addr if msg_addr else 0)
+                    # Clear the blocked states
                     ExecLibrary._waitport_blocked_port = None
                     ExecLibrary._waitport_blocked_sp = None
+                    ExecLibrary._waitport_blocked_ret = None
+                    ExecLibrary._wait_blocked_mask = None
+                    ExecLibrary._wait_blocked_sp = None
+                    ExecLibrary._wait_blocked_ret = None
                     state.exit_count = 0  # Reset exit counter
                 else:
                     # No message pending - save restart point but don't spin.
                     # Next run_burst will restart from here when a message is queued.
                     if _pc_valid(ret_addr):
                         state.pc = ret_addr
-                        state.sp = waitport_sp + 4
+                        state.sp = blocked_sp + 4
                     elif state.main_loop_pc and _pc_valid(state.main_loop_pc):
                         state.pc = state.main_loop_pc
                         state.sp = state.main_loop_sp
                     # Keep blocked state so we know handler is waiting
-                    # Don't clear: ExecLibrary._waitport_blocked_port/sp
+                    # Don't clear: ExecLibrary._waitport_blocked_port/sp or _wait_blocked_*
             else:
                 # Normal exit trap (RTS to run_exit_addr) without WaitPort block.
                 # PFS3 handler processes ONE message and exits. To process another,
