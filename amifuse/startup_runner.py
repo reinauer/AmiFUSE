@@ -51,6 +51,8 @@ ACTION_FLUSH = 27
 OFFSET_BEGINNING = -1
 OFFSET_CURRENT = 0
 OFFSET_END = 1
+SHARED_LOCK = -2
+EXCLUSIVE_LOCK = -1
 
 
 @dataclass
@@ -633,9 +635,15 @@ class HandlerLauncher:
         )
         return pkt_addr, msg_addr
 
-    def send_locate(self, state: HandlerLaunchState, lock_bptr: int, name_bptr: int):
+    def send_locate(
+        self,
+        state: HandlerLaunchState,
+        lock_bptr: int,
+        name_bptr: int,
+        mode: int = SHARED_LOCK,
+    ):
         """ACTION_LOCATE_OBJECT: returns a new lock BPTR in dp_Res1."""
-        return self.send_packet(state, 8, [lock_bptr, name_bptr])
+        return self.send_packet(state, 8, [lock_bptr, name_bptr, mode])
 
     def send_examine(self, state: HandlerLaunchState, lock_bptr: int, fib_addr: int):
         """ACTION_EXAMINE_OBJECT"""
