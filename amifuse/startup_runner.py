@@ -25,7 +25,7 @@ from amitools.vamos.libstructs.dos import (
     ProcessStruct,
     FileHandleStruct,
 )  # type: ignore
-from amitools.vamos.machine.regs import REG_A0, REG_A4, REG_A6, REG_A7, REG_D0  # type: ignore
+from amitools.vamos.machine.regs import REG_A6, REG_A7, REG_D0  # type: ignore
 from amitools.vamos.schedule.stack import Stack  # type: ignore
 from amitools.vamos.schedule.task import Task  # type: ignore
 from .amiga_structs import DeviceNodeStruct  # type: ignore
@@ -81,7 +81,7 @@ class HandlerLauncher:
         self,
         vh,
         boot_info: Dict,
-        handler_entry_addr: int,
+        segment_addr: int,
     ):
         self.vh = vh
         self.alloc = vh.alloc
@@ -90,7 +90,7 @@ class HandlerLauncher:
         # ExecBase is stored at address 4 on Amiga systems
         self.exec_base_addr = self.mem.r32(4)
         self.boot = boot_info
-        self.handler_entry_addr = handler_entry_addr
+        self.segment_addr = segment_addr
         # Scratch packet buffers to avoid unbounded allocs (we serialize requests).
         self._stdpkt_ring = []
         self._stdpkt_sizes = []
@@ -278,10 +278,10 @@ class HandlerLauncher:
         if extra_packets:
             for pkt_type, args in extra_packets:
                 self._build_std_packet(port_addr, reply_port, pkt_type, args)
-        # build entry stub to force A0 = fssm_bptr<<2 before jumping to handler entry
-        stub_pc = build_entry_stub(
-            self.mem, self.alloc, self.boot["fssm_addr"] >> 2, self.handler_entry_addr
-        )
+        # Build entry stub that jumps to segment start.
+        # Handler's own startup code will set up registers and call WaitPort/GetMsg
+        # to retrieve the startup packet from pr_MsgPort.
+        stub_pc = build_entry_stub(self.mem, self.alloc, self.segment_addr)
         start_regs = {REG_A6: self.exec_base_addr}
         task = Task("handler_task", stub_pc, stack, start_regs=start_regs)
         return HandlerLaunchState(

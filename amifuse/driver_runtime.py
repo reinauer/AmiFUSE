@@ -310,9 +310,12 @@ def main(argv=None):
                 # buffers for post-startup requests
                 info_buf = vh.alloc.alloc_memory(InfoDataStruct.get_size(), label="InfoData")
                 read_buf = vh.alloc.alloc_memory(512, label="ReadBuf")
-                entry_addr = vh.slm.seg_loader.infos[seg].seglist.get_segment().get_addr()
-                print(f"Entry bytes: {mem.r_block(entry_addr, 16).hex()}")
-                launcher = HandlerLauncher(vh, boot, entry_addr)
+                # Handler entry point is at segment start (byte 0).
+                # AmigaOS starts C/assembler handlers at the first byte of the segment.
+                seg_info = vh.slm.seg_loader.infos[seg]
+                seg_addr = seg_info.seglist.get_segment().get_addr()
+                print(f"Entry bytes: {mem.r_block(seg_addr, 16).hex()}")
+                launcher = HandlerLauncher(vh, boot, seg_addr)
                 state = launcher.launch_with_startup()
                 print(f"Stub PC=0x{state.pc:x} initial SP=0x{state.sp:x}")
                 print(f"Stub bytes: {mem.r_block(state.pc, 16).hex()}")
