@@ -154,8 +154,8 @@ class HandlerBridge:
             replies = self.launcher.poll_replies(self.state.reply_port_addr)
             if replies:
                 break
-            # If handler is blocked in WaitPort with no messages, stop spinning
-            if ExecLibrary._waitport_blocked_sp is not None:
+            # If handler is blocked in WaitPort/Wait with no messages, stop spinning
+            if ExecLibrary._waitport_blocked_sp is not None or ExecLibrary._wait_blocked_sp is not None:
                 # Handler is waiting for a message that isn't there yet
                 # This shouldn't happen if caller queued a message before calling us
                 break
