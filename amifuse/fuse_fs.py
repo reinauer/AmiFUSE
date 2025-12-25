@@ -124,7 +124,7 @@ class HandlerBridge:
             self._neg_cache_ttl = 0.0
         if self._debug:
             print(
-                f"[amifuse] handler loaded seg_baddr=0x{seg_baddr:x} entry=0x{entry_addr:x} "
+                f"[amifuse] handler loaded seg_baddr=0x{seg_baddr:x} seg_addr=0x{seg_addr:x} "
                 f"port=0x{self.state.port_addr:x} reply=0x{self.state.reply_port_addr:x}"
             )
 
