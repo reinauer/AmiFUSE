@@ -11,6 +11,8 @@ from amitools.vamos.astructs import AmigaStructDef, AmigaStruct  # type: ignore
 from amitools.vamos.astructs.scalar import UBYTE, UWORD, ULONG  # type: ignore
 from amitools.vamos.libstructs.exec_ import IORequestStruct, UnitStruct  # type: ignore
 
+# IO flags
+IOF_QUICK = 0x01  # Complete IO synchronously if possible
 
 CMD_READ = 2  # TD_READ
 CMD_WRITE = 3  # TD_WRITE
@@ -46,6 +48,53 @@ class ScsiDevice(LibImpl):
         super().__init__()
         self.backend = backend
         self.debug = debug
+
+    def _signal_io_complete(self, ctx, req_ptr):
+        """Signal the task that IO has completed.
+
+        Even with IOF_QUICK set, some handlers (like FFS) check for the IO
+        completion signal. We need to set the signal bit from the IORequest's
+        reply port in the current task's tc_SigRecvd.
+        """
+        from amitools.vamos.libstructs.exec_ import (
+            ExecLibraryStruct, TaskStruct, MsgPortStruct, MessageStruct
+        )
+        mem = ctx.mem
+
+        # Get reply port from IORequest's embedded message (io_Message.mn_ReplyPort)
+        # IORequest starts with io_Message (a Message struct)
+        # Message.mn_ReplyPort is at offset 14
+        reply_port = mem.r32(req_ptr + 14)  # mn_ReplyPort offset
+        if reply_port == 0:
+            if self.debug:
+                print(f"[SCSI] _signal_io_complete: no reply_port (req_ptr=0x{req_ptr:x})")
+            return
+
+        # Get signal bit from reply port (mp_SigBit at offset 15)
+        sigbit = mem.r8(reply_port + 15)
+        if sigbit >= 32:
+            if self.debug:
+                print(f"[SCSI] _signal_io_complete: invalid sigbit={sigbit} (reply_port=0x{reply_port:x})")
+            return
+
+        # Get ThisTask from ExecBase (address 4)
+        exec_base = mem.r32(4)
+        if exec_base == 0:
+            return
+
+        # ThisTask offset in ExecLibrary
+        this_task_off = ExecLibraryStruct.sdef.find_field_def_by_name("ThisTask").offset
+        this_task = mem.r32(exec_base + this_task_off)
+        if this_task == 0:
+            return
+
+        # tc_SigRecvd offset in Task
+        sigrecvd_off = TaskStruct.sdef.find_field_def_by_name("tc_SigRecvd").offset
+        current_sigs = mem.r32(this_task + sigrecvd_off)
+        new_sigs = current_sigs | (1 << sigbit)
+        mem.w32(this_task + sigrecvd_off, new_sigs)
+        if self.debug:
+            print(f"[SCSI] _signal_io_complete: set sigbit={sigbit} (0x{1<<sigbit:x}) tc_SigRecvd: 0x{current_sigs:x} -> 0x{new_sigs:x}")
 
     def get_version(self):
         return 40
@@ -85,8 +134,12 @@ class ScsiDevice(LibImpl):
                 extra = f" total={self.backend.total_blocks} cyls={self.backend.cyls} heads={self.backend.heads} secs={self.backend.secs}"
             print(f"[SCSI] {cmd_name} offset={offset} len={length}{extra}")
 
-        # Clear error
+        # Clear error and ensure IOF_QUICK is set (we always complete synchronously)
+        # This tells the handler that BeginIO completed immediately - no need to wait
+        # for a reply message via WaitIO/CheckIO.
         ior.w_s("io_Error", 0)
+        flags = ior.r_s("io_Flags")
+        ior.w_s("io_Flags", flags | IOF_QUICK)
 
         if cmd == 28:  # HD_SCSICMD
             scsi = AccessStruct(mem, SCSICmdStruct, buf_ptr)
@@ -223,6 +276,11 @@ class ScsiDevice(LibImpl):
             # For unhandled commands (e.g., TD_ADDCHANGEINT), report success.
             ior.w_s("io_Error", 0)
             ior.w_s("io_Actual", 0)
+
+        # NOTE: We do NOT signal IO completion because we complete synchronously
+        # with IOF_QUICK set. The caller (DoIO/WaitIO) checks IOF_QUICK and returns
+        # immediately. Signaling would confuse handlers that use the same signal
+        # bit for both DOS packets and IO completion.
         return 0
 
     def AbortIO(self, ctx):
