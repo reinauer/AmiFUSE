@@ -14,6 +14,11 @@ from amitools.vamos.libstructs.exec_ import IORequestStruct, UnitStruct  # type:
 
 CMD_READ = 2  # TD_READ
 CMD_WRITE = 3  # TD_WRITE
+CMD_UPDATE = 4  # Flush buffers
+CMD_CLEAR = 5  # Clear buffers
+TD_SEEK = 10
+TD_ADDCHANGEINT = 20
+TD_REMCHANGEINT = 21
 TD_GETGEOMETRY = 22
 # HD_SCSICMD = 28
 
@@ -63,13 +68,22 @@ class ScsiDevice(LibImpl):
         buf_ptr = ior.r_s("io_Data")
         # SCSI command dispatch
         cmd_names = {
-            2: "CMD_READ", 3: "CMD_WRITE", 9: "TD_MOTOR", 11: "TD_FORMAT",
+            2: "CMD_READ", 3: "CMD_WRITE", 4: "CMD_UPDATE", 5: "CMD_CLEAR",
+            9: "TD_MOTOR", 10: "TD_SEEK", 11: "TD_FORMAT",
             14: "TD_CHANGESTATE", 15: "TD_PROTSTATUS", 18: "TD_GETDRIVETYPE",
-            22: "TD_GETGEOMETRY", 28: "HD_SCSICMD",
+            20: "TD_ADDCHANGEINT", 21: "TD_REMCHANGEINT", 22: "TD_GETGEOMETRY",
+            28: "HD_SCSICMD",
         }
         if self.debug:
             cmd_name = cmd_names.get(cmd, f"CMD_{cmd}")
-            print(f"[SCSI] {cmd_name} offset={offset} len={length} buf=0x{buf_ptr:08x}")
+            extra = ""
+            if cmd == CMD_READ or cmd == CMD_WRITE:
+                block_num = offset // self.backend.block_size if self.backend.block_size else 0
+                num_blocks = length // self.backend.block_size if self.backend.block_size else 0
+                extra = f" block={block_num} count={num_blocks}"
+            elif cmd == TD_GETGEOMETRY:
+                extra = f" total={self.backend.total_blocks} cyls={self.backend.cyls} heads={self.backend.heads} secs={self.backend.secs}"
+            print(f"[SCSI] {cmd_name} offset={offset} len={length}{extra}")
 
         # Clear error
         ior.w_s("io_Error", 0)
@@ -187,6 +201,23 @@ class ScsiDevice(LibImpl):
             ior.w_s("io_Actual", 0 if not self.backend.read_only else 1)
         elif cmd == 18:  # TD_GETDRIVETYPE
             # Return drive type: 0 = 3.5" drive
+            ior.w_s("io_Actual", 0)
+        elif cmd == CMD_UPDATE:  # CMD_UPDATE (4)
+            # Flush buffers to disk - sync backend
+            if hasattr(self.backend, 'sync'):
+                self.backend.sync()
+            ior.w_s("io_Actual", 0)
+        elif cmd == CMD_CLEAR:  # CMD_CLEAR (5)
+            # Clear buffers - no-op for us
+            ior.w_s("io_Actual", 0)
+        elif cmd == TD_SEEK:  # TD_SEEK (10)
+            # Seek to track - no-op for file-backed images
+            ior.w_s("io_Actual", 0)
+        elif cmd == TD_ADDCHANGEINT:  # TD_ADDCHANGEINT (20)
+            # Add disk change interrupt - no-op, disk never changes
+            ior.w_s("io_Actual", 0)
+        elif cmd == TD_REMCHANGEINT:  # TD_REMCHANGEINT (21)
+            # Remove disk change interrupt - no-op
             ior.w_s("io_Actual", 0)
         else:
             # For unhandled commands (e.g., TD_ADDCHANGEINT), report success.
