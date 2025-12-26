@@ -259,6 +259,11 @@ class HandlerBridge:
                 # Error during run - might be WaitPort block, check if we have replies
                 replies = self.launcher.poll_replies(self.state.reply_port_addr, debug=self._debug)
                 break
+            # If handler exited (done=True) without blocking, stop looping - it's not coming back
+            if getattr(rs, "done", False) and not self.state.initialized:
+                # Handler exited during startup without entering main loop
+                # The startup packet results are in the packet struct - let caller check them
+                break
             # Yield with exponential backoff to avoid tight polling loops.
             if sleep_base > 0:
                 time.sleep(sleep_time)
