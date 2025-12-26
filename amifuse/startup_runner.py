@@ -691,22 +691,14 @@ class HandlerLauncher:
                     # Don't clear: ExecLibrary._waitport_blocked_port/sp or _wait_blocked_*
             else:
                 # Normal exit trap (RTS to run_exit_addr) without WaitPort block.
-                # PFS3 handler processes ONE message and exits. To process another,
-                # we need to restart. Check if there are pending messages.
+                # For FFS, this means startup processing is complete. Check if there's
+                # a reply we can read from the packet.
                 has_pending = self.exec_impl.port_mgr.has_msg(state.port_addr)
-                if has_pending:
-                    # Messages waiting - restart handler to process them.
-                    # IMPORTANT: Use main_loop_pc to preserve handler state, not entry_stub_pc
-                    # which would cause full reinitialization and lose mounted volume state.
-                    if state.initialized and state.main_loop_pc != 0:
-                        state.pc = state.main_loop_pc
-                        state.sp = state.main_loop_sp
-                    else:
-                        # Fall back to entry_stub_pc if no main loop saved
-                        state.pc = state.entry_stub_pc
-                        state.sp = state.stack.get_initial_sp()
-                        state.started = False
-                # else: No messages pending - keep old PC (caller will send message and retry)
+                if has_pending and state.initialized and state.main_loop_pc != 0:
+                    # Messages waiting and we have a valid restart point
+                    state.pc = state.main_loop_pc
+                    state.sp = state.main_loop_sp
+                # else: Startup complete or no restart point - let caller check packet results
         else:
             if _pc_valid(new_pc):
                 state.pc = new_pc
