@@ -73,10 +73,12 @@ class HandlerBridge:
         debug: bool = False,
         trace: bool = False,
         partition: Optional[str] = None,
+        adf_info=None,
     ):
         self._lock = threading.RLock()  # Reentrant lock for thread safety
         self._debug = debug
-        self.backend = BlockDeviceBackend(image, block_size=block_size, read_only=read_only)
+        self._adf_info = adf_info
+        self.backend = BlockDeviceBackend(image, block_size=block_size, read_only=read_only, adf_info=adf_info)
         self.backend.open()
         self.vh = VamosHandlerRuntime()
         # Use 68020 CPU for compatibility with SFS and other modern handlers
@@ -86,23 +88,31 @@ class HandlerBridge:
         self.mem = self.vh.alloc.get_mem()
         seg_baddr = self.vh.load_handler(driver)
         # Build DeviceNode/FSSM using seglist bptr
-        ba = BootstrapAllocator(self.vh, image, partition=partition)
-        boot = ba.alloc_all(handler_seglist_baddr=seg_baddr, handler_seglist_bptr=seg_baddr, handler_name="DH0:")
+        ba = BootstrapAllocator(self.vh, image, partition=partition, adf_info=adf_info)
+        handler_name = "DF0:" if adf_info else "DH0:"
+        boot = ba.alloc_all(handler_seglist_baddr=seg_baddr, handler_seglist_bptr=seg_baddr, handler_name=handler_name)
         self._partition_index = boot["part"].num if boot.get("part") else 0
 
         # Log partition geometry for debugging.
         if boot.get("part") and debug:
             part = boot["part"]
-            dos_env = part.part_blk.dos_env
-            # Use partition geometry from DosEnvec, not disk geometry
-            blk_per_cyl = dos_env.surfaces * dos_env.blk_per_trk
-            start_cyl = dos_env.low_cyl
-            end_cyl = dos_env.high_cyl
-            num_cyl = end_cyl - start_cyl + 1
-            start_blk = start_cyl * blk_per_cyl
-            num_blk = num_cyl * blk_per_cyl
+            if adf_info:
+                # For ADF, use the synthetic info
+                print(f"[amifuse] ADF geometry:")
+                floppy_type = "HD" if adf_info.is_hd else "DD"
+                print(f"[amifuse]   Type: {floppy_type} floppy")
+                print(f"[amifuse]   Cylinders={adf_info.cylinders} Heads={adf_info.heads} Sectors={adf_info.sectors_per_track}")
+                print(f"[amifuse]   Total blocks: {adf_info.total_blocks}")
+            else:
+                dos_env = part.part_blk.dos_env
+                # Use partition geometry from DosEnvec, not disk geometry
+                blk_per_cyl = dos_env.surfaces * dos_env.blk_per_trk
+                start_cyl = dos_env.low_cyl
+                end_cyl = dos_env.high_cyl
+                num_cyl = end_cyl - start_cyl + 1
+                start_blk = start_cyl * blk_per_cyl
+                num_blk = num_cyl * blk_per_cyl
 
-            if debug:
                 print(f"[amifuse] Partition geometry:")
                 print(f"[amifuse]   DosEnvec: LowCyl={start_cyl} HighCyl={end_cyl} Surfaces={dos_env.surfaces} BlkPerTrack={dos_env.blk_per_trk}")
                 print(f"[amifuse]   Calculated: blk_per_cyl={blk_per_cyl} start_blk={start_blk} num_blk={num_blk}")
@@ -1366,30 +1376,54 @@ def mount_fuse(
     write: bool = False,
     partition: Optional[str] = None,
 ):
-    # Get partition name for display and auto-mountpoint
-    try:
-        part_name = get_partition_name(image, block_size, partition)
-    except IOError as e:
-        raise SystemExit(f"Error: {e}")
+    import amitools.fs.DosType as DosType
+    from .rdb_inspect import detect_adf
 
-    # If no driver specified, try to extract from RDB
-    temp_driver = None
-    driver_desc = None
-    if driver is None:
+    # First, check if this is an ADF (floppy disk image)
+    adf_info = detect_adf(image)
+
+    if adf_info is not None:
+        # ADF floppy detected - use DF0 as the partition name
+        dt_str = DosType.num_to_tag_str(adf_info.dos_type)
+        floppy_type = "HD" if adf_info.is_hd else "DD"
+        part_name = "DF0"  # Will use actual volume name from handler later
+
+        # ADF files don't have embedded drivers - user must specify one
+        if driver is None:
+            raise SystemExit(
+                f"ADF floppy image detected ({floppy_type}, {dt_str}).\n"
+                "Floppy images don't contain embedded filesystem drivers.\n"
+                "You need to specify a filesystem handler with --driver\n"
+                "For FFS/OFS floppies, use the L:FastFileSystem from a Workbench disk."
+            )
+        driver_desc = str(driver)
+        temp_driver = None
+    else:
+        # HDF/RDB image - get partition info
+        adf_info = None  # Ensure it's None for later checks
         try:
-            result = extract_embedded_driver(image, block_size, partition)
+            part_name = get_partition_name(image, block_size, partition)
         except IOError as e:
             raise SystemExit(f"Error: {e}")
-        if result is None:
-            raise SystemExit(
-                "No embedded filesystem driver found for this partition.\n"
-                "You need to specify a filesystem handler with --driver"
-            )
-        temp_driver, dt_str, dostype = result
-        driver = temp_driver
-        driver_desc = f"{dt_str}/0x{dostype:08x} (from RDB)"
-    else:
-        driver_desc = str(driver)
+
+        # If no driver specified, try to extract from RDB
+        temp_driver = None
+        driver_desc = None
+        if driver is None:
+            try:
+                result = extract_embedded_driver(image, block_size, partition)
+            except IOError as e:
+                raise SystemExit(f"Error: {e}")
+            if result is None:
+                raise SystemExit(
+                    "No embedded filesystem driver found for this partition.\n"
+                    "You need to specify a filesystem handler with --driver"
+                )
+            temp_driver, dt_str, dostype = result
+            driver = temp_driver
+            driver_desc = f"{dt_str}/0x{dostype:08x} (from RDB)"
+        else:
+            driver_desc = str(driver)
 
     # Auto-create mountpoint on macOS/Windows if not specified
     if mountpoint is None:
@@ -1424,7 +1458,11 @@ def mount_fuse(
 
     # Print startup banner
     print(f"amifuse {__version__} - Copyright (C) 2025 by Stefan Reinauer")
-    print(f"Mounting partition '{part_name}' from {image}")
+    if adf_info is not None:
+        floppy_type = "HD" if adf_info.is_hd else "DD"
+        print(f"Mounting ADF floppy ({floppy_type}) from {image}")
+    else:
+        print(f"Mounting partition '{part_name}' from {image}")
     print(f"Filesystem driver: {driver_desc}")
     print(f"Mount point: {mountpoint}")
 
@@ -1451,7 +1489,8 @@ def mount_fuse(
         read_only=not write,
         debug=debug,
         trace=trace,
-        partition=partition
+        partition=partition,
+        adf_info=adf_info,
     )
 
     # Let default signal handling work - FUSE will call destroy() on unmount
@@ -1488,7 +1527,23 @@ __version__ = "0.1.0"
 
 def cmd_inspect(args):
     """Handle the 'inspect' subcommand."""
-    from .rdb_inspect import open_rdisk, format_fs_summary
+    import amitools.fs.DosType as DosType
+    from .rdb_inspect import open_rdisk, format_fs_summary, detect_adf
+
+    # First check for ADF
+    adf_info = detect_adf(args.image)
+    if adf_info is not None:
+        dt_str = DosType.num_to_tag_str(adf_info.dos_type)
+        floppy_type = "HD" if adf_info.is_hd else "DD"
+        print(f"ADF Floppy Image: {args.image}")
+        print(f"  Type: {floppy_type} ({adf_info.sectors_per_track} sectors/track)")
+        print(f"  Geometry: {adf_info.cylinders} cylinders, {adf_info.heads} heads")
+        print(f"  Block size: {adf_info.block_size} bytes")
+        print(f"  Total blocks: {adf_info.total_blocks}")
+        print(f"  DOS type: {dt_str} (0x{adf_info.dos_type:08x})")
+        print("\nNote: ADF files don't contain embedded filesystem drivers.")
+        print("Use --driver to specify a filesystem handler when mounting.")
+        return
 
     blkdev = None
     rdisk = None

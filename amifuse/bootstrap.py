@@ -4,22 +4,61 @@ DeviceNode) in vamos memory using partition info.
 """
 
 from pathlib import Path
+from typing import Optional
+
 from amitools.vamos.astructs.access import AccessStruct  # type: ignore
 from amitools.fs.blkdev.RawBlockDevice import RawBlockDevice  # type: ignore
 from amitools.fs.rdb.RDisk import RDisk  # type: ignore
 
 from .amiga_structs import DosEnvecStruct, FileSysStartupMsgStruct, DeviceNodeStruct
 from amitools.vamos.libstructs.exec_ import MsgPortStruct, ListStruct, NodeType  # type: ignore
+from .rdb_inspect import detect_adf, ADFInfo
+
+
+class SyntheticDosEnv:
+    """Synthetic DosEnvec-like object for ADF (floppy) images."""
+    def __init__(self, adf_info: ADFInfo):
+        self.size = 16  # de_TableSize
+        self.block_size = 128  # de_SizeBlock in longwords (512 bytes / 4)
+        self.sec_org = 0
+        self.surfaces = adf_info.heads
+        self.sec_per_blk = 1
+        self.blk_per_trk = adf_info.sectors_per_track
+        self.reserved = 2  # Boot blocks
+        self.pre_alloc = 0
+        self.interleave = 0
+        self.low_cyl = 0
+        self.high_cyl = adf_info.cylinders - 1
+        self.num_buffer = 5
+        self.buf_mem_type = 0
+        self.max_transfer = 0x7FFFFFFF
+        self.mask = 0xFFFFFFFF
+        self.boot_pri = 0
+        self.dos_type = adf_info.dos_type
+        self.baud = 0
+        self.control = 0
+        self.boot_blocks = 2
+
+
+class SyntheticPartition:
+    """Synthetic partition info for ADF images."""
+    def __init__(self, adf_info: ADFInfo):
+        self.num = 0
+        self.adf_info = adf_info
+
+    def get_num_blocks(self):
+        return self.adf_info.total_blocks
 
 
 class BootstrapAllocator:
-    def __init__(self, vh, image_path: Path, block_size=512, partition=None):
+    def __init__(self, vh, image_path: Path, block_size=512, partition=None, adf_info: Optional[ADFInfo] = None):
         self.vh = vh
         self.alloc = vh.alloc
         self.mem = vh.alloc.get_mem()
         self.image_path = image_path
         self.block_size = block_size
         self.partition = partition  # name, index, or None for first
+        self.adf_info = adf_info  # Pre-detected ADF info, if any
 
     def _read_partition_env(self):
         blk = RawBlockDevice(str(self.image_path), read_only=True, block_bytes=self.block_size)
@@ -36,8 +75,20 @@ class BootstrapAllocator:
         de = part.part_blk.dos_env
         return de, blk, rd, part
 
+    def _read_adf_env(self):
+        """Create synthetic partition info for ADF images."""
+        blk = RawBlockDevice(str(self.image_path), read_only=True, block_bytes=self.block_size)
+        blk.open()
+        de = SyntheticDosEnv(self.adf_info)
+        part = SyntheticPartition(self.adf_info)
+        return de, blk, None, part  # rd is None for ADF
+
     def alloc_all(self, handler_seglist_baddr, handler_seglist_bptr, handler_name="PFS0:"):
-        de, blk, rd, part = self._read_partition_env()
+        # Use ADF synthetic partition if adf_info is set, otherwise read from RDB
+        if self.adf_info is not None:
+            de, blk, rd, part = self._read_adf_env()
+        else:
+            de, blk, rd, part = self._read_partition_env()
         # DosEnvec
         env_mem = self.alloc.alloc_memory(DosEnvecStruct.get_size(), label="DosEnvec")
         env = AccessStruct(self.mem, DosEnvecStruct, env_mem.addr)

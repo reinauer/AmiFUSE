@@ -1,8 +1,10 @@
 import argparse
 import json
+import os
 import sys
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 AMITOOLS_PATH = REPO_ROOT / "amitools"
@@ -16,6 +18,82 @@ if str(AMITOOLS_PATH) not in sys.path:
 from amitools.fs.blkdev.RawBlockDevice import RawBlockDevice  # type: ignore  # noqa: E402
 from amitools.fs.rdb.RDisk import RDisk  # type: ignore  # noqa: E402
 import amitools.fs.DosType as DosType  # type: ignore  # noqa: E402
+
+
+# ADF geometry constants
+ADF_DD_SIZE = 901120   # 80 cylinders * 2 heads * 11 sectors * 512 bytes
+ADF_HD_SIZE = 1802240  # 80 cylinders * 2 heads * 22 sectors * 512 bytes
+
+
+@dataclass
+class ADFInfo:
+    """Information about an ADF (floppy) image."""
+    dos_type: int           # DOS type from boot block (0x444F5300-0x444F5307)
+    is_hd: bool             # True if HD floppy (22 sectors/track), False for DD (11)
+    cylinders: int          # Always 80 for floppies
+    heads: int              # Always 2 for floppies
+    sectors_per_track: int  # 11 for DD, 22 for HD
+    block_size: int         # Always 512
+    total_blocks: int       # Total number of blocks
+
+
+def detect_adf(image: Path) -> Optional[ADFInfo]:
+    """Detect if image is an ADF (Amiga floppy disk) based on content.
+
+    Checks:
+    1. First 3 bytes are "DOS" (0x44 0x4F 0x53)
+    2. 4th byte is 0-7 (DOS type variant)
+    3. File size matches DD (901120) or HD (1802240) floppy size
+
+    Returns ADFInfo if detected, None otherwise.
+    """
+    try:
+        size = os.path.getsize(image)
+    except OSError:
+        return None
+
+    # Check file size matches floppy geometry
+    if size == ADF_DD_SIZE:
+        is_hd = False
+        sectors_per_track = 11
+    elif size == ADF_HD_SIZE:
+        is_hd = True
+        sectors_per_track = 22
+    else:
+        return None
+
+    # Read first 4 bytes and check for DOS signature
+    try:
+        with open(image, 'rb') as f:
+            header = f.read(4)
+    except OSError:
+        return None
+
+    if len(header) < 4:
+        return None
+
+    # Check for "DOS" signature (bytes 0-2) and valid variant (byte 3)
+    if header[0:3] != b'DOS':
+        return None
+
+    variant = header[3]
+    if variant > 7:
+        return None
+
+    # Build DOS type: 'DOS\x00' = 0x444F5300, 'DOS\x01' = 0x444F5301, etc.
+    dos_type = 0x444F5300 | variant
+
+    total_blocks = 80 * 2 * sectors_per_track
+
+    return ADFInfo(
+        dos_type=dos_type,
+        is_hd=is_hd,
+        cylinders=80,
+        heads=2,
+        sectors_per_track=sectors_per_track,
+        block_size=512,
+        total_blocks=total_blocks,
+    )
 
 
 def open_rdisk(

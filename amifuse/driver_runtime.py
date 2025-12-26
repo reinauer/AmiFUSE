@@ -32,18 +32,30 @@ from .startup_runner import HandlerLauncher  # noqa: E402
 class BlockDeviceBackend:
     """Thin wrapper around a host file to provide block reads/writes."""
 
-    def __init__(self, image: Path, block_size: Optional[int] = None, read_only=True):
+    def __init__(self, image: Path, block_size: Optional[int] = None, read_only=True, adf_info=None):
         self.image = image
         self.block_size = block_size or 512
         self.read_only = read_only
         self.blkdev: Optional[RawBlockDevice] = None
         self.rdb: Optional[RDisk] = None
+        self.adf_info = adf_info  # ADFInfo if this is a floppy image
 
     def open(self):
         self.blkdev = RawBlockDevice(
             str(self.image), read_only=self.read_only, block_bytes=self.block_size
         )
         self.blkdev.open()
+
+        # For ADF images, skip RDB parsing and use synthetic geometry
+        if self.adf_info is not None:
+            self.rdb = None
+            self.block_size = self.adf_info.block_size
+            self.cyls = self.adf_info.cylinders
+            self.heads = self.adf_info.heads
+            self.secs = self.adf_info.sectors_per_track
+            self.total_blocks = self.adf_info.total_blocks
+            return
+
         self.rdb = RDisk(self.blkdev)
         # Try to auto-adjust block size if the RDB disagrees.
         peeked = self.rdb.peek_block_size()
@@ -94,6 +106,12 @@ class BlockDeviceBackend:
             self.blkdev.flush()
 
     def describe(self) -> str:
+        if self.adf_info is not None:
+            floppy_type = "HD" if self.adf_info.is_hd else "DD"
+            return (
+                f"{self.image} ADF ({floppy_type}) cyls={self.cyls} heads={self.heads} "
+                f"secs={self.secs} block={self.block_size}"
+            )
         assert self.rdb is not None
         pd = self.rdb.rdb.phy_drv
         return (
