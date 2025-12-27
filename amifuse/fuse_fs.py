@@ -786,20 +786,21 @@ class HandlerBridge:
 
 class AmigaFuseFS(Operations):
     # macOS special files we should reject immediately without calling handler
+    # Note: "Icon\r" and ".VolumeIcon.icns" are NOT in this list - we handle them for custom icons
     _MACOS_SPECIAL = frozenset([
         "._.", ".hidden", ".Trashes", ".Spotlight-V100", ".fseventsd",
         ".metadata_never_index", ".com.apple.timemachine.donotpresent",
-        ".VolumeIcon.icns", ".DS_Store", "Icon\r", ".ql_disablethumbnails",
+        ".DS_Store", ".ql_disablethumbnails",
         ".localized", ".TemporaryItems", ".DocumentRevisions-V100",
         ".vol", ".file", ".hotfiles.btree", ".quota.user", ".quota.group",
         ".apdisk", ".com.apple.NetBootX", "mach_kernel", ".PKInstallSandboxManager",
         ".PKInstallSandboxManager-SystemSoftware", ".Trashes.501", "Backups.backupdb",
     ])
-
     def __init__(
         self,
         bridge: HandlerBridge,
         debug: bool = False,
+        icons: bool = False,
     ):
         self.bridge = bridge
         self._debug = debug
@@ -820,13 +821,53 @@ class AmigaFuseFS(Operations):
         self._next_fh = 1
         self._last_op_time = time.time()
         self._op_count = 0
+        # Icon support - use platform-specific handler
+        self._icons_enabled = icons
+        self._icon_parser = None
+        self._icon_cache = None
+        self._icon_existence_cache = None
+        self._icon_handler = None
+        if icons:
+            from .icon_parser import IconParser
+            from .icon_cache import IconCache, IconExistenceCache
+            from . import platform
+            self._icon_parser = IconParser(debug=debug)
+            self._icon_cache = IconCache()
+            self._icon_existence_cache = IconExistenceCache()
+            self._icon_handler = platform.get_icon_handler(icons_enabled=True, debug=debug)
 
     def _is_macos_special(self, path: str) -> bool:
         """Return True if path is a macOS special file we should reject."""
         name = path.rsplit("/", 1)[-1]
         if name.startswith("._"):  # AppleDouble resource fork files
             return True
+        # Icon files are handled specially when icons enabled
+        if self._icon_handler:
+            from . import platform
+            icon_file, volume_icon_file = platform.get_icon_file_names()
+            if icon_file and name == icon_file:
+                return False  # Let it through - we handle it in getattr
+            if volume_icon_file and name == volume_icon_file:
+                return False  # Let it through - we handle it in getattr
         return name in self._MACOS_SPECIAL
+
+    def _is_icon_file(self, path: str) -> bool:
+        """Return True if path is the virtual icon file for custom folder icons."""
+        if self._icon_handler:
+            return self._icon_handler.is_icon_file(path)
+        return False
+
+    def _is_volume_icon_file(self, path: str) -> bool:
+        """Return True if path is the virtual volume icon file."""
+        if self._icon_handler:
+            return self._icon_handler.is_volume_icon_file(path)
+        return False
+
+    def _get_parent_dir(self, path: str) -> str:
+        """Get the parent directory of a path."""
+        if path == "/" or "/" not in path.lstrip("/"):
+            return "/"
+        return "/" + path.lstrip("/").rsplit("/", 1)[0]
 
     def _get_cached_stat(self, path: str) -> Optional[Dict]:
         """Return cached stat result if still valid, else None."""
@@ -912,7 +953,6 @@ class AmigaFuseFS(Operations):
 
     # --- FUSE operations ---
     def getattr(self, path, fh=None):
-        # Don't log getattr - too noisy. Only log on errors.
         self._check_handler_alive()
         # Reject macOS special files immediately without calling handler
         if self._is_macos_special(path):
@@ -921,6 +961,24 @@ class AmigaFuseFS(Operations):
         if path == "/":
             self._track_op("getattr", path, cached=True)
             return self._root_stat()
+        # Handle virtual Icon file for custom folder icons (platform-specific)
+        if self._icon_handler and self._is_icon_file(path):
+            parent_dir = self._get_parent_dir(path)
+            # Check if parent directory has a custom icon
+            if self._has_valid_icon(parent_dir):
+                icns_data = self._get_icon_for_path(parent_dir)
+                icns_size = len(icns_data) if icns_data else 0
+                return self._icon_handler.get_icon_file_stat(icns_size, self._uid, self._gid)
+            raise FuseOSError(errno.ENOENT)
+        # Handle virtual volume icon file (platform-specific)
+        # Note: macFUSE's volicon module handles this at mount time, but we keep
+        # this as a fallback for older versions or non-macOS systems
+        if self._icon_handler and self._is_volume_icon_file(path):
+            if self._has_valid_icon("/"):
+                icns_data = self._get_icon_for_path("/")
+                if icns_data:
+                    return self._icon_handler.get_volume_icon_stat(len(icns_data), self._uid, self._gid)
+            raise FuseOSError(errno.ENOENT)
         # Check negative cache first (known non-existent paths)
         if self._is_neg_cached(path):
             self._track_op("getattr", path, cached=True)
@@ -955,6 +1013,10 @@ class AmigaFuseFS(Operations):
             "st_uid": self._uid,
             "st_gid": self._gid,
         }
+        # Set UF_HIDDEN on all .info files when icons mode is enabled
+        # This hides the Amiga icon files since we display icons via xattrs
+        if self._icons_enabled and (path.endswith(".info") or path.lower().endswith(".info")):
+            result["st_flags"] = result.get("st_flags", 0) | 0x8000  # UF_HIDDEN
         self._set_cached_stat(path, result)
         return result
 
@@ -995,7 +1057,24 @@ class AmigaFuseFS(Operations):
                 "st_uid": self._uid,
                 "st_gid": self._gid,
             }
+            # Set UF_HIDDEN on .info files when icons mode is enabled
+            if self._icons_enabled and (name.endswith(".info") or name.lower().endswith(".info")):
+                stat_result["st_flags"] = 0x8000  # UF_HIDDEN
             self._stat_cache[child_path] = (now, stat_result)
+
+        # Add virtual icon files if this directory has a custom icon
+        if self._icon_handler and self._has_valid_icon(path):
+            from . import platform
+            icon_file, _ = platform.get_icon_file_names()
+            if icon_file:
+                entries.append(icon_file)
+
+        # Add virtual volume icon file at root if Disk.info exists
+        if self._icon_handler and path == "/" and self._has_valid_icon("/"):
+            from . import platform
+            _, volume_icon_file = platform.get_icon_file_names()
+            if volume_icon_file:
+                entries.append(volume_icon_file)
 
         # Cache the directory listing
         self._dir_cache[path] = (now, entries)
@@ -1006,6 +1085,39 @@ class AmigaFuseFS(Operations):
         self._check_handler_alive()
         if not self.bridge._write_enabled and (flags & (os.O_WRONLY | os.O_RDWR)):
             raise FuseOSError(errno.EROFS)
+        # Handle virtual Icon\r file - return a special handle
+        if self._icons_enabled and self._is_icon_file(path):
+            parent_dir = self._get_parent_dir(path)
+            if self._has_valid_icon(parent_dir):
+                with self._fh_lock:
+                    handle = self._next_fh
+                    self._next_fh += 1
+                    self._fh_cache[handle] = {
+                        "virtual_icon": True,
+                        "parent_dir": parent_dir,
+                        "pos": 0,
+                        "lock": threading.Lock(),
+                        "closed": False,
+                    }
+                return handle
+            raise FuseOSError(errno.ENOENT)
+        # Handle virtual .VolumeIcon.icns file - return a special handle
+        if self._icons_enabled and self._is_volume_icon_file(path):
+            if self._has_valid_icon("/"):
+                icns_data = self._get_icon_for_path("/")
+                if icns_data:
+                    with self._fh_lock:
+                        handle = self._next_fh
+                        self._next_fh += 1
+                        self._fh_cache[handle] = {
+                            "virtual_volume_icon": True,
+                            "icns_data": icns_data,
+                            "pos": 0,
+                            "lock": threading.Lock(),
+                            "closed": False,
+                        }
+                    return handle
+            raise FuseOSError(errno.ENOENT)
         opened = self.bridge.open_file(path, flags)
         if opened is None:
             info = self.bridge.stat_path(path)
@@ -1035,6 +1147,16 @@ class AmigaFuseFS(Operations):
             if data is None:
                 raise FuseOSError(errno.EIO)
             return data
+        # Virtual Icon\r file returns empty content (icon is in ResourceFork)
+        if entry.get("virtual_icon"):
+            return b""
+        # Virtual .VolumeIcon.icns file returns actual ICNS data
+        if entry.get("virtual_volume_icon"):
+            icns_data = entry.get("icns_data", b"")
+            end = min(offset + size, len(icns_data))
+            if offset >= len(icns_data):
+                return b""
+            return icns_data[offset:end]
         fh_addr = entry["fh_addr"]
         with entry["lock"]:
             if entry.get("closed"):
@@ -1261,11 +1383,187 @@ class AmigaFuseFS(Operations):
         return 0
 
     def listxattr(self, path):
-        return []
+        if self._debug:
+            print(f"[FUSE][listxattr] path={path} icons_enabled={self._icons_enabled}", flush=True)
+        if not self._icons_enabled or not self._icon_handler:
+            return []
+
+        # For Icon\r files, check if parent has a valid icon
+        # For other paths, check if the path itself has a valid icon
+        if self._is_icon_file(path):
+            parent_dir = self._get_parent_dir(path)
+            has_icon = self._has_valid_icon(parent_dir)
+        else:
+            has_icon = self._has_valid_icon(path)
+
+        result = self._icon_handler.get_listxattr_for_path(path, has_icon)
+        if self._debug and result:
+            print(f"[FUSE][listxattr] {path} -> {result}", flush=True)
+        return result
 
     def getxattr(self, path, name, position=0):
+        if self._debug:
+            print(f"[FUSE][getxattr] path={path} name={name} position={position}", flush=True)
         enoattr = getattr(errno, "ENOATTR", errno.ENODATA)
+
+        if not self._icons_enabled or not self._icon_handler:
+            raise FuseOSError(enoattr)
+
+        # For Icon\r files, get icon data from parent directory
+        # For other paths, get icon data from the path itself
+        if self._is_icon_file(path):
+            icon_source_path = self._get_parent_dir(path)
+        else:
+            icon_source_path = path
+
+        # Get icon data and has_icon status
+        icns_data = self._get_icon_for_path(icon_source_path)
+        has_icon = self._has_valid_icon(icon_source_path)
+
+        # Use DarwinIconHandler to get the xattr value
+        result = self._icon_handler.get_xattr_value(path, name, icns_data, has_icon, position)
+
+        if result is not None:
+            if self._debug:
+                print(f"[FUSE][getxattr] {name} for {path}: {len(result)} bytes", flush=True)
+            return result
+
         raise FuseOSError(enoattr)
+
+    def _find_info_file(self, path: str) -> Optional[str]:
+        """Find the .info file for a given path using case-insensitive matching.
+
+        For root ("/"), looks for Disk.info.
+        For other paths, looks for path.info.
+
+        Returns:
+            The actual path to the .info file, or None if not found.
+        """
+        if path == "/":
+            # Root directory uses Disk.info for its icon
+            target_name = "disk.info"
+            dir_path = "/"
+        else:
+            # Normal files/directories: append .info suffix
+            # Get parent directory and target name
+            if "/" in path[1:]:  # Has subdirectories
+                dir_path = path.rsplit("/", 1)[0] or "/"
+                base_name = path.rsplit("/", 1)[1]
+            else:
+                dir_path = "/"
+                base_name = path[1:]  # Remove leading /
+            target_name = (base_name + ".info").lower()
+
+        # List directory and find matching .info file case-insensitively
+        try:
+            entries = self.bridge.list_dir_path(dir_path)
+            for entry in entries:
+                name = entry.get("name", "")
+                if name.lower() == target_name:
+                    if dir_path == "/":
+                        return "/" + name
+                    else:
+                        return dir_path + "/" + name
+        except Exception:
+            pass
+
+        return None
+
+    def _has_valid_icon(self, path: str) -> bool:
+        """Check if the file at path has a valid .info icon file that can be converted.
+
+        This actually tries to generate the ICNS to ensure consistency with _get_icon_for_path.
+        """
+        if not self._icons_enabled:
+            return False
+
+        # Check existence cache first
+        cached = self._icon_existence_cache.get(path)
+        if cached is not None:
+            return cached
+
+        # Actually try to get the icon - this ensures we can parse it
+        icns_data = self._get_icon_for_path(path)
+        if icns_data:
+            self._icon_existence_cache.put(path, True)
+            return True
+
+        self._icon_existence_cache.put(path, False)
+        return False
+
+    def _get_icon_for_path(self, path: str) -> Optional[bytes]:
+        """Get ICNS data for a file by parsing its .info file."""
+        if not self._icons_enabled:
+            return None
+
+        # Check ICNS cache first (keyed by base path)
+        cached = self._icon_cache.get(path)
+        if cached is not None:
+            return cached
+
+        # Find the .info file using case-insensitive matching
+        info_path = self._find_info_file(path)
+        if not info_path:
+            return None
+
+        info_stat = self._get_cached_stat(info_path)
+        if info_stat is None:
+            info_stat = self.bridge.stat_path(info_path)
+        if not info_stat:
+            return None
+
+        # Read the entire .info file
+        # info_stat could be from bridge.stat_path (has 'size') or from _stat_cache (has 'st_size')
+        if isinstance(info_stat, dict):
+            file_size = info_stat.get("size") or info_stat.get("st_size", 0)
+        else:
+            file_size = 0
+        if file_size <= 0 or file_size > 1024 * 1024:  # Max 1MB
+            return None
+
+        data = self.bridge.read_file(info_path, file_size, 0)
+        if not data:
+            if self._debug:
+                print(f"[FUSE] Failed to read icon data from {info_path}", flush=True)
+            return None
+
+        if self._debug:
+            print(f"[FUSE] Parsing icon: {info_path} ({len(data)} bytes)", flush=True)
+
+        # Parse the icon
+        icon_info = self._icon_parser.parse(data)
+        if not icon_info:
+            if self._debug:
+                print(f"[FUSE] Failed to parse icon from {info_path}", flush=True)
+            return None
+
+        # Convert to ICNS
+        from .icon_parser import create_icns
+        aspect_ratio = icon_info.get("aspect_ratio", 1.0)
+        icns_data = create_icns(icon_info["rgba"], icon_info["width"], icon_info["height"],
+                                debug=self._debug, aspect_ratio=aspect_ratio)
+
+        # Cache the result
+        self._icon_cache.put(path, icns_data)
+
+        if self._debug:
+            print(f"[FUSE] Generated {len(icns_data)} byte ICNS for {path} "
+                  f"({icon_info['width']}x{icon_info['height']} {icon_info['format']})", flush=True)
+            # Save ICNS to temp file for verification
+            safe_name = path.replace("/", "_").lstrip("_")
+            icns_path = f"/tmp/amifuse_icon_{safe_name}.icns"
+            with open(icns_path, "wb") as f:
+                f.write(icns_data)
+            print(f"[FUSE] DEBUG: Saved ICNS to {icns_path}", flush=True)
+            # Also save resource fork for verification
+            from .resource_fork import build_resource_fork
+            rfork_data = build_resource_fork(icns_data, 0)
+            rfork_path = f"/tmp/amifuse_icon_{safe_name}.rsrc"
+            with open(rfork_path, "wb") as f:
+                f.write(rfork_data)
+            print(f"[FUSE] DEBUG: Saved resource fork ({len(rfork_data)} bytes) to {rfork_path}", flush=True)
+
+        return icns_data
 
     def setxattr(self, path, name, value, options, position=0):
         if not self.bridge._write_enabled:
@@ -1285,6 +1583,12 @@ class AmigaFuseFS(Operations):
                 return 0
             entry["closed"] = True
             del self._fh_cache[fh]
+        # Virtual Icon\r files have no real handle to close
+        if entry.get("virtual_icon"):
+            return 0
+        # Virtual .VolumeIcon.icns files have no real handle to close
+        if entry.get("virtual_volume_icon"):
+            return 0
         with entry["lock"]:
             self._log_op("release", path, f"closing fh_addr=0x{entry['fh_addr']:x}")
             self.bridge.close_file(entry["fh_addr"])
@@ -1375,6 +1679,7 @@ def mount_fuse(
     trace: bool = False,
     write: bool = False,
     partition: Optional[str] = None,
+    icons: bool = False,
 ):
     import amitools.fs.DosType as DosType
     from .rdb_inspect import detect_adf
@@ -1426,21 +1731,11 @@ def mount_fuse(
             driver_desc = str(driver)
 
     # Auto-create mountpoint on macOS/Windows if not specified
+    from . import platform as plat
     if mountpoint is None:
-        if sys.platform.startswith("darwin"):
-            mountpoint = Path(f"/Volumes/{volname_opt or part_name}")
-        elif sys.platform.startswith("win"):
-            # Find first available drive letter (starting from A:)
-            import string
-            for letter in string.ascii_uppercase:
-                drive = f"{letter}:"
-                if not os.path.exists(drive):
-                    mountpoint = Path(drive)
-                    break
-            if mountpoint is None:
-                raise SystemExit("No available drive letter found. Use --mountpoint to specify one.")
-        else:
-            raise SystemExit("--mountpoint is required on Linux")
+        mountpoint = plat.get_default_mountpoint(volname_opt or part_name)
+        if mountpoint is None:
+            raise SystemExit("--mountpoint is required on this platform")
 
     if mountpoint.exists() and os.path.ismount(mountpoint):
         raise SystemExit(
@@ -1448,12 +1743,8 @@ def mount_fuse(
         )
 
     # Create mountpoint directory if it doesn't exist
-    # On macOS /Volumes, FUSE creates the mount point automatically
     if not mountpoint.exists():
-        if sys.platform.startswith("darwin") and str(mountpoint).startswith("/Volumes/"):
-            # macFUSE will create the mount point in /Volumes
-            pass
-        else:
+        if not plat.should_auto_create_mountpoint(mountpoint):
             mountpoint.mkdir(parents=True)
 
     # Print startup banner
@@ -1470,16 +1761,13 @@ def mount_fuse(
         # Guard against accidental writes without explicit intent.
         print("[amifuse] write mode enabled; ensure the image is backed up")
 
+    if icons:
+        print("[amifuse] icon mode enabled; Amiga icons will appear as macOS custom icons")
+
     def _unmount_mountpoint():
         if not mountpoint.exists() or not os.path.ismount(mountpoint):
             return
-        if sys.platform.startswith("darwin"):
-            cmd = ["umount", "-f", str(mountpoint)]
-        else:
-            if shutil.which("fusermount"):
-                cmd = ["fusermount", "-u", str(mountpoint)]
-            else:
-                cmd = ["umount", "-f", str(mountpoint)]
+        cmd = plat.get_unmount_command(mountpoint)
         subprocess.run(cmd, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     bridge = HandlerBridge(
@@ -1495,6 +1783,14 @@ def mount_fuse(
 
     # Let default signal handling work - FUSE will call destroy() on unmount
     volname = volname_opt or bridge.volume_name()
+
+    # Pre-generate volume icon if platform requires it at mount time
+    temp_volicon = None
+    if icons:
+        temp_volicon = plat.pre_generate_volume_icon(bridge, debug=debug)
+        if temp_volicon:
+            print(f"[amifuse] Volume icon generated: {temp_volicon}")
+
     # Multi-threaded mode with caching to minimize macOS polling.
     use_threads = not write
     fuse_kwargs = {
@@ -1506,20 +1802,26 @@ def mount_fuse(
         "subtype": "amifuse",
         "default_permissions": True,  # Let kernel handle permission checks
     }
-    if sys.platform.startswith("darwin"):
-        # macOS-specific options to reduce Finder/Spotlight polling
-        fuse_kwargs.update({
-            "volname": volname,  # Volume name shown in Finder
-            "local": True,  # Tell macOS this is a local FS (not network)
-            "noappledouble": True,  # Disable AppleDouble ._ files
-            "noapplexattr": True,  # Disable Apple extended attributes
-        })
+    # Add platform-specific mount options
+    platform_opts = plat.get_mount_options(
+        volname=volname,
+        volicon_path=str(temp_volicon) if temp_volicon else None,
+        icons_enabled=icons
+    )
+    fuse_kwargs.update(platform_opts)
+
+    if debug:
+        print(f"[amifuse] FUSE options: {fuse_kwargs}", flush=True)
+
     try:
-        FUSE(AmigaFuseFS(bridge, debug=debug), str(mountpoint), **fuse_kwargs)
+        FUSE(AmigaFuseFS(bridge, debug=debug, icons=icons), str(mountpoint), **fuse_kwargs)
     finally:
         # Clean up temp driver file if we extracted one
         if temp_driver is not None and temp_driver.exists():
             temp_driver.unlink()
+        # Clean up temp volume icon file
+        if temp_volicon is not None and temp_volicon.exists():
+            temp_volicon.unlink()
 
 
 __version__ = "0.1.0"
@@ -1575,7 +1877,8 @@ def cmd_mount(args):
     mount_fuse(
         args.image, args.driver, args.mountpoint,
         args.block_size, args.volname, args.debug, args.trace, args.write,
-        partition=args.partition
+        partition=args.partition,
+        icons=args.icons
     )
 
     if args.profile:
@@ -1636,6 +1939,10 @@ def main(argv=None):
     )
     mount_parser.add_argument(
         "--write", action="store_true", help="Enable read-write mode (experimental)."
+    )
+    mount_parser.add_argument(
+        "--icons", action="store_true",
+        help="Convert Amiga .info icons to native macOS icons (experimental)."
     )
     mount_parser.set_defaults(func=cmd_mount)
 
