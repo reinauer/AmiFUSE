@@ -28,14 +28,14 @@ git submodule update --init
 python3 -m venv .venv
 source .venv/bin/activate   # On Windows: .venv\Scripts\activate
 
-pip install -e ./amitools[vamos]   # Install amitools from submodule (includes machine68k)
-pip install -e .                   # Install amifuse
+pip install -e './amitools[vamos]'   # Install amitools from submodule (includes machine68k)
+pip install -e .                     # Install amifuse
 ```
 
 ### Without virtual environment
 
 ```bash
-pip install --user -e ./amitools[vamos]
+pip install --user -e './amitools[vamos]'
 pip install --user -e .
 ```
 
