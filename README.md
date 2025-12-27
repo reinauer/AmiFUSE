@@ -1,12 +1,14 @@
 # amifuse
 
-Mount Amiga filesystem images on macOS/Linux using native AmigaOS filesystem handlers via FUSE.
+Mount Amiga filesystem images on macOS/Linux/Windows using native AmigaOS filesystem handlers via FUSE.
 
 amifuse runs actual Amiga filesystem drivers (like PFS3) through m68k CPU emulation, allowing you to read Amiga hard disk images without relying on reverse-engineered implementations.
 
 ## Requirements
 
-- **macOS**: [macFUSE](https://osxfuse.github.io/) (or FUSE for Linux)
+- **macOS**: [macFUSE](https://osxfuse.github.io/)
+- **Linux**: FUSE for Linux
+- **Windows**: [WinFSP](https://winfsp.dev/)
 - **Python 3.9+**
 - **7z**: Required for `make unpack` (install via `brew install p7zip` on macOS)
 - A **filesystem handler**: e.g. [pfs3aio](https://aminet.net/package/disk/misc/pfs3aio) (or use `make download`)
@@ -123,6 +125,7 @@ amifuse mount /path/to/disk.hdf
 | `--debug` | No | Enable debug logging of FUSE operations |
 | `--profile` | No | Enable cProfile profiling and write stats to `profile.txt` on exit |
 | `--write` | No | Enable read-write mode (experimental, use with caution) |
+| `--icons` | No | Convert Amiga .info icons to native icons (experimental, macOS only) |
 
 ### Examples
 
@@ -142,6 +145,12 @@ amifuse mount multi-partition.hdf --partition 2
 # Linux: Explicit mountpoint required
 mkdir -p ./mnt
 amifuse mount disk.hdf --mountpoint ./mnt
+
+# Mount an ADF floppy image (requires explicit driver)
+amifuse mount workbench.adf --driver L/FastFileSystem
+
+# Enable native icons (macOS only, converts Amiga .info files)
+amifuse mount disk.hdf --icons
 
 # Browse the filesystem
 ls /Volumes/PDH0   # macOS
@@ -199,12 +208,30 @@ driver-info --base 0x200000 pfs3aio
 | `--base` | Base address for relocation (default: 0x100000) |
 | `--padding` | Padding between segments when relocating |
 
+## Supported Image Formats
+
+- **HDF/RDB** - Hard disk images with Rigid Disk Block. Filesystem drivers can be embedded in the RDB or specified via `--driver`.
+- **ADF** - Amiga Disk File floppy images (DD and HD). Requires `--driver` since ADFs don't contain embedded drivers.
+
 ## Supported Filesystems
 
 Currently tested with:
 - **PFS3** (Professional File System 3) via `pfs3aio` handler
+- **FFS/OFS** (Fast/Old File System) via `L:FastFileSystem` from Workbench
 
-Other Amiga filesystem handlers may work but have not been tested.
+Other Amiga filesystem handlers may work but have not been tested. Reports are
+welcome.
+
+## Icon Support
+
+The `--icons` flag enables conversion of Amiga `.info` icon files to native Finder icons:
+
+- Folder and file icons from `.info` files are displayed in Finder
+- Supports Traditional, NewIcons, and GlowIcons formats
+- The `.info` files are hidden in directory listings
+- Volume icons are displayed on the Desktop
+
+*** This feature is experimental and macOS-only. ***
 
 ## Notes
 
