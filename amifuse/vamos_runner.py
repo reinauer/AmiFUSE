@@ -203,12 +203,11 @@ class VamosHandlerRuntime:
                 er = machine.execute(max_cycles)
                 total_cycles = er.cycles if hasattr(er, 'cycles') else max_cycles
                 done = machine.was_exit(er)
-            except UnsupportedFeatureError as e:
+            except UnsupportedFeatureError:
                 # WaitPort/WaitPkt blocked - this is expected behavior
                 error = True
-            except Exception as e:
-                import sys
-                print(f"[machine_run] Exception during execute: {type(e).__name__}: {e}", file=sys.stderr)
+            except Exception:
+                # Unexpected error during execution
                 error = True
 
             return SimpleRunState(
