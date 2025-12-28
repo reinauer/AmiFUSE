@@ -1020,7 +1020,7 @@ class IconParser:
                 "height": img_height,
                 "rgba": bytes(rgba),
                 "format": "traditional",
-                "aspect_ratio": 1.0,  # No aspect correction - icons were designed for their displays
+                "aspect_ratio": 2.0,  # 2:1 aspect correction - icons were designed for 640x200
             }
 
         except Exception as e:
