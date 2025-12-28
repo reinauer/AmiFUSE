@@ -4,6 +4,8 @@ Mount Amiga filesystem images on macOS/Linux/Windows using native AmigaOS filesy
 
 amifuse runs actual Amiga filesystem drivers (like PFS3) through m68k CPU emulation, allowing you to read Amiga hard disk images without relying on reverse-engineered implementations.
 
+![XSysInfo](Docs/amifuse.png)
+
 ## Requirements
 
 - **macOS**: [macFUSE](https://osxfuse.github.io/)
@@ -211,12 +213,14 @@ driver-info --base 0x200000 pfs3aio
 ## Supported Image Formats
 
 - **HDF/RDB** - Hard disk images with Rigid Disk Block. Filesystem drivers can be embedded in the RDB or specified via `--driver`.
+- **Emu68-style MBR images** - Disk images with MBR partition table containing an RDB partition, as used by Emu68 on Raspberry Pi.
 - **ADF** - Amiga Disk File floppy images (DD and HD). Requires `--driver` since ADFs don't contain embedded drivers.
 
 ## Supported Filesystems
 
 Currently tested with:
 - **PFS3** (Professional File System 3) via `pfs3aio` handler
+- **SFS** (Smart File System 1.279) via `SmartFileSystem` handler
 - **FFS/OFS** (Fast/Old File System) via `L:FastFileSystem` from Workbench
 
 Other Amiga filesystem handlers may work but have not been tested. Reports are
