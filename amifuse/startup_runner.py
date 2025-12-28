@@ -369,7 +369,7 @@ class HandlerLauncher:
     # ---- public orchestration ----
 
     def launch_with_startup(self, extra_packets=None, debug=False) -> HandlerLaunchState:
-        proc_addr, port_addr, stack = self._create_process(name="pfs_handler")
+        proc_addr, port_addr, stack = self._create_process(name="amifuse_handler")
         reply_port = self._create_port("caller_port", proc_addr)
         # fill DeviceNode dn_Task now that we have a port
         dn = AccessStruct(self.mem, DeviceNodeStruct, self.boot["dn_addr"])
