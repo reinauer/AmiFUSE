@@ -23,6 +23,11 @@ TD_CHANGENUM = 13
 TD_ADDCHANGEINT = 20
 TD_REMCHANGEINT = 21
 TD_GETGEOMETRY = 22
+# TD64 commands for >4GB disk support (uses io_Actual as high 32 bits of offset)
+TD_READ64 = 24
+TD_WRITE64 = 25
+TD_SEEK64 = 26
+TD_FORMAT64 = 27
 # HD_SCSICMD = 28
 
 
@@ -116,18 +121,26 @@ class ScsiDevice(LibImpl):
         length = ior.r_s("io_Length")
         offset = ior.r_s("io_Offset")
         buf_ptr = ior.r_s("io_Data")
+        # For TD64 commands, io_Actual contains the high 32 bits of the offset
+        io_actual = ior.r_s("io_Actual")
         # SCSI command dispatch
         cmd_names = {
             2: "CMD_READ", 3: "CMD_WRITE", 4: "CMD_UPDATE", 5: "CMD_CLEAR",
             9: "TD_MOTOR", 10: "TD_SEEK", 11: "TD_FORMAT", 13: "TD_CHANGENUM",
             14: "TD_CHANGESTATE", 15: "TD_PROTSTATUS", 18: "TD_GETDRIVETYPE",
             20: "TD_ADDCHANGEINT", 21: "TD_REMCHANGEINT", 22: "TD_GETGEOMETRY",
+            24: "TD_READ64", 25: "TD_WRITE64", 26: "TD_SEEK64", 27: "TD_FORMAT64",
             28: "HD_SCSICMD",
         }
         if self.debug:
             cmd_name = cmd_names.get(cmd, f"CMD_{cmd}")
             extra = ""
-            if cmd == CMD_READ or cmd == CMD_WRITE:
+            # For TD64, compute 64-bit offset
+            if cmd in (TD_READ64, TD_WRITE64):
+                offset64 = (io_actual << 32) | offset
+                block_num = offset64 // self.backend.block_size if self.backend.block_size else 0
+                num_blocks = length // self.backend.block_size if self.backend.block_size else 0
+            elif cmd == CMD_READ or cmd == CMD_WRITE:
                 block_num = offset // self.backend.block_size if self.backend.block_size else 0
                 num_blocks = length // self.backend.block_size if self.backend.block_size else 0
                 extra = f" block={block_num} count={num_blocks}"
@@ -219,6 +232,20 @@ class ScsiDevice(LibImpl):
         elif cmd == CMD_WRITE:
             data = mem.r_block(buf_ptr, length)
             block_num = offset // self.backend.block_size
+            self.backend.write_blocks(block_num, data, length // self.backend.block_size)
+            ior.w_s("io_Actual", length)
+        elif cmd == TD_READ64:
+            # TD64: 64-bit offset using io_Actual as high 32 bits
+            offset64 = (io_actual << 32) | offset
+            block_num = offset64 // self.backend.block_size
+            data = self.backend.read_blocks(block_num, length // self.backend.block_size)
+            mem.w_block(buf_ptr, data)
+            ior.w_s("io_Actual", len(data))
+        elif cmd == TD_WRITE64:
+            # TD64: 64-bit offset using io_Actual as high 32 bits
+            offset64 = (io_actual << 32) | offset
+            data = mem.r_block(buf_ptr, length)
+            block_num = offset64 // self.backend.block_size
             self.backend.write_blocks(block_num, data, length // self.backend.block_size)
             ior.w_s("io_Actual", length)
         elif cmd == TD_GETGEOMETRY:
