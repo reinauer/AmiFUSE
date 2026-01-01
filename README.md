@@ -222,6 +222,7 @@ Currently tested with:
 - **PFS3** (Professional File System 3) via `pfs3aio` handler
 - **SFS** (Smart File System 1.279) via `SmartFileSystem` handler
 - **FFS/OFS** (Fast/Old File System) via `L:FastFileSystem` from Workbench
+- **BFFS** (Berkeley Fast File System) via Chris Hooper's [BFFSFilesystem](https://github.com/cdhooper/bffs) handler
 
 Other Amiga filesystem handlers may work but have not been tested. Reports are
 welcome.
