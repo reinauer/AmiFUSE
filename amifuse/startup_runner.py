@@ -25,8 +25,45 @@ from amitools.vamos.libstructs.dos import (
     FileHandleStruct,
 )  # type: ignore
 from amitools.vamos.machine.regs import REG_A6, REG_A7, REG_D0  # type: ignore
-from amitools.vamos.task import Stack  # type: ignore
+from amitools.vamos.task import Stack, ExecTask  # type: ignore
 from .amiga_structs import DeviceNodeStruct  # type: ignore
+
+
+class HandlerTask(ExecTask):
+    """Minimal ExecTask wrapper for filesystem handlers.
+
+    This provides just enough to satisfy library calls like StackSwap that
+    need ctx.task.get_stack(). We don't use the scheduler infrastructure.
+    """
+
+    def __init__(self, stack: Stack):
+        # Store stack without calling super().__init__ to avoid scheduler setup
+        self._handler_stack = stack
+        # ExecTask/MappedTask attributes that might be accessed
+        self.task = None
+        self.own_task = False
+        self.seg_list = None
+        self.sched_task = None  # No scheduler task for handlers
+        self.ami_task = None
+        self.ami_proc = None
+
+    def get_stack(self) -> Stack:
+        return self._handler_stack
+
+    def get_seg_list(self):
+        return None
+
+    def get_ami_task(self):
+        return self.ami_task
+
+    def get_ami_process(self):
+        return self.ami_proc
+
+    def get_sched_task(self):
+        return self.sched_task
+
+    def free(self):
+        pass  # Stack is managed by HandlerLauncher
 from amitools.vamos.libstructs.exec_ import NodeStruct  # type: ignore
 from amitools.vamos.lib.DosLibrary import DosLibrary  # type: ignore
 from .handler_stub import build_entry_stub  # type: ignore
@@ -393,6 +430,13 @@ class HandlerLauncher:
         # Handler's own startup code will set up registers and call WaitPort/GetMsg
         # to retrieve the startup packet from pr_MsgPort.
         stub_pc = build_entry_stub(self.mem, self.alloc, self.segment_addr)
+
+        # Register a minimal task with exec context so StackSwap and similar calls work.
+        # This provides ctx.task.get_stack() for library calls that need stack info.
+        handler_task = HandlerTask(stack)
+        if hasattr(self.vh, 'slm') and hasattr(self.vh.slm, 'exec_ctx'):
+            self.vh.slm.exec_ctx.set_cur_task_process(handler_task, None)
+
         return HandlerLaunchState(
             process_addr=proc_addr,
             port_addr=port_addr,
