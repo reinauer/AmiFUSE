@@ -1878,7 +1878,7 @@ def mount_fuse(
             temp_volicon.unlink()
 
 
-__version__ = "0.1.0"
+__version__ = "v0.2.0"
 
 
 def cmd_inspect(args):
