@@ -60,14 +60,16 @@ class MBRInfo:
 
 @dataclass
 class MBRContext:
-    """Context for an RDB opened within an MBR partition.
+    """Context for an RDB opened alongside or within an MBR partition.
 
-    Stored so callers can understand the disk layout and adjust block
-    operations accordingly.
+    For Emu68-style disks, the RDB lives inside an MBR partition of type 0x76.
+    For Parceiro-style disks, the MBR and RDB coexist at the disk level: the
+    MBR occupies block 0 and the RDB starts at block 1+, with no block offset.
     """
     mbr_info: MBRInfo           # Full MBR partition table info
-    mbr_partition: MBRPartition  # The specific 0x76 partition containing the RDB
-    offset_blocks: int          # Block offset from start of disk
+    mbr_partition: Optional[MBRPartition]  # 0x76 partition (Emu68), None for Parceiro
+    offset_blocks: int          # Block offset from start of disk (0 for Parceiro)
+    scheme: str = "emu68"       # "emu68" or "parceiro"
 
 
 def detect_mbr(image: Path) -> Optional[MBRInfo]:
@@ -251,6 +253,78 @@ def _scan_for_rdb(blkdev, block_size: Optional[int] = None):
     return None, None
 
 
+def _lenient_rdisk_open(rdisk) -> List[str]:
+    """Open an RDisk leniently, tolerating corrupt filesystem blocks.
+
+    Replicates the logic of RDisk.open() but continues past corrupt
+    filesystem (LSEG) blocks instead of failing.  Partition blocks are
+    still required to be valid.
+
+    Returns a list of warning strings (empty if everything parsed cleanly).
+    """
+    from amitools.fs.block.Block import Block
+    from amitools.fs.block.rdb.PartitionBlock import PartitionBlock
+    from amitools.fs.rdb.Partition import Partition
+    from amitools.fs.rdb.FileSystem import FileSystem
+
+    rdb = rdisk.rdb
+    if rdb.block_size != rdisk.rawblk.block_bytes:
+        raise ValueError(
+            "block size mismatch: rdb=%d != device=%d"
+            % (rdb.block_size, rdisk.rawblk.block_bytes)
+        )
+    rdisk.block_bytes = rdb.block_size
+    rdisk.used_blks = [rdb.blk_num]
+    warnings = []
+
+    # Read partitions (critical — fail on errors)
+    part_blk = rdb.part_list
+    rdisk.parts = []
+    num = 0
+    while part_blk != Block.no_blk:
+        p = Partition(rdisk.rawblk, part_blk, num, rdb.log_drv.cyl_blks, rdisk)
+        num += 1
+        if not p.read():
+            raise IOError(f"Corrupt partition block at block {part_blk}")
+        rdisk.parts.append(p)
+        rdisk.used_blks.append(p.get_blk_num())
+        part_blk = p.get_next_partition_blk()
+
+    # Read filesystems (non-critical — warn on errors)
+    fs_blk = rdb.fs_list
+    rdisk.fs = []
+    num = 0
+    while fs_blk != PartitionBlock.no_blk:
+        fs = FileSystem(rdisk.rawblk, fs_blk, num)
+        num += 1
+        if not fs.read():
+            # The FSHD itself may have read OK (fs.fshd.valid) even though
+            # the LSEG data chain is corrupt.
+            if fs.fshd is not None and fs.fshd.valid:
+                dt = fs.fshd.dos_type
+                dt_str = DosType.num_to_tag_str(dt)
+                warnings.append(
+                    f"Filesystem #{fs.num} ({dt_str}/0x{dt:08x}): "
+                    f"corrupt data block in LSEG chain (driver data unavailable)"
+                )
+                # We can still follow the next-FS pointer from the header
+                fs_blk = fs.fshd.next
+            else:
+                warnings.append(
+                    f"Corrupt filesystem header at block {fs_blk} "
+                    f"(remaining filesystem entries skipped)"
+                )
+                break
+            continue
+        rdisk.fs.append(fs)
+        rdisk.used_blks += fs.get_blk_nums()
+        fs_blk = fs.get_next_fs_blk()
+
+    rdisk.valid = True
+    rdisk.max_blks = rdb.log_drv.rdb_blk_hi + 1
+    return warnings
+
+
 def open_rdisk(
     image: Path, block_size: Optional[int] = None, mbr_partition_index: Optional[int] = None
 ) -> Tuple[Union[RawBlockDevice, 'OffsetBlockDevice'], RDisk, Optional[MBRContext]]:
@@ -259,10 +333,16 @@ def open_rdisk(
     Scans blocks 0-15 for the RDB signature (RDSK), as the RDB can be located
     at any of these blocks depending on the disk geometry.
 
-    For MBR-partitioned disks (e.g., Emu68 SD cards), if no direct RDB is found
-    but the disk has MBR partitions of type 0x76, the RDB is searched within
-    those partitions. The returned block device will be an OffsetBlockDevice
-    that maps to the partition boundaries.
+    Supports three disk layouts:
+    - Plain RDB: RDSK at block 0 (standard Amiga hard disk)
+    - Parceiro-style: MBR at block 0, RDSK at block 1+, coexisting at the
+      disk level.  Non-Amiga partitions (e.g. FAT32) live in MBR entries.
+    - Emu68-style: MBR with 0x76 (Amiga RDB) partition, RDSK inside that
+      partition.
+
+    Tolerates corrupt filesystem driver (LSEG) blocks in the RDB — partition
+    data is parsed strictly, but corrupt FS entries are skipped with warnings
+    stored in ``rdisk.rdb_warnings``.
 
     Args:
         image: Path to the disk image
@@ -272,7 +352,7 @@ def open_rdisk(
 
     Returns:
         Tuple of (block_device, rdisk, mbr_context).
-        mbr_context is None for direct RDB disks, or MBRContext for MBR partitions.
+        mbr_context is None for plain RDB disks, or MBRContext for MBR disks.
     """
     initial_block_size = block_size or 512
     blkdev = RawBlockDevice(str(image), read_only=True, block_bytes=initial_block_size)
@@ -289,13 +369,32 @@ def open_rdisk(
         rdb_block, _ = _scan_for_rdb(blkdev, block_size)
 
     if rdb_block is not None:
-        # Found direct RDB
+        # Found direct RDB — try strict open first, then lenient fallback
         rdisk = RDisk(blkdev)
         rdisk.rdb = rdb_block
+        rdisk.rdb_warnings = []
         if not rdisk.open():
-            blkdev.close()
-            raise IOError(f"Failed to parse RDB at {image}")
-        return blkdev, rdisk, None
+            # Strict open failed — try lenient parse (tolerates corrupt FS blocks)
+            rdisk2 = RDisk(blkdev)
+            rdisk2.rdb = rdb_block
+            try:
+                rdisk2.rdb_warnings = _lenient_rdisk_open(rdisk2)
+            except IOError:
+                blkdev.close()
+                raise IOError(f"Failed to parse RDB at {image}")
+            rdisk = rdisk2
+
+        # Check for Parceiro-style MBR+RDB coexistence
+        mbr_ctx = None
+        mbr_info = detect_mbr(image)
+        if mbr_info is not None and rdb_block.blk_num > 0:
+            mbr_ctx = MBRContext(
+                mbr_info=mbr_info,
+                mbr_partition=None,
+                offset_blocks=0,
+                scheme="parceiro",
+            )
+        return blkdev, rdisk, mbr_ctx
 
     # No direct RDB - check for MBR with 0x76 partitions
     mbr_info = detect_mbr(image)
@@ -330,8 +429,16 @@ def open_rdisk(
                 # Found RDB in this partition
                 rdisk = RDisk(offset_dev)
                 rdisk.rdb = rdb_block
+                rdisk.rdb_warnings = []
                 if not rdisk.open():
-                    continue  # Try next partition
+                    # Try lenient parse
+                    rdisk2 = RDisk(offset_dev)
+                    rdisk2.rdb = rdb_block
+                    try:
+                        rdisk2.rdb_warnings = _lenient_rdisk_open(rdisk2)
+                    except IOError:
+                        continue  # Try next partition
+                    rdisk = rdisk2
 
                 mbr_ctx = MBRContext(
                     mbr_info=mbr_info,
@@ -375,17 +482,37 @@ def format_fs_summary(rdisk: RDisk):
     return lines
 
 
+_MBR_TYPE_NAMES = {
+    MBR_TYPE_AMIGA_RDB: "Amiga RDB",
+    0x01: "FAT12",
+    0x04: "FAT16 <32M",
+    0x06: "FAT16",
+    0x07: "NTFS/exFAT",
+    0x0B: "W95 FAT32",
+    0x0C: "W95 FAT32 (LBA)",
+    0x0E: "W95 FAT16 (LBA)",
+    0x0F: "W95 Extended (LBA)",
+    0x82: "Linux swap",
+    0x83: "Linux",
+    0xEE: "GPT protective",
+}
+
+
 def format_mbr_info(mbr_ctx: MBRContext) -> List[str]:
     """Format MBR partition info as a list of lines for display."""
     lines = []
-    lines.append("MBR Partition Table detected (Emu68-style)")
-    lines.append(f"  Active partition: MBR slot {mbr_ctx.mbr_partition.index}")
-    lines.append(f"  Partition offset: {mbr_ctx.offset_blocks} sectors ({mbr_ctx.offset_blocks * 512 // 1024 // 1024} MB)")
-    lines.append(f"  Partition size: {mbr_ctx.mbr_partition.num_sectors} sectors ({mbr_ctx.mbr_partition.num_sectors * 512 // 1024 // 1024} MB)")
+    if mbr_ctx.scheme == "parceiro":
+        lines.append("MBR + RDB coexistence detected (Parceiro-style)")
+        lines.append("  MBR at block 0, RDB at block 1+")
+    else:
+        lines.append("MBR Partition Table detected (Emu68-style)")
+        lines.append(f"  Active partition: MBR slot {mbr_ctx.mbr_partition.index}")
+        lines.append(f"  Partition offset: {mbr_ctx.offset_blocks} sectors ({mbr_ctx.offset_blocks * 512 // 1024 // 1024} MB)")
+        lines.append(f"  Partition size: {mbr_ctx.mbr_partition.num_sectors} sectors ({mbr_ctx.mbr_partition.num_sectors * 512 // 1024 // 1024} MB)")
     lines.append("")
-    lines.append("  All MBR partitions:")
+    lines.append("  MBR partitions:")
     for p in mbr_ctx.mbr_info.partitions:
-        type_str = "Amiga RDB" if p.partition_type == MBR_TYPE_AMIGA_RDB else f"0x{p.partition_type:02x}"
+        type_str = _MBR_TYPE_NAMES.get(p.partition_type, f"0x{p.partition_type:02x}")
         boot_str = " (bootable)" if p.bootable else ""
         size_mb = p.num_sectors * 512 // 1024 // 1024
         lines.append(f"    [{p.index}] Type: {type_str}{boot_str}, Start: {p.start_lba}, Size: {p.num_sectors} ({size_mb} MB)")
@@ -440,13 +567,14 @@ def main(argv=None):
     try:
         blkdev, rdisk, mbr_ctx = open_rdisk(args.image, block_size=args.block_size)
 
+        warnings = getattr(rdisk, 'rdb_warnings', [])
+
         if args.json:
             desc = rdisk.get_desc()
             if mbr_ctx is not None:
-                desc["mbr"] = {
-                    "partition_index": mbr_ctx.mbr_partition.index,
+                mbr_desc = {
+                    "scheme": mbr_ctx.scheme,
                     "offset_blocks": mbr_ctx.offset_blocks,
-                    "partition_size": mbr_ctx.mbr_partition.num_sectors,
                     "all_partitions": [
                         {
                             "index": p.index,
@@ -458,6 +586,12 @@ def main(argv=None):
                         for p in mbr_ctx.mbr_info.partitions
                     ],
                 }
+                if mbr_ctx.mbr_partition is not None:
+                    mbr_desc["partition_index"] = mbr_ctx.mbr_partition.index
+                    mbr_desc["partition_size"] = mbr_ctx.mbr_partition.num_sectors
+                desc["mbr"] = mbr_desc
+            if warnings:
+                desc["warnings"] = warnings
             print(json.dumps(desc, indent=2))
         else:
             # Show MBR info if present
@@ -473,6 +607,11 @@ def main(argv=None):
                 print("\nFilesystem drivers:")
                 for line in fs_lines:
                     print(" ", line)
+
+            if warnings:
+                print("\nWarnings:")
+                for w in warnings:
+                    print(f"  {w}")
 
         if args.extract_fs is not None:
             fs_obj = rdisk.get_filesystem(args.extract_fs)

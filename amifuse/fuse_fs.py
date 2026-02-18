@@ -1923,6 +1923,12 @@ def cmd_inspect(args):
             print("\nFilesystem drivers:")
             for line in fs_lines:
                 print(" ", line)
+
+        warnings = getattr(rdisk, 'rdb_warnings', [])
+        if warnings:
+            print("\nWarnings:")
+            for w in warnings:
+                print(f"  {w}")
     finally:
         if rdisk is not None:
             rdisk.close()
