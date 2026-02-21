@@ -569,16 +569,18 @@ class HandlerLauncher:
             cpu.w_reg(REG_A6, self.exec_base_addr)
         except Exception:
             pass
+        first_run = not state.started
         if not state.started:
             state.started = True
-        # machine.run() pushes an exit trap address at SP. When resuming after
-        # Wait/WaitPort, we must NOT offset SP by -4 or the handler's stack will
-        # be corrupted (the handler expects SP to be at state.sp, not state.sp-4).
-        # The exit trap overwrites whatever is at state.sp (typically a saved
-        # register), but this is acceptable since the handler will restore/reuse
-        # that location anyway. The critical thing is that rts pops from the
-        # correct address (state.sp + 4 = the real return address).
+        # After the first execution, pre-set CPU SP to match state.sp so
+        # machine.run()'s prepare() heuristic (|sp - current_sp| > 16)
+        # does NOT fire.  prepare() pushes an exit trap on the stack which
+        # is needed for the initial startup (clean exit if handler RTS's)
+        # but would corrupt the handler's stack during resumption from a
+        # Wait/WaitPort block.
         run_sp = state.sp
+        if not first_run:
+            cpu.w_sp(run_sp)
         run_state = self.vh.machine.run(
             state.pc,
             sp=run_sp,
