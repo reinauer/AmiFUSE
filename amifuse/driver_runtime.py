@@ -42,8 +42,20 @@ class BlockDeviceBackend:
         self.mbr_partition_index = mbr_partition_index  # For MBR disks with multiple 0x76 partitions
         self.mbr_context = None  # MBRContext if opened via MBR partition
 
+    def _setup_geometry(self):
+        """Set geometry fields from the open RDB."""
+        pd = self.rdb.rdb.phy_drv
+        self.block_size = self.blkdev.block_bytes
+        self.cyls = pd.cyls
+        self.heads = pd.heads
+        self.secs = pd.secs
+        self.total_blocks = pd.cyls * pd.heads * pd.secs
+
     def open(self):
-        from .rdb_inspect import OffsetBlockDevice, MBRContext, detect_mbr, MBR_TYPE_AMIGA_RDB
+        from .rdb_inspect import (
+            OffsetBlockDevice, MBRContext, detect_mbr, MBR_TYPE_AMIGA_RDB,
+            _scan_for_rdb, _lenient_rdisk_open,
+        )
 
         # For ADF images, skip RDB/MBR parsing and use synthetic geometry
         if self.adf_info is not None:
@@ -59,33 +71,39 @@ class BlockDeviceBackend:
             self.total_blocks = self.adf_info.total_blocks
             return
 
-        # Try opening as direct RDB first
+        # Try opening as direct RDB first (scan blocks 0-15)
         self.blkdev = RawBlockDevice(
             str(self.image), read_only=self.read_only, block_bytes=self.block_size
         )
         self.blkdev.open()
 
-        self.rdb = RDisk(self.blkdev)
-        peeked = self.rdb.peek_block_size()
+        rdb_block, new_block_size = _scan_for_rdb(self.blkdev, self.block_size)
 
-        if peeked:
-            # Found RDB directly
-            if peeked != self.blkdev.block_bytes:
-                self.close()
-                self.blkdev = RawBlockDevice(
-                    str(self.image), read_only=self.read_only, block_bytes=peeked
-                )
-                self.blkdev.open()
-                self.rdb = RDisk(self.blkdev)
+        if new_block_size is not None:
+            self.blkdev.close()
+            self.blkdev = RawBlockDevice(
+                str(self.image), read_only=self.read_only, block_bytes=new_block_size
+            )
+            self.blkdev.open()
+            rdb_block, _ = _scan_for_rdb(self.blkdev, self.block_size)
+
+        if rdb_block is not None:
+            self.rdb = RDisk(self.blkdev)
+            self.rdb.rdb = rdb_block
             if self.rdb.open():
                 # Direct RDB success
-                pd = self.rdb.rdb.phy_drv
-                self.block_size = self.blkdev.block_bytes
-                self.cyls = pd.cyls
-                self.heads = pd.heads
-                self.secs = pd.secs
-                self.total_blocks = pd.cyls * pd.heads * pd.secs
+                self._setup_geometry()
                 return
+            # Strict open failed — try lenient parse (Parceiro checksums)
+            rdisk2 = RDisk(self.blkdev)
+            rdisk2.rdb = rdb_block
+            try:
+                rdisk2.rdb_warnings = _lenient_rdisk_open(rdisk2)
+                self.rdb = rdisk2
+                self._setup_geometry()
+                return
+            except IOError:
+                pass  # Fall through to MBR check
 
         # No direct RDB - check for MBR with 0x76 partitions
         mbr_info = detect_mbr(self.image)
