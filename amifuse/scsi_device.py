@@ -29,6 +29,12 @@ TD_WRITE64 = 25
 TD_SEEK64 = 26
 TD_FORMAT64 = 27
 # HD_SCSICMD = 28
+NSCMD_DEVICEQUERY = 0x4000  # New Style Device query
+
+# Fixed address in high memory for the NSD supported commands table.
+# This must be a valid Amiga memory address that won't collide with
+# handler code/data (which is allocated from the low end).
+_NSD_CMD_TABLE_ADDR = 0x7FFF00
 
 
 @AmigaStructDef
@@ -134,12 +140,15 @@ class ScsiDevice(LibImpl):
         }
         if self.debug:
             cmd_name = cmd_names.get(cmd, f"CMD_{cmd}")
+            if cmd == NSCMD_DEVICEQUERY:
+                cmd_name = "NSCMD_DEVICEQUERY"
             extra = ""
             # For TD64, compute 64-bit offset
             if cmd in (TD_READ64, TD_WRITE64):
                 offset64 = (io_actual << 32) | offset
                 block_num = offset64 // self.backend.block_size if self.backend.block_size else 0
                 num_blocks = length // self.backend.block_size if self.backend.block_size else 0
+                extra = f" offset64={offset64} block={block_num} count={num_blocks}"
             elif cmd == CMD_READ or cmd == CMD_WRITE:
                 block_num = offset // self.backend.block_size if self.backend.block_size else 0
                 num_blocks = length // self.backend.block_size if self.backend.block_size else 0
@@ -230,10 +239,15 @@ class ScsiDevice(LibImpl):
             mem.w_block(buf_ptr, data)
             ior.w_s("io_Actual", len(data))
         elif cmd == CMD_WRITE:
-            data = mem.r_block(buf_ptr, length)
-            block_num = offset // self.backend.block_size
-            self.backend.write_blocks(block_num, data, length // self.backend.block_size)
-            ior.w_s("io_Actual", length)
+            if self.backend.read_only:
+                # Silently discard writes in read-only mode so the handler
+                # doesn't crash when it tries to update its activity log.
+                ior.w_s("io_Actual", length)
+            else:
+                data = mem.r_block(buf_ptr, length)
+                block_num = offset // self.backend.block_size
+                self.backend.write_blocks(block_num, data, length // self.backend.block_size)
+                ior.w_s("io_Actual", length)
         elif cmd == TD_READ64:
             # TD64: 64-bit offset using io_Actual as high 32 bits
             offset64 = (io_actual << 32) | offset
@@ -243,11 +257,14 @@ class ScsiDevice(LibImpl):
             ior.w_s("io_Actual", len(data))
         elif cmd == TD_WRITE64:
             # TD64: 64-bit offset using io_Actual as high 32 bits
-            offset64 = (io_actual << 32) | offset
-            data = mem.r_block(buf_ptr, length)
-            block_num = offset64 // self.backend.block_size
-            self.backend.write_blocks(block_num, data, length // self.backend.block_size)
-            ior.w_s("io_Actual", length)
+            if self.backend.read_only:
+                ior.w_s("io_Actual", length)
+            else:
+                offset64 = (io_actual << 32) | offset
+                data = mem.r_block(buf_ptr, length)
+                block_num = offset64 // self.backend.block_size
+                self.backend.write_blocks(block_num, data, length // self.backend.block_size)
+                ior.w_s("io_Actual", length)
         elif cmd == TD_GETGEOMETRY:
             # DriveGeometry structure from devices/trackdisk.h:
             # All main fields are ULONGs (4 bytes each)!
@@ -306,13 +323,47 @@ class ScsiDevice(LibImpl):
             # Seek to track - no-op for file-backed images
             ior.w_s("io_Actual", 0)
         elif cmd == TD_ADDCHANGEINT:  # TD_ADDCHANGEINT (20)
-            # Add disk change interrupt - no-op, disk never changes
+            # Disk change notification - the device holds the request and
+            # only replies when a disk change occurs.  Since we never
+            # change the disk, this request is never completed.  Clear
+            # IOF_QUICK to tell SendIO not to queue a reply.
             ior.w_s("io_Actual", 0)
+            flags = ior.r_s("io_Flags") & ~1  # Clear IOF_QUICK
+            ior.w_s("io_Flags", flags)
         elif cmd == TD_REMCHANGEINT:  # TD_REMCHANGEINT (21)
             # Remove disk change interrupt - no-op
             ior.w_s("io_Actual", 0)
+        elif cmd == NSCMD_DEVICEQUERY:
+            # New Style Device query: tell the handler which commands we support.
+            # NSDeviceQueryResult layout (16 bytes):
+            #   ULONG  DevQueryFormat;       // 0: must be 0
+            #   ULONG  SizeAvailable;        // 4: bytes filled in (16)
+            #   UWORD  DeviceType;           // 8: NSDEVTYPE_TRACKDISK = 0
+            #   UWORD  DeviceSubType;        // 10: 0
+            #   UWORD *SupportedCommands;    // 12: pointer to 0-terminated word array
+            if buf_ptr and length >= 16:
+                # Write the supported commands table at a fixed high address
+                supported = [
+                    CMD_READ, CMD_WRITE, CMD_UPDATE, CMD_CLEAR,
+                    TD_SEEK, TD_CHANGENUM, TD_ADDCHANGEINT, TD_REMCHANGEINT,
+                    TD_GETGEOMETRY,
+                    TD_READ64, TD_WRITE64, TD_SEEK64, TD_FORMAT64,
+                    NSCMD_DEVICEQUERY,
+                    0,  # terminator
+                ]
+                for i, cmd_id in enumerate(supported):
+                    mem.w16(_NSD_CMD_TABLE_ADDR + i * 2, cmd_id)
+                # Fill in NSDeviceQueryResult
+                mem.w32(buf_ptr + 0, 0)                       # DevQueryFormat
+                mem.w32(buf_ptr + 4, 16)                      # SizeAvailable
+                mem.w16(buf_ptr + 8, 0)                       # DeviceType (trackdisk)
+                mem.w16(buf_ptr + 10, 0)                      # DeviceSubType
+                mem.w32(buf_ptr + 12, _NSD_CMD_TABLE_ADDR)    # SupportedCommands
+                ior.w_s("io_Actual", 16)
+            else:
+                ior.w_s("io_Error", -3)  # IOERR_NOCMD
         else:
-            # For unhandled commands (e.g., TD_ADDCHANGEINT), report success.
+            # For unhandled commands, report success.
             ior.w_s("io_Error", 0)
             ior.w_s("io_Actual", 0)
 
