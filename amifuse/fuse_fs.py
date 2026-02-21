@@ -2050,7 +2050,7 @@ def mount_fuse(
             mountpoint.mkdir(parents=True)
 
     # Print startup banner
-    print(f"amifuse {__version__} - Copyright (C) 2025 by Stefan Reinauer")
+    print(__banner__)
     if adf_info is not None:
         floppy_type = "HD" if adf_info.is_hd else "DD"
         print(f"Mounting ADF floppy ({floppy_type}) from {image}")
@@ -2127,6 +2127,7 @@ def mount_fuse(
 
 
 __version__ = "v0.2.0"
+__banner__ = f"amifuse {__version__} - Copyright (C) 2025-2026 by Stefan Reinauer"
 
 
 def _inspect_rdisk(rdisk, full=False):
@@ -2249,9 +2250,14 @@ def cmd_mount(args):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(
-        description=f"amifuse {__version__} - Copyright (C) 2025 by Stefan Reinauer\n\n"
+        description=f"{__banner__}\n\n"
         "Mount Amiga filesystem images via FUSE.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=__banner__,
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
