@@ -129,6 +129,27 @@ class HandlerBridge:
                 print(f"[amifuse]   DosEnvec: LowCyl={start_cyl} HighCyl={end_cyl} Surfaces={dos_env.surfaces} BlkPerTrack={dos_env.blk_per_trk}")
                 print(f"[amifuse]   Calculated: blk_per_cyl={blk_per_cyl} start_blk={start_blk} num_blk={num_blk}")
 
+        # Check that the partition data is within the image file
+        if boot.get("part") and not adf_info:
+            dos_env = boot["part"].part_blk.dos_env
+            blk_per_cyl = dos_env.surfaces * dos_env.blk_per_trk
+            part_end_byte = (dos_env.high_cyl + 1) * blk_per_cyl * self.backend.block_size
+            image_size = os.path.getsize(str(image))
+            if part_end_byte > image_size:
+                part_start_byte = dos_env.low_cyl * blk_per_cyl * self.backend.block_size
+                part_name = partition or f"#{boot['part'].num}"
+                if part_start_byte >= image_size:
+                    raise SystemExit(
+                        f"Partition '{part_name}' starts at byte {part_start_byte:,} "
+                        f"but image is only {image_size:,} bytes ({image_size/1024/1024:.0f} MB). "
+                        f"The image appears to be truncated."
+                    )
+                else:
+                    print(
+                        f"[amifuse] WARNING: Partition extends to byte {part_end_byte:,} "
+                        f"but image is only {image_size:,} bytes. Data may be incomplete."
+                    )
+
         self.vh.set_scsi_backend(self.backend, debug=debug)
 
         # Handler entry point is at segment start (byte 0).
