@@ -137,6 +137,7 @@ class HandlerLaunchState:
     crashed: bool = False  # True if handler hit an unrecoverable error
     last_error_pc: int = 0  # PC at time of crash for diagnostics
     consecutive_errors: int = 0  # Count of consecutive errors without successful reply
+    wait_mask: int = 0  # Handler's Wait() signal mask (for deferred init)
 
 
 class HandlerLauncher:
@@ -638,6 +639,10 @@ class HandlerLauncher:
                     state.main_loop_pc = ret_addr
                     state.main_loop_sp = blocked_sp + 4
                     state.initialized = True
+                    # Capture Wait mask for _flush_pending_signals before
+                    # _clear_all_block_state wipes it.
+                    if wait_mask is not None and not state.wait_mask:
+                        state.wait_mask = wait_mask
                 # Check if there's something pending that would wake the handler
                 if wait_mask is not None:
                     # Wait() blocked - check for ANY pending signals (messages OR IO completion)
@@ -702,6 +707,8 @@ class HandlerLauncher:
                     state.main_loop_pc = ret_addr
                     state.main_loop_sp = blocked_sp + 4  # Pop return address
                     state.initialized = True
+                    if wait_mask is not None and not state.wait_mask:
+                        state.wait_mask = wait_mask
                 # Only restart immediately if there's something pending (message or signal).
                 # Otherwise, leave state pointing to Wait/WaitPort return - caller
                 # will queue a message before calling run_burst again.

@@ -179,7 +179,7 @@ class HandlerBridge:
         # SFS creates child processes that need to run and register ports.
         # Smaller bursts give us more chances to interleave child execution.
         # Use small bursts for startup to frequently yield and run children
-        replies = self._run_until_replies(cycles=10_000, max_iters=2000)
+        replies = self._run_until_replies(cycles=10_000, max_iters=2000, drain_non_essential=False)
         # Check if startup succeeded - res1=0 means the handler rejected the disk
         pkt = AccessStruct(self.mem, DosPacketStruct, self.state.stdpkt_addr)
         startup_res1 = pkt.r_s("dp_Res1")
@@ -197,19 +197,50 @@ class HandlerBridge:
             error_desc = error_msgs.get(startup_res2, f"error code {startup_res2}")
             raise SystemExit(f"Filesystem handler rejected the disk: {error_desc}")
         self._update_handler_port_from_startup()
-        # Clear stale blocking state from startup before capturing main loop.
-        # Also set D0=0 so handler doesn't try to process non-existent message
-        # when it resumes from the WaitPort return address.
-        _clear_all_block_state()
+        # Capture main loop state from the current blocking state BEFORE
+        # clearing it.  run_burst() during _run_until_replies may have
+        # already set main_loop_pc; if not, we grab it from the raw
+        # blocking variables.  This is critical for WaitPort-based handlers
+        # (e.g. PFS3 on large partitions) where clearing the blocking
+        # state and setting D0=0 would cause a NULL-message crash when the
+        # handler resumes from the WaitPort return address.
         from amitools.vamos.machine.regs import REG_D0
         cpu = self.vh.machine.cpu
+        if not self.state.main_loop_pc:
+            from amitools.vamos.lib.ExecLibrary import ExecLibrary as _EL
+            _wps = _get_block_state(_EL, '_waitport_blocked_sp')
+            _ws = _get_block_state(_EL, '_wait_blocked_sp')
+            _wpr = _get_block_state(_EL, '_waitport_blocked_ret')
+            _wr = _get_block_state(_EL, '_wait_blocked_ret')
+            _wm = _get_block_state(_EL, '_wait_blocked_mask')
+            _bsp = _wps if _wps is not None else _ws
+            _bret = _wpr if _wpr is not None else _wr
+            if _bsp is not None:
+                _ret = _bret if _bret is not None else self.mem.r32(_bsp)
+                if _ret >= 0x800:
+                    self.state.main_loop_pc = _ret
+                    self.state.main_loop_sp = _bsp + 4
+                    if _wm is not None and _wm != 0:
+                        self.state.wait_mask = _wm
+                    self.state.initialized = True
+                    if self._debug:
+                        mask_str = f" wait_mask=0x{self.state.wait_mask:x}" if self.state.wait_mask else ""
+                        print(f"[amifuse] Captured main_loop from blocking state: pc=0x{_ret:x}, sp=0x{_bsp+4:x}{mask_str}")
+        _clear_all_block_state()
         cpu.w_reg(REG_D0, 0)
-        # Let the handler settle into its message wait loop.
+        # Let the handler settle into its message wait loop (only if not
+        # already captured above).
         self._capture_main_loop_state()
         if not self.state.initialized:
             self.state.initialized = True
         if self._debug:
             print(f"[amifuse] Saved main_loop_pc=0x{self.state.pc:x}, main_loop_sp=0x{self.state.sp:x}")
+        # Flush pending timer events so the handler can complete delayed disk
+        # validation.  PFS3 uses TR_ADDREQUEST to schedule deferred volume
+        # validation; the timer signal must fire before the volume becomes
+        # accessible.  We deliver all pending signals from the handler's
+        # wait mask so it can process any queued timer or I/O events.
+        self._flush_pending_signals()
         # cache a best-effort volume name
         self._volname = None
         self._fib_mem = None
@@ -234,7 +265,7 @@ class HandlerBridge:
                 f"port=0x{self.state.port_addr:x} reply=0x{self.state.reply_port_addr:x}"
             )
 
-    def _run_until_replies(self, max_iters: int = 50, cycles: int = 200_000, sleep_base: float = 0.0005, sleep_max: float = 0.01):
+    def _run_until_replies(self, max_iters: int = 50, cycles: int = 200_000, sleep_base: float = 0.0005, sleep_max: float = 0.01, drain_non_essential: bool = True):
         """Run handler bursts until at least one reply is queued or iterations exhausted."""
         from amitools.vamos.lib.ExecLibrary import ExecLibrary
         replies = []
@@ -281,18 +312,22 @@ class HandlerBridge:
                     port_status.append(f"0x{addr:x}:py{qlen}/sig{sigbit}/{list_str}")
                 print(f"[amifuse] Ports: {' '.join(port_status)}")
             if has_msg:
-                # Set D0 to signal that message is available
-                # FFS uses Wait() with signal mask, so D0 must have the signal bit set
-                # We use signal bit 8 (0x100) which matches mp_SigBit in _create_process
-                self.vh.machine.cpu.w_reg(0, 0x100)  # REG_D0 = signal bit 8
+                # Only deliver the DOS port signal (bit 8) during normal
+                # packet processing.  Timer and other signals were already
+                # handled during _flush_pending_signals at init time.
+                # Delivering ALL signals here causes a timer storm: the
+                # handler processes the timer, re-arms it, and SendIO
+                # queues another reply, triggering the timer on every
+                # single packet until the handler state gets corrupted.
+                dos_signal = 0x100  # bit 8 = DOS port signal
+                self.vh.machine.cpu.w_reg(0, dos_signal)  # REG_D0
                 # Also set tc_SigRecvd in case handler checks the task structure
-                # Process structure starts with Task, so tc_SigRecvd is at same offset
                 from amitools.vamos.libstructs.exec_ import TaskStruct
                 sigrecvd_off = TaskStruct.sdef.find_field_def_by_name("tc_SigRecvd").offset
                 proc_addr = self.state.process_addr
-                self.mem.w32(proc_addr + sigrecvd_off, 0x100)
+                self.mem.w32(proc_addr + sigrecvd_off, dos_signal)
                 if self._debug:
-                    print(f"[amifuse] Resuming: D0=0x100 tc_SigRecvd@0x{proc_addr + sigrecvd_off:x}=0x100")
+                    print(f"[amifuse] Resuming: D0=0x{dos_signal:x} tc_SigRecvd@0x{proc_addr + sigrecvd_off:x}=0x{dos_signal:x}")
 
         for i in range(max_iters):
             old_pc = self.state.pc
@@ -353,10 +388,28 @@ class HandlerBridge:
                 sleep_time = min(sleep_time * 2, sleep_max)
         if self._debug and not replies:
             print(f"[amifuse] _run_until_replies: exhausted {max_iters} iters with no replies, pc=0x{self.state.pc:x}")
+
+        # Drain stale timer/IO messages that accumulated during packet
+        # processing.  SendIO queues replies synchronously; without this
+        # drain, the next _run_until_replies would deliver timer signals
+        # alongside the DOS signal, causing a timer storm.
+        # During startup (drain_non_essential=False), keep timer messages
+        # so _flush_pending_signals can deliver them for deferred init.
+        if drain_non_essential:
+            pmgr = self.vh.slm.exec_impl.port_mgr
+            dos_port = self.state.port_addr
+            reply_port = self.state.reply_port_addr
+            for port_addr in list(pmgr.ports.keys()):
+                if port_addr != dos_port and port_addr != reply_port:
+                    while pmgr.has_msg(port_addr):
+                        pmgr.get_msg(port_addr)
+
         return replies
 
     def _capture_main_loop_state(self, max_iters: int = 50, cycles: int = 10_000):
         """Run until the handler blocks in Wait/WaitPort and capture restart PC/SP."""
+        if self.state.main_loop_pc:
+            return  # Already captured (e.g. during _run_until_replies)
         from amitools.vamos.lib.ExecLibrary import ExecLibrary
         for i in range(max_iters):
             if self.state.pc < 0x800 or self.state.pc > 0xFFFFFF:
@@ -383,13 +436,174 @@ class HandlerBridge:
                 if ret_addr >= 0x800:
                     self.state.main_loop_pc = ret_addr
                     self.state.main_loop_sp = blocked_sp + 4
+                    # Capture Wait mask for _flush_pending_signals
+                    wait_mask = _get_block_state(ExecLibrary, '_wait_blocked_mask')
+                    if wait_mask is not None and wait_mask != 0:
+                        self.state.wait_mask = wait_mask
                     if self._debug:
-                        print(f"[amifuse] _capture_main_loop_state: captured at iter {i}, pc=0x{ret_addr:x}, sp=0x{blocked_sp+4:x}")
+                        mask_str = f" wait_mask=0x{self.state.wait_mask:x}" if self.state.wait_mask else ""
+                        print(f"[amifuse] _capture_main_loop_state: captured at iter {i}, pc=0x{ret_addr:x}, sp=0x{blocked_sp+4:x}{mask_str}")
                 return
             # Check if handler crashed (invalid PC)
             if rs and hasattr(rs, 'pc') and rs.pc < 0x800:
                 print(f"[amifuse] _capture_main_loop_state: handler crashed at iter {i}, pc=0x{rs.pc:x}", file=sys.stderr)
                 return
+
+    def _flush_pending_signals(self, max_rounds: int = 20):
+        """Deliver pending signals so the handler can complete deferred init.
+
+        PFS3 uses Signal(FindTask(NULL), ...) to schedule deferred volume
+        validation steps.  Each self-signal causes Wait() to return
+        immediately, letting the handler continue validation within one
+        burst.  When validation finishes (or the handler needs to wait for
+        real time / IO), it calls Wait() without pending self-signals and
+        blocks.
+
+        We deliver an initial timer signal (bit 19) to kick off the first
+        validation cycle.  Subsequent rounds only fire if the handler
+        blocked again with pending signals (port messages or self-signals).
+        """
+        if not self.state.main_loop_pc:
+            return
+        from amitools.vamos.libstructs.exec_ import ExecLibraryStruct, TaskStruct, MsgPortStruct
+        from amitools.vamos.lib.ExecLibrary import ExecLibrary
+        from amitools.vamos.lib.lexec.signalfunc import SignalFunc
+        from amitools.vamos.machine.regs import REG_D0
+
+        # If we don't have a wait mask yet, run the handler once to capture it.
+        if not self.state.wait_mask:
+            _clear_all_block_state()
+            self.state.pc = self.state.main_loop_pc
+            self.state.sp = self.state.main_loop_sp
+            self.vh.machine.cpu.w_reg(REG_D0, 0)
+            self.launcher.run_burst(self.state, max_cycles=100_000)
+            wait_mask = _get_block_state(ExecLibrary, '_wait_blocked_mask')
+            if wait_mask and wait_mask != 0:
+                self.state.wait_mask = wait_mask
+            _clear_all_block_state()
+
+        wait_mask = self.state.wait_mask
+        if not wait_mask:
+            return
+
+        if self._debug:
+            print(f"[amifuse] _flush_pending_signals: wait_mask=0x{wait_mask:x}")
+
+        pmgr = self.vh.slm.exec_impl.port_mgr
+        exec_base = self.mem.r32(4)
+        this_task_off = ExecLibraryStruct.sdef.find_field_def_by_name("ThisTask").offset
+        this_task = self.mem.r32(exec_base + this_task_off)
+        sigrecvd_off = TaskStruct.sdef.find_field_def_by_name("tc_SigRecvd").offset
+        mp_sigbit_off = MsgPortStruct.sdef.find_field_def_by_name("mp_SigBit").offset
+
+        for rnd in range(max_rounds):
+            # --- Gather all pending signals ---
+            # 1. Self-signals set by handler via Signal(FindTask(NULL), ...)
+            self_signals = SignalFunc._fallback_signals
+
+            # 2. tc_SigRecvd from m68k memory (IO completion, etc.)
+            tc_sigrecvd = self.mem.r32(this_task + sigrecvd_off)
+
+            # 3. Signals from ports with actual messages
+            port_signals = 0
+            for port_addr, port in pmgr.ports.items():
+                has_msg = (port.queue is not None and len(port.queue) > 0)
+                if not has_msg:
+                    try:
+                        mp_msglist_off = MsgPortStruct.sdef.find_field_def_by_name("mp_MsgList").offset
+                        list_addr = port_addr + mp_msglist_off
+                        lh_head = self.mem.r32(list_addr)
+                        has_msg = (lh_head != 0 and lh_head != list_addr + 4)
+                    except Exception:
+                        pass
+                if has_msg:
+                    try:
+                        sigbit = self.mem.read(0, port_addr + mp_sigbit_off)
+                        if 0 <= sigbit < 32:
+                            port_signals |= 1 << sigbit
+                    except Exception:
+                        pass
+
+            # 4. On the first round, inject the timer/validation signal to
+            #    kick off the deferred validation cycle.
+            timer_signal = (1 << 19) if rnd == 0 else 0
+
+            # Combine and mask to what the handler is waiting for.
+            combined = self_signals | tc_sigrecvd | port_signals | timer_signal
+            actual_signals = combined & wait_mask
+
+            # If no signals to deliver (and past the first round), we're done.
+            if actual_signals == 0 and rnd > 0:
+                if self._debug:
+                    print(f"[amifuse] _flush round {rnd}: no pending signals, done")
+                break
+
+            # Ensure at least the timer signal on first round.
+            if actual_signals == 0:
+                actual_signals = (1 << 19) & wait_mask
+                if actual_signals == 0:
+                    actual_signals = wait_mask  # Last resort
+
+            if self._debug:
+                print(f"[amifuse] _flush round {rnd}: signals=0x{actual_signals:x} "
+                      f"(self=0x{self_signals:x} tc=0x{tc_sigrecvd:x} "
+                      f"ports=0x{port_signals:x} timer=0x{timer_signal:x})")
+
+            # Clear delivered signals from _fallback_signals and tc_SigRecvd,
+            # mimicking how Wait() atomically clears returned signals.
+            SignalFunc._fallback_signals &= ~actual_signals
+            self.mem.w32(this_task + sigrecvd_off, tc_sigrecvd & ~actual_signals)
+
+            # Set up Wait() return: D0 = returned signals
+            self.state.pc = self.state.main_loop_pc
+            self.state.sp = self.state.main_loop_sp
+            self.vh.machine.cpu.w_reg(REG_D0, actual_signals)
+            _clear_all_block_state()
+
+            old_pc = self.state.pc
+            self.launcher.run_burst(self.state, max_cycles=2_000_000)
+            rs = self.state.run_state
+            if self._debug:
+                cycles_run = getattr(rs, 'cycles', 0) if rs else 0
+                print(f"[amifuse] _flush round {rnd}: PC 0x{old_pc:x}->0x{self.state.pc:x} "
+                      f"cycles={cycles_run} error={getattr(rs, 'error', None)} crashed={self.state.crashed}")
+
+            # Drain any spurious replies (timer completion etc.)
+            self.launcher.poll_replies(self.state.reply_port_addr)
+            _clear_all_block_state()
+            if self.state.crashed:
+                break
+
+            # Capture updated wait_mask if handler changed it
+            new_mask = _get_block_state(ExecLibrary, '_wait_blocked_mask')
+            if new_mask and new_mask != 0:
+                wait_mask = new_mask
+                self.state.wait_mask = new_mask
+
+        # Drain stale messages from ALL non-essential ports (timer, disk
+        # change).  After initialization, timer signals must NOT interfere
+        # with normal DOS packet processing.
+        dos_port = self.state.port_addr
+        reply_port = self.state.reply_port_addr
+        for port_addr in list(pmgr.ports.keys()):
+            if port_addr != dos_port and port_addr != reply_port:
+                while pmgr.has_msg(port_addr):
+                    pmgr.get_msg(port_addr)
+
+        # Clean up fallback signals to avoid stale signals during normal
+        # DOS packet processing.
+        SignalFunc._fallback_signals = 0
+
+        # After the flush rounds, the handler is blocked in Wait() and
+        # run_burst has set state.pc to the Wait() return address (= the
+        # main loop entry).  Update main_loop_pc/sp to match so subsequent
+        # _run_until_replies calls work correctly.
+        if self.state.pc >= 0x800:
+            self.state.main_loop_pc = self.state.pc
+            self.state.main_loop_sp = self.state.sp
+
+        # Ensure clean blocking state for normal operation.
+        _clear_all_block_state()
 
     def _update_handler_port_from_startup(self):
         pkt = AccessStruct(self.mem, DosPacketStruct, self.state.stdpkt_addr)
