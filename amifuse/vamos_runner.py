@@ -91,8 +91,13 @@ class VamosHandlerRuntime:
         path_cfg["path"]["auto_volumes"] = []
         path_cfg["path"]["auto_assigns"] = []
         path_cfg["path"]["vols_base_dir"] = temp_path
-        path_cfg["path"]["cwd"] = f"root:{temp_path}"
-        path_cfg["path"]["command"] = [f"root:{temp_path}"]
+        # Use "root:" (volume root) for cwd/command rather than embedding
+        # the host path.  On Windows the host temp path contains a drive
+        # letter colon (e.g. C:\…) which is rejected by AmiPath validation
+        # (only one colon allowed).  The volume definition below maps root:
+        # to the actual temp directory, so "root:" resolves correctly.
+        path_cfg["path"]["cwd"] = "root:"
+        path_cfg["path"]["command"] = ["root:"]
         # Provide a minimal root: volume pointing to temp dir so cwd resolves.
         path_cfg["volumes"] = [f"root:{temp_path}"]
         path_cfg["assigns"] = {}
