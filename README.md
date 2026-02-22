@@ -1,10 +1,10 @@
-# amifuse
+# AmiFUSE
 
 Mount Amiga filesystem images on macOS/Linux/Windows using native AmigaOS filesystem handlers via FUSE.
 
-amifuse runs actual Amiga filesystem drivers (like PFS3) through m68k CPU emulation, allowing you to read Amiga hard disk images without relying on reverse-engineered implementations.
+AmiFUSE runs actual Amiga filesystem drivers (like PFS3) through m68k CPU emulation, allowing you to read Amiga hard disk images without relying on reverse-engineered implementations.
 
-![amifuse](https://raw.githubusercontent.com/reinauer/amifuse/main/Docs/amifuse.png)
+![amifuse](https://raw.githubusercontent.com/reinauer/AmiFUSE/main/Docs/amifuse.png)
 
 ## Requirements
 
@@ -19,8 +19,8 @@ amifuse runs actual Amiga filesystem drivers (like PFS3) through m68k CPU emulat
 
 ```bash
 # Clone the repository with submodules
-git clone --recursive https://github.com/reinauer/amifuse.git
-cd amifuse
+git clone --recursive https://github.com/reinauer/AmiFUSE.git
+cd AmiFUSE
 
 # Or if already cloned, initialize submodules
 git submodule update --init
@@ -33,7 +33,7 @@ python3 -m venv .venv
 source .venv/bin/activate   # On Windows: .venv\Scripts\activate
 
 pip install -e './amitools[vamos]'   # Install amitools from submodule (includes machine68k)
-pip install -e .                     # Install amifuse
+pip install -e .                     # Install AmiFUSE
 ```
 
 ### Without virtual environment
@@ -69,7 +69,7 @@ sudo dnf install fuse fuse-devel
 
 ### Running from source (without installing)
 
-To run amifuse directly from a local checkout (useful for development/debugging):
+To run AmiFUSE directly from a local checkout (useful for development/debugging):
 
 ```bash
 python3 -m amifuse mount disk.hdf
