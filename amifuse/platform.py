@@ -32,9 +32,8 @@ def get_default_mountpoint(volname: str) -> Optional[Path]:
     if sys.platform.startswith("darwin"):
         return Path(f"/Volumes/{volname}")
     elif sys.platform.startswith("win"):
-        # Find first available drive letter (starting from A:)
-        import string
-        for letter in string.ascii_uppercase:
+        # Find first available drive letter (skip A/B floppy and C system)
+        for letter in "DEFGHIJKLMNOPQRSTUVWXYZ":
             drive = f"{letter}:"
             if not os.path.exists(drive):
                 return Path(drive)
@@ -56,6 +55,9 @@ def should_auto_create_mountpoint(mountpoint: Path) -> bool:
     if sys.platform.startswith("darwin"):
         # macFUSE will create mount points in /Volumes automatically
         return str(mountpoint).startswith("/Volumes/")
+    if sys.platform.startswith("win"):
+        # WinFsp handles drive letter mountpoints; don't mkdir them
+        return True
     return False
 
 
