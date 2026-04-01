@@ -2179,7 +2179,10 @@ def format_volume(
         # Allocate volume name BSTR and send ACTION_FORMAT
         _, volname_bptr = bridge.launcher.alloc_bstr(volname, label="FormatVolName")
         bridge.launcher.send_format(bridge.state, volname_bptr, dostype)
-        replies = bridge._run_until_replies()
+        # Format can take many cycles for large partitions — PFS3 must
+        # initialize bitmap and root blocks proportional to partition size.
+        # Use generous limits; the loop returns immediately once a reply arrives.
+        replies = bridge._run_until_replies(max_iters=2000, cycles=2_000_000)
 
         if not replies:
             raise SystemExit("Format failed: no reply from handler.")
@@ -2199,13 +2202,15 @@ def format_volume(
         if debug:
             print(f"[amifuse] FORMAT reply: res1={res1} res2={res2}")
 
-        # Uninhibit to re-mount the newly formatted volume
+        # Uninhibit to re-mount the newly formatted volume.
+        # PFS3 re-validates bitmap blocks during remount, which can take
+        # significant cycles on large partitions.
         bridge.launcher.send_inhibit(bridge.state, False)
-        bridge._run_until_replies()
+        bridge._run_until_replies(max_iters=500, cycles=2_000_000)
 
         # Flush to ensure data is written
         bridge.launcher.send_flush(bridge.state)
-        bridge._run_until_replies()
+        bridge._run_until_replies(max_iters=500, cycles=2_000_000)
 
         print(f"Format complete. Volume '{volname}' created on partition '{partition}'.")
     finally:
