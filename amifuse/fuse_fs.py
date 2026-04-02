@@ -304,14 +304,28 @@ class HandlerBridge:
             pmgr = self.vh.slm.exec_impl.port_mgr
             has_msg = pmgr.has_msg(self.state.port_addr)
             if has_msg:
-                # Only deliver the DOS port signal (bit 8) during normal
-                # packet processing.  Timer and other signals were already
+                # Only deliver the DOS port signal during normal packet
+                # processing.  Timer and other signals were already
                 # handled during _flush_pending_signals at init time.
                 # Delivering ALL signals here causes a timer storm: the
                 # handler processes the timer, re-arms it, and SendIO
                 # queues another reply, triggering the timer on every
                 # single packet until the handler state gets corrupted.
-                dos_signal = 0x100  # bit 8 = DOS port signal
+                # Use the handler's actual Wait mask to determine which
+                # signal to deliver.  Handlers like CDFileSystem use a
+                # custom Wait loop whose mask may not include the port's
+                # mp_SigBit; signalling the port bit alone won't wake them.
+                # Fall back to bit 8 for handlers with no captured mask.
+                from amitools.vamos.libstructs.exec_ import MsgPortStruct
+                mp_sigbit_off = MsgPortStruct.sdef.find_field_def_by_name("mp_SigBit").offset
+                sigbit = self.mem.read(0, self.state.port_addr + mp_sigbit_off)
+                port_signal = 1 << sigbit if 0 <= sigbit < 32 else 0x100
+                wait_mask = getattr(self.state, 'wait_mask', 0)
+                if wait_mask and not (wait_mask & port_signal):
+                    # Port signal not in wait mask — deliver the full mask
+                    dos_signal = wait_mask
+                else:
+                    dos_signal = port_signal
                 self.vh.machine.cpu.w_reg(0, dos_signal)  # REG_D0
                 # Also set tc_SigRecvd in case handler checks the task structure
                 from amitools.vamos.libstructs.exec_ import TaskStruct
@@ -621,6 +635,18 @@ class HandlerBridge:
                 new_port = dp_port
             elif alt_port and alt_port != self.state.port_addr:
                 new_port = alt_port
+
+            # Some handlers (CDFileSystem) set dn_Task to a different port
+            # than dp_Port in the startup reply.  Check dn_Task as fallback.
+            if not new_port:
+                from .amiga_structs import DeviceNodeStruct
+                dn_addr = self.launcher.boot["dn_addr"]
+                dn_task = self.mem.r32(dn_addr + DeviceNodeStruct.sdef.find_field_def_by_name("dn_Task").offset)
+                if dn_task and dn_task != self.state.port_addr:
+                    new_port = dn_task
+                    if self._debug:
+                        print(f"[amifuse] dn_Task port: 0x{dn_task:x}")
+
             if new_port:
                 pmgr = self.vh.slm.exec_impl.port_mgr
                 if not pmgr.has_port(new_port):
