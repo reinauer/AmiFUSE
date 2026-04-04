@@ -6,6 +6,8 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
+import shutil
 import statistics
 import subprocess
 import sys
@@ -35,6 +37,8 @@ class Fixture:
     image_size_mb: int
     expected_root: tuple[str, ...] = ()
     lookup_path: Optional[str] = None
+    seed_image: Optional[Path] = None
+    default_run: bool = True
 
 
 FIXTURES: Dict[str, Fixture] = {
@@ -50,6 +54,18 @@ FIXTURES: Dict[str, Fixture] = {
         expected_root=("Libs", "S", "foo.md", "plan.md"),
         lookup_path="/foo.md",
     ),
+    "pfs3-rw": Fixture(
+        key="pfs3-rw",
+        fs_name="PFS3 rw",
+        image=FIXTURE_ROOT / "generated" / "pfs3_rw.hdf",
+        driver=FIXTURE_ROOT / "pfs3aio",
+        partition="PDH0",
+        mode="rw",
+        image_kind="rdb-hdf",
+        image_size_mb=8,
+        seed_image=FIXTURE_ROOT / "pfs.hdf",
+        default_run=False,
+    ),
     "sfs": Fixture(
         key="sfs",
         fs_name="SFS",
@@ -60,6 +76,18 @@ FIXTURES: Dict[str, Fixture] = {
         image_kind="rdb-hdf",
         image_size_mb=8,
     ),
+    "sfs-rw": Fixture(
+        key="sfs-rw",
+        fs_name="SFS rw",
+        image=FIXTURE_ROOT / "generated" / "sfs_rw.hdf",
+        driver=FIXTURE_ROOT / "SmartFilesystem",
+        partition="SDH0",
+        mode="rw",
+        image_kind="rdb-hdf",
+        image_size_mb=8,
+        seed_image=FIXTURE_ROOT / "sfs.hdf",
+        default_run=False,
+    ),
     "ffs": Fixture(
         key="ffs",
         fs_name="FFS",
@@ -69,6 +97,18 @@ FIXTURES: Dict[str, Fixture] = {
         mode="ro",
         image_kind="rdb-hdf",
         image_size_mb=512,
+    ),
+    "ffs-rw": Fixture(
+        key="ffs-rw",
+        fs_name="FFS rw",
+        image=FIXTURE_ROOT / "generated" / "ffs_rw.hdf",
+        driver=FIXTURE_ROOT / "FastFileSystem",
+        partition="QDH0",
+        mode="rw",
+        image_kind="rdb-hdf",
+        image_size_mb=512,
+        seed_image=FIXTURE_ROOT / "Default.hdf",
+        default_run=False,
     ),
     "ofs": Fixture(
         key="ofs",
@@ -81,6 +121,18 @@ FIXTURES: Dict[str, Fixture] = {
         image_size_mb=1,
         expected_root=("Docs", "OFS_README.txt"),
         lookup_path="/OFS_README.txt",
+    ),
+    "ofs-rw": Fixture(
+        key="ofs-rw",
+        fs_name="OFS rw",
+        image=FIXTURE_ROOT / "generated" / "ofs_rw.adf",
+        driver=FIXTURE_ROOT / "FastFileSystem",
+        partition=None,
+        mode="rw",
+        image_kind="adf",
+        image_size_mb=1,
+        seed_image=FIXTURE_ROOT / "ofs.adf",
+        default_run=False,
     ),
     "cdfs": Fixture(
         key="cdfs",
@@ -261,19 +313,107 @@ def _find_sample_files(bridge, limit_dirs: int = 8):
     }
 
 
-def _run_fixture_worker(fixture_key: str):
-    fixture = FIXTURES[fixture_key]
-    HandlerBridge, detect_adf, detect_iso, open_rdisk = _load_runtime()
+def _shutdown_bridge(bridge):
+    shutdown = getattr(getattr(bridge, "vh", None), "shutdown", None)
+    if shutdown is not None:
+        shutdown()
 
-    inspect_s, inspect_info = _timed(
-        _inspect_fixture, fixture, detect_adf, detect_iso, open_rdisk
-    )
-    inspect_meta, adf_info, iso_info = inspect_info
-    if not inspect_meta.get("partition_found", True):
-        raise RuntimeError(
-            f"expected partition {fixture.partition!r} not found in inspect data"
-        )
 
+def _split_parent(path: str) -> tuple[str, str]:
+    parts = [part for part in path.split("/") if part]
+    if not parts:
+        raise ValueError(f"invalid path: {path!r}")
+    name = parts[-1]
+    if len(parts) == 1:
+        return "/", name
+    return "/" + "/".join(parts[:-1]), name
+
+
+def _locate_dir_lock(bridge, dir_path: str):
+    lock_bptr, res2, locks = bridge.locate_path(dir_path)
+    if dir_path == "/" and lock_bptr == 0:
+        lock_bptr, res2 = bridge.locate(0, "")
+        locks = [lock_bptr] if lock_bptr else []
+    return lock_bptr, res2, locks
+
+
+def _create_dir_path(bridge, path: str):
+    parent_path, name = _split_parent(path)
+    lock_bptr, res2, locks = _locate_dir_lock(bridge, parent_path)
+    try:
+        if lock_bptr == 0 and parent_path != "/":
+            raise RuntimeError(f"parent dir not found for mkdir {path}: res2={res2}")
+        new_lock, io_err = bridge.create_dir(lock_bptr, name)
+        if new_lock == 0:
+            raise RuntimeError(f"mkdir failed for {path}: res2={io_err}")
+        bridge.free_lock(new_lock)
+    finally:
+        for lock in reversed(locks):
+            bridge.free_lock(lock)
+
+
+def _delete_path(bridge, path: str):
+    parent_path, name = _split_parent(path)
+    lock_bptr, res2, locks = _locate_dir_lock(bridge, parent_path)
+    try:
+        if lock_bptr == 0 and parent_path != "/":
+            raise RuntimeError(f"parent dir not found for delete {path}: res2={res2}")
+        deleted, io_err = bridge.delete_object(lock_bptr, name)
+        if deleted == 0:
+            raise RuntimeError(f"delete failed for {path}: res2={io_err}")
+    finally:
+        for lock in reversed(locks):
+            bridge.free_lock(lock)
+
+
+def _rename_path(bridge, old_path: str, new_path: str):
+    src_parent, src_name = _split_parent(old_path)
+    dst_parent, dst_name = _split_parent(new_path)
+    src_lock, src_res2, src_locks = _locate_dir_lock(bridge, src_parent)
+    dst_lock, dst_res2, dst_locks = _locate_dir_lock(bridge, dst_parent)
+    try:
+        if src_lock == 0 and src_parent != "/":
+            raise RuntimeError(
+                f"source dir not found for rename {old_path}: res2={src_res2}"
+            )
+        if dst_lock == 0 and dst_parent != "/":
+            raise RuntimeError(
+                f"dest dir not found for rename {new_path}: res2={dst_res2}"
+            )
+        renamed, io_err = bridge.rename_object(src_lock, src_name, dst_lock, dst_name)
+        if renamed == 0:
+            raise RuntimeError(f"rename failed {old_path} -> {new_path}: res2={io_err}")
+    finally:
+        for lock in reversed(src_locks):
+            bridge.free_lock(lock)
+        for lock in reversed(dst_locks):
+            if lock not in src_locks:
+                bridge.free_lock(lock)
+
+
+def _write_file_path(bridge, path: str, data: bytes):
+    opened = bridge.open_file(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
+    if opened is None:
+        raise RuntimeError(f"open_file failed for write path {path}")
+    fh_addr, parent_lock = opened
+    try:
+        written = bridge.write_handle(fh_addr, data)
+        if written != len(data):
+            raise RuntimeError(f"short write for {path}: {written} != {len(data)}")
+    finally:
+        bridge.close_file(fh_addr)
+        if parent_lock:
+            bridge.free_lock(parent_lock)
+
+
+def _prepare_rw_image(fixture: Fixture):
+    if fixture.seed_image is None:
+        return
+    fixture.image.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(fixture.seed_image, fixture.image)
+
+
+def _run_ro_fixture(fixture: Fixture, HandlerBridge, adf_info, iso_info, inspect_s, inspect_meta):
     init_s, bridge = _timed(
         HandlerBridge,
         fixture.image,
@@ -346,15 +486,169 @@ def _run_fixture_worker(fixture_key: str):
             "stat_s": stat_s,
             "small_read_s": small_read_s,
             "large_read_s": large_read_s,
+            "mkdir_s": 0.0,
+            "create_s": 0.0,
+            "write_s": 0.0,
+            "rename_s": 0.0,
             "flush_s": flush_s,
+            "remount_s": 0.0,
+            "verify_stat_s": 0.0,
+            "verify_read_s": 0.0,
+            "delete_s": 0.0,
+            "cleanup_flush_s": 0.0,
             "total_s": total_s,
             "small_read_bytes": small_read_bytes,
             "large_read_bytes": large_read_bytes,
         }
     finally:
-        shutdown = getattr(getattr(bridge, "vh", None), "shutdown", None)
-        if shutdown is not None:
-            shutdown()
+        _shutdown_bridge(bridge)
+
+
+def _run_rw_fixture(fixture: Fixture, HandlerBridge, adf_info, iso_info, inspect_s, inspect_meta):
+    rw_dir = "/AmiFuseRW"
+    created_path = f"{rw_dir}/hello.txt"
+    renamed_path = f"{rw_dir}/hello-renamed.txt"
+    payload = b"AmiFuse writable smoke\n"
+    payload += bytes((ord("A") + (idx % 26) for idx in range(8192)))
+
+    init_s, bridge = _timed(
+        HandlerBridge,
+        fixture.image,
+        fixture.driver,
+        partition=fixture.partition,
+        read_only=False,
+        adf_info=adf_info,
+        iso_info=iso_info,
+    )
+
+    try:
+        list_root_s, root_entries = _timed(bridge.list_dir_path, "/")
+        root_names = [entry["name"] for entry in root_entries]
+
+        mkdir_s, _ = _timed(_create_dir_path, bridge, rw_dir)
+        create_s, opened = _timed(
+            bridge.open_file, created_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+        )
+        if opened is None:
+            raise RuntimeError(f"open_file failed for create path {created_path}")
+        fh_addr, parent_lock = opened
+        try:
+            write_s, written = _timed(bridge.write_handle, fh_addr, payload)
+            if written != len(payload):
+                raise RuntimeError(
+                    f"short write for {created_path}: {written} != {len(payload)}"
+                )
+        finally:
+            bridge.close_file(fh_addr)
+            if parent_lock:
+                bridge.free_lock(parent_lock)
+
+        rename_s, _ = _timed(_rename_path, bridge, created_path, renamed_path)
+        flush_s, _ = _timed(bridge.flush_volume)
+    finally:
+        _shutdown_bridge(bridge)
+
+    remount_s, verify_bridge = _timed(
+        HandlerBridge,
+        fixture.image,
+        fixture.driver,
+        partition=fixture.partition,
+        read_only=False,
+        adf_info=adf_info,
+        iso_info=iso_info,
+    )
+    try:
+        verify_stat_s, verify_stat = _timed(verify_bridge.stat_path, renamed_path)
+        if verify_stat is None:
+            raise RuntimeError(f"remount stat failed for {renamed_path}")
+        if int(verify_stat.get("size", -1)) != len(payload):
+            raise RuntimeError(
+                f"remount size mismatch for {renamed_path}: {verify_stat.get('size')}"
+            )
+        verify_read_s, verify_data = _timed(
+            verify_bridge.read_file, renamed_path, len(payload), 0
+        )
+        if verify_data != payload:
+            raise RuntimeError(f"remount read mismatch for {renamed_path}")
+        delete_s, _ = _timed(_delete_path, verify_bridge, renamed_path)
+        _, _ = _timed(_delete_path, verify_bridge, rw_dir)
+        cleanup_flush_s, _ = _timed(verify_bridge.flush_volume)
+        total_s = (
+            inspect_s
+            + init_s
+            + list_root_s
+            + mkdir_s
+            + create_s
+            + write_s
+            + rename_s
+            + flush_s
+            + remount_s
+            + verify_stat_s
+            + verify_read_s
+            + delete_s
+            + cleanup_flush_s
+        )
+        return {
+            "fixture": fixture.key,
+            "fs_name": fixture.fs_name,
+            "image": str(fixture.image),
+            "driver": str(fixture.driver),
+            "partition": fixture.partition,
+            "mode": fixture.mode,
+            "image_kind": fixture.image_kind,
+            "image_size_mb": fixture.image_size_mb,
+            "status": "ok",
+            "inspect": inspect_meta,
+            "root_count": len(root_entries),
+            "root_names": root_names,
+            "lookup_path": renamed_path,
+            "small_read_path": renamed_path,
+            "large_read_path": renamed_path,
+            "inspect_s": inspect_s,
+            "init_s": init_s,
+            "list_root_s": list_root_s,
+            "stat_s": 0.0,
+            "small_read_s": 0.0,
+            "large_read_s": 0.0,
+            "mkdir_s": mkdir_s,
+            "create_s": create_s,
+            "write_s": write_s,
+            "rename_s": rename_s,
+            "flush_s": flush_s,
+            "remount_s": remount_s,
+            "verify_stat_s": verify_stat_s,
+            "verify_read_s": verify_read_s,
+            "delete_s": delete_s,
+            "cleanup_flush_s": cleanup_flush_s,
+            "total_s": total_s,
+            "small_read_bytes": len(payload),
+            "large_read_bytes": len(payload),
+        }
+    finally:
+        _shutdown_bridge(verify_bridge)
+
+
+def _run_fixture_worker(fixture_key: str):
+    fixture = FIXTURES[fixture_key]
+    HandlerBridge, detect_adf, detect_iso, open_rdisk = _load_runtime()
+    if fixture.mode == "rw":
+        _prepare_rw_image(fixture)
+
+    inspect_s, inspect_info = _timed(
+        _inspect_fixture, fixture, detect_adf, detect_iso, open_rdisk
+    )
+    inspect_meta, adf_info, iso_info = inspect_info
+    if not inspect_meta.get("partition_found", True):
+        raise RuntimeError(
+            f"expected partition {fixture.partition!r} not found in inspect data"
+        )
+    if fixture.mode == "rw":
+        return _run_rw_fixture(
+            fixture, HandlerBridge, adf_info, iso_info, inspect_s, inspect_meta
+        )
+    return _run_ro_fixture(
+        fixture, HandlerBridge, adf_info, iso_info, inspect_s, inspect_meta
+    )
 
 
 def _worker_main(args):
@@ -401,7 +695,16 @@ TIMING_KEYS = (
     "stat_s",
     "small_read_s",
     "large_read_s",
+    "mkdir_s",
+    "create_s",
+    "write_s",
+    "rename_s",
     "flush_s",
+    "remount_s",
+    "verify_stat_s",
+    "verify_read_s",
+    "delete_s",
+    "cleanup_flush_s",
     "total_s",
 )
 
@@ -415,6 +718,7 @@ def _aggregate_fixture_runs(
         return {
             "fixture": fixture.key,
             "fs_name": fixture.fs_name,
+            "mode": fixture.mode,
             "status": first.get("status", "error"),
             "error": first.get("error", "unknown error"),
             "runs": len(run_results),
@@ -469,6 +773,8 @@ def _format_total_range(result: Dict[str, object]) -> str:
 
 
 def _render_markdown(results: List[Dict[str, object]]) -> str:
+    ro_results = [result for result in results if result.get("mode") == "ro"]
+    rw_results = [result for result in results if result.get("mode") == "rw"]
     lines = [
         "# AmiFuse Matrix Run",
         "",
@@ -477,10 +783,17 @@ def _render_markdown(results: List[Dict[str, object]]) -> str:
         f"- Worker timeout: `{DEFAULT_TIMEOUT:.0f}s`",
         f"- Runs per fixture: `{results[0]['runs'] if results else 0}`",
         "",
-        "| FS | Status | Inspect med | Init med | Root med | Stat med | Small med | Large med | Flush med | Total min/med/max | Notes |",
-        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
-    for result in results:
+    if ro_results:
+        lines.extend(
+            [
+                "## Read-only Smoke",
+                "",
+                "| FS | Status | Inspect med | Init med | Root med | Stat med | Small med | Large med | Flush med | Total min/med/max | Notes |",
+                "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+            ]
+        )
+    for result in ro_results:
         notes = []
         if result["status"] == "ok":
             notes.append(f"runs={result['runs']}")
@@ -521,11 +834,72 @@ def _render_markdown(results: List[Dict[str, object]]) -> str:
                 "<br>".join(notes),
             ]
         lines.append("| " + " | ".join(row) + " |")
+    if rw_results:
+        lines.extend(
+            [
+                "",
+                "## Writable Smoke",
+                "",
+                "| FS | Status | Inspect med | Init med | Root med | Mkdir med | Create med | Write med | Rename med | Flush med | Remount med | Verify stat med | Verify read med | Delete med | Cleanup flush med | Total min/med/max | Notes |",
+                "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+            ]
+        )
+    for result in rw_results:
+        notes = []
+        if result["status"] == "ok":
+            notes.append(f"runs={result['runs']}")
+            notes.append(f"root={result['root_count']}")
+            if result.get("lookup_path"):
+                notes.append(f"verify={result['lookup_path']}")
+            row = [
+                result["fs_name"],
+                "ok",
+                _format_seconds(float(result["inspect_s_median"])),
+                _format_seconds(float(result["init_s_median"])),
+                _format_seconds(float(result["list_root_s_median"])),
+                _format_seconds(float(result["mkdir_s_median"])),
+                _format_seconds(float(result["create_s_median"])),
+                _format_seconds(float(result["write_s_median"])),
+                _format_seconds(float(result["rename_s_median"])),
+                _format_seconds(float(result["flush_s_median"])),
+                _format_seconds(float(result["remount_s_median"])),
+                _format_seconds(float(result["verify_stat_s_median"])),
+                _format_seconds(float(result["verify_read_s_median"])),
+                _format_seconds(float(result["delete_s_median"])),
+                _format_seconds(float(result["cleanup_flush_s_median"])),
+                _format_total_range(result),
+                "<br>".join(notes),
+            ]
+        else:
+            notes.append(f"runs={result.get('runs', 0)}")
+            notes.append(result.get("error", "unknown error"))
+            row = [
+                FIXTURES[result["fixture"]].fs_name,
+                result["status"],
+                "-",
+                "-",
+                "-",
+                "-",
+                "-",
+                "-",
+                "-",
+                "-",
+                "-",
+                "-",
+                "-",
+                "-",
+                "-",
+                "-",
+                "<br>".join(notes),
+            ]
+        lines.append("| " + " | ".join(row) + " |")
     return "\n".join(lines) + "\n"
 
 
 def _main(args):
-    fixture_keys = args.fixtures or list(FIXTURES)
+    fixture_keys = args.fixtures or [
+        key for key, fixture in FIXTURES.items() if fixture.default_run
+    ]
     script_path = Path(__file__).resolve()
     results = []
     for key in fixture_keys:
