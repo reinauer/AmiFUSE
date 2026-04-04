@@ -19,11 +19,17 @@ from typing import Dict, List, Optional, Tuple
 
 try:
     from fuse import FUSE, FuseOSError, LoggingMixIn, Operations  # type: ignore
-except ImportError as e:
-    raise SystemExit(
-        "Python FUSE bindings not found. Install fusepy (pip install fusepy) "
-        "or build the local python-fuse bindings and add them to PYTHONPATH."
-    ) from e
+except ImportError:
+    FUSE = None
+
+    class FuseOSError(RuntimeError):
+        pass
+
+    class LoggingMixIn:
+        pass
+
+    class Operations:
+        pass
 
 from .driver_runtime import BlockDeviceBackend
 from .vamos_runner import VamosHandlerRuntime
@@ -40,6 +46,14 @@ from .startup_runner import (
 from amitools.vamos.astructs.access import AccessStruct  # type: ignore
 from amitools.vamos.libstructs.dos import FileInfoBlockStruct, FileHandleStruct, DosPacketStruct  # type: ignore
 from amitools.vamos.lib.dos.DosProtection import DosProtection  # type: ignore
+
+
+def _require_fuse():
+    if FUSE is None:
+        raise SystemExit(
+            "Python FUSE bindings not found. Install fusepy (pip install fusepy) "
+            "or build the local python-fuse bindings and add them to PYTHONPATH."
+        )
 
 
 def _parse_fib(mem, fib_addr: int) -> Dict:
@@ -2071,6 +2085,7 @@ def mount_fuse(
     partition: Optional[str] = None,
     icons: bool = False,
 ):
+    _require_fuse()
     import amitools.fs.DosType as DosType
     from .rdb_inspect import detect_adf, detect_iso
 
