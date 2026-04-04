@@ -43,6 +43,14 @@ Writable fixture runs add:
 - delete
 - cleanup flush
 
+Format fixture runs add:
+
+- image creation
+- filesystem format
+- first post-format mount
+- writable smoke on the fresh volume
+- remount verification after format
+
 The harness now defaults to `3` runs per fixture and reports:
 
 - per-operation median times
@@ -107,3 +115,30 @@ This is the first all-green writable smoke matrix across `OFS`, `FFS`,
 real post-startup compatibility bug: child processes were not preserving
 their own blocked wait state or register set, so they never resumed when
 port traffic arrived after startup.
+
+## Latest Format Run
+
+Run:
+
+```sh
+python3 tools/amifuse_matrix.py --fixtures ofs-fmt ffs-fmt pfs3-fmt sfs-fmt --runs 3
+```
+
+Date: `2026-04-04`
+
+The format smoke tests create fresh generated RDB images under
+`~/AmigaOS/AmiFuse/generated/`, format them through AmiFuse, then mount
+them read-write, create and rename a file, remount, verify the contents,
+delete the test file, and flush again.
+
+| FS | Status | Create img med | Inspect med | Format med | Init med | Root med | Mkdir med | Create med | Write med | Rename med | Flush med | Remount med | Verify stat med | Verify read med | Delete med | Cleanup flush med | Total min / med / max | Notes |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `OFS fmt` | `ok` | `0.078s` | `0.001s` | `0.038s` | `0.021s` | `0.003s` | `0.006s` | `0.003s` | `0.009s` | `0.005s` | `0.001s` | `0.021s` | `0.005s` | `0.010s` | `0.003s` | `0.001s` | `0.206s / 0.206s / 0.208s` | `runs=3`, verify=`/AmiFuseRW/hello-renamed.txt` |
+| `FFS fmt` | `ok` | `0.077s` | `0.001s` | `0.040s` | `0.022s` | `0.003s` | `0.005s` | `0.004s` | `0.003s` | `0.004s` | `0.001s` | `0.022s` | `0.005s` | `0.005s` | `0.004s` | `0.001s` | `0.197s / 0.197s / 0.207s` | `runs=3`, verify=`/AmiFuseRW/hello-renamed.txt` |
+| `PFS3 fmt` | `ok` | `0.082s` | `0.001s` | `0.059s` | `0.037s` | `0.005s` | `0.009s` | `0.008s` | `0.008s` | `0.031s` | `0.002s` | `0.063s` | `0.007s` | `0.008s` | `0.018s` | `0.002s` | `0.339s / 0.339s / 0.346s` | `runs=3`, verify=`/AmiFuseRW/hello-renamed.txt` |
+| `SFS fmt` | `ok` | `0.080s` | `0.001s` | `0.061s` | `0.059s` | `0.007s` | `0.010s` | `0.007s` | `0.004s` | `0.013s` | `0.002s` | `0.080s` | `0.009s` | `0.009s` | `0.010s` | `0.002s` | `0.351s / 0.356s / 0.357s` | `runs=3`, verify=`/AmiFuseRW/hello-renamed.txt` |
+
+One runtime quirk matters here: `SFS` crashes if the formatter bridge is
+driven through a post-format uninhibit cycle after `ACTION_FORMAT`
+already succeeded, while classic DOS filesystems still need that
+uninhibit before the next mount sees a usable freshly formatted volume.
