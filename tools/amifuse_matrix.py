@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import statistics
 import subprocess
 import sys
 import time
@@ -381,8 +382,78 @@ def _run_fixture_subprocess(script_path: Path, fixture: Fixture, timeout_s: floa
     return result
 
 
+TIMING_KEYS = (
+    "inspect_s",
+    "init_s",
+    "list_root_s",
+    "stat_s",
+    "small_read_s",
+    "large_read_s",
+    "flush_s",
+    "total_s",
+)
+
+
+def _aggregate_fixture_runs(
+    fixture: Fixture, run_results: List[Dict[str, object]]
+) -> Dict[str, object]:
+    errors = [result for result in run_results if result.get("status") != "ok"]
+    if errors:
+        first = errors[0]
+        return {
+            "fixture": fixture.key,
+            "fs_name": fixture.fs_name,
+            "status": first.get("status", "error"),
+            "error": first.get("error", "unknown error"),
+            "runs": len(run_results),
+            "samples": run_results,
+        }
+
+    summary: Dict[str, object] = {
+        "fixture": fixture.key,
+        "fs_name": fixture.fs_name,
+        "status": "ok",
+        "runs": len(run_results),
+        "samples": run_results,
+    }
+
+    for key in TIMING_KEYS:
+        values = [float(result[key]) for result in run_results]
+        summary[f"{key}_min"] = min(values)
+        summary[f"{key}_median"] = statistics.median(values)
+        summary[f"{key}_max"] = max(values)
+
+    first = run_results[0]
+    for key in (
+        "mode",
+        "image_kind",
+        "image_size_mb",
+        "inspect",
+        "root_count",
+        "root_names",
+        "lookup_path",
+        "small_read_path",
+        "large_read_path",
+        "small_read_bytes",
+        "large_read_bytes",
+    ):
+        summary[key] = first.get(key)
+
+    return summary
+
+
 def _format_seconds(value: float) -> str:
     return f"{value:.3f}s"
+
+
+def _format_total_range(result: Dict[str, object]) -> str:
+    return " / ".join(
+        [
+            _format_seconds(float(result["total_s_min"])),
+            _format_seconds(float(result["total_s_median"])),
+            _format_seconds(float(result["total_s_max"])),
+        ]
+    )
 
 
 def _render_markdown(results: List[Dict[str, object]]) -> str:
@@ -392,13 +463,15 @@ def _render_markdown(results: List[Dict[str, object]]) -> str:
         f"- Date: {time.strftime('%Y-%m-%d')}",
         f"- Fixture root: `{FIXTURE_ROOT}`",
         f"- Worker timeout: `{DEFAULT_TIMEOUT:.0f}s`",
+        f"- Runs per fixture: `{results[0]['runs'] if results else 0}`",
         "",
-        "| FS | Status | Inspect | Init | Root | Stat | Small Read | Large Read | Flush | Total | Notes |",
+        "| FS | Status | Inspect med | Init med | Root med | Stat med | Small med | Large med | Flush med | Total min/med/max | Notes |",
         "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     for result in results:
         notes = []
         if result["status"] == "ok":
+            notes.append(f"runs={result['runs']}")
             notes.append(f"root={result['root_count']}")
             if result.get("lookup_path"):
                 notes.append(f"lookup={result['lookup_path']}")
@@ -409,17 +482,18 @@ def _render_markdown(results: List[Dict[str, object]]) -> str:
             row = [
                 result["fs_name"],
                 "ok",
-                _format_seconds(result["inspect_s"]),
-                _format_seconds(result["init_s"]),
-                _format_seconds(result["list_root_s"]),
-                _format_seconds(result["stat_s"]),
-                _format_seconds(result["small_read_s"]),
-                _format_seconds(result["large_read_s"]),
-                _format_seconds(result["flush_s"]),
-                _format_seconds(result["total_s"]),
+                _format_seconds(float(result["inspect_s_median"])),
+                _format_seconds(float(result["init_s_median"])),
+                _format_seconds(float(result["list_root_s_median"])),
+                _format_seconds(float(result["stat_s_median"])),
+                _format_seconds(float(result["small_read_s_median"])),
+                _format_seconds(float(result["large_read_s_median"])),
+                _format_seconds(float(result["flush_s_median"])),
+                _format_total_range(result),
                 "<br>".join(notes),
             ]
         else:
+            notes.append(f"runs={result.get('runs', 0)}")
             notes.append(result.get("error", "unknown error"))
             row = [
                 FIXTURES[result["fixture"]].fs_name,
@@ -444,15 +518,20 @@ def _main(args):
     results = []
     for key in fixture_keys:
         fixture = FIXTURES[key]
-        try:
-            result = _run_fixture_subprocess(script_path, fixture, args.timeout)
-        except subprocess.TimeoutExpired:
-            result = {
-                "fixture": key,
-                "status": "timeout",
-                "error": f"worker exceeded {args.timeout:.0f}s timeout",
-            }
-        results.append(result)
+        run_results = []
+        for _ in range(args.runs):
+            try:
+                result = _run_fixture_subprocess(script_path, fixture, args.timeout)
+            except subprocess.TimeoutExpired:
+                result = {
+                    "fixture": key,
+                    "status": "timeout",
+                    "error": f"worker exceeded {args.timeout:.0f}s timeout",
+                }
+            run_results.append(result)
+            if result.get("status") != "ok":
+                break
+        results.append(_aggregate_fixture_runs(fixture, run_results))
 
     if args.json:
         print(json.dumps(results, indent=2, sort_keys=True))
@@ -475,6 +554,12 @@ def _parse_args(argv: Optional[Iterable[str]] = None):
         type=float,
         default=DEFAULT_TIMEOUT,
         help="per-fixture worker timeout in seconds",
+    )
+    parser.add_argument(
+        "--runs",
+        type=int,
+        default=3,
+        help="number of repeated runs per fixture",
     )
     parser.add_argument(
         "--json",
