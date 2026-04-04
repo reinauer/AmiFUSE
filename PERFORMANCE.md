@@ -62,10 +62,8 @@ The initial canonical set is:
 - `SFS`: `sfs.hdf` with `SmartFilesystem`
 - `FFS`: `Default.hdf` with `FastFileSystem`
 - `OFS`: `ofs.adf` with `FastFileSystem`
+- `BFFS`: `netbsdamiga92.hdf` with `BFFSFilesystem`
 - `CDFileSystem`: `AmigaOS3.2CD.iso` with `CDFileSystem`
-
-`BFFS` is intentionally left for the next pass, where the fixture will
-be extracted or generated in a more controlled way.
 
 ## Latest Read-only Run
 
@@ -79,16 +77,22 @@ Date: `2026-04-04`
 
 | FS | Status | Inspect med | Init med | Root med | Stat med | Small med | Large med | Flush med | Total min / med / max | Notes |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `PFS3` | `ok` | `0.008s` | `0.054s` | `0.023s` | `0.003s` | `0.013s` | `0.021s` | `0.003s` | `0.114s / 0.127s / 0.137s` | `runs=3`, `pfs.hdf`, `PDH0`, small=`/foo.md`, large=`/S/pci.db` |
-| `SFS` | `ok` | `0.011s` | `0.084s` | `0.018s` | `0.003s` | `0.017s` | `0.011s` | `0.011s` | `0.143s / 0.162s / 0.171s` | `runs=3`, `sfs.hdf`, `SDH0`, lookup=`/Prefs`, small=`/Prefs/Asl`, large=`/System/Installer` |
-| `FFS` | `ok` | `0.003s` | `0.558s` | `0.042s` | `0.002s` | `0.003s` | `0.004s` | `0.001s` | `0.621s / 0.621s / 0.624s` | `runs=3`, `Default.hdf`, `QDH0`, small=`/CD0`, large=`/MMULib.lha` |
-| `OFS` | `ok` | `0.000s` | `0.024s` | `0.006s` | `0.002s` | `0.002s` | `0.078s` | `0.001s` | `0.105s / 0.113s / 0.115s` | `runs=3`, `ofs.adf`, small=`/OFS_README.txt`, large=`/Docs/OFS_LARGE.bin` |
-| `CDFileSystem` | `ok` | `0.000s` | `0.069s` | `0.018s` | `0.002s` | `0.004s` | `0.004s` | `0.001s` | `0.097s / 0.100s / 0.109s` | `runs=3`, `AmigaOS3.2CD.iso`, small=`/CDVersion`, large=`/ADF/Backdrops3.2.adf` |
+| `PFS3` | `ok` | `0.008s` | `0.058s` | `0.029s` | `0.003s` | `0.005s` | `0.026s` | `0.005s` | `0.136s / 0.137s / 0.149s` | `runs=3`, `pfs.hdf`, `PDH0`, small=`/foo.md`, large=`/S/pci.db` |
+| `SFS` | `ok` | `0.012s` | `0.089s` | `0.021s` | `0.004s` | `0.020s` | `0.013s` | `0.010s` | `0.163s / 0.173s / 0.183s` | `runs=3`, `sfs.hdf`, `SDH0`, lookup=`/Prefs`, small=`/Prefs/Asl`, large=`/System/Installer` |
+| `FFS` | `ok` | `0.003s` | `0.558s` | `0.043s` | `0.002s` | `0.004s` | `0.005s` | `0.001s` | `0.610s / 0.620s / 0.626s` | `runs=3`, `Default.hdf`, `QDH0`, small=`/CD0`, large=`/MMULib.lha` |
+| `OFS` | `ok` | `0.000s` | `0.026s` | `0.006s` | `0.002s` | `0.002s` | `0.087s` | `0.001s` | `0.114s / 0.123s / 0.127s` | `runs=3`, `ofs.adf`, small=`/OFS_README.txt`, large=`/Docs/OFS_LARGE.bin` |
+| `BFFS` | `ok` | `0.003s` | `0.200s` | `0.024s` | `0.003s` | `0.002s` | `0.003s` | `0.001s` | `0.234s / 0.236s / 0.240s` | `runs=3`, `netbsdamiga92.hdf`, `netbsd-root`, lookup=`/bin/cat`, small=`/.cshrc`, large=`/netbsd` |
+| `CDFileSystem` | `ok` | `0.000s` | `0.072s` | `0.019s` | `0.002s` | `0.003s` | `0.003s` | `0.000s` | `0.098s / 0.099s / 0.100s` | `runs=3`, `AmigaOS3.2CD.iso`, small=`/CDVersion`, large=`/ADF/Backdrops3.2.adf` |
 
 This is the current all-green aggregated read-only matrix for the
 expanded canonical fixture set. The earlier single-run table overstated
 drift, especially for `PFS3`, because its totals were too noisy to
 compare from one sample.
+
+`BFFS` now uses the NetBSD fixture directly in the default read-only
+matrix. The key compatibility fix there was making AmiFuse-generated
+BSTRs safe for handlers that temporarily treat counted strings as
+NUL-terminated C strings.
 
 ## Latest Writable Run
 

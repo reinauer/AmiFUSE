@@ -225,6 +225,18 @@ FIXTURES: Dict[str, Fixture] = {
         expected_root=("Docs", "OFS_README.txt"),
         lookup_path="/OFS_README.txt",
     ),
+    "bffs": Fixture(
+        key="bffs",
+        fs_name="BFFS",
+        image=FIXTURE_ROOT / "netbsdamiga92.hdf",
+        driver=FIXTURE_ROOT / "BFFSFilesystem",
+        partition="netbsd-root",
+        mode="ro",
+        image_kind="rdb-hdf",
+        image_size_mb=4095,
+        expected_root=("bin", "etc", "usr", "var", "netbsd"),
+        lookup_path="/bin/cat",
+    ),
     "ofs-rw": Fixture(
         key="ofs-rw",
         fs_name="OFS rw",
