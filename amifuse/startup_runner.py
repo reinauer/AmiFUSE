@@ -293,7 +293,9 @@ class HandlerLauncher:
     def _write_bstr(self, text: str, label: str) -> int:
         # Use latin-1 encoding for Amiga compatibility (handles chars 0-255)
         encoded = text.encode("latin-1", errors="replace")
-        data = bytes([len(encoded)]) + encoded
+        # Some handlers temporarily treat BSTR payloads as C strings and
+        # read/write one byte past the counted payload to append a NUL.
+        data = bytes([len(encoded)]) + encoded + b"\x00"
         mem_obj = self.alloc.alloc_memory(len(data), label=label)
         self.mem.w_block(mem_obj.addr, data)
         return mem_obj.addr
