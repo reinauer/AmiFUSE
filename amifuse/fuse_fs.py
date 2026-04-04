@@ -762,7 +762,9 @@ class HandlerBridge:
         encoded = text.encode("latin-1", errors="replace")
         if len(encoded) > 255:
             encoded = encoded[:255]
-        data = bytes([len(encoded)]) + encoded
+        # Keep one trailing NUL byte so handlers can temporarily treat the
+        # counted string payload as a C string without overrunning our buffer.
+        data = bytes([len(encoded)]) + encoded + b"\x00"
         if not self._bstr_ring:
             self._bstr_ring = [None] * self._bstr_ring_size
             self._bstr_sizes = [0] * self._bstr_ring_size
