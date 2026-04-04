@@ -142,3 +142,26 @@ One runtime quirk matters here: `SFS` crashes if the formatter bridge is
 driven through a post-format uninhibit cycle after `ACTION_FORMAT`
 already succeeded, while classic DOS filesystems still need that
 uninhibit before the next mount sees a usable freshly formatted volume.
+
+## Large Image Smoke
+
+Run:
+
+```sh
+python3 tools/amifuse_matrix.py --fixtures pfs3-4g --runs 1 --json
+```
+
+Date: `2026-04-04`
+
+This is the first ephemeral `>4GB` smoke case. It creates a sparse `5GiB`
+RDB image, places a small `PFS3` partition at byte `4,644,864,000`, formats
+that partition, writes deterministic data, remounts, reads it back, verifies
+it, and then removes the image immediately after the run.
+
+| FS | Status | Image size | Partition start | Create img | Inspect | Format | Init | Root | Mkdir | Create | Write | Rename | Flush | Remount | Verify stat | Verify read | Delete | Cleanup flush | Total |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `PFS3 >4G` | `ok` | `5GiB sparse` | `4,644,864,000` | `0.090s` | `0.001s` | `0.078s` | `0.062s` | `0.007s` | `0.016s` | `0.020s` | `0.015s` | `0.019s` | `0.002s` | `0.074s` | `0.012s` | `0.024s` | `0.011s` | `0.002s` | `0.434s` |
+
+This case is intentionally not part of the default matrix run. It is meant to
+exercise large-offset image I/O without keeping a persistent multi-gigabyte
+fixture on disk.

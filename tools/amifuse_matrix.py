@@ -41,6 +41,8 @@ class Fixture:
     default_run: bool = True
     create_args: tuple[str, ...] = ()
     format_volname: Optional[str] = None
+    cleanup_image: bool = False
+    min_partition_start_byte: Optional[int] = None
 
 
 FIXTURES: Dict[str, Fixture] = {
@@ -91,6 +93,33 @@ FIXTURES: Dict[str, Fixture] = {
             "fs=PFS3",
         ),
         format_volname="PFS3Fmt",
+    ),
+    "pfs3-4g": Fixture(
+        key="pfs3-4g",
+        fs_name="PFS3 >4G",
+        image=FIXTURE_ROOT / "generated" / "pfs3_4g.hdf",
+        driver=FIXTURE_ROOT / "pfs3aio",
+        partition="LDH0",
+        mode="fmt",
+        image_kind="rdb-hdf",
+        image_size_mb=5120,
+        default_run=False,
+        create_args=(
+            "create",
+            "chs=10400,16,63",
+            "+",
+            "init",
+            "rdb_cyls=2",
+            "+",
+            "add",
+            "start=9000",
+            "size=64MiB",
+            "name=LDH0",
+            "fs=PFS3",
+        ),
+        format_volname="Large4G",
+        cleanup_image=True,
+        min_partition_start_byte=4 * 1024 * 1024 * 1024,
     ),
     "sfs": Fixture(
         key="sfs",
@@ -328,10 +357,15 @@ def _inspect_fixture(fixture: Fixture, detect_adf, detect_iso, open_rdisk):
         partition_found = fixture.partition is None
         for part in rdisk.parts:
             part_name = str(part.part_blk.drv_name)
+            dos_env = part.part_blk.dos_env
+            cyl_blocks = dos_env.surfaces * dos_env.blk_per_trk
+            start_block = dos_env.low_cyl * cyl_blocks
             parts.append(
                 {
                     "name": part_name,
                     "dos_type": f"0x{part.part_blk.dos_env.dos_type:08x}",
+                    "start_block": start_block,
+                    "start_byte": start_block * blkdev.block_bytes,
                 }
             )
             if part_name == fixture.partition:
@@ -533,6 +567,11 @@ def _prepare_format_image(fixture: Fixture):
     if not fixture.create_args:
         raise RuntimeError(f"no create_args configured for {fixture.key}")
     _run_amitools_tool("amitools.tools.rdbtool", str(fixture.image), *fixture.create_args)
+
+
+def _cleanup_generated_image(fixture: Fixture):
+    if fixture.cleanup_image and fixture.image.exists():
+        fixture.image.unlink()
 
 
 def _exercise_rw_session(bridge):
@@ -786,95 +825,114 @@ def _run_fmt_fixture(
     detect_iso,
     open_rdisk,
 ):
-    create_image_s, _ = _timed(_prepare_format_image, fixture)
-    inspect_s, inspect_info = _timed(
-        _inspect_fixture, fixture, detect_adf, detect_iso, open_rdisk
-    )
-    inspect_meta2, adf_info, iso_info = inspect_info
-    if not inspect_meta2.get("partition_found", True):
-        raise RuntimeError(
-            f"expected partition {fixture.partition!r} not found in inspect data"
-        )
-    format_s, _ = _timed(
-        format_volume,
-        fixture.image,
-        fixture.driver,
-        None,
-        fixture.partition,
-        fixture.format_volname or "FmtVol",
-        False,
-    )
-    init_s, bridge = _timed(
-        HandlerBridge,
-        fixture.image,
-        fixture.driver,
-        partition=fixture.partition,
-        read_only=False,
-        adf_info=adf_info,
-        iso_info=iso_info,
-    )
     try:
-        session = _exercise_rw_session(bridge)
+        create_image_s, _ = _timed(_prepare_format_image, fixture)
+        inspect_s, inspect_info = _timed(
+            _inspect_fixture, fixture, detect_adf, detect_iso, open_rdisk
+        )
+        inspect_meta2, adf_info, iso_info = inspect_info
+        if not inspect_meta2.get("partition_found", True):
+            raise RuntimeError(
+                f"expected partition {fixture.partition!r} not found in inspect data"
+            )
+        if fixture.min_partition_start_byte is not None:
+            parts = inspect_meta2.get("partitions", [])
+            part_info = next(
+                (part for part in parts if part.get("name") == fixture.partition),
+                None,
+            )
+            if part_info is None:
+                raise RuntimeError(
+                    f"missing inspect partition data for {fixture.partition!r}"
+                )
+            start_byte = int(part_info.get("start_byte", 0))
+            if start_byte < fixture.min_partition_start_byte:
+                raise RuntimeError(
+                    f"partition {fixture.partition} starts at {start_byte}, "
+                    f"expected >= {fixture.min_partition_start_byte}"
+                )
+        format_s, _ = _timed(
+            format_volume,
+            fixture.image,
+            fixture.driver,
+            None,
+            fixture.partition,
+            fixture.format_volname or "FmtVol",
+            False,
+        )
+        init_s, bridge = _timed(
+            HandlerBridge,
+            fixture.image,
+            fixture.driver,
+            partition=fixture.partition,
+            read_only=False,
+            adf_info=adf_info,
+            iso_info=iso_info,
+        )
+        try:
+            session = _exercise_rw_session(bridge)
+        finally:
+            _shutdown_bridge(bridge)
+        verify = _verify_rw_session(
+            HandlerBridge, fixture, session["renamed_path"], session["payload"]
+        )
+        total_s = (
+            create_image_s
+            + inspect_s
+            + format_s
+            + init_s
+            + session["list_root_s"]
+            + session["mkdir_s"]
+            + session["create_s"]
+            + session["write_s"]
+            + session["rename_s"]
+            + session["flush_s"]
+            + verify["remount_s"]
+            + verify["verify_stat_s"]
+            + verify["verify_read_s"]
+            + verify["delete_s"]
+            + verify["cleanup_flush_s"]
+        )
+        return {
+            "fixture": fixture.key,
+            "fs_name": fixture.fs_name,
+            "image": str(fixture.image),
+            "driver": str(fixture.driver),
+            "partition": fixture.partition,
+            "mode": fixture.mode,
+            "image_kind": fixture.image_kind,
+            "image_size_mb": fixture.image_size_mb,
+            "status": "ok",
+            "inspect": inspect_meta2,
+            "root_count": len(session["root_entries"]),
+            "root_names": session["root_names"],
+            "lookup_path": session["renamed_path"],
+            "small_read_path": session["renamed_path"],
+            "large_read_path": session["renamed_path"],
+            "create_image_s": create_image_s,
+            "format_s": format_s,
+            "inspect_s": inspect_s,
+            "init_s": init_s,
+            "list_root_s": session["list_root_s"],
+            "stat_s": 0.0,
+            "small_read_s": 0.0,
+            "large_read_s": 0.0,
+            "mkdir_s": session["mkdir_s"],
+            "create_s": session["create_s"],
+            "write_s": session["write_s"],
+            "rename_s": session["rename_s"],
+            "flush_s": session["flush_s"],
+            "remount_s": verify["remount_s"],
+            "verify_stat_s": verify["verify_stat_s"],
+            "verify_read_s": verify["verify_read_s"],
+            "delete_s": verify["delete_s"],
+            "cleanup_flush_s": verify["cleanup_flush_s"],
+            "total_s": total_s,
+            "small_read_bytes": len(session["payload"]),
+            "large_read_bytes": len(session["payload"]),
+        }
     finally:
-        _shutdown_bridge(bridge)
-    verify = _verify_rw_session(
-        HandlerBridge, fixture, session["renamed_path"], session["payload"]
-    )
-    total_s = (
-        create_image_s
-        + inspect_s
-        + format_s
-        + init_s
-        + session["list_root_s"]
-        + session["mkdir_s"]
-        + session["create_s"]
-        + session["write_s"]
-        + session["rename_s"]
-        + session["flush_s"]
-        + verify["remount_s"]
-        + verify["verify_stat_s"]
-        + verify["verify_read_s"]
-        + verify["delete_s"]
-        + verify["cleanup_flush_s"]
-    )
-    return {
-        "fixture": fixture.key,
-        "fs_name": fixture.fs_name,
-        "image": str(fixture.image),
-        "driver": str(fixture.driver),
-        "partition": fixture.partition,
-        "mode": fixture.mode,
-        "image_kind": fixture.image_kind,
-        "image_size_mb": fixture.image_size_mb,
-        "status": "ok",
-        "inspect": inspect_meta2,
-        "root_count": len(session["root_entries"]),
-        "root_names": session["root_names"],
-        "lookup_path": session["renamed_path"],
-        "small_read_path": session["renamed_path"],
-        "large_read_path": session["renamed_path"],
-        "create_image_s": create_image_s,
-        "format_s": format_s,
-        "inspect_s": inspect_s,
-        "init_s": init_s,
-        "list_root_s": session["list_root_s"],
-        "stat_s": 0.0,
-        "small_read_s": 0.0,
-        "large_read_s": 0.0,
-        "mkdir_s": session["mkdir_s"],
-        "create_s": session["create_s"],
-        "write_s": session["write_s"],
-        "rename_s": session["rename_s"],
-        "flush_s": session["flush_s"],
-        "remount_s": verify["remount_s"],
-        "verify_stat_s": verify["verify_stat_s"],
-        "verify_read_s": verify["verify_read_s"],
-        "delete_s": verify["delete_s"],
-        "cleanup_flush_s": verify["cleanup_flush_s"],
-        "total_s": total_s,
-        "small_read_bytes": len(session["payload"]),
-        "large_read_bytes": len(session["payload"]),
-    }
+        _cleanup_generated_image(fixture)
 
 
 def _run_fixture_worker(fixture_key: str):
@@ -1002,6 +1060,7 @@ def _aggregate_fixture_runs(
     first = run_results[0]
     for key in (
         "mode",
+        "partition",
         "image_kind",
         "image_size_mb",
         "inspect",
