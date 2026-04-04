@@ -401,7 +401,10 @@ class HandlerBridge:
                 num_children = self.proc_mgr.run_all_ready_children(
                     cycles_per_child=cycles // 4
                 )
-                _restore_block_state(parent_block_state)
+                if self.state.initialized:
+                    _restore_block_state(parent_block_state)
+                else:
+                    _clear_all_block_state()
                 if num_children > 0 and self._debug:
                     print(f"[amifuse] Ran {num_children} child process(es)")
             else:
@@ -421,7 +424,10 @@ class HandlerBridge:
                     self.proc_mgr.run_all_ready_children(
                         cycles_per_child=cycles // 2
                     )
+                if self.state.initialized:
                     _restore_block_state(parent_block_state)
+                else:
+                    _clear_all_block_state()
                 continue
             # If handler exited (done=True) without blocking, stop looping - it's not coming back
             if getattr(rs, "done", False) and not self.state.initialized:
@@ -467,7 +473,10 @@ class HandlerBridge:
             if hasattr(self, 'proc_mgr'):
                 parent_block_state = _snapshot_block_state()
                 self.proc_mgr.run_all_ready_children(cycles_per_child=cycles // 2)
-                _restore_block_state(parent_block_state)
+                if self.state.initialized:
+                    _restore_block_state(parent_block_state)
+                else:
+                    _clear_all_block_state()
 
             if self.state.main_loop_pc:
                 return

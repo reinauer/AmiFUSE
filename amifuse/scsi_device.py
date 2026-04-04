@@ -323,13 +323,9 @@ class ScsiDevice(LibImpl):
             # Seek to track - no-op for file-backed images
             ior.w_s("io_Actual", 0)
         elif cmd == TD_ADDCHANGEINT:  # TD_ADDCHANGEINT (20)
-            # Disk change notification - the device holds the request and
-            # only replies when a disk change occurs.  Since we never
-            # change the disk, this request is never completed.  Clear
-            # IOF_QUICK to tell SendIO not to queue a reply.
+            # Our media never changes, so complete the request
+            # synchronously like the older amifuse trackdisk shim did.
             ior.w_s("io_Actual", 0)
-            flags = ior.r_s("io_Flags") & ~1  # Clear IOF_QUICK
-            ior.w_s("io_Flags", flags)
         elif cmd == TD_REMCHANGEINT:  # TD_REMCHANGEINT (21)
             # Remove disk change interrupt - no-op
             ior.w_s("io_Actual", 0)
