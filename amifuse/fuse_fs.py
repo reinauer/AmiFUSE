@@ -1700,9 +1700,10 @@ class AmigaFuseFS(Operations):
         parent_lock, _, locks = self.bridge.locate_path(dir_path)
         if parent_lock == 0 and dir_path != "/":
             raise FuseOSError(errno.ENOENT)
-        res1, _ = self.bridge.create_dir(parent_lock, name)
-        if res1 == 0:
+        new_lock, _ = self.bridge.create_dir(parent_lock, name)
+        if new_lock == 0:
             raise FuseOSError(errno.EIO)
+        self.bridge.free_lock(new_lock)
         self._dir_cache.pop(dir_path, None)
         for l in reversed(locks):
             self.bridge.free_lock(l)

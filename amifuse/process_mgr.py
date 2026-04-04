@@ -5,12 +5,20 @@ This module manages multiple Amiga processes (parent handler + children)
 for filesystems like SFS that spawn child processes via CreateNewProc().
 """
 
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Any
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
 
 from amitools.vamos.astructs import AccessStruct
 from amitools.vamos.libstructs import ProcessStruct
 from amitools.vamos.machine.regs import REG_D0, REG_A6
+from amitools.vamos.libstructs.dos import MessageStruct
+
+from .startup_runner import (
+    _clear_all_block_state,
+    _restore_block_state,
+    _snapshot_block_state,
+    _unlink_msg_from_m68k_list,
+)
 
 
 @dataclass
@@ -28,6 +36,8 @@ class ProcessState:
     started: bool = False       # True if process has started executing
     exited: bool = False        # True if process has exited
     stack: Any = None           # Stack object (for cleanup)
+    regs: Optional[List[int]] = None  # Saved D0-D7/A0-A7 register state
+    block_state: Optional[Dict[str, Any]] = None
 
 
 class ProcessManager:
@@ -97,8 +107,121 @@ class ProcessManager:
 
     def get_ready_children(self) -> List[ProcessState]:
         """Get list of child processes ready to execute."""
-        return [p for p in self.ready_queue
-                if not p.blocked and not p.exited]
+        return [p for p in self.ready_queue if not p.exited]
+
+    def _compute_pending_signals(self, mask: int = 0xFFFFFFFF) -> int:
+        """Compute pending signals for the current ThisTask."""
+        from amitools.vamos.libstructs.exec_ import (
+            ExecLibraryStruct,
+            MsgPortStruct,
+            TaskStruct,
+        )
+
+        pending = 0
+        try:
+            exec_base = self.mem.r32(4)
+            if exec_base != 0:
+                this_task_off = ExecLibraryStruct.sdef.find_field_def_by_name(
+                    "ThisTask"
+                ).offset
+                this_task = self.mem.r32(exec_base + this_task_off)
+                if this_task != 0:
+                    sigrecvd_off = TaskStruct.sdef.find_field_def_by_name(
+                        "tc_SigRecvd"
+                    ).offset
+                    pending = self.mem.r32(this_task + sigrecvd_off)
+        except Exception:
+            pass
+
+        for port_addr, port in self.exec_impl.port_mgr.ports.items():
+            try:
+                if port.queue is not None and len(port.queue) > 0:
+                    sigbit = self.mem.r8(
+                        port_addr
+                        + MsgPortStruct.sdef.find_field_def_by_name("mp_SigBit").offset
+                    )
+                    if 0 <= sigbit < 32:
+                        pending |= 1 << sigbit
+            except Exception:
+                continue
+        return pending & mask
+
+    def _clear_signals_from_task(self, signals: int):
+        """Clear signals from the current ThisTask after a Wait() resume."""
+        from amitools.vamos.libstructs.exec_ import ExecLibraryStruct, TaskStruct
+
+        try:
+            exec_base = self.mem.r32(4)
+            if exec_base != 0:
+                this_task_off = ExecLibraryStruct.sdef.find_field_def_by_name(
+                    "ThisTask"
+                ).offset
+                this_task = self.mem.r32(exec_base + this_task_off)
+                if this_task != 0:
+                    sigrecvd_off = TaskStruct.sdef.find_field_def_by_name(
+                        "tc_SigRecvd"
+                    ).offset
+                    sigrecvd = self.mem.r32(this_task + sigrecvd_off)
+                    self.mem.w32(this_task + sigrecvd_off, sigrecvd & ~signals)
+        except Exception:
+            pass
+
+    def _resume_child_if_ready(self, child: ProcessState) -> bool:
+        """Resume a blocked child when its wake condition is satisfied."""
+        if not child.blocked or not child.block_state:
+            return not child.blocked
+
+        _restore_block_state(child.block_state)
+        waitport_sp = child.block_state.get("waitport_blocked_sp")
+        wait_sp = child.block_state.get("wait_blocked_sp")
+        waitport_ret = child.block_state.get("waitport_blocked_ret")
+        wait_ret = child.block_state.get("wait_blocked_ret")
+        wait_mask = child.block_state.get("wait_blocked_mask")
+        waitpkt_blocked = child.block_state.get("waitpkt_blocked", False)
+
+        blocked_sp = waitport_sp if waitport_sp is not None else wait_sp
+        if blocked_sp is None:
+            child.blocked = False
+            return True
+
+        if wait_sp is not None and wait_mask is not None:
+            pending = self._compute_pending_signals(wait_mask)
+            if pending == 0:
+                return False
+            all_pending = self._compute_pending_signals(0xFFFFFFFF)
+            blocked_ret = wait_ret
+            d0_val = all_pending
+            self._clear_signals_from_task(all_pending)
+        else:
+            waitport_port = child.block_state.get("waitport_blocked_port") or child.port_addr
+            if not waitport_port or not self.exec_impl.port_mgr.has_msg(waitport_port):
+                return False
+            blocked_ret = waitport_ret
+            msg_addr = self.exec_impl.port_mgr.get_msg(waitport_port)
+            if msg_addr:
+                _unlink_msg_from_m68k_list(self.mem, msg_addr)
+            if waitpkt_blocked and msg_addr:
+                msg = AccessStruct(self.mem, MessageStruct, msg_addr)
+                pkt_addr = msg.r_s("mn_Node.ln_Name")
+                d0_val = pkt_addr if pkt_addr else 0
+            else:
+                d0_val = msg_addr if msg_addr else 0
+
+        try:
+            ret_addr = blocked_ret if blocked_ret is not None else self.mem.r32(blocked_sp)
+        except Exception:
+            ret_addr = 0
+        if ret_addr == 0:
+            return False
+
+        child.entry_pc = ret_addr
+        child.sp = blocked_sp + 4
+        if child.regs is None:
+            child.regs = [0] * 16
+        child.regs[REG_D0] = d0_val
+        _clear_all_block_state()
+        child.blocked = False
+        return True
 
     def run_child_burst(self, child: ProcessState, max_cycles: int = 50000) -> bool:
         """Run a child process for a burst of cycles.
@@ -118,6 +241,17 @@ class ProcessManager:
         saved_sp = self.cpu.r_sp()
         saved_regs = [self.cpu.r_reg(i) for i in range(16)]  # D0-D7, A0-A7
 
+        # Switch ThisTask to child process before checking resume conditions.
+        self._set_this_task(child.proc_addr)
+
+        if child.blocked and not self._resume_child_if_ready(child):
+            self._set_this_task(self.parent_addr)
+            self.cpu.w_pc(saved_pc)
+            self.cpu.w_sp(saved_sp)
+            for i in range(16):
+                self.cpu.w_reg(i, saved_regs[i])
+            return False
+
         # Set up child's context
         if not child.started:
             # First run - set entry point and initial SP
@@ -129,8 +263,10 @@ class ProcessManager:
             pc = child.entry_pc  # Updated after each burst
             sp = child.sp
 
-        # Switch ThisTask to child process
-        self._set_this_task(child.proc_addr)
+        if child.regs is not None:
+            for i in range(16):
+                self.cpu.w_reg(i, child.regs[i])
+        self.cpu.w_reg(REG_A6, self.mem.r32(4))
 
         # Run child
         try:
@@ -144,16 +280,20 @@ class ProcessManager:
             # Update child state
             child.entry_pc = run_state.pc
             child.sp = run_state.sp
+            child.regs = [self.cpu.r_reg(i) for i in range(16)]
 
             if run_state.done:
                 child.exited = True
                 return False
             elif run_state.error:
-                # Child blocked (WaitPort/Wait)
+                # Child blocked (WaitPort/Wait) - preserve its block state.
+                child.block_state = _snapshot_block_state()
+                _clear_all_block_state()
                 child.blocked = True
                 return False
             else:
                 # Still running, just hit cycle limit
+                child.blocked = False
                 return True
 
         finally:
