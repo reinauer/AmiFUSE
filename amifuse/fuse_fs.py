@@ -29,7 +29,14 @@ from .driver_runtime import BlockDeviceBackend
 from .vamos_runner import VamosHandlerRuntime
 from .bootstrap import BootstrapAllocator
 from .process_mgr import ProcessManager
-from .startup_runner import HandlerLauncher, OFFSET_BEGINNING, _get_block_state, _clear_all_block_state
+from .startup_runner import (
+    HandlerLauncher,
+    OFFSET_BEGINNING,
+    _get_block_state,
+    _clear_all_block_state,
+    _snapshot_block_state,
+    _restore_block_state,
+)
 from amitools.vamos.astructs.access import AccessStruct  # type: ignore
 from amitools.vamos.libstructs.dos import FileInfoBlockStruct, FileHandleStruct, DosPacketStruct  # type: ignore
 from amitools.vamos.lib.dos.DosProtection import DosProtection  # type: ignore
@@ -198,6 +205,35 @@ class HandlerBridge:
         pkt = AccessStruct(self.mem, DosPacketStruct, self.state.stdpkt_addr)
         startup_res1 = pkt.r_s("dp_Res1")
         startup_res2 = pkt.r_s("dp_Res2")
+        if not replies and startup_res1 == 0 and not self.state.crashed:
+            if self._debug:
+                print("[amifuse] No startup reply yet; attempting deferred signal flush before failing")
+            if not self.state.main_loop_pc:
+                from amitools.vamos.machine.regs import REG_D0
+                cpu = self.vh.machine.cpu
+                from amitools.vamos.lib.ExecLibrary import ExecLibrary as _EL
+                _wps = _get_block_state(_EL, '_waitport_blocked_sp')
+                _ws = _get_block_state(_EL, '_wait_blocked_sp')
+                _wpr = _get_block_state(_EL, '_waitport_blocked_ret')
+                _wr = _get_block_state(_EL, '_wait_blocked_ret')
+                _wm = _get_block_state(_EL, '_wait_blocked_mask')
+                _bsp = _wps if _wps is not None else _ws
+                _bret = _wpr if _wpr is not None else _wr
+                if _bsp is not None:
+                    _ret = _bret if _bret is not None else self.mem.r32(_bsp)
+                    if _ret >= 0x800:
+                        self.state.main_loop_pc = _ret
+                        self.state.main_loop_sp = _bsp + 4
+                        if _wm is not None and _wm != 0:
+                            self.state.wait_mask = _wm
+                        self.state.initialized = True
+                _clear_all_block_state()
+                cpu.w_reg(REG_D0, 0)
+                self._capture_main_loop_state()
+            self._flush_pending_signals()
+            replies = self._run_until_replies(cycles=10_000, max_iters=2000, drain_non_essential=False)
+            startup_res1 = pkt.r_s("dp_Res1")
+            startup_res2 = pkt.r_s("dp_Res2")
         if self._debug:
             print(f"[amifuse] Startup packet result: res1={startup_res1} res2={startup_res2}")
         if startup_res1 == 0:
@@ -361,12 +397,13 @@ class HandlerBridge:
             if hasattr(self, 'proc_mgr'):
                 if self._debug and i < 5:
                     print(f"[amifuse] iter {i}: calling run_all_ready_children")
-                num_children = self.proc_mgr.run_all_ready_children(cycles_per_child=cycles // 4)
+                parent_block_state = _snapshot_block_state()
+                num_children = self.proc_mgr.run_all_ready_children(
+                    cycles_per_child=cycles // 4
+                )
+                _restore_block_state(parent_block_state)
                 if num_children > 0 and self._debug:
                     print(f"[amifuse] Ran {num_children} child process(es)")
-                # CRITICAL: Clear global blocking state after running children.
-                # Otherwise the child's blocking state gets applied to the parent.
-                _clear_all_block_state()
             else:
                 if self._debug and i < 5:
                     print(f"[amifuse] iter {i}: no proc_mgr")
@@ -380,8 +417,11 @@ class HandlerBridge:
                     break
                 # No replies - run children and continue (don't break)
                 if hasattr(self, 'proc_mgr'):
-                    self.proc_mgr.run_all_ready_children(cycles_per_child=cycles // 2)
-                    _clear_all_block_state()  # Clear child's blocking state
+                    parent_block_state = _snapshot_block_state()
+                    self.proc_mgr.run_all_ready_children(
+                        cycles_per_child=cycles // 2
+                    )
+                    _restore_block_state(parent_block_state)
                 continue
             # If handler exited (done=True) without blocking, stop looping - it's not coming back
             if getattr(rs, "done", False) and not self.state.initialized:
@@ -425,9 +465,9 @@ class HandlerBridge:
 
             # Run child processes - SFS needs DosList handler to run during init
             if hasattr(self, 'proc_mgr'):
+                parent_block_state = _snapshot_block_state()
                 self.proc_mgr.run_all_ready_children(cycles_per_child=cycles // 2)
-                # CRITICAL: Clear global blocking state after running children
-                _clear_all_block_state()
+                _restore_block_state(parent_block_state)
 
             if self.state.main_loop_pc:
                 return

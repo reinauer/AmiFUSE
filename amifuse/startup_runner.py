@@ -94,6 +94,42 @@ def _clear_all_block_state():
     _set_block_state(DosLibrary, '_waitpkt_blocked', False)
 
 
+def _snapshot_block_state():
+    """Capture the current parent blocking state so child execution can't clobber it."""
+    from amitools.vamos.lib.ExecLibrary import ExecLibrary
+
+    return {
+        "waitport_blocked_sp": _get_block_state(ExecLibrary, "_waitport_blocked_sp"),
+        "waitport_blocked_port": _get_block_state(
+            ExecLibrary, "_waitport_blocked_port"
+        ),
+        "waitport_blocked_ret": _get_block_state(
+            ExecLibrary, "_waitport_blocked_ret"
+        ),
+        "wait_blocked_mask": _get_block_state(ExecLibrary, "_wait_blocked_mask"),
+        "wait_blocked_sp": _get_block_state(ExecLibrary, "_wait_blocked_sp"),
+        "wait_blocked_ret": _get_block_state(ExecLibrary, "_wait_blocked_ret"),
+        "waitpkt_blocked": _get_block_state(DosLibrary, "_waitpkt_blocked", False),
+    }
+
+
+def _restore_block_state(state):
+    """Restore a previously captured blocking state."""
+    from amitools.vamos.lib.ExecLibrary import ExecLibrary
+
+    _set_block_state(ExecLibrary, "_waitport_blocked_sp", state["waitport_blocked_sp"])
+    _set_block_state(
+        ExecLibrary, "_waitport_blocked_port", state["waitport_blocked_port"]
+    )
+    _set_block_state(
+        ExecLibrary, "_waitport_blocked_ret", state["waitport_blocked_ret"]
+    )
+    _set_block_state(ExecLibrary, "_wait_blocked_mask", state["wait_blocked_mask"])
+    _set_block_state(ExecLibrary, "_wait_blocked_sp", state["wait_blocked_sp"])
+    _set_block_state(ExecLibrary, "_wait_blocked_ret", state["wait_blocked_ret"])
+    _set_block_state(DosLibrary, "_waitpkt_blocked", state["waitpkt_blocked"])
+
+
 def _unlink_msg_from_m68k_list(mem, msg_addr):
     """Remove a message node from its Amiga Exec doubly-linked list in m68k memory.
 
@@ -579,12 +615,31 @@ class HandlerLauncher:
     def run_burst(self, state: HandlerLaunchState, max_cycles=200000, debug: bool = False):
         """Run the handler from its current PC/SP for a limited number of cycles."""
         import sys
+        from types import SimpleNamespace
         # If handler has already crashed, don't try to run it
         if state.crashed:
             return state.run_state
 
         # Check if we need to resume from a blocked Wait/WaitPort
-        self.setup_resume_if_blocked(state, debug=debug)
+        resumed = self.setup_resume_if_blocked(state, debug=debug)
+        from amitools.vamos.lib.ExecLibrary import ExecLibrary
+
+        blocked_waitport_sp = _get_block_state(ExecLibrary, "_waitport_blocked_sp")
+        blocked_wait_sp = _get_block_state(ExecLibrary, "_wait_blocked_sp")
+        if not resumed and (
+            blocked_waitport_sp is not None or blocked_wait_sp is not None
+        ):
+            # The handler is genuinely parked in Wait()/WaitPort() with no
+            # wakeup condition yet. Re-entering at the saved return PC would
+            # bypass the blocking API and immediately fall into GetMsg(None).
+            state.run_state = SimpleNamespace(
+                done=False,
+                error=True,
+                cycles=0,
+                pc=state.pc,
+                sp=state.sp,
+            )
+            return state.run_state
 
         cpu = self.vh.machine.cpu
         mem = self.vh.alloc.get_mem()
@@ -653,7 +708,6 @@ class HandlerLauncher:
             state.last_error_pc = new_pc
             return run_state
         # Check if WaitPort or Wait blocked (saved state in ExecLibrary class variable)
-        from amitools.vamos.lib.ExecLibrary import ExecLibrary
         waitport_sp = _get_block_state(ExecLibrary, '_waitport_blocked_sp')
         wait_sp = _get_block_state(ExecLibrary, '_wait_blocked_sp')
         waitport_ret = _get_block_state(ExecLibrary, '_waitport_blocked_ret')
