@@ -70,6 +70,18 @@ FIXTURES: Dict[str, Fixture] = {
         image_kind="rdb-hdf",
         image_size_mb=512,
     ),
+    "ofs": Fixture(
+        key="ofs",
+        fs_name="OFS",
+        image=FIXTURE_ROOT / "ofs.adf",
+        driver=FIXTURE_ROOT / "FastFileSystem",
+        partition=None,
+        mode="ro",
+        image_kind="adf",
+        image_size_mb=1,
+        expected_root=("Docs", "OFS_README.txt"),
+        lookup_path="/OFS_README.txt",
+    ),
     "cdfs": Fixture(
         key="cdfs",
         fs_name="CDFileSystem",
