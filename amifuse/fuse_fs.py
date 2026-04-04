@@ -241,8 +241,10 @@ class HandlerBridge:
                         if _wm is not None and _wm != 0:
                             self.state.wait_mask = _wm
                         self.state.initialized = True
+                        self.state.block_state = _snapshot_block_state()
                 _clear_all_block_state()
                 cpu.w_reg(REG_D0, 0)
+                self._set_saved_main_reg(REG_D0, 0)
                 self._capture_main_loop_state()
             self._flush_pending_signals()
             replies = self._run_until_replies(cycles=10_000, max_iters=2000, drain_non_essential=False)
@@ -287,11 +289,13 @@ class HandlerBridge:
                     if _wm is not None and _wm != 0:
                         self.state.wait_mask = _wm
                     self.state.initialized = True
+                    self.state.block_state = _snapshot_block_state()
                     if self._debug:
                         mask_str = f" wait_mask=0x{self.state.wait_mask:x}" if self.state.wait_mask else ""
                         print(f"[amifuse] Captured main_loop from blocking state: pc=0x{_ret:x}, sp=0x{_bsp+4:x}{mask_str}")
         _clear_all_block_state()
         cpu.w_reg(REG_D0, 0)
+        self._set_saved_main_reg(REG_D0, 0)
         # Let the handler settle into its message wait loop (only if not
         # already captured above).
         self._capture_main_loop_state()
@@ -329,6 +333,11 @@ class HandlerBridge:
                 f"port=0x{self.state.port_addr:x} reply=0x{self.state.reply_port_addr:x}"
             )
 
+    def _set_saved_main_reg(self, reg_num: int, value: int):
+        """Mirror manual register changes into the saved main handler state."""
+        if self.state.regs is not None:
+            self.state.regs[reg_num] = value
+
     def _run_until_replies(self, max_iters: int = 50, cycles: int = 200_000, sleep_base: float = 0.0005, sleep_max: float = 0.01, drain_non_essential: bool = True):
         """Run handler bursts until at least one reply is queued or iterations exhausted."""
         from amitools.vamos.lib.ExecLibrary import ExecLibrary
@@ -350,7 +359,11 @@ class HandlerBridge:
 
         # If handler is at main_loop_pc and there's a pending message, set D0 to wake it
         # This handles the case where handler is blocked waiting but blocked state was cleared
-        if self.state.main_loop_pc and self.state.pc == self.state.main_loop_pc:
+        if (
+            self.state.main_loop_pc
+            and self.state.pc == self.state.main_loop_pc
+            and not self.state.block_state
+        ):
             pmgr = self.vh.slm.exec_impl.port_mgr
             has_msg = pmgr.has_msg(self.state.port_addr)
             if has_msg:
@@ -377,6 +390,7 @@ class HandlerBridge:
                 else:
                     dos_signal = port_signal
                 self.vh.machine.cpu.w_reg(0, dos_signal)  # REG_D0
+                self._set_saved_main_reg(0, dos_signal)
                 # Also set tc_SigRecvd in case handler checks the task structure
                 from amitools.vamos.libstructs.exec_ import TaskStruct
                 sigrecvd_off = TaskStruct.sdef.find_field_def_by_name("tc_SigRecvd").offset
@@ -505,6 +519,7 @@ class HandlerBridge:
                 if ret_addr >= 0x800:
                     self.state.main_loop_pc = ret_addr
                     self.state.main_loop_sp = blocked_sp + 4
+                    self.state.block_state = _snapshot_block_state()
                     # Capture Wait mask for _flush_pending_signals
                     wait_mask = _get_block_state(ExecLibrary, '_wait_blocked_mask')
                     if wait_mask is not None and wait_mask != 0:
@@ -545,6 +560,7 @@ class HandlerBridge:
             self.state.pc = self.state.main_loop_pc
             self.state.sp = self.state.main_loop_sp
             self.vh.machine.cpu.w_reg(REG_D0, 0)
+            self._set_saved_main_reg(REG_D0, 0)
             self.launcher.run_burst(self.state, max_cycles=100_000)
             wait_mask = _get_block_state(ExecLibrary, '_wait_blocked_mask')
             if wait_mask and wait_mask != 0:
@@ -627,6 +643,7 @@ class HandlerBridge:
             self.state.pc = self.state.main_loop_pc
             self.state.sp = self.state.main_loop_sp
             self.vh.machine.cpu.w_reg(REG_D0, actual_signals)
+            self._set_saved_main_reg(REG_D0, actual_signals)
             _clear_all_block_state()
 
             old_pc = self.state.pc
