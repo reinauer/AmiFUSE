@@ -42,10 +42,11 @@ The initial canonical set is:
 - `PFS3`: `pfs.hdf` with `pfs3aio`
 - `SFS`: `sfs.hdf` with `SmartFilesystem`
 - `FFS`: `Default.hdf` with `FastFileSystem`
+- `OFS`: `ofs.adf` with `FastFileSystem`
 - `CDFileSystem`: `AmigaOS3.2CD.iso` with `CDFileSystem`
 
-`OFS` and `BFFS` are intentionally left for the next pass, where the
-fixtures will be generated or extracted in a more controlled way.
+`BFFS` is intentionally left for the next pass, where the fixture will
+be extracted or generated in a more controlled way.
 
 ## Latest Run
 
@@ -55,16 +56,17 @@ Run:
 python3 tools/amifuse_matrix.py
 ```
 
-Date: `2026-04-03`
+Date: `2026-04-04`
 
 | FS | Status | Inspect med | Init med | Root med | Stat med | Small med | Large med | Flush med | Total min / med / max | Notes |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `PFS3` | `ok` | `0.005s` | `0.039s` | `0.016s` | `0.002s` | `0.007s` | `0.022s` | `0.002s` | `0.084s / 0.092s / 0.097s` | `runs=3`, `pfs.hdf`, `PDH0`, small=`/foo.md`, large=`/S/pci.db` |
-| `SFS` | `ok` | `0.008s` | `0.074s` | `0.013s` | `0.000s` | `0.000s` | `0.000s` | `0.004s` | `0.096s / 0.099s / 0.102s` | `runs=3`, `sfs.hdf`, `SDH0`, lookup=`/` |
-| `FFS` | `ok` | `0.002s` | `0.552s` | `0.032s` | `0.001s` | `0.002s` | `0.002s` | `0.000s` | `0.587s / 0.593s / 0.596s` | `runs=3`, `Default.hdf`, `QDH0`, small=`/CD0`, large=`/MMULib.lha` |
-| `CDFileSystem` | `ok` | `0.000s` | `0.063s` | `0.016s` | `0.001s` | `0.002s` | `0.002s` | `0.000s` | `0.083s / 0.086s / 0.087s` | `runs=3`, `AmigaOS3.2CD.iso`, small=`/CDVersion`, large=`/ADF/Backdrops3.2.adf` |
+| `PFS3` | `ok` | `0.008s` | `0.054s` | `0.025s` | `0.003s` | `0.015s` | `0.019s` | `0.003s` | `0.127s / 0.138s / 0.139s` | `runs=3`, `pfs.hdf`, `PDH0`, small=`/foo.md`, large=`/S/pci.db` |
+| `SFS` | `ok` | `0.012s` | `0.086s` | `0.017s` | `0.000s` | `0.000s` | `0.000s` | `0.007s` | `0.118s / 0.121s / 0.125s` | `runs=3`, `sfs.hdf`, `SDH0`, lookup=`/` |
+| `FFS` | `ok` | `0.003s` | `0.555s` | `0.043s` | `0.002s` | `0.015s` | `0.004s` | `0.001s` | `0.618s / 0.621s / 0.646s` | `runs=3`, `Default.hdf`, `QDH0`, small=`/CD0`, large=`/MMULib.lha` |
+| `OFS` | `ok` | `0.000s` | `0.025s` | `0.006s` | `0.002s` | `0.002s` | `0.085s` | `0.001s` | `0.118s / 0.119s / 0.125s` | `runs=3`, `ofs.adf`, small=`/OFS_README.txt`, large=`/Docs/OFS_LARGE.bin` |
+| `CDFileSystem` | `ok` | `0.000s` | `0.071s` | `0.018s` | `0.002s` | `0.003s` | `0.003s` | `0.000s` | `0.099s / 0.099s / 0.105s` | `runs=3`, `AmigaOS3.2CD.iso`, small=`/CDVersion`, large=`/ADF/Backdrops3.2.adf` |
 
-This is the first all-green aggregated matrix run for the current
-canonical fixture set. The earlier single-run table overstated drift,
-especially for `PFS3`, because its totals were too noisy to compare from
-one sample.
+This is the first all-green aggregated matrix run for the expanded
+canonical fixture set, now including an `OFS` floppy image. The earlier
+single-run table overstated drift, especially for `PFS3`, because its
+totals were too noisy to compare from one sample.
