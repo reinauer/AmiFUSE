@@ -2242,6 +2242,7 @@ def format_volume(
     debug: bool = False,
 ):
     import amitools.fs.DosType as DosType
+    bridge = None
 
     # Get partition dostype from RDB
     part_info = get_partition_info(image, block_size, partition)
@@ -2317,18 +2318,28 @@ def format_volume(
         if debug:
             print(f"[amifuse] FORMAT reply: res1={res1} res2={res2}")
 
-        # Uninhibit to re-mount the newly formatted volume.
-        # PFS3 re-validates bitmap blocks during remount, which can take
-        # significant cycles on large partitions.
-        bridge.launcher.send_inhibit(bridge.state, False)
-        bridge._run_until_replies(max_iters=500, cycles=2_000_000)
+        # Classic DOS filesystems need an uninhibit cycle before the next
+        # mount sees the freshly written root structures reliably. SFS is
+        # different here: re-entering the same formatter bridge after a
+        # successful ACTION_FORMAT can crash its handler task, so leave the
+        # new volume for the next mount instead.
+        if not dt_str.startswith("SFS"):
+            bridge.launcher.send_inhibit(bridge.state, False)
+            bridge._run_until_replies(max_iters=500, cycles=2_000_000)
 
-        # Flush to ensure data is written
+        # Flush the just-formatted volume before tearing down the handler.
         bridge.launcher.send_flush(bridge.state)
         bridge._run_until_replies(max_iters=500, cycles=2_000_000)
 
         print(f"Format complete. Volume '{volname}' created on partition '{partition}'.")
     finally:
+        if bridge is not None:
+            shutdown = getattr(getattr(bridge, "vh", None), "shutdown", None)
+            if shutdown is not None:
+                shutdown()
+            backend = getattr(bridge, "backend", None)
+            if backend is not None:
+                backend.close()
         if temp_driver is not None and temp_driver.exists():
             temp_driver.unlink()
 
