@@ -7,7 +7,7 @@ Launch a filesystem handler with a minimal DOS-style bootstrap:
 """
 
 from dataclasses import dataclass
-from typing import Dict, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from amitools.vamos.astructs.access import AccessStruct  # type: ignore
 from amitools.vamos.libstructs.exec_ import (  # type: ignore
@@ -193,6 +193,8 @@ class HandlerLaunchState:
     last_error_pc: int = 0  # PC at time of crash for diagnostics
     consecutive_errors: int = 0  # Count of consecutive errors without successful reply
     wait_mask: int = 0  # Handler's Wait() signal mask (for deferred init)
+    regs: Optional[List[int]] = None  # Saved D0-D7/A0-A7 register state
+    block_state: Optional[Dict[str, Any]] = None
 
 
 class HandlerLauncher:
@@ -274,6 +276,17 @@ class HandlerLauncher:
                     self.mem.w32(this_task + sigrecvd_off, current & ~signals)
         except Exception:
             pass
+
+    def _capture_cpu_regs(self, state: HandlerLaunchState):
+        """Save the current D0-D7/A0-A7 state for later handler resumes."""
+        cpu = self.vh.machine.cpu
+        state.regs = [cpu.r_reg(i) for i in range(16)]
+
+    def _set_saved_reg(self, state: HandlerLaunchState, reg_num: int, value: int):
+        """Keep state.regs in sync with manual register adjustments."""
+        if state.regs is None:
+            self._capture_cpu_regs(state)
+        state.regs[reg_num] = value
 
     # ---- low-level helpers ----
 
@@ -533,6 +546,14 @@ class HandlerLauncher:
         wait_ret = _get_block_state(ExecLibrary, '_wait_blocked_ret')
         wait_mask = _get_block_state(ExecLibrary, '_wait_blocked_mask')
 
+        if waitport_sp is None and wait_sp is None and state.block_state:
+            _restore_block_state(state.block_state)
+            waitport_sp = _get_block_state(ExecLibrary, '_waitport_blocked_sp')
+            wait_sp = _get_block_state(ExecLibrary, '_wait_blocked_sp')
+            waitport_ret = _get_block_state(ExecLibrary, '_waitport_blocked_ret')
+            wait_ret = _get_block_state(ExecLibrary, '_wait_blocked_ret')
+            wait_mask = _get_block_state(ExecLibrary, '_wait_blocked_mask')
+
         blocked_sp = waitport_sp if waitport_sp is not None else wait_sp
         if blocked_sp is None:
             return False
@@ -580,6 +601,7 @@ class HandlerLauncher:
             # even if handler's mask didn't include it - otherwise handler spins forever
             pending = self._compute_pending_signals(0xFFFFFFFF)
             cpu.w_reg(REG_D0, pending)
+            self._set_saved_reg(state, REG_D0, pending)
             # CRITICAL: Clear the returned signals from tc_SigRecvd, just like Wait() would.
             # If we don't clear, the handler's next Wait() call will see the same signals
             # and return immediately, causing an infinite GetMsg/Wait loop.
@@ -606,9 +628,11 @@ class HandlerLauncher:
                     # WaitPort() resume - return message address
                     d0_val = msg_addr if msg_addr else 0
                 cpu.w_reg(REG_D0, d0_val)
+                self._set_saved_reg(state, REG_D0, d0_val)
 
         # Clear blocked state
         _clear_all_block_state()
+        state.block_state = None
 
         return True
 
@@ -658,11 +682,12 @@ class HandlerLauncher:
 
         # Always restore A6 to ExecBase before entering handler code.
         # We can re-enter the handler after WaitPort/exit traps, and A6 may be 0.
+        if state.regs is not None:
+            for i in range(16):
+                cpu.w_reg(i, state.regs[i])
         set_regs = {REG_A6: self.exec_base_addr}
-        try:
-            cpu.w_reg(REG_A6, self.exec_base_addr)
-        except Exception:
-            pass
+        cpu.w_reg(REG_A6, self.exec_base_addr)
+        self._set_saved_reg(state, REG_A6, self.exec_base_addr)
         first_run = not state.started
         if not state.started:
             state.started = True
@@ -686,6 +711,7 @@ class HandlerLauncher:
         state.run_state = run_state
         new_pc = cpu.r_pc()
         new_sp = cpu.r_reg(REG_A7)
+        self._capture_cpu_regs(state)
 
         # Detect crash: if error occurred and new_pc is garbage, handler is dead
         if run_state.error and not _pc_valid(new_pc):
@@ -725,6 +751,7 @@ class HandlerLauncher:
         if run_state.error:
             # WaitPort/Wait or other blocking call failed - handler is waiting for a message.
             if blocked_sp is not None:
+                state.block_state = _snapshot_block_state()
                 ret_addr = blocked_ret if blocked_ret is not None else mem.r32(blocked_sp)
                 # Save as main loop PC if not yet set - this is where handler waits for messages
                 if (not state.initialized or state.main_loop_pc == 0) and _pc_valid(ret_addr):
@@ -762,6 +789,7 @@ class HandlerLauncher:
                         else:
                             pending = self._compute_pending_signals(wait_mask)
                         cpu.w_reg(REG_D0, pending)
+                        self._set_saved_reg(state, REG_D0, pending)
                         if debug:
                             print(f"[run_burst] Wait resume: D0=0x{pending:x}")
                         # Clear returned signals from tc_SigRecvd (like Wait() would)
@@ -778,12 +806,15 @@ class HandlerLauncher:
                                 # WaitPkt() resume - extract packet from message
                                 msg = AccessStruct(self.mem, MessageStruct, msg_addr)
                                 pkt_addr = msg.r_s("mn_Node.ln_Name")
-                                cpu.w_reg(REG_D0, pkt_addr if pkt_addr else 0)
+                                d0_val = pkt_addr if pkt_addr else 0
                             else:
                                 # WaitPort() resume - return message address
-                                cpu.w_reg(REG_D0, msg_addr if msg_addr else 0)
+                                d0_val = msg_addr if msg_addr else 0
+                            cpu.w_reg(REG_D0, d0_val)
+                            self._set_saved_reg(state, REG_D0, d0_val)
                     # Clear both blocking states
                     _clear_all_block_state()
+                    state.block_state = None
                 else:
                     # No message pending - save restart point for later
                     if _pc_valid(ret_addr):
@@ -801,6 +832,7 @@ class HandlerLauncher:
             # Handler exited via exit trap.
             # Check if WaitPort/Wait blocked - if so, we can get the return address from the saved SP
             if blocked_sp is not None:
+                state.block_state = _snapshot_block_state()
                 ret_addr = blocked_ret if blocked_ret is not None else mem.r32(blocked_sp)
                 # Save as main loop PC if not yet initialized
                 if (not state.initialized or state.main_loop_pc == 0) and _pc_valid(ret_addr):
@@ -835,6 +867,7 @@ class HandlerLauncher:
                         else:
                             pending = self._compute_pending_signals(wait_mask)
                         cpu.w_reg(REG_D0, pending)
+                        self._set_saved_reg(state, REG_D0, pending)
                         # Clear returned signals from tc_SigRecvd (like Wait() would)
                         self._clear_signals_from_task(pending)
                     elif waitport_sp is not None:
@@ -849,12 +882,15 @@ class HandlerLauncher:
                                 # WaitPkt() resume - extract packet from message
                                 msg = AccessStruct(self.mem, MessageStruct, msg_addr)
                                 pkt_addr = msg.r_s("mn_Node.ln_Name")
-                                cpu.w_reg(REG_D0, pkt_addr if pkt_addr else 0)
+                                d0_val = pkt_addr if pkt_addr else 0
                             else:
                                 # WaitPort() resume - return message address
-                                cpu.w_reg(REG_D0, msg_addr if msg_addr else 0)
+                                d0_val = msg_addr if msg_addr else 0
+                            cpu.w_reg(REG_D0, d0_val)
+                            self._set_saved_reg(state, REG_D0, d0_val)
                     # Clear the blocked states
                     _clear_all_block_state()
+                    state.block_state = None
                     state.exit_count = 0  # Reset exit counter
                 else:
                     # No message pending - save restart point but don't spin.
@@ -877,6 +913,7 @@ class HandlerLauncher:
                     state.sp = state.main_loop_sp
                 # else: Startup complete or no restart point - let caller check packet results
         else:
+            state.block_state = None
             if _pc_valid(new_pc):
                 state.pc = new_pc
                 state.sp = new_sp
