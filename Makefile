@@ -86,6 +86,9 @@ bench-pfs:
 		--driver "$(PFS_BENCH_DRIVER)" \
 		--repeat "$(PFS_BENCH_REPEAT)"
 
+example-smoke:
+	@python3 tools/readme_smoke.py
+
 run:
 	@echo "Run with:"
 	@echo " $$ python3 -m amifuse mount pfs.hdf \\"
