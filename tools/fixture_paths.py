@@ -23,7 +23,7 @@ GENERATED_DIR = FIXTURE_ROOT / "generated"
 BENCH_DIR = FIXTURE_ROOT / "bench"
 TMP_DIR = FIXTURE_ROOT / "tmp"
 SRC_DIR = FIXTURE_ROOT / "src"
-ODFS_DRIVER = Path.home() / "git" / "xcdfs" / "build" / "amiga" / "ODFileSystem"
+ODFS_DRIVER = DRIVERS_DIR / "ODFileSystem"
 NETBSD_AMIGA_92_URL = "https://aminet.net/misc/os/netbsdamiga92.hdf.gz"
 DEFAULT_HDF_URL = (
     "https://drive.google.com/file/d/1B72e2zHbeSKuWgNUfEPcy5IYYJj_TCr0/view"
