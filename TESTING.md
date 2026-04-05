@@ -35,10 +35,11 @@ Fastest high-signal top-level checks:
 ```sh
 python3 tools/amifuse_matrix.py
 python3 tools/readme_smoke.py
+python3 tools/image_format_smoke.py
 ```
 
-If both pass, the current read-only matrix and the documented CLI
-examples are working.
+If these pass, the current read-only matrix, documented CLI examples,
+and image-format smoke coverage are working.
 
 ## Top-Level AmiFuse Tests
 
@@ -184,6 +185,36 @@ What it covers:
 
 This does not require a live FUSE mount. It is intended to catch
 documentation drift and bootstrap-path regressions.
+
+## Image Format Smoke
+
+Run:
+
+```sh
+python3 tools/image_format_smoke.py
+```
+
+or:
+
+```sh
+make image-format-smoke
+```
+
+What it covers:
+
+- direct `RDB/HDF`
+- `ADF`
+- `ISO 9660`
+- Emu68-style `MBR+RDB`
+- Parceiro-style `MBR+RDB`
+
+The runner verifies both:
+
+- image detection / inspect path
+- mount bootstrap path through `mount_fuse()`
+
+It uses a fake FUSE shim, so it exercises the real AmiFuse startup path
+without requiring a live OS mount.
 
 ## Performance
 

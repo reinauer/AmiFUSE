@@ -89,10 +89,13 @@ bench-pfs:
 example-smoke:
 	@python3 tools/readme_smoke.py
 
+image-format-smoke:
+	@python3 tools/image_format_smoke.py
+
 run:
 	@echo "Run with:"
 	@echo " $$ python3 -m amifuse mount pfs.hdf \\"
 	@echo "           --driver pfs3aio \\"
 	@echo "           --mountpoint ./mnt"
 
-.PHONY: all run
+.PHONY: all run example-smoke image-format-smoke
