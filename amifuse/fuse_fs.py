@@ -2373,7 +2373,7 @@ def format_volume(
             temp_driver.unlink()
 
 
-__version__ = "v0.4.0"
+__version__ = "v0.4.9"
 __banner__ = f"amifuse {__version__} - Copyright (C) 2025-2026 by Stefan Reinauer"
 
 
