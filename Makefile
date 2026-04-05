@@ -94,3 +94,5 @@ run:
 	@echo " $$ python3 -m amifuse mount pfs.hdf \\"
 	@echo "           --driver pfs3aio \\"
 	@echo "           --mountpoint ./mnt"
+
+.PHONY: all run
