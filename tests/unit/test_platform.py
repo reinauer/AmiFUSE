@@ -538,7 +538,7 @@ class TestValidateMountpoint:
         assert result is None
 
     def test_validate_unix_mountpoint_mounted(self, monkeypatch):
-        """On Linux, path that exists and is a mount returns error with fusermount hint."""
+        """On Linux, path that exists and is a mount returns amifuse unmount hint."""
         monkeypatch.setattr("sys.platform", "linux")
         monkeypatch.setattr(
             "amifuse.platform.os.path.exists",
@@ -557,7 +557,7 @@ class TestValidateMountpoint:
         result = validate_mountpoint(PurePosixPath("/mnt/amiga"))
         assert result is not None
         assert "already a mount" in result
-        assert "fusermount" in result
+        assert "amifuse unmount /mnt/amiga" in result
 
     def test_validate_unix_mountpoint_exists_not_mounted(self, monkeypatch):
         """On Linux, path that exists but is not a mount returns None (fine to use)."""
@@ -654,3 +654,26 @@ class TestWindowsMountpointEdgeCases:
 
         result = get_default_mountpoint("TestVol")
         assert result == Path("D:")
+
+
+# ---------------------------------------------------------------------------
+# J. mount_runs_in_foreground_by_default() -- 3 tests
+# ---------------------------------------------------------------------------
+
+
+class TestMountRunsInForegroundByDefault:
+    """Tests for mount_runs_in_foreground_by_default()."""
+
+    @pytest.mark.parametrize(
+        "platform,expected",
+        [
+            ("darwin", False),
+            ("linux", False),
+            ("win32", True),
+        ],
+    )
+    def test_default_mode_by_platform(self, monkeypatch, platform, expected):
+        monkeypatch.setattr("sys.platform", platform)
+        from amifuse.platform import mount_runs_in_foreground_by_default
+
+        assert mount_runs_in_foreground_by_default() is expected

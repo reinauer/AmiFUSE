@@ -5,9 +5,10 @@ from tests/conftest.py allows importing amifuse.fuse_fs without fusepy
 installed.
 """
 
+import argparse
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -154,6 +155,124 @@ class TestMountFuseOptions:
         kwargs = mock_mount_fuse_deps["fuse_kwargs"]
         assert kwargs is not None, "FUSE was not called"
         assert "subtype" not in kwargs
+
+    def test_mount_defaults_to_daemon_on_linux(self, monkeypatch, mock_mount_fuse_deps):
+        """Linux mounts default to background mode."""
+        monkeypatch.setattr("sys.platform", "linux")
+        from amifuse.fuse_fs import mount_fuse
+
+        mount_fuse(
+            image=Path("/tmp/test.hdf"),
+            driver=None,
+            mountpoint=None,
+            block_size=None,
+        )
+
+        kwargs = mock_mount_fuse_deps["fuse_kwargs"]
+        assert kwargs is not None, "FUSE was not called"
+        assert kwargs["foreground"] is False
+
+    def test_mount_defaults_to_foreground_on_windows(self, monkeypatch, mock_mount_fuse_deps):
+        """Windows keeps the mount attached by default."""
+        monkeypatch.setattr("sys.platform", "win32")
+        from amifuse.fuse_fs import mount_fuse
+
+        mount_fuse(
+            image=Path("/tmp/test.hdf"),
+            driver=None,
+            mountpoint=None,
+            block_size=None,
+        )
+
+        kwargs = mock_mount_fuse_deps["fuse_kwargs"]
+        assert kwargs is not None, "FUSE was not called"
+        assert kwargs["foreground"] is True
+
+    def test_mount_respects_explicit_interactive_mode(self, monkeypatch, mock_mount_fuse_deps):
+        """An explicit foreground request overrides the platform default."""
+        monkeypatch.setattr("sys.platform", "linux")
+        from amifuse.fuse_fs import mount_fuse
+
+        mount_fuse(
+            image=Path("/tmp/test.hdf"),
+            driver=None,
+            mountpoint=None,
+            block_size=None,
+            foreground=True,
+        )
+
+        kwargs = mock_mount_fuse_deps["fuse_kwargs"]
+        assert kwargs is not None, "FUSE was not called"
+        assert kwargs["foreground"] is True
+
+    def test_mount_rejects_daemon_mode_without_unmount_command(
+        self, monkeypatch, mock_mount_fuse_deps
+    ):
+        """Background mode is rejected if the platform cannot unmount it later."""
+        monkeypatch.setattr("sys.platform", "win32")
+        import amifuse.platform as plat_mod
+        from amifuse.fuse_fs import mount_fuse
+
+        monkeypatch.setattr(plat_mod, "get_unmount_command", lambda mp: [])
+
+        with pytest.raises(SystemExit) as exc_info:
+            mount_fuse(
+                image=Path("/tmp/test.hdf"),
+                driver=None,
+                mountpoint=None,
+                block_size=None,
+                foreground=False,
+            )
+
+        assert "Daemon mode is not supported" in str(exc_info.value)
+
+
+class TestUnmountCommand:
+    """Tests for the unmount subcommand helper."""
+
+    def test_unmount_runs_platform_command(self, monkeypatch, fuse_mock):
+        monkeypatch.setattr("os.path.ismount", lambda path: True)
+        monkeypatch.setattr(
+            "amifuse.platform.get_unmount_command",
+            lambda mountpoint: ["umount", "-f", str(mountpoint)],
+        )
+        called = {}
+
+        def fake_run(cmd, check=False):
+            called["cmd"] = cmd
+            called["check"] = check
+            return argparse.Namespace(returncode=0)
+
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        monkeypatch.setattr(fuse_fs_mod.subprocess, "run", fake_run)
+
+        fuse_fs_mod.cmd_unmount(argparse.Namespace(mountpoint=Path("/mnt/amiga")))
+
+        assert called["cmd"] == ["umount", "-f", "/mnt/amiga"]
+        assert called["check"] is False
+
+    def test_unmount_rejects_non_mountpoint(self, monkeypatch, fuse_mock):
+        monkeypatch.setattr("os.path.ismount", lambda path: False)
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        with pytest.raises(SystemExit) as exc_info:
+            fuse_fs_mod.cmd_unmount(argparse.Namespace(mountpoint=Path("/mnt/amiga")))
+
+        assert "is not currently mounted" in str(exc_info.value)
+
+    def test_unmount_rejects_platforms_without_command(self, monkeypatch, fuse_mock):
+        monkeypatch.setattr("os.path.ismount", lambda path: True)
+        monkeypatch.setattr(
+            "amifuse.platform.get_unmount_command",
+            lambda mountpoint: [],
+        )
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        with pytest.raises(SystemExit) as exc_info:
+            fuse_fs_mod.cmd_unmount(argparse.Namespace(mountpoint=Path("/mnt/amiga")))
+
+        assert "does not provide a standalone unmount command" in str(exc_info.value)
 
 
 # ---------------------------------------------------------------------------
