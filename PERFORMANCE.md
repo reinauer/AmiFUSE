@@ -153,6 +153,7 @@ Run:
 
 ```sh
 python3 tools/amifuse_matrix.py --fixtures pfs3-4g --runs 1 --json
+python3 tools/amifuse_matrix.py --fixtures pfs3-part-4g --runs 1 --json
 ```
 
 Date: `2026-04-04`
@@ -169,3 +170,27 @@ it, and then removes the image immediately after the run.
 This case is intentionally not part of the default matrix run. It is meant to
 exercise large-offset image I/O without keeping a persistent multi-gigabyte
 fixture on disk.
+
+## Large Partition Smoke
+
+Run:
+
+```sh
+python3 tools/amifuse_matrix.py --fixtures pfs3-part-4g --runs 1 --json
+```
+
+Date: `2026-04-04`
+
+This case creates a sparse `~6GiB` image with a `PFS3` partition that
+itself spans `4,386,816,000` bytes, formats it, mounts it read-write,
+performs the normal writable smoke sequence, remounts, verifies the
+written data, and removes the image afterward.
+
+| FS | Status | Image size | Partition size | Partition start | Create img | Inspect | Format | Init | Root | Mkdir | Create | Write | Rename | Flush | Remount | Verify stat | Verify read | Delete | Cleanup flush | Total |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `PFS3 partition >4G` | `ok` | `~6GiB sparse` | `4,386,816,000` | `1,032,192` | `0.130s` | `0.002s` | `3.056s` | `0.125s` | `0.009s` | `0.084s` | `0.028s` | `0.010s` | `0.016s` | `0.027s` | `0.232s` | `0.012s` | `0.011s` | `0.069s` | `0.004s` | `3.814s` |
+
+This closes the "filesystem spans a partition larger than `4GiB`" smoke
+gap. One limitation remains: the current DOS file-handle seek/setsize
+packet path is still `32-bit`, so this case does not yet verify file
+offsets beyond `4GiB` within that large partition.
