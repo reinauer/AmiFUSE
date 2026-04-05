@@ -218,7 +218,7 @@ class HandlerBridge:
         # Use moderate cycle count for startup to allow child processes to run.
         # SFS creates child processes that need to run and register ports.
         # Smaller bursts give us more chances to interleave child execution.
-        replies = self._run_until_replies(cycles=10_000, max_iters=2000, drain_non_essential=False)
+        replies = self._run_startup_until_replies(cycles=10_000, max_iters=2000)
         # Check if startup succeeded - res1=0 means the handler rejected the disk
         pkt = AccessStruct(self.mem, DosPacketStruct, self.state.stdpkt_addr)
         startup_res1 = pkt.r_s("dp_Res1")
@@ -251,7 +251,7 @@ class HandlerBridge:
                 self._set_saved_main_reg(REG_D0, 0)
                 self._capture_main_loop_state()
             self._flush_pending_signals()
-            replies = self._run_until_replies(cycles=10_000, max_iters=2000, drain_non_essential=False)
+            replies = self._run_startup_until_replies(cycles=10_000, max_iters=2000)
             startup_res1 = pkt.r_s("dp_Res1")
             startup_res2 = pkt.r_s("dp_Res2")
         if self._debug:
@@ -267,22 +267,28 @@ class HandlerBridge:
             error_desc = error_msgs.get(startup_res2, f"error code {startup_res2}")
             raise SystemExit(f"Filesystem handler rejected the disk: {error_desc}")
         self._update_handler_port_from_startup()
+        if self._debug:
+            print(
+                f"[amifuse] Post-startup state: pc=0x{self.state.pc:x} "
+                f"sp=0x{self.state.sp:x} main_loop_pc=0x{self.state.main_loop_pc:x}"
+            )
         # Capture main loop state from the current blocking state BEFORE
-        # clearing it.  run_burst() during _run_until_replies may have
-        # already set main_loop_pc; if not, we grab it from the raw
-        # blocking variables.  This is critical for WaitPort-based handlers
-        # (e.g. PFS3 on large partitions) where clearing the blocking
-        # state and setting D0=0 would cause a NULL-message crash when the
-        # handler resumes from the WaitPort return address.
+        # clearing it. run_burst() during _run_until_replies may have
+        # already set main_loop_pc; if not, grab it from the raw
+        # blocking variables. This is critical for WaitPort-based handlers
+        # where clearing the blocking state and setting D0=0 would cause a
+        # NULL-message crash when the handler resumes from the WaitPort
+        # return address.
         from amitools.vamos.machine.regs import REG_D0
         cpu = self.vh.machine.cpu
         if not self.state.main_loop_pc:
             from amitools.vamos.lib.ExecLibrary import ExecLibrary as _EL
-            _wps = _get_block_state(_EL, '_waitport_blocked_sp')
-            _ws = _get_block_state(_EL, '_wait_blocked_sp')
-            _wpr = _get_block_state(_EL, '_waitport_blocked_ret')
-            _wr = _get_block_state(_EL, '_wait_blocked_ret')
-            _wm = _get_block_state(_EL, '_wait_blocked_mask')
+
+            _wps = _get_block_state(_EL, "_waitport_blocked_sp")
+            _ws = _get_block_state(_EL, "_wait_blocked_sp")
+            _wpr = _get_block_state(_EL, "_waitport_blocked_ret")
+            _wr = _get_block_state(_EL, "_wait_blocked_ret")
+            _wm = _get_block_state(_EL, "_wait_blocked_mask")
             _bsp = _wps if _wps is not None else _ws
             _bret = _wpr if _wpr is not None else _wr
             if _bsp is not None:
@@ -295,18 +301,38 @@ class HandlerBridge:
                     self.state.initialized = True
                     self.state.block_state = _snapshot_block_state()
                     if self._debug:
-                        mask_str = f" wait_mask=0x{self.state.wait_mask:x}" if self.state.wait_mask else ""
-                        print(f"[amifuse] Captured main_loop from blocking state: pc=0x{_ret:x}, sp=0x{_bsp+4:x}{mask_str}")
-        _clear_all_block_state()
-        cpu.w_reg(REG_D0, 0)
-        self._set_saved_main_reg(REG_D0, 0)
-        # Let the handler settle into its message wait loop (only if not
-        # already captured above).
-        self._capture_main_loop_state()
+                        mask_str = (
+                            f" wait_mask=0x{self.state.wait_mask:x}"
+                            if self.state.wait_mask
+                            else ""
+                        )
+                        print(
+                            f"[amifuse] Captured main_loop from blocking state: "
+                            f"pc=0x{_ret:x}, sp=0x{_bsp + 4:x}{mask_str}"
+                        )
+        if not self.state.main_loop_pc:
+            self.state.main_loop_pc = 0
+            self.state.main_loop_sp = 0
+            self.state.wait_mask = 0
+            self.state.block_state = None
+            _clear_all_block_state()
+            cpu.w_reg(REG_D0, 0)
+            self._set_saved_main_reg(REG_D0, 0)
+            self._capture_main_loop_state(max_iters=500, cycles=50_000)
         if not self.state.initialized:
             self.state.initialized = True
         if self._debug:
-            print(f"[amifuse] Saved main_loop_pc=0x{self.state.pc:x}, main_loop_sp=0x{self.state.sp:x}")
+            wait_mask = getattr(self.state, "wait_mask", 0)
+            if wait_mask:
+                print(
+                    f"[amifuse] Saved main_loop_pc=0x{self.state.pc:x}, "
+                    f"main_loop_sp=0x{self.state.sp:x} wait_mask=0x{wait_mask:x}"
+                )
+            else:
+                print(
+                    f"[amifuse] Saved main_loop_pc=0x{self.state.pc:x}, "
+                    f"main_loop_sp=0x{self.state.sp:x}"
+                )
         # Flush pending timer events so the handler can complete delayed disk
         # validation.  PFS3 uses TR_ADDREQUEST to schedule deferred volume
         # validation; the timer signal must fire before the volume becomes
@@ -341,6 +367,102 @@ class HandlerBridge:
         """Mirror manual register changes into the saved main handler state."""
         if self.state.regs is not None:
             self.state.regs[reg_num] = value
+
+    def _run_startup_until_replies(
+        self,
+        max_iters: int = 2000,
+        cycles: int = 10_000,
+        sleep_base: float = 0.0005,
+        sleep_max: float = 0.01,
+    ):
+        """Run startup bursts until we have the startup reply.
+
+        Some handlers reply to startup before their private mount path has
+        reached the final steady-state Wait() loop. Keep driving startup after
+        the reply arrives and hand the saved reply back to the caller once the
+        startup budget is exhausted or the handler stops making forward
+        progress.
+        """
+        replies = []
+        sleep_time = sleep_base
+
+        if self.state.crashed:
+            if self._debug:
+                print("[amifuse] startup: handler crashed, returning empty")
+            return []
+
+        for i in range(max_iters):
+            old_pc = self.state.pc
+            self.launcher.run_burst(self.state, max_cycles=cycles, debug=self._debug)
+            rs = self.state.run_state
+            new_pc = self.state.pc
+
+            if self._debug and i < 3:
+                cycles_run = getattr(rs, "cycles", 0) if rs else 0
+                print(
+                    f"[amifuse] startup iter {i}: PC 0x{old_pc:x}->0x{new_pc:x} "
+                    f"cycles={cycles_run} done={getattr(rs, 'done', False)} "
+                    f"error={getattr(rs, 'error', None)}"
+                )
+
+            if self.state.crashed:
+                if self._debug:
+                    print(f"[amifuse] startup: handler crashed at iter {i}")
+                return replies
+
+            polled = self.launcher.poll_replies(
+                self.state.reply_port_addr, debug=self._debug
+            )
+            if polled:
+                replies.extend(polled)
+                if self._debug and i > 5:
+                    print(
+                        f"[amifuse] startup: got {len(replies)} replies "
+                        f"after {i} iters; continuing"
+                    )
+
+            if hasattr(self, "proc_mgr"):
+                parent_block_state = _snapshot_block_state()
+                num_children = self.proc_mgr.run_all_ready_children(
+                    cycles_per_child=cycles // 4
+                )
+                if self.state.initialized:
+                    _restore_block_state(parent_block_state)
+                else:
+                    _clear_all_block_state()
+                if num_children > 0 and self._debug:
+                    print(f"[amifuse] startup ran {num_children} child process(es)")
+
+            if getattr(rs, "error", None):
+                polled = self.launcher.poll_replies(
+                    self.state.reply_port_addr, debug=self._debug
+                )
+                if polled:
+                    replies.extend(polled)
+                if hasattr(self, "proc_mgr"):
+                    parent_block_state = _snapshot_block_state()
+                    self.proc_mgr.run_all_ready_children(
+                        cycles_per_child=cycles // 2
+                    )
+                    if self.state.initialized:
+                        _restore_block_state(parent_block_state)
+                    else:
+                        _clear_all_block_state()
+                continue
+
+            if getattr(rs, "done", False) and not replies:
+                break
+
+            if sleep_base > 0:
+                time.sleep(sleep_time)
+                sleep_time = min(sleep_time * 2, sleep_max)
+
+        if self._debug and not replies:
+            print(
+                f"[amifuse] startup: exhausted {max_iters} iters with no "
+                f"replies, pc=0x{self.state.pc:x}"
+            )
+        return replies
 
     def _run_until_replies(self, max_iters: int = 50, cycles: int = 200_000, sleep_base: float = 0.0005, sleep_max: float = 0.01, drain_non_essential: bool = True):
         """Run handler bursts until at least one reply is queued or iterations exhausted."""
@@ -401,11 +523,15 @@ class HandlerBridge:
                 proc_addr = self.state.process_addr
                 self.mem.w32(proc_addr + sigrecvd_off, dos_signal)
                 if self._debug:
-                    print(f"[amifuse] Resuming: D0=0x{dos_signal:x} tc_SigRecvd@0x{proc_addr + sigrecvd_off:x}=0x{dos_signal:x}")
+                    print(
+                        f"[amifuse] Resuming: port_signal=0x{port_signal:x} "
+                        f"wait_mask=0x{wait_mask:x} D0=0x{dos_signal:x} "
+                        f"tc_SigRecvd@0x{proc_addr + sigrecvd_off:x}=0x{dos_signal:x}"
+                    )
 
         for i in range(max_iters):
             old_pc = self.state.pc
-            self.launcher.run_burst(self.state, max_cycles=cycles)
+            self.launcher.run_burst(self.state, max_cycles=cycles, debug=self._debug)
             rs = self.state.run_state
             new_pc = self.state.pc
             # Log first few iterations to debug handler movement
@@ -418,10 +544,16 @@ class HandlerBridge:
                     print(f"[amifuse] _run_until_replies: handler crashed at iter {i}")
                 return []
             # Check for replies first - if we have them, we're done
-            replies = self.launcher.poll_replies(self.state.reply_port_addr, debug=self._debug)
-            if replies:
+            polled = self.launcher.poll_replies(
+                self.state.reply_port_addr, debug=self._debug
+            )
+            if polled:
+                replies = polled
                 if self._debug and i > 5:
-                    print(f"[amifuse] _run_until_replies: got {len(replies)} replies after {i} iters")
+                    print(
+                        f"[amifuse] _run_until_replies: got {len(replies)} "
+                        f"replies after {i} iters"
+                    )
                 break
 
             # Run any child processes that were created (e.g., SFS DosList handler)
@@ -447,8 +579,11 @@ class HandlerBridge:
             if getattr(rs, "error", None):
                 # Error during run - might be WaitPort block or FindPort yield
                 # Check if we have replies first
-                replies = self.launcher.poll_replies(self.state.reply_port_addr, debug=self._debug)
-                if replies:
+                polled = self.launcher.poll_replies(
+                    self.state.reply_port_addr, debug=self._debug
+                )
+                if polled:
+                    replies = polled
                     break
                 # No replies - run children and continue (don't break)
                 if hasattr(self, 'proc_mgr'):
@@ -499,7 +634,7 @@ class HandlerBridge:
             if self.state.pc < 0x800 or self.state.pc > 0xFFFFFF:
                 print(f"[_capture] ERROR: invalid state.pc=0x{self.state.pc:x} before run_burst", file=sys.stderr)
                 return
-            rs = self.launcher.run_burst(self.state, max_cycles=cycles)
+            rs = self.launcher.run_burst(self.state, max_cycles=cycles, debug=self._debug)
 
             # Run child processes - SFS needs DosList handler to run during init
             if hasattr(self, 'proc_mgr'):
@@ -529,8 +664,13 @@ class HandlerBridge:
                     if wait_mask is not None and wait_mask != 0:
                         self.state.wait_mask = wait_mask
                     if self._debug:
+                        block_kind = "WaitPort" if waitport_sp is not None else "Wait"
                         mask_str = f" wait_mask=0x{self.state.wait_mask:x}" if self.state.wait_mask else ""
-                        print(f"[amifuse] _capture_main_loop_state: captured at iter {i}, pc=0x{ret_addr:x}, sp=0x{blocked_sp+4:x}{mask_str}")
+                        print(
+                            f"[amifuse] _capture_main_loop_state: {block_kind} "
+                            f"captured at iter {i}, current_pc=0x{self.state.pc:x} "
+                            f"ret=0x{ret_addr:x}, sp=0x{blocked_sp+4:x}{mask_str}"
+                        )
                 return
             # Check if handler crashed (invalid PC)
             if rs and hasattr(rs, 'pc') and rs.pc < 0x800:
