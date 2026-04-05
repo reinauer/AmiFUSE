@@ -10,6 +10,8 @@ Mock targets are patched at the module level where they are looked up:
     - amifuse.platform.shutil.which
 """
 
+import sys
+import types
 from pathlib import Path, PurePosixPath
 
 import pytest
@@ -85,11 +87,25 @@ class TestShouldAutoCreateMountpoint:
         assert should_auto_create_mountpoint(PurePosixPath("/mnt/amiga")) is False
 
     def test_auto_create_windows(self, monkeypatch):
-        """Windows returns True (WinFsp handles drive letter mountpoints)."""
+        """Windows returns True for drive letter mountpoints (WinFSP creates them)."""
         monkeypatch.setattr("sys.platform", "win32")
         from amifuse.platform import should_auto_create_mountpoint
 
         assert should_auto_create_mountpoint(Path("D:")) is True
+
+    def test_auto_create_windows_drive_letter(self, monkeypatch):
+        """Windows drive letter (E:) returns True."""
+        monkeypatch.setattr("sys.platform", "win32")
+        from amifuse.platform import should_auto_create_mountpoint
+
+        assert should_auto_create_mountpoint(Path("E:")) is True
+
+    def test_auto_create_windows_directory_path(self, monkeypatch):
+        r"""Windows directory path (C:\mnt\amiga) returns False (needs mkdir)."""
+        monkeypatch.setattr("sys.platform", "win32")
+        from amifuse.platform import should_auto_create_mountpoint
+
+        assert should_auto_create_mountpoint(Path(r"C:\mnt\amiga")) is False
 
 
 # ---------------------------------------------------------------------------
@@ -147,9 +163,20 @@ class TestGetUnmountCommand:
         result = get_unmount_command(mp)
         assert result == ["umount", "-f", "/mnt/amiga"]
 
+    def test_unmount_command_windows_returns_empty(self, monkeypatch):
+        """On Windows, returns empty list (no standalone unmount CLI tool).
+
+        WinFSP foreground mounts unmount when the FUSE process exits (Ctrl+C).
+        """
+        monkeypatch.setattr("sys.platform", "win32")
+        from amifuse.platform import get_unmount_command
+
+        result = get_unmount_command(Path("D:"))
+        assert result == []
+
 
 # ---------------------------------------------------------------------------
-# D. get_mount_options() -- 1 test
+# D. get_mount_options() -- 4 tests
 # ---------------------------------------------------------------------------
 
 
@@ -163,6 +190,35 @@ class TestGetMountOptions:
 
         result = get_mount_options("TestVol")
         assert result == {}
+
+    def test_mount_options_windows_volname(self, monkeypatch):
+        """On Windows, returns dict with volname and FileSystemName."""
+        monkeypatch.setattr("sys.platform", "win32")
+        from amifuse.platform import get_mount_options
+
+        result = get_mount_options("TestVol")
+        assert result == {"volname": "TestVol", "FileSystemName": "AmiFUSE"}
+
+    def test_mount_options_windows_ignores_icon_args(self, monkeypatch):
+        """On Windows, icon args are ignored (macOS-only)."""
+        monkeypatch.setattr("sys.platform", "win32")
+        from amifuse.platform import get_mount_options
+
+        result = get_mount_options(
+            "TestVol", volicon_path="/tmp/icon.icns", icons_enabled=True
+        )
+        assert result == {"volname": "TestVol", "FileSystemName": "AmiFUSE"}
+
+    def test_mount_options_darwin_unchanged(self, monkeypatch):
+        """On darwin, get_mount_options returns a dict containing 'volname' key.
+
+        Verifies the macOS code path is unchanged by the Windows additions.
+        """
+        monkeypatch.setattr("sys.platform", "darwin")
+        from amifuse.platform import get_mount_options
+
+        result = get_mount_options("TestVol")
+        assert "volname" in result
 
 
 # ---------------------------------------------------------------------------
@@ -230,3 +286,371 @@ class TestGetIconFileNames:
 
         result = get_icon_file_names()
         assert result == (None, None)
+
+
+# ---------------------------------------------------------------------------
+# G. check_fuse_available() -- 7 tests
+# ---------------------------------------------------------------------------
+
+
+class _FakeWinreg:
+    """Fake winreg module for testing on non-Windows platforms.
+
+    winreg is a Windows-only stdlib module. When monkeypatching sys.platform
+    to 'win32' on macOS/Linux, `import winreg` inside check_fuse_available()
+    would fail. This fake module provides the minimal interface needed by the
+    function: OpenKey, QueryValueEx, and HKEY_LOCAL_MACHINE.
+    """
+
+    HKEY_LOCAL_MACHINE = 0x80000002
+
+    def __init__(self, install_dir=None, raise_on_open=False):
+        """Configure fake registry behavior.
+
+        Args:
+            install_dir: Value to return from QueryValueEx, or None
+            raise_on_open: If True, OpenKey raises OSError (key not found)
+        """
+        self._install_dir = install_dir
+        self._raise_on_open = raise_on_open
+
+    def OpenKey(self, hkey, sub_key):
+        if self._raise_on_open:
+            raise OSError("Registry key not found")
+        return self
+
+    def QueryValueEx(self, key, value_name):
+        return (self._install_dir, 1)  # (value, type)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        pass
+
+
+@pytest.fixture
+def fake_winreg_module():
+    """Create a fake winreg module suitable for monkeypatch.setitem(sys.modules, ...).
+
+    Returns a factory function that accepts configuration and returns a
+    properly set up fake winreg module.
+    """
+    def _make(install_dir=None, raise_on_open=False):
+        mod = types.ModuleType("winreg")
+        fake = _FakeWinreg(install_dir=install_dir, raise_on_open=raise_on_open)
+        mod.HKEY_LOCAL_MACHINE = _FakeWinreg.HKEY_LOCAL_MACHINE
+        mod.OpenKey = fake.OpenKey
+        mod.QueryValueEx = fake.QueryValueEx
+        return mod
+    return _make
+
+
+class TestCheckFuseAvailable:
+    """Tests for check_fuse_available().
+
+    This function checks for WinFSP installation on Windows and is a no-op
+    on macOS and Linux. On non-Windows test platforms, we inject a fake
+    winreg module via sys.modules since winreg only exists on Windows.
+    """
+
+    def test_check_fuse_noop_on_darwin(self, monkeypatch):
+        """On macOS, check_fuse_available() returns None (no-op)."""
+        monkeypatch.setattr("sys.platform", "darwin")
+        from amifuse.platform import check_fuse_available
+
+        result = check_fuse_available()
+        assert result is None
+
+    def test_check_fuse_noop_on_linux(self, monkeypatch):
+        """On Linux, check_fuse_available() returns None (no-op)."""
+        monkeypatch.setattr("sys.platform", "linux")
+        from amifuse.platform import check_fuse_available
+
+        result = check_fuse_available()
+        assert result is None
+
+    def test_check_fuse_windows_registry(self, monkeypatch, fake_winreg_module):
+        """On Windows, finding WinFSP via registry succeeds without error."""
+        monkeypatch.setattr("sys.platform", "win32")
+
+        # Inject fake winreg with a valid install dir
+        fake_mod = fake_winreg_module(install_dir=r"C:\Program Files (x86)\WinFsp")
+        monkeypatch.setitem(sys.modules, "winreg", fake_mod)
+
+        # Mock os.path.isdir to confirm the directory exists
+        monkeypatch.setattr(
+            "amifuse.platform.os.path.isdir",
+            lambda path: path == r"C:\Program Files (x86)\WinFsp",
+        )
+
+        from amifuse.platform import check_fuse_available
+
+        # Should not raise
+        result = check_fuse_available()
+        assert result is None
+
+    def test_check_fuse_windows_env_var(self, monkeypatch, fake_winreg_module):
+        """On Windows, falls back to WINFSP_INSTALL_DIR env var when registry fails."""
+        monkeypatch.setattr("sys.platform", "win32")
+
+        # Registry key not found
+        fake_mod = fake_winreg_module(raise_on_open=True)
+        monkeypatch.setitem(sys.modules, "winreg", fake_mod)
+
+        # Set env var
+        monkeypatch.setenv("WINFSP_INSTALL_DIR", r"D:\Tools\WinFsp")
+
+        # Only the env var path is valid
+        monkeypatch.setattr(
+            "amifuse.platform.os.path.isdir",
+            lambda path: path == r"D:\Tools\WinFsp",
+        )
+
+        from amifuse.platform import check_fuse_available
+
+        # Should not raise
+        result = check_fuse_available()
+        assert result is None
+
+    def test_check_fuse_windows_default_dir(self, monkeypatch, fake_winreg_module):
+        """On Windows, falls back to default install path when registry and env var fail."""
+        monkeypatch.setattr("sys.platform", "win32")
+
+        # Registry key not found
+        fake_mod = fake_winreg_module(raise_on_open=True)
+        monkeypatch.setitem(sys.modules, "winreg", fake_mod)
+
+        # No env var
+        monkeypatch.delenv("WINFSP_INSTALL_DIR", raising=False)
+
+        # Only default dir exists
+        monkeypatch.setattr(
+            "amifuse.platform.os.path.isdir",
+            lambda path: path == r"C:\Program Files (x86)\WinFsp",
+        )
+
+        from amifuse.platform import check_fuse_available
+
+        # Should not raise
+        result = check_fuse_available()
+        assert result is None
+
+    def test_check_fuse_windows_not_installed(self, monkeypatch, fake_winreg_module):
+        """On Windows, raises SystemExit when WinFSP is not found anywhere."""
+        monkeypatch.setattr("sys.platform", "win32")
+
+        # Registry key not found
+        fake_mod = fake_winreg_module(raise_on_open=True)
+        monkeypatch.setitem(sys.modules, "winreg", fake_mod)
+
+        # No env var
+        monkeypatch.delenv("WINFSP_INSTALL_DIR", raising=False)
+
+        # No directories exist
+        monkeypatch.setattr("amifuse.platform.os.path.isdir", lambda path: False)
+
+        from amifuse.platform import check_fuse_available
+
+        with pytest.raises(SystemExit) as exc_info:
+            check_fuse_available()
+
+        msg = str(exc_info.value)
+        assert "WinFSP is not installed" in msg
+        assert "https://winfsp.dev" in msg
+
+    def test_check_fuse_windows_error_message_actionable(
+        self, monkeypatch, fake_winreg_module
+    ):
+        """Error message contains install URL, restart hint, and env var fallback."""
+        monkeypatch.setattr("sys.platform", "win32")
+
+        # Registry key not found
+        fake_mod = fake_winreg_module(raise_on_open=True)
+        monkeypatch.setitem(sys.modules, "winreg", fake_mod)
+
+        # No env var
+        monkeypatch.delenv("WINFSP_INSTALL_DIR", raising=False)
+
+        # No directories exist
+        monkeypatch.setattr("amifuse.platform.os.path.isdir", lambda path: False)
+
+        from amifuse.platform import check_fuse_available
+
+        with pytest.raises(SystemExit) as exc_info:
+            check_fuse_available()
+
+        msg = str(exc_info.value)
+        # Verify all three actionable elements
+        assert "https://winfsp.dev/rel/" in msg
+        assert "restart your terminal" in msg.lower() or "Restart your terminal" in msg
+        assert "WINFSP_INSTALL_DIR" in msg
+
+
+# ---------------------------------------------------------------------------
+# H. validate_mountpoint() -- 7 tests
+# ---------------------------------------------------------------------------
+
+
+class TestValidateMountpoint:
+    """Tests for validate_mountpoint().
+
+    Uses os.path.exists and os.path.ismount (string-based) rather than
+    Path.exists() for testability across platforms. All mocks target
+    amifuse.platform.os.path.* to match the module-level lookup.
+    """
+
+    def test_validate_drive_letter_available(self, monkeypatch):
+        r"""On Windows, D: with D:\ not existing returns None (available)."""
+        monkeypatch.setattr("sys.platform", "win32")
+        monkeypatch.setattr(
+            "amifuse.platform.os.path.exists",
+            lambda path: False,
+        )
+        from amifuse.platform import validate_mountpoint
+
+        result = validate_mountpoint(Path("D:"))
+        assert result is None
+
+    def test_validate_drive_letter_in_use(self, monkeypatch):
+        r"""On Windows, D: with D:\ existing returns error string."""
+        monkeypatch.setattr("sys.platform", "win32")
+        monkeypatch.setattr(
+            "amifuse.platform.os.path.exists",
+            lambda path: path == "D:\\",
+        )
+        from amifuse.platform import validate_mountpoint
+
+        result = validate_mountpoint(Path("D:"))
+        assert result is not None
+        assert "already in use" in result
+
+    def test_validate_unix_mountpoint_available(self, monkeypatch):
+        """On Linux, path that doesn't exist returns None (available)."""
+        monkeypatch.setattr("sys.platform", "linux")
+        monkeypatch.setattr(
+            "amifuse.platform.os.path.exists",
+            lambda path: False,
+        )
+        from amifuse.platform import validate_mountpoint
+
+        result = validate_mountpoint(PurePosixPath("/mnt/amiga"))
+        assert result is None
+
+    def test_validate_unix_mountpoint_mounted(self, monkeypatch):
+        """On Linux, path that exists and is a mount returns error with fusermount hint."""
+        monkeypatch.setattr("sys.platform", "linux")
+        monkeypatch.setattr(
+            "amifuse.platform.os.path.exists",
+            lambda path: True,
+        )
+        monkeypatch.setattr(
+            "amifuse.platform.os.path.ismount",
+            lambda path: True,
+        )
+        monkeypatch.setattr(
+            "amifuse.platform.shutil.which",
+            lambda cmd: "/usr/bin/fusermount" if cmd == "fusermount" else None,
+        )
+        from amifuse.platform import validate_mountpoint
+
+        result = validate_mountpoint(PurePosixPath("/mnt/amiga"))
+        assert result is not None
+        assert "already a mount" in result
+        assert "fusermount" in result
+
+    def test_validate_unix_mountpoint_exists_not_mounted(self, monkeypatch):
+        """On Linux, path that exists but is not a mount returns None (fine to use)."""
+        monkeypatch.setattr("sys.platform", "linux")
+        monkeypatch.setattr(
+            "amifuse.platform.os.path.exists",
+            lambda path: True,
+        )
+        monkeypatch.setattr(
+            "amifuse.platform.os.path.ismount",
+            lambda path: False,
+        )
+        from amifuse.platform import validate_mountpoint
+
+        result = validate_mountpoint(PurePosixPath("/mnt/amiga"))
+        assert result is None
+
+    def test_validate_windows_dir_mountpoint_mounted(self, monkeypatch):
+        r"""On Windows, non-drive-letter path (C:\mnt\amiga) that is mounted returns error."""
+        monkeypatch.setattr("sys.platform", "win32")
+        monkeypatch.setattr(
+            "amifuse.platform.os.path.exists",
+            lambda path: True,
+        )
+        monkeypatch.setattr(
+            "amifuse.platform.os.path.ismount",
+            lambda path: True,
+        )
+        from amifuse.platform import validate_mountpoint
+
+        result = validate_mountpoint(Path(r"C:\mnt\amiga"))
+        assert result is not None
+        assert "already a mount" in result
+
+    def test_validate_windows_dir_mountpoint_available(self, monkeypatch):
+        r"""On Windows, non-drive-letter path (C:\mnt\amiga) that doesn't exist returns None."""
+        monkeypatch.setattr("sys.platform", "win32")
+        monkeypatch.setattr(
+            "amifuse.platform.os.path.exists",
+            lambda path: False,
+        )
+        from amifuse.platform import validate_mountpoint
+
+        result = validate_mountpoint(Path(r"C:\mnt\amiga"))
+        assert result is None
+
+
+# ---------------------------------------------------------------------------
+# I. Windows mountpoint edge cases -- 3 tests
+# ---------------------------------------------------------------------------
+
+
+class TestWindowsMountpointEdgeCases:
+    """Tests for get_default_mountpoint() Windows edge cases.
+
+    Verifies drive letter exhaustion, priority ordering, and the first-available
+    logic in get_default_mountpoint() on Windows.
+    """
+
+    def test_default_mountpoint_windows_all_taken(self, monkeypatch):
+        """On Windows, all D-Z drive letters taken returns None."""
+        monkeypatch.setattr("sys.platform", "win32")
+        # All drive letters exist (are in use)
+        monkeypatch.setattr(
+            "amifuse.platform.os.path.exists",
+            lambda path: True,
+        )
+        from amifuse.platform import get_default_mountpoint
+
+        result = get_default_mountpoint("TestVol")
+        assert result is None
+
+    def test_default_mountpoint_windows_first_available(self, monkeypatch):
+        """On Windows, D-F taken and G free returns Path('G:')."""
+        monkeypatch.setattr("sys.platform", "win32")
+        taken = {"D:", "E:", "F:"}
+        monkeypatch.setattr(
+            "amifuse.platform.os.path.exists",
+            lambda path: path in taken,
+        )
+        from amifuse.platform import get_default_mountpoint
+
+        result = get_default_mountpoint("TestVol")
+        assert result == Path("G:")
+
+    def test_default_mountpoint_windows_d_available(self, monkeypatch):
+        """On Windows, all drives free returns Path('D:') (first checked)."""
+        monkeypatch.setattr("sys.platform", "win32")
+        monkeypatch.setattr(
+            "amifuse.platform.os.path.exists",
+            lambda path: False,
+        )
+        from amifuse.platform import get_default_mountpoint
+
+        result = get_default_mountpoint("TestVol")
+        assert result == Path("D:")

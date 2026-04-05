@@ -56,8 +56,10 @@ def should_auto_create_mountpoint(mountpoint: Path) -> bool:
         # macFUSE will create mount points in /Volumes automatically
         return str(mountpoint).startswith("/Volumes/")
     if sys.platform.startswith("win"):
-        # WinFsp handles drive letter mountpoints; don't mkdir them
-        return True
+        # WinFSP handles drive letter mountpoints; don't mkdir them.
+        # Directory mountpoints (e.g. C:\mnt\amiga) still need mkdir.
+        mp_str = str(mountpoint)
+        return len(mp_str) == 2 and mp_str[1] == ":"
     return False
 
 
@@ -68,16 +70,105 @@ def get_unmount_command(mountpoint: Path) -> List[str]:
         mountpoint: The mountpoint to unmount
 
     Returns:
-        Command as a list of strings suitable for subprocess
+        Command as a list of strings suitable for subprocess.
+        Returns an empty list [] on platforms where no unmount command is
+        available (e.g. Windows foreground mounts). Callers must handle
+        the empty-list case -- typically by skipping subprocess invocation
+        and providing a user hint instead.
+
+        Note: A future `amifuse unmount` command will need a different
+        strategy on Windows (process termination or signal) since no CLI
+        unmount tool exists for foreground WinFSP mounts.
     """
     if sys.platform.startswith("darwin"):
         return ["umount", "-f", str(mountpoint)]
-    else:
-        # Linux - prefer fusermount if available
-        if shutil.which("fusermount"):
-            return ["fusermount", "-u", str(mountpoint)]
+    if sys.platform.startswith("win"):
+        # WinFSP foreground mounts have no standalone unmount CLI tool.
+        # The filesystem unmounts when the FUSE process exits (Ctrl+C).
+        return []
+    # Linux - prefer fusermount if available
+    if shutil.which("fusermount"):
+        return ["fusermount", "-u", str(mountpoint)]
+    return ["umount", "-f", str(mountpoint)]
+
+
+def check_fuse_available() -> None:
+    """Verify that the platform's FUSE driver is installed.
+
+    Raises SystemExit with an actionable error message if the required
+    FUSE driver is not found.
+    """
+    if not sys.platform.startswith("win"):
+        # macOS and Linux: fusepy will raise its own error if FUSE is missing.
+        # Those errors are already clear enough (libfuse not found, etc.)
+        return
+
+    # Windows: check for WinFSP via Registry (most reliable)
+    try:
+        import winreg
+        with winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE,
+            r"SOFTWARE\WOW6432Node\WinFsp",
+        ) as key:
+            install_dir = winreg.QueryValueEx(key, "InstallDir")[0]
+            if install_dir and os.path.isdir(install_dir):
+                return
+    except (OSError, FileNotFoundError):
+        pass  # Registry key not found -- WinFSP may not be installed
+
+    # Fallback: check WINFSP_INSTALL_DIR env var
+    winfsp_dir = os.environ.get("WINFSP_INSTALL_DIR", "")
+    if winfsp_dir and os.path.isdir(winfsp_dir):
+        return
+
+    # Fallback: check default install location
+    default_dir = r"C:\Program Files (x86)\WinFsp"
+    if os.path.isdir(default_dir):
+        return
+
+    # Non-standard installs can set WINFSP_INSTALL_DIR env var
+    raise SystemExit(
+        "WinFSP is not installed. AmiFUSE requires WinFSP to mount filesystems on Windows.\n"
+        "\n"
+        "Install WinFSP from: https://winfsp.dev/rel/\n"
+        "After installing, restart your terminal and try again.\n"
+        "\n"
+        "If WinFSP is installed in a non-standard location, set the\n"
+        "WINFSP_INSTALL_DIR environment variable to the install directory."
+    )
+
+
+def validate_mountpoint(mountpoint: Path) -> Optional[str]:
+    """Validate that a mountpoint is available for use.
+
+    Args:
+        mountpoint: The mountpoint path to validate
+
+    Returns:
+        None if the mountpoint is available, or an error message string
+        if it is already in use or otherwise invalid.
+    """
+    mp_str = str(mountpoint)
+    if sys.platform.startswith("win") and len(mp_str) == 2 and mp_str[1] == ":":
+        # Drive letter mountpoint -- check if drive exists (i.e., is assigned)
+        if os.path.exists(mp_str + "\\"):
+            return (
+                f"Drive {mp_str} is already in use; choose a different drive letter "
+                f"or free it first."
+            )
+    elif os.path.exists(mp_str) and os.path.ismount(mp_str):
+        hint_cmd = " ".join(get_unmount_command(mountpoint))
+        if hint_cmd:
+            return (
+                f"Mountpoint {mountpoint} is already a mount; unmount it first "
+                f"(e.g. {hint_cmd})."
+            )
         else:
-            return ["umount", "-f", str(mountpoint)]
+            return (
+                f"Mountpoint {mountpoint} is already a mount. "
+                f"Stop the amifuse process to unmount (Ctrl+C)."
+            )
+    return None
 
 
 def get_mount_options(volname: str, volicon_path: Optional[str] = None,
@@ -95,7 +186,12 @@ def get_mount_options(volname: str, volicon_path: Optional[str] = None,
     if sys.platform.startswith("darwin"):
         from .icon_darwin import get_darwin_mount_options
         return get_darwin_mount_options(volname, volicon_path, icons_enabled)
-    # Other platforms don't have special mount options yet
+    if sys.platform.startswith("win"):
+        return {
+            "volname": volname,
+            "FileSystemName": "AmiFUSE",
+        }
+    # Linux doesn't need special mount options
     return {}
 
 

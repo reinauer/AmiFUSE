@@ -2251,6 +2251,10 @@ def mount_fuse(
     _require_fuse()
     import amitools.fs.DosType as DosType
     from .rdb_inspect import detect_adf, detect_iso
+    from . import platform as plat
+
+    # Fail fast if FUSE driver is missing -- before any image analysis
+    plat.check_fuse_available()
 
     # First, check if this is an ADF (floppy disk image)
     adf_info = detect_adf(image)
@@ -2315,16 +2319,18 @@ def mount_fuse(
                 driver_desc = str(driver)
 
     # Auto-create mountpoint on macOS/Windows if not specified
-    from . import platform as plat
     if mountpoint is None:
         mountpoint = plat.get_default_mountpoint(volname_opt or part_name)
         if mountpoint is None:
+            if sys.platform.startswith("win"):
+                raise SystemExit(
+                    "No free drive letter found. Specify a mountpoint with --mountpoint D:"
+                )
             raise SystemExit("--mountpoint is required on this platform")
 
-    if mountpoint.exists() and os.path.ismount(mountpoint):
-        raise SystemExit(
-            f"Mountpoint {mountpoint} is already a mount; unmount it first (e.g. umount -f {mountpoint})."
-        )
+    validation_error = plat.validate_mountpoint(mountpoint)
+    if validation_error:
+        raise SystemExit(validation_error)
 
     # Create mountpoint directory if it doesn't exist
     if not mountpoint.exists():
@@ -2354,6 +2360,10 @@ def mount_fuse(
         if not mountpoint.exists() or not os.path.ismount(mountpoint):
             return
         cmd = plat.get_unmount_command(mountpoint)
+        if not cmd:
+            # No unmount command available (e.g. Windows foreground mounts).
+            # The process exit will trigger WinFSP cleanup automatically.
+            return
         subprocess.run(cmd, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     bridge = HandlerBridge(
@@ -2386,9 +2396,11 @@ def mount_fuse(
         "allow_other": False,
         "nothreads": not use_threads,
         "fsname": f"amifuse:{volname}",
-        "subtype": "amifuse",
         "default_permissions": True,  # Let kernel handle permission checks
     }
+    # subtype is a Linux-only FUSE option; WinFSP and macFUSE don't support it
+    if sys.platform.startswith("linux"):
+        fuse_kwargs["subtype"] = "amifuse"
     # Add platform-specific mount options
     platform_opts = plat.get_mount_options(
         volname=volname,
@@ -2666,7 +2678,7 @@ commands:
     --mountpoint PATH         Mount location (default: /Volumes/<partition>).
     --partition NAME          Partition name (e.g. DH0) or index (defaults to first).
     --block-size N            Override block size (defaults to auto/512).
-    --volname NAME            Override macFUSE volume name (defaults to partition name).
+    --volname NAME            Override volume name (defaults to partition name).
     --write                   Enable read-write mode (experimental).
     --icons                   Convert Amiga .info icons to native macOS icons (experimental).
     --debug                   Enable debug logging of FUSE operations.
@@ -2714,7 +2726,7 @@ commands:
         "--block-size", type=int, help="Override block size (defaults to auto/512)."
     )
     mount_parser.add_argument(
-        "--volname", type=str, help="Override macFUSE volume name (defaults to partition name)."
+        "--volname", type=str, help="Override volume name displayed by the OS (defaults to partition name)."
     )
     mount_parser.add_argument(
         "--debug", action="store_true", help="Enable debug logging of FUSE operations."
