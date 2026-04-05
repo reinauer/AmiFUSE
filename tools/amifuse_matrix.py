@@ -18,10 +18,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
+from fixture_paths import DEFAULT_HDF_URL, DOWNLOADED_DIR, DRIVERS_DIR, FIXTURE_ROOT
+from fixture_paths import GENERATED_DIR, NETBSD_AMIGA_92_URL, ODFS_DRIVER
+from fixture_paths import READONLY_DIR
+from fixture_paths import ensure_downloaded_fixture
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 AMITOOLS_ROOT = REPO_ROOT / "amitools"
-FIXTURE_ROOT = Path.home() / "AmigaOS" / "AmiFuse"
 DEFAULT_TIMEOUT = 60.0
 
 
@@ -37,6 +40,8 @@ class Fixture:
     image_size_mb: int
     expected_root: tuple[str, ...] = ()
     lookup_path: Optional[str] = None
+    small_read_path: Optional[str] = None
+    large_read_path: Optional[str] = None
     seed_image: Optional[Path] = None
     default_run: bool = True
     create_args: tuple[str, ...] = ()
@@ -44,38 +49,43 @@ class Fixture:
     cleanup_image: bool = False
     min_partition_start_byte: Optional[int] = None
     min_partition_size_byte: Optional[int] = None
+    optional: bool = False
+    download_url: Optional[str] = None
+    seed_download_url: Optional[str] = None
 
 
 FIXTURES: Dict[str, Fixture] = {
     "pfs3": Fixture(
         key="pfs3",
         fs_name="PFS3",
-        image=FIXTURE_ROOT / "pfs.hdf",
-        driver=FIXTURE_ROOT / "pfs3aio",
+        image=READONLY_DIR / "pfs.hdf",
+        driver=DRIVERS_DIR / "pfs3aio",
         partition="PDH0",
         mode="ro",
         image_kind="rdb-hdf",
         image_size_mb=8,
         expected_root=("Libs", "S", "foo.md", "plan.md"),
         lookup_path="/foo.md",
+        small_read_path="/foo.md",
+        large_read_path="/S/pci.db",
     ),
     "pfs3-rw": Fixture(
         key="pfs3-rw",
         fs_name="PFS3 rw",
-        image=FIXTURE_ROOT / "generated" / "pfs3_rw.hdf",
-        driver=FIXTURE_ROOT / "pfs3aio",
+        image=GENERATED_DIR / "pfs3_rw.hdf",
+        driver=DRIVERS_DIR / "pfs3aio",
         partition="PDH0",
         mode="rw",
         image_kind="rdb-hdf",
         image_size_mb=8,
-        seed_image=FIXTURE_ROOT / "pfs.hdf",
+        seed_image=READONLY_DIR / "pfs.hdf",
         default_run=False,
     ),
     "pfs3-fmt": Fixture(
         key="pfs3-fmt",
         fs_name="PFS3 fmt",
-        image=FIXTURE_ROOT / "generated" / "pfs3_fmt.hdf",
-        driver=FIXTURE_ROOT / "pfs3aio",
+        image=GENERATED_DIR / "pfs3_fmt.hdf",
+        driver=DRIVERS_DIR / "pfs3aio",
         partition="PDH0",
         mode="fmt",
         image_kind="rdb-hdf",
@@ -98,8 +108,8 @@ FIXTURES: Dict[str, Fixture] = {
     "pfs3-4g": Fixture(
         key="pfs3-4g",
         fs_name="PFS3 >4G",
-        image=FIXTURE_ROOT / "generated" / "pfs3_4g.hdf",
-        driver=FIXTURE_ROOT / "pfs3aio",
+        image=GENERATED_DIR / "pfs3_4g.hdf",
+        driver=DRIVERS_DIR / "pfs3aio",
         partition="LDH0",
         mode="fmt",
         image_kind="rdb-hdf",
@@ -125,8 +135,8 @@ FIXTURES: Dict[str, Fixture] = {
     "pfs3-part-4g": Fixture(
         key="pfs3-part-4g",
         fs_name="PFS3 partition >4G",
-        image=FIXTURE_ROOT / "generated" / "pfs3_part_4g.hdf",
-        driver=FIXTURE_ROOT / "pfs3aio",
+        image=GENERATED_DIR / "pfs3_part_4g.hdf",
+        driver=DRIVERS_DIR / "pfs3aio",
         partition="XDH0",
         mode="fmt",
         image_kind="rdb-hdf",
@@ -151,8 +161,8 @@ FIXTURES: Dict[str, Fixture] = {
     "sfs": Fixture(
         key="sfs",
         fs_name="SFS",
-        image=FIXTURE_ROOT / "sfs.hdf",
-        driver=FIXTURE_ROOT / "SmartFilesystem",
+        image=READONLY_DIR / "sfs.hdf",
+        driver=DRIVERS_DIR / "SmartFilesystem",
         partition="SDH0",
         mode="ro",
         image_kind="rdb-hdf",
@@ -161,20 +171,20 @@ FIXTURES: Dict[str, Fixture] = {
     "sfs-rw": Fixture(
         key="sfs-rw",
         fs_name="SFS rw",
-        image=FIXTURE_ROOT / "generated" / "sfs_rw.hdf",
-        driver=FIXTURE_ROOT / "SmartFilesystem",
+        image=GENERATED_DIR / "sfs_rw.hdf",
+        driver=DRIVERS_DIR / "SmartFilesystem",
         partition="SDH0",
         mode="rw",
         image_kind="rdb-hdf",
         image_size_mb=8,
-        seed_image=FIXTURE_ROOT / "sfs.hdf",
+        seed_image=READONLY_DIR / "sfs.hdf",
         default_run=False,
     ),
     "sfs-fmt": Fixture(
         key="sfs-fmt",
         fs_name="SFS fmt",
-        image=FIXTURE_ROOT / "generated" / "sfs_fmt.hdf",
-        driver=FIXTURE_ROOT / "SmartFilesystem",
+        image=GENERATED_DIR / "sfs_fmt.hdf",
+        driver=DRIVERS_DIR / "SmartFilesystem",
         partition="SDH0",
         mode="fmt",
         image_kind="rdb-hdf",
@@ -197,30 +207,32 @@ FIXTURES: Dict[str, Fixture] = {
     "ffs": Fixture(
         key="ffs",
         fs_name="FFS",
-        image=FIXTURE_ROOT / "Default.hdf",
-        driver=FIXTURE_ROOT / "FastFileSystem",
+        image=READONLY_DIR / "Default.hdf",
+        driver=DRIVERS_DIR / "FastFileSystem",
         partition="QDH0",
         mode="ro",
         image_kind="rdb-hdf",
         image_size_mb=512,
+        download_url=DEFAULT_HDF_URL,
     ),
     "ffs-rw": Fixture(
         key="ffs-rw",
         fs_name="FFS rw",
-        image=FIXTURE_ROOT / "generated" / "ffs_rw.hdf",
-        driver=FIXTURE_ROOT / "FastFileSystem",
+        image=GENERATED_DIR / "ffs_rw.hdf",
+        driver=DRIVERS_DIR / "FastFileSystem",
         partition="QDH0",
         mode="rw",
         image_kind="rdb-hdf",
         image_size_mb=512,
-        seed_image=FIXTURE_ROOT / "Default.hdf",
+        seed_image=READONLY_DIR / "Default.hdf",
         default_run=False,
+        seed_download_url=DEFAULT_HDF_URL,
     ),
     "ffs-fmt": Fixture(
         key="ffs-fmt",
         fs_name="FFS fmt",
-        image=FIXTURE_ROOT / "generated" / "ffs_fmt.hdf",
-        driver=FIXTURE_ROOT / "FastFileSystem",
+        image=GENERATED_DIR / "ffs_fmt.hdf",
+        driver=DRIVERS_DIR / "FastFileSystem",
         partition="FDH0",
         mode="fmt",
         image_kind="rdb-hdf",
@@ -243,44 +255,49 @@ FIXTURES: Dict[str, Fixture] = {
     "ofs": Fixture(
         key="ofs",
         fs_name="OFS",
-        image=FIXTURE_ROOT / "ofs.adf",
-        driver=FIXTURE_ROOT / "FastFileSystem",
+        image=READONLY_DIR / "ofs.adf",
+        driver=DRIVERS_DIR / "FastFileSystem",
         partition=None,
         mode="ro",
         image_kind="adf",
         image_size_mb=1,
         expected_root=("Docs", "OFS_README.txt"),
         lookup_path="/OFS_README.txt",
+        small_read_path="/OFS_README.txt",
+        large_read_path="/Docs/OFS_LARGE.bin",
     ),
     "bffs": Fixture(
         key="bffs",
         fs_name="BFFS",
-        image=FIXTURE_ROOT / "netbsdamiga92.hdf",
-        driver=FIXTURE_ROOT / "BFFSFilesystem",
+        image=DOWNLOADED_DIR / "netbsdamiga92.hdf",
+        driver=DRIVERS_DIR / "BFFSFilesystem",
         partition="netbsd-root",
         mode="ro",
         image_kind="rdb-hdf",
         image_size_mb=4095,
         expected_root=("bin", "etc", "usr", "var", "netbsd"),
         lookup_path="/bin/cat",
+        small_read_path="/.cshrc",
+        large_read_path="/netbsd",
+        download_url=NETBSD_AMIGA_92_URL,
     ),
     "ofs-rw": Fixture(
         key="ofs-rw",
         fs_name="OFS rw",
-        image=FIXTURE_ROOT / "generated" / "ofs_rw.adf",
-        driver=FIXTURE_ROOT / "FastFileSystem",
+        image=GENERATED_DIR / "ofs_rw.adf",
+        driver=DRIVERS_DIR / "FastFileSystem",
         partition=None,
         mode="rw",
         image_kind="adf",
         image_size_mb=1,
-        seed_image=FIXTURE_ROOT / "ofs.adf",
+        seed_image=READONLY_DIR / "ofs.adf",
         default_run=False,
     ),
     "ofs-fmt": Fixture(
         key="ofs-fmt",
         fs_name="OFS fmt",
-        image=FIXTURE_ROOT / "generated" / "ofs_fmt.hdf",
-        driver=FIXTURE_ROOT / "FastFileSystem",
+        image=GENERATED_DIR / "ofs_fmt.hdf",
+        driver=DRIVERS_DIR / "FastFileSystem",
         partition="ODH0",
         mode="fmt",
         image_kind="rdb-hdf",
@@ -303,14 +320,32 @@ FIXTURES: Dict[str, Fixture] = {
     "cdfs": Fixture(
         key="cdfs",
         fs_name="CDFileSystem",
-        image=FIXTURE_ROOT / "AmigaOS3.2CD.iso",
-        driver=FIXTURE_ROOT / "CDFileSystem",
+        image=READONLY_DIR / "AmigaOS3.2CD.iso",
+        driver=DRIVERS_DIR / "CDFileSystem",
         partition=None,
         mode="ro",
         image_kind="iso",
         image_size_mb=74,
         expected_root=("C", "Devs", "Libs", "System"),
         lookup_path="/System",
+        small_read_path="/CDVersion",
+        large_read_path="/ADF/Backdrops3.2.adf",
+    ),
+    "odfs": Fixture(
+        key="odfs",
+        fs_name="ODFileSystem",
+        image=READONLY_DIR / "AmigaOS3.2CD.iso",
+        driver=ODFS_DRIVER,
+        partition=None,
+        mode="ro",
+        image_kind="iso",
+        image_size_mb=74,
+        expected_root=("C", "Devs", "Libs", "System"),
+        lookup_path="/System",
+        small_read_path="/CDVersion",
+        large_read_path="/CDVersion",
+        default_run=False,
+        optional=True,
     ),
 }
 
@@ -728,8 +763,8 @@ def _run_ro_fixture(fixture: Fixture, HandlerBridge, adf_info, iso_info, inspect
             raise RuntimeError(f"stat failed for {lookup_path}")
 
         samples = _find_sample_files(bridge)
-        small_path = samples["small"]
-        large_path = samples["large"]
+        small_path = fixture.small_read_path or samples["small"]
+        large_path = fixture.large_read_path or samples["large"]
 
         small_read_s = 0.0
         small_read_bytes = 0
@@ -1010,6 +1045,37 @@ def _run_fmt_fixture(
 
 def _run_fixture_worker(fixture_key: str):
     fixture = FIXTURES[fixture_key]
+    if fixture.download_url:
+        ensure_downloaded_fixture(
+            fixture.image, fixture.download_url, fixture.fs_name
+        )
+    if fixture.seed_image is not None and fixture.seed_download_url:
+        ensure_downloaded_fixture(
+            fixture.seed_image, fixture.seed_download_url, f"{fixture.fs_name} seed"
+        )
+    missing = []
+    if fixture.mode == "ro":
+        if not fixture.image.exists():
+            missing.append(f"image {fixture.image}")
+    elif fixture.mode == "rw":
+        if fixture.seed_image is None:
+            missing.append(f"seed image missing for {fixture.key}")
+        elif not fixture.seed_image.exists():
+            missing.append(f"seed image {fixture.seed_image}")
+    elif fixture.mode == "fmt" and not fixture.create_args:
+        missing.append(f"create args missing for {fixture.key}")
+    if fixture.driver is not None and not fixture.driver.exists():
+        missing.append(f"driver {fixture.driver}")
+    if missing:
+        if fixture.optional:
+            return {
+                "fixture": fixture.key,
+                "fs_name": fixture.fs_name,
+                "mode": fixture.mode,
+                "status": "skip",
+                "error": ", ".join(missing),
+            }
+        raise RuntimeError(", ".join(missing))
     HandlerBridge, format_volume, detect_adf, detect_iso, open_rdisk = _load_runtime()
     if fixture.mode == "rw":
         _prepare_rw_image(fixture)
@@ -1074,6 +1140,12 @@ def _run_fixture_subprocess(script_path: Path, fixture: Fixture, timeout_s: floa
         result.setdefault("error", f"worker exit code {proc.returncode}")
     if proc.stderr.strip():
         result["stderr"] = proc.stderr.strip()
+        if (
+            result.get("status") == "ok"
+            and "[amifuse] FATAL: Handler crashed" in proc.stderr
+        ):
+            result["status"] = "error"
+            result["error"] = "handler crashed"
     return result
 
 
@@ -1103,6 +1175,18 @@ TIMING_KEYS = (
 def _aggregate_fixture_runs(
     fixture: Fixture, run_results: List[Dict[str, object]]
 ) -> Dict[str, object]:
+    skips = [result for result in run_results if result.get("status") == "skip"]
+    if skips:
+        first = skips[0]
+        return {
+            "fixture": fixture.key,
+            "fs_name": fixture.fs_name,
+            "mode": fixture.mode,
+            "status": "skip",
+            "error": first.get("error", "fixture unavailable"),
+            "runs": len(run_results),
+            "samples": run_results,
+        }
     errors = [result for result in run_results if result.get("status") != "ok"]
     if errors:
         first = errors[0]

@@ -58,12 +58,31 @@ The harness now defaults to `3` runs per fixture and reports:
 
 The initial canonical set is:
 
-- `PFS3`: `pfs.hdf` with `pfs3aio`
-- `SFS`: `sfs.hdf` with `SmartFilesystem`
-- `FFS`: `Default.hdf` with `FastFileSystem`
-- `OFS`: `ofs.adf` with `FastFileSystem`
-- `BFFS`: `netbsdamiga92.hdf` with `BFFSFilesystem`
-- `CDFileSystem`: `AmigaOS3.2CD.iso` with `CDFileSystem`
+- `PFS3`: `fixtures/readonly/pfs.hdf` with `drivers/pfs3aio`
+- `SFS`: `fixtures/readonly/sfs.hdf` with `drivers/SmartFilesystem`
+- `FFS`: `fixtures/readonly/Default.hdf` with
+  `drivers/FastFileSystem`
+- `OFS`: `fixtures/readonly/ofs.adf` with `drivers/FastFileSystem`
+- `BFFS`: `fixtures/downloaded/netbsdamiga92.hdf` with
+  `drivers/BFFSFilesystem`
+- `CDFileSystem`: `fixtures/readonly/AmigaOS3.2CD.iso` with
+  `drivers/CDFileSystem`
+
+If the NetBSD `BFFS` image is missing, the matrix downloads the
+compressed aminet payload and decompresses it before running the `bffs`
+fixture.
+
+The `FFS` canonical image `fixtures/readonly/Default.hdf` also has an
+on-demand compressed source, so the read-only and writable `FFS`
+fixtures no longer require that image to be checked in locally.
+
+There is also a dedicated `ODFileSystem` smoke fixture using:
+
+- `fixtures/readonly/AmigaOS3.2CD.iso`
+- `~/git/xcdfs/build/amiga/ODFileSystem`
+
+It is not part of the default read-only matrix yet, because it is still
+the most experimental ISO handler path.
 
 ## Latest Read-only Run
 

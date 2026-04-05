@@ -16,10 +16,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
+from fixture_paths import DOWNLOADED_DIR, DRIVERS_DIR, FIXTURE_ROOT, READONLY_DIR
+from fixture_paths import PARCEIRO_FULL_URL, ensure_downloaded_fixture
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 AMITOOLS_ROOT = REPO_ROOT / "amitools"
-FIXTURE_ROOT = Path.home() / "AmigaOS" / "AmiFuse"
 
 
 @dataclass(frozen=True)
@@ -33,6 +34,7 @@ class FormatCase:
     expected_scheme: Optional[str]
     expected_root: tuple[str, ...]
     read_path: str
+    download_url: Optional[str] = None
 
 
 @dataclass
@@ -50,7 +52,7 @@ CASES: List[FormatCase] = [
     FormatCase(
         key="direct-rdb-pfs3",
         label="Direct RDB HDF",
-        image=FIXTURE_ROOT / "pfs.hdf",
+        image=READONLY_DIR / "pfs.hdf",
         driver=None,
         partition="PDH0",
         expected_kind="rdb",
@@ -61,8 +63,8 @@ CASES: List[FormatCase] = [
     FormatCase(
         key="adf-ofs",
         label="ADF OFS",
-        image=FIXTURE_ROOT / "ofs.adf",
-        driver=FIXTURE_ROOT / "FastFileSystem",
+        image=READONLY_DIR / "ofs.adf",
+        driver=DRIVERS_DIR / "FastFileSystem",
         partition=None,
         expected_kind="adf",
         expected_scheme=None,
@@ -72,8 +74,8 @@ CASES: List[FormatCase] = [
     FormatCase(
         key="iso-cdfs",
         label="ISO 9660",
-        image=FIXTURE_ROOT / "AmigaOS3.2CD.iso",
-        driver=FIXTURE_ROOT / "CDFileSystem",
+        image=READONLY_DIR / "AmigaOS3.2CD.iso",
+        driver=DRIVERS_DIR / "CDFileSystem",
         partition=None,
         expected_kind="iso",
         expected_scheme=None,
@@ -83,7 +85,7 @@ CASES: List[FormatCase] = [
     FormatCase(
         key="emu68-pfs3",
         label="Emu68 MBR+RDB PFS3",
-        image=FIXTURE_ROOT / "mbr.hdf",
+        image=READONLY_DIR / "mbr.hdf",
         driver=None,
         partition="PDH0",
         expected_kind="rdb",
@@ -94,7 +96,7 @@ CASES: List[FormatCase] = [
     FormatCase(
         key="emu68-ffs",
         label="Emu68 MBR+RDB FFS",
-        image=FIXTURE_ROOT / "emu68k.hdf",
+        image=READONLY_DIR / "emu68k.hdf",
         driver=None,
         partition="UDH0",
         expected_kind="rdb",
@@ -105,13 +107,14 @@ CASES: List[FormatCase] = [
     FormatCase(
         key="parceiro-pfs3",
         label="Parceiro MBR+RDB PFS3",
-        image=FIXTURE_ROOT / "parceiro-full.img",
+        image=DOWNLOADED_DIR / "parceiro-full.img",
         driver=None,
         partition="SD0",
         expected_kind="rdb",
         expected_scheme="parceiro",
         expected_root=("Launcher", "Parceiro", "c"),
         read_path="/Launcher",
+        download_url=PARCEIRO_FULL_URL,
     ),
 ]
 
@@ -258,6 +261,8 @@ def _mount_case(case: FormatCase, fake_fuse, fuse_fs):
 
 def _run_case(case: FormatCase) -> FormatResult:
     try:
+        if case.download_url:
+            ensure_downloaded_fixture(case.image, case.download_url, case.label)
         fake_fuse, fuse_fs, detect_adf, detect_iso, open_rdisk = _load_runtime()
         inspect_info = _inspect_case(case, detect_adf, detect_iso, open_rdisk)
         mount_info = _mount_case(case, fake_fuse, fuse_fs)

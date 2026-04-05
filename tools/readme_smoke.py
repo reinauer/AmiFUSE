@@ -18,9 +18,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional
 
+from fixture_paths import DEFAULT_HDF_URL, DRIVERS_DIR, FIXTURE_ROOT, GENERATED_DIR
+from fixture_paths import READONLY_DIR, ensure_downloaded_fixture
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-FIXTURE_ROOT = Path.home() / "AmigaOS" / "AmiFuse"
 
 
 @dataclass
@@ -169,27 +170,27 @@ def _cli_results() -> List[ExampleResult]:
     results = [
         _cli_example(
             "module_inspect",
-            [sys.executable, "-m", "amifuse", "inspect", str(FIXTURE_ROOT / "pfs.hdf")],
+            [sys.executable, "-m", "amifuse", "inspect", str(READONLY_DIR / "pfs.hdf")],
             lambda proc: "PDH0" if "PDH0" in proc.stdout and "PFS3" in proc.stdout else (_raise("inspect output missing PDH0/PFS3")),
         ),
         _cli_example(
             "module_inspect_full",
-            [sys.executable, "-m", "amifuse", "inspect", "--full", str(FIXTURE_ROOT / "pfs.hdf")],
+            [sys.executable, "-m", "amifuse", "inspect", "--full", str(READONLY_DIR / "pfs.hdf")],
             lambda proc: "full inspect ok" if "blk_longs=" in proc.stdout and "fs_block_size=" in proc.stdout else (_raise("full inspect output missing partition detail lines")),
         ),
         _cli_example(
             "rdb_inspect_summary",
-            [sys.executable, "-m", "amifuse.rdb_inspect", str(FIXTURE_ROOT / "pfs.hdf")],
+            [sys.executable, "-m", "amifuse.rdb_inspect", str(READONLY_DIR / "pfs.hdf")],
             lambda proc: "filesystem summary ok" if "FileSystem #0" in proc.stdout and "PFS3" in proc.stdout else (_raise("rdb-inspect summary missing filesystem info")),
         ),
         _cli_example(
             "rdb_inspect_full",
-            [sys.executable, "-m", "amifuse.rdb_inspect", "--full", str(FIXTURE_ROOT / "pfs.hdf")],
+            [sys.executable, "-m", "amifuse.rdb_inspect", "--full", str(READONLY_DIR / "pfs.hdf")],
             lambda proc: "full rdb inspect ok" if "blk_longs=" in proc.stdout and "fs_block_size=" in proc.stdout else (_raise("rdb-inspect --full missing partition detail lines")),
         ),
         _cli_example(
             "rdb_inspect_json",
-            [sys.executable, "-m", "amifuse.rdb_inspect", "--json", str(FIXTURE_ROOT / "pfs.hdf")],
+            [sys.executable, "-m", "amifuse.rdb_inspect", "--json", str(READONLY_DIR / "pfs.hdf")],
             lambda proc: _expect_rdb_json(proc.stdout),
         ),
         _cli_example(
@@ -202,13 +203,13 @@ def _cli_results() -> List[ExampleResult]:
                 "0",
                 "--out",
                 str(extract_out),
-                str(FIXTURE_ROOT / "pfs.hdf"),
+                str(READONLY_DIR / "pfs.hdf"),
             ],
             lambda proc: _expect_extracted_fs(extract_out),
         ),
         _cli_example(
             "driver_info",
-            [sys.executable, "-m", "amifuse.driver_info", str(FIXTURE_ROOT / "pfs3aio")],
+            [sys.executable, "-m", "amifuse.driver_info", str(DRIVERS_DIR / "pfs3aio")],
             lambda proc: "driver-info ok" if "Segments:" in proc.stdout and "#00 CODE" in proc.stdout else (_raise("driver-info output missing segment summary")),
         ),
     ]
@@ -240,19 +241,23 @@ def _expect_extracted_fs(path: Path) -> str:
 
 
 def _mount_results() -> List[ExampleResult]:
+    ensure_downloaded_fixture(
+        READONLY_DIR / "Default.hdf",
+        DEFAULT_HDF_URL,
+        "Default.hdf",
+    )
     run = _mount_example_runner()
-    home = FIXTURE_ROOT
     tmp = REPO_ROOT / "run" / "readme-smoke"
     tmp.mkdir(parents=True, exist_ok=True)
-    write_image = FIXTURE_ROOT / "generated" / "readme_ofs_write.adf"
+    write_image = GENERATED_DIR / "readme_ofs_write.adf"
     write_image.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(home / "ofs.adf", write_image)
+    shutil.copyfile(READONLY_DIR / "ofs.adf", write_image)
     results = [
         run(
             "mount_embedded_driver",
             "amifuse mount disk.hdf",
             lambda info, module: "embedded driver mount ok" if "Prefs" in info["root_names"] else (_raise("embedded mount root listing missing Prefs")),
-            image=home / "Default.hdf",
+            image=READONLY_DIR / "Default.hdf",
             driver=None,
             mountpoint=tmp / "embedded",
             block_size=None,
@@ -262,8 +267,8 @@ def _mount_results() -> List[ExampleResult]:
             "mount_explicit_driver",
             "amifuse mount pfs.hdf --driver pfs3aio",
             lambda info, module: "explicit driver mount ok" if "Libs" in info["root_names"] else (_raise("explicit driver mount root listing missing Libs")),
-            image=home / "pfs.hdf",
-            driver=home / "pfs3aio",
+            image=READONLY_DIR / "pfs.hdf",
+            driver=DRIVERS_DIR / "pfs3aio",
             mountpoint=tmp / "pfs3",
             block_size=None,
             partition=None,
@@ -273,13 +278,13 @@ def _mount_results() -> List[ExampleResult]:
             "amifuse mount multi-partition.hdf --partition DH0",
             lambda info, module: (
                 "partition-by-name ok"
-                if module.get_partition_name(home / "Default.hdf", None, "QDH1") == "QDH1"
+                if module.get_partition_name(READONLY_DIR / "Default.hdf", None, "QDH1") == "QDH1"
                 and info["volume_name"] == "Work"
                 and "Smartfilesystem" in info["root_names"]
                 else (_raise("partition-by-name example did not resolve QDH1"))
             ),
-            image=home / "Default.hdf",
-            driver=home / "FastFileSystem",
+            image=READONLY_DIR / "Default.hdf",
+            driver=DRIVERS_DIR / "FastFileSystem",
             mountpoint=tmp / "part-name",
             block_size=None,
             partition="QDH1",
@@ -289,13 +294,13 @@ def _mount_results() -> List[ExampleResult]:
             "amifuse mount multi-partition.hdf --partition 2",
             lambda info, module: (
                 "partition-by-index ok"
-                if module.get_partition_name(home / "Default.hdf", None, "1") == "QDH1"
+                if module.get_partition_name(READONLY_DIR / "Default.hdf", None, "1") == "QDH1"
                 and info["volume_name"] == "Work"
                 and "Smartfilesystem" in info["root_names"]
                 else (_raise("partition-by-index example did not resolve index 1"))
             ),
-            image=home / "Default.hdf",
-            driver=home / "FastFileSystem",
+            image=READONLY_DIR / "Default.hdf",
+            driver=DRIVERS_DIR / "FastFileSystem",
             mountpoint=tmp / "part-index",
             block_size=None,
             partition="1",
@@ -308,8 +313,8 @@ def _mount_results() -> List[ExampleResult]:
                 if str(info["mountpoint"]).endswith("linux-mnt")
                 else (_raise("explicit mountpoint example did not use provided mountpoint"))
             ),
-            image=home / "pfs.hdf",
-            driver=home / "pfs3aio",
+            image=READONLY_DIR / "pfs.hdf",
+            driver=DRIVERS_DIR / "pfs3aio",
             mountpoint=tmp / "linux-mnt",
             block_size=None,
             partition=None,
@@ -318,8 +323,8 @@ def _mount_results() -> List[ExampleResult]:
             "mount_adf_explicit_driver",
             "amifuse mount workbench.adf --driver L/FastFileSystem",
             lambda info, module: "adf mount ok" if "OFS_README.txt" in info["root_names"] else (_raise("ADF mount root listing missing OFS_README.txt")),
-            image=home / "ofs.adf",
-            driver=home / "FastFileSystem",
+            image=READONLY_DIR / "ofs.adf",
+            driver=DRIVERS_DIR / "FastFileSystem",
             mountpoint=tmp / "ofs-adf",
             block_size=None,
             partition=None,
@@ -328,7 +333,7 @@ def _mount_results() -> List[ExampleResult]:
             "mount_icons",
             "amifuse mount disk.hdf --icons",
             lambda info, module: _expect_icons_mount(info),
-            image=home / "Default.hdf",
+            image=READONLY_DIR / "Default.hdf",
             driver=None,
             mountpoint=tmp / "icons",
             block_size=None,
@@ -340,7 +345,7 @@ def _mount_results() -> List[ExampleResult]:
             "amifuse mount disk.hdf --write",
             lambda info, module: "write mode ok" if info["kwargs"].get("ro") is False else (_raise("write mode did not disable read-only FUSE option")),
             image=write_image,
-            driver=home / "FastFileSystem",
+            driver=DRIVERS_DIR / "FastFileSystem",
             mountpoint=tmp / "write",
             block_size=None,
             partition=None,

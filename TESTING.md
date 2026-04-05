@@ -14,19 +14,41 @@ Top-level AmiFuse tests use images and drivers from:
 
 `~/AmigaOS/AmiFuse/`
 
-That directory is outside the repo on purpose. New scratch and generated
-images should also live there, usually under:
+That directory is outside the repo on purpose. The fixture tree is now
+split into:
+
+- `~/AmigaOS/AmiFuse/drivers/`
+- `~/AmigaOS/AmiFuse/fixtures/readonly/`
+- `~/AmigaOS/AmiFuse/fixtures/downloaded/`
+- `~/AmigaOS/AmiFuse/generated/`
+- `~/AmigaOS/AmiFuse/bench/`
+- `~/AmigaOS/AmiFuse/tmp/`
+- `~/AmigaOS/AmiFuse/src/`
+
+New scratch and generated images should live under:
 
 `~/AmigaOS/AmiFuse/generated/`
 
 Current canonical fixture set used by the matrix:
 
-- `pfs.hdf` with `pfs3aio`
-- `sfs.hdf` with `SmartFilesystem`
-- `Default.hdf` with `FastFileSystem`
-- `ofs.adf` with `FastFileSystem`
-- `netbsdamiga92.hdf` with `BFFSFilesystem`
-- `AmigaOS3.2CD.iso` with `CDFileSystem`
+- `fixtures/readonly/pfs.hdf` with `drivers/pfs3aio`
+- `fixtures/readonly/sfs.hdf` with `drivers/SmartFilesystem`
+- `fixtures/readonly/Default.hdf` with `drivers/FastFileSystem`
+- `fixtures/readonly/ofs.adf` with `drivers/FastFileSystem`
+- `fixtures/downloaded/netbsdamiga92.hdf` with `drivers/BFFSFilesystem`
+- `fixtures/readonly/AmigaOS3.2CD.iso` with `drivers/CDFileSystem`
+
+The `BFFS` NetBSD fixture is fetched on demand from the compressed
+aminet payload if
+`fixtures/downloaded/netbsdamiga92.hdf` is missing.
+
+`fixtures/readonly/Default.hdf` is also fetched on demand from the
+compressed Google Drive upload if it is missing.
+
+Additional explicit smoke coverage:
+
+- `fixtures/readonly/AmigaOS3.2CD.iso` with
+  `~/git/xcdfs/build/amiga/ODFileSystem`
 
 ## Quick Start
 
@@ -70,6 +92,10 @@ Default fixtures:
 - `bffs`
 - `cdfs`
 
+Dedicated explicit fixture:
+
+- `odfs`
+
 Output modes:
 
 - default: markdown table
@@ -79,6 +105,7 @@ Useful options:
 
 ```sh
 python3 tools/amifuse_matrix.py --fixtures pfs3 sfs
+python3 tools/amifuse_matrix.py --fixtures odfs
 python3 tools/amifuse_matrix.py --runs 1
 python3 tools/amifuse_matrix.py --timeout 120
 python3 tools/amifuse_matrix.py --json
@@ -194,6 +221,9 @@ What it covers:
 
 This does not require a live FUSE mount. It is intended to catch
 documentation drift and bootstrap-path regressions.
+
+The README runner now uses the reorganized fixture layout under
+`drivers/`, `fixtures/readonly/`, and `generated/`.
 
 ## Image Format Smoke
 
