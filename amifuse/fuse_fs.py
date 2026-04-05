@@ -2352,17 +2352,12 @@ def format_volume(
         if debug:
             print(f"[amifuse] FORMAT reply: res1={res1} res2={res2}")
 
-        # Classic DOS filesystems need an uninhibit cycle before the next
-        # mount sees the freshly written root structures reliably. SFS is
-        # different here: re-entering the same formatter bridge after a
-        # successful ACTION_FORMAT can crash its handler task, so leave the
-        # new volume for the next mount instead.
-        if not dt_str.startswith("SFS"):
-            bridge.launcher.send_inhibit(bridge.state, False)
-            bridge._run_until_replies(max_iters=500, cycles=2_000_000)
-
-        # Flush the just-formatted volume before tearing down the handler.
+        # Flush first, then uninhibit the new volume. SFS can fault if we
+        # flush the formatter bridge after reopening the volume.
         bridge.launcher.send_flush(bridge.state)
+        bridge._run_until_replies(max_iters=500, cycles=2_000_000)
+
+        bridge.launcher.send_inhibit(bridge.state, False)
         bridge._run_until_replies(max_iters=500, cycles=2_000_000)
 
         print(f"Format complete. Volume '{volname}' created on partition '{partition}'.")
