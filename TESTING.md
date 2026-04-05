@@ -147,16 +147,25 @@ Run:
 
 ```sh
 python3 tools/amifuse_matrix.py --fixtures pfs3-4g --runs 1 --json
+python3 tools/amifuse_matrix.py --fixtures pfs3-part-4g --runs 1 --json
 ```
 
 What it covers:
 
 - sparse image larger than `4GiB`
 - partition starting beyond the `4GiB` boundary
+- partition whose filesystem itself spans more than `4GiB`
 - format, write, remount, read-back, cleanup
 
 This is not part of the default matrix because it is slower and creates
 an ephemeral multi-gigabyte image.
+
+Current limitation:
+
+- the large-partition case verifies format and normal file I/O on a
+  `>4GiB` partition
+- it does not yet verify file offsets beyond `4GiB` through DOS handle
+  APIs, because the current seek/setsize packet path is still `32-bit`
 
 ## README / Web Example Smoke
 
@@ -307,7 +316,7 @@ In practice:
 The following are still planned, not fully documented as standalone test
 entry points yet:
 
-- dedicated image-format coverage for `MBR+RDB` variants
-- a test where the filesystem itself spans a partition larger than `4GiB`
+- far-end file I/O coverage inside a filesystem that spans a partition
+  larger than `4GiB`
 - fuller long-run generated benchmark recipes
 - fixture-layout cleanup for `~/AmigaOS/AmiFuse/`

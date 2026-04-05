@@ -43,6 +43,7 @@ class Fixture:
     format_volname: Optional[str] = None
     cleanup_image: bool = False
     min_partition_start_byte: Optional[int] = None
+    min_partition_size_byte: Optional[int] = None
 
 
 FIXTURES: Dict[str, Fixture] = {
@@ -120,6 +121,32 @@ FIXTURES: Dict[str, Fixture] = {
         format_volname="Large4G",
         cleanup_image=True,
         min_partition_start_byte=4 * 1024 * 1024 * 1024,
+    ),
+    "pfs3-part-4g": Fixture(
+        key="pfs3-part-4g",
+        fs_name="PFS3 partition >4G",
+        image=FIXTURE_ROOT / "generated" / "pfs3_part_4g.hdf",
+        driver=FIXTURE_ROOT / "pfs3aio",
+        partition="XDH0",
+        mode="fmt",
+        image_kind="rdb-hdf",
+        image_size_mb=6144,
+        default_run=False,
+        create_args=(
+            "create",
+            "chs=12483,16,63",
+            "+",
+            "init",
+            "rdb_cyls=2",
+            "+",
+            "add",
+            "size=8500",
+            "name=XDH0",
+            "fs=PFS3",
+        ),
+        format_volname="Span4G",
+        cleanup_image=True,
+        min_partition_size_byte=4 * 1024 * 1024 * 1024,
     ),
     "sfs": Fixture(
         key="sfs",
@@ -378,6 +405,10 @@ def _inspect_fixture(fixture: Fixture, detect_adf, detect_iso, open_rdisk):
                     "dos_type": f"0x{part.part_blk.dos_env.dos_type:08x}",
                     "start_block": start_block,
                     "start_byte": start_block * blkdev.block_bytes,
+                    "size_blocks": (dos_env.high_cyl - dos_env.low_cyl + 1) * cyl_blocks,
+                    "size_byte": (dos_env.high_cyl - dos_env.low_cyl + 1)
+                    * cyl_blocks
+                    * blkdev.block_bytes,
                 }
             )
             if part_name == fixture.partition:
@@ -862,6 +893,22 @@ def _run_fmt_fixture(
                 raise RuntimeError(
                     f"partition {fixture.partition} starts at {start_byte}, "
                     f"expected >= {fixture.min_partition_start_byte}"
+                )
+        if fixture.min_partition_size_byte is not None:
+            parts = inspect_meta2.get("partitions", [])
+            part_info = next(
+                (part for part in parts if part.get("name") == fixture.partition),
+                None,
+            )
+            if part_info is None:
+                raise RuntimeError(
+                    f"missing inspect partition data for {fixture.partition!r}"
+                )
+            size_byte = int(part_info.get("size_byte", 0))
+            if size_byte < fixture.min_partition_size_byte:
+                raise RuntimeError(
+                    f"partition {fixture.partition} size is {size_byte}, "
+                    f"expected >= {fixture.min_partition_size_byte}"
                 )
         format_s, _ = _timed(
             format_volume,
