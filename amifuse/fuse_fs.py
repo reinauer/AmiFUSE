@@ -2196,10 +2196,28 @@ class AmigaFuseFS(Operations):
         return 0
 
     def destroy(self, path):
-        """Called when filesystem is unmounted. Flush handler buffers."""
+        """Called when filesystem is unmounted. Flush and release all resources."""
         print("[amifuse] Unmounting - flushing volume...", flush=True)
-        if self.bridge._write_enabled:
-            self.bridge.flush_volume()
+        try:
+            if self.bridge._write_enabled:
+                self.bridge.flush_volume()
+        except Exception as e:
+            print(f"[amifuse] WARNING: flush failed: {e}", flush=True)
+        # Shut down the m68k runtime (frees machine, memory maps, temp files)
+        try:
+            shutdown = getattr(getattr(self.bridge, "vh", None), "shutdown", None)
+            if shutdown is not None:
+                shutdown()
+        except Exception as e:
+            print(f"[amifuse] WARNING: runtime shutdown failed: {e}", flush=True)
+        # Close the block device backend (releases file handle / image lock)
+        try:
+            backend = getattr(self.bridge, "backend", None)
+            if backend is not None:
+                backend.sync()
+                backend.close()
+        except Exception as e:
+            print(f"[amifuse] WARNING: backend close failed: {e}", flush=True)
         print("[amifuse] Unmount complete.", flush=True)
 
 
