@@ -408,7 +408,11 @@ class HandlerLauncher:
         proc.w_s("pr_Task.tc_SPLower", stack.get_lower())
         proc.w_s("pr_Task.tc_SPUpper", stack.get_upper())
         proc.w_s("pr_StackSize", stack.get_size())
-        proc.w_s("pr_StackBase", stack.get_lower())
+        # pr_StackBase should be the upper bound (top) of the stack allocation.
+        # The 68k stack grows downward, so the "base" for StackSwap/Exit is the
+        # highest address.  Note: amitools' DosLibrary.py uses get_lower() but
+        # that is inconsistent with how handlers (SFS, PFS3) interpret the field.
+        proc.w_s("pr_StackBase", stack.get_upper())
         proc.w_s("pr_GlobVec", 0xFFFFFFFF)
         # NOTE: Do NOT set pr_CLI - SFS checks this to distinguish handler vs CLI
         # invocation, and rejects startup if pr_CLI is set.

@@ -207,15 +207,28 @@ class BootstrapAllocator:
         }
 
     def alloc_msgport(self):
-        """Allocate and minimally init a MsgPort."""
+        """Allocate and minimally init a MsgPort.
+
+        Initializes mp_MsgList as a proper empty Exec list with correct
+        sentinel pointers (lh_Head -> &lh_Tail, lh_Tail = 0,
+        lh_TailPred -> &lh_Head). This matches the logic/semantics of
+        HandlerLauncher._init_msgport() (proper sentinel pointers) but
+        uses inline offset computation rather than the cached offsets
+        that _init_msgport() uses.
+        """
         mp_mem = self.alloc.alloc_memory(MsgPortStruct.get_size(), label="MsgPort")
         mp = AccessStruct(self.mem, MsgPortStruct, mp_mem.addr)
         mp.w_s("mp_Node.type", NodeType.NT_MSGPORT)
-        # Init message list to empty
-        lst = AccessStruct(self.mem, ListStruct, mp_mem.addr + MsgPortStruct.sdef.find_field_def_by_name("mp_MsgList").offset)
-        lst.w_s("lh_Head", 0)
-        lst.w_s("lh_Tail", 0)
-        lst.w_s("lh_TailPred", 0)
+        # Init message list as a proper empty Exec list
+        list_offset = MsgPortStruct.sdef.find_field_def_by_name("mp_MsgList").offset
+        list_addr = mp_mem.addr + list_offset
+        lst = AccessStruct(self.mem, ListStruct, list_addr)
+        lh_head_addr = list_addr + ListStruct.sdef.find_field_def_by_name("lh_Head").offset
+        lh_tail_addr = list_addr + ListStruct.sdef.find_field_def_by_name("lh_Tail").offset
+        # Empty list: Head points to Tail address, TailPred points to Head address
+        lst.w_s("lh_Head", lh_tail_addr)     # Points to end marker
+        lst.w_s("lh_Tail", 0)                # End marker is 0
+        lst.w_s("lh_TailPred", lh_head_addr) # Points back to start
         lst.w_s("lh_Type", NodeType.NT_MESSAGE)
         mp.w_s("mp_Flags", 0)
         mp.w_s("mp_SigBit", 0)
