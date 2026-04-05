@@ -217,8 +217,26 @@ class HandlerLauncher:
         self._stdpkt_sizes = []
         self._stdpkt_index = 0
         self._stdpkt_ring_size = 8
+        # Cache hot struct sizes/offsets for packet marshalling.
+        self._msg_size = MessageStruct.get_size()
+        self._pkt_size = DosPacketStruct.get_size()
+        self._msg_ln_succ_offset = NodeStruct.sdef.find_field_def_by_name("ln_Succ").offset
+        self._msg_ln_pred_offset = NodeStruct.sdef.find_field_def_by_name("ln_Pred").offset
+        self._msg_ln_type_offset = NodeStruct.sdef.find_field_def_by_name("ln_Type").offset
+        self._msg_ln_name_offset = NodeStruct.sdef.find_field_def_by_name("ln_Name").offset
+        self._mn_replyport_offset = MessageStruct.sdef.find_field_def_by_name("mn_ReplyPort").offset
+        self._mn_length_offset = MessageStruct.sdef.find_field_def_by_name("mn_Length").offset
+        self._dp_link_offset = DosPacketStruct.sdef.find_field_def_by_name("dp_Link").offset
+        self._dp_port_offset = DosPacketStruct.sdef.find_field_def_by_name("dp_Port").offset
+        self._dp_type_offset = DosPacketStruct.sdef.find_field_def_by_name("dp_Type").offset
+        self._dp_arg1_offset = DosPacketStruct.sdef.find_field_def_by_name("dp_Arg1").offset
+        self._lh_head_offset = ListStruct.sdef.find_field_def_by_name("lh_Head").offset
+        self._lh_tail_offset = ListStruct.sdef.find_field_def_by_name("lh_Tail").offset
+        self._lh_tailpred_offset = ListStruct.sdef.find_field_def_by_name("lh_TailPred").offset
+        self._lh_type_offset = ListStruct.sdef.find_field_def_by_name("lh_Type").offset
         # Cache mp_SigBit offset for signal computation
         self._mp_sigbit_offset = MsgPortStruct.sdef.find_field_def_by_name("mp_SigBit").offset
+        self._mp_msglist_offset = MsgPortStruct.sdef.find_field_def_by_name("mp_MsgList").offset
         # Local signal allocation tracking (bits 0-31, lower 16 reserved by system)
         self._signals_allocated = 0x0000FFFF  # Reserve first 16 signals
 
@@ -316,12 +334,11 @@ class HandlerLauncher:
         mp.w_s("mp_SigTask", task_addr)
         # Initialize mp_MsgList as a proper empty Amiga list
         # An empty list has: lh_Head -> &lh_Tail, lh_Tail = 0, lh_TailPred -> &lh_Head
-        lst_off = MsgPortStruct.sdef.find_field_def_by_name("mp_MsgList").offset
-        list_addr = port_addr + lst_off
+        list_addr = port_addr + self._mp_msglist_offset
         lst = AccessStruct(self.mem, ListStruct, list_addr)
         # Get addresses of list header fields
-        lh_head_addr = list_addr + ListStruct.sdef.find_field_def_by_name("lh_Head").offset
-        lh_tail_addr = list_addr + ListStruct.sdef.find_field_def_by_name("lh_Tail").offset
+        lh_head_addr = list_addr + self._lh_head_offset
+        lh_tail_addr = list_addr + self._lh_tail_offset
         # Empty list: Head points to Tail address, TailPred points to Head address
         lst.w_s("lh_Head", lh_tail_addr)  # Points to end marker
         lst.w_s("lh_Tail", 0)             # End marker is 0
@@ -403,7 +420,7 @@ class HandlerLauncher:
         self, dest_port_addr: int, reply_port_addr: int, pkt_type: int, args
     ) -> Tuple[int, int]:
         """Allocate contiguous StandardPacket = Message + DosPacket."""
-        total = MessageStruct.get_size() + DosPacketStruct.get_size()
+        total = self._msg_size + self._pkt_size
         if not self._stdpkt_ring:
             self._stdpkt_ring = [None] * self._stdpkt_ring_size
             self._stdpkt_sizes = [0] * self._stdpkt_ring_size
@@ -416,22 +433,22 @@ class HandlerLauncher:
             self._stdpkt_sizes[idx] = total
         sp_addr = sp_mem.addr
         self.mem.w_block(sp_addr, b"\x00" * total)
-        msg = AccessStruct(self.mem, MessageStruct, sp_addr)
-        pkt = AccessStruct(self.mem, DosPacketStruct, sp_addr + MessageStruct.get_size())
+        pkt_addr = sp_addr + self._msg_size
         # message
-        msg.w_s("mn_Node.ln_Type", NodeType.NT_MESSAGE)
-        msg.w_s("mn_Node.ln_Succ", 0)
-        msg.w_s("mn_Node.ln_Pred", 0)
-        msg.w_s("mn_ReplyPort", reply_port_addr)
-        msg.w_s("mn_Length", total)
+        self.mem.w8(sp_addr + self._msg_ln_type_offset, NodeType.NT_MESSAGE)
+        self.mem.w32(sp_addr + self._msg_ln_succ_offset, 0)
+        self.mem.w32(sp_addr + self._msg_ln_pred_offset, 0)
+        self.mem.w32(sp_addr + self._mn_replyport_offset, reply_port_addr & 0xFFFFFFFF)
+        self.mem.w16(sp_addr + self._mn_length_offset, total)
+        self.mem.w32(sp_addr + self._msg_ln_name_offset, pkt_addr & 0xFFFFFFFF)
         # packet
-        pkt.w_s("dp_Link", sp_addr)  # BPTR to message in StandardPacket
-        pkt.w_s("dp_Port", reply_port_addr)
-        pkt.w_s("dp_Type", pkt_type)
-        for i, val in enumerate(args[:7], start=1):
-            pkt.w_s(f"dp_Arg{i}", val)
-        # link message name to packet
-        msg.w_s("mn_Node.ln_Name", sp_addr + MessageStruct.get_size())
+        self.mem.w32(pkt_addr + self._dp_link_offset, sp_addr & 0xFFFFFFFF)
+        self.mem.w32(pkt_addr + self._dp_port_offset, reply_port_addr & 0xFFFFFFFF)
+        self.mem.w32(pkt_addr + self._dp_type_offset, pkt_type & 0xFFFFFFFF)
+        arg_addr = pkt_addr + self._dp_arg1_offset
+        for val in args[:7]:
+            self.mem.w32(arg_addr, val & 0xFFFFFFFF)
+            arg_addr += 4
         # queue message to destination port - both Python queue and Amiga memory
         self.exec_impl.port_mgr.put_msg(dest_port_addr, sp_addr)
         # Also link the message into the port's mp_MsgList in memory
@@ -448,7 +465,7 @@ class HandlerLauncher:
                 SignalFunc._fallback_signals |= 1 << sigbit
         except Exception:
             pass
-        return sp_addr + MessageStruct.get_size(), sp_addr
+        return pkt_addr, sp_addr
 
     def _link_msg_to_port(self, port_addr: int, msg_addr: int):
         """Link a message into a port's mp_MsgList in Amiga memory.
@@ -461,29 +478,19 @@ class HandlerLauncher:
         memory list. By always reinitializing, we avoid list corruption from
         stale entries.
         """
-        from amitools.vamos.libstructs.exec_ import MsgPortStruct, ListStruct, NodeStruct
-        from amitools.vamos.astructs.access import AccessStruct
-
-        # Get mp_MsgList offset in MsgPort
-        msglist_off = MsgPortStruct.sdef.find_field_def_by_name("mp_MsgList").offset
-        list_addr = port_addr + msglist_off
-
-        lst = AccessStruct(self.mem, ListStruct, list_addr)
-
-        # Get node addresses in list structure
-        lh_head_addr = list_addr + ListStruct.sdef.find_field_def_by_name("lh_Head").offset
-        lh_tail_addr = list_addr + ListStruct.sdef.find_field_def_by_name("lh_Tail").offset
-
-        # Access the message node (mn_Node is at offset 0 of Message)
-        msg_node = AccessStruct(self.mem, NodeStruct, msg_addr)
+        list_addr = port_addr + self._mp_msglist_offset
+        lh_head_addr = list_addr + self._lh_head_offset
+        lh_tail_addr = list_addr + self._lh_tail_offset
 
         # Always reinitialize as single-element list to avoid stale entry issues
         # lh_Head points to first node, lh_Tail is 0 (end marker), lh_TailPred points to last node
-        lst.w_s("lh_Head", msg_addr)
-        lst.w_s("lh_TailPred", msg_addr)
+        self.mem.w32(list_addr + self._lh_head_offset, msg_addr & 0xFFFFFFFF)
+        self.mem.w32(list_addr + self._lh_tail_offset, 0)
+        self.mem.w32(list_addr + self._lh_tailpred_offset, msg_addr & 0xFFFFFFFF)
+        self.mem.w8(list_addr + self._lh_type_offset, NodeType.NT_MESSAGE)
         # Message node: ln_Succ points to lh_Tail (end of list), ln_Pred points to lh_Head
-        msg_node.w_s("ln_Succ", lh_tail_addr)
-        msg_node.w_s("ln_Pred", lh_head_addr)
+        self.mem.w32(msg_addr + self._msg_ln_succ_offset, lh_tail_addr & 0xFFFFFFFF)
+        self.mem.w32(msg_addr + self._msg_ln_pred_offset, lh_head_addr & 0xFFFFFFFF)
 
     # ---- public orchestration ----
 
