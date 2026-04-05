@@ -250,6 +250,7 @@ class HandlerLauncher:
         from amitools.vamos.libstructs.exec_ import ExecLibraryStruct, TaskStruct
 
         pending = 0
+        this_task = 0
 
         # First, include any signals already set in tc_SigRecvd (e.g., IO completion)
         try:
@@ -268,6 +269,18 @@ class HandlerLauncher:
         for port_addr, port in port_mgr.ports.items():
             try:
                 if port.queue is not None and len(port.queue) > 0:
+                    flags = self.mem.r8(
+                        port_addr
+                        + MsgPortStruct.sdef.find_field_def_by_name("mp_Flags").offset
+                    )
+                    if flags != MsgPortFlags.PA_SIGNAL:
+                        continue
+                    sig_task = self.mem.r32(
+                        port_addr
+                        + MsgPortStruct.sdef.find_field_def_by_name("mp_SigTask").offset
+                    )
+                    if this_task != 0 and sig_task != this_task:
+                        continue
                     sigbit = self.mem.read(0, port_addr + self._mp_sigbit_offset)
                     if 0 <= sigbit < 32:
                         pending |= 1 << sigbit
@@ -318,12 +331,18 @@ class HandlerLauncher:
         self.mem.w_block(mem_obj.addr, data)
         return mem_obj.addr
 
-    def _init_msgport(self, port_addr: int, task_addr: int, sigbit: int = None):
+    def _init_msgport(
+        self,
+        port_addr: int,
+        task_addr: int,
+        sigbit: int = None,
+        flags: int = MsgPortFlags.PA_SIGNAL,
+    ):
         mp = AccessStruct(self.mem, MsgPortStruct, port_addr)
         # zero first to clear garbage
         self.mem.w_block(port_addr, b"\x00" * MsgPortStruct.get_size())
         mp.w_s("mp_Node.ln_Type", NodeType.NT_MSGPORT)
-        mp.w_s("mp_Flags", MsgPortFlags.PA_SIGNAL)
+        mp.w_s("mp_Flags", flags)
         if sigbit is None:
             sigbit = self._alloc_signal_bit()
         else:
@@ -346,9 +365,15 @@ class HandlerLauncher:
         lst.w_s("lh_Type", NodeType.NT_MESSAGE)
         return sigbit
 
-    def _create_port(self, name: str, task_addr: int) -> int:
+    def _create_port(
+        self,
+        name: str,
+        task_addr: int,
+        sigbit: int = None,
+        flags: int = MsgPortFlags.PA_SIGNAL,
+    ) -> int:
         port_mem = self.alloc.alloc_memory(MsgPortStruct.get_size(), label=name)
-        self._init_msgport(port_mem.addr, task_addr)
+        self._init_msgport(port_mem.addr, task_addr, sigbit=sigbit, flags=flags)
         if not self.exec_impl.port_mgr.has_port(port_mem.addr):
             self.exec_impl.port_mgr.register_port(port_mem.addr)
         return port_mem.addr
@@ -496,7 +521,14 @@ class HandlerLauncher:
 
     def launch_with_startup(self, extra_packets=None, debug=False) -> HandlerLaunchState:
         proc_addr, port_addr, stack = self._create_process(name="amifuse_handler")
-        reply_port = self._create_port("caller_port", proc_addr)
+        # The caller reply port is consumed by host-side polling, not by the
+        # Amiga handler task. Keep it out of the handler's signal namespace.
+        reply_port = self._create_port(
+            "caller_port",
+            0,
+            sigbit=0xFF,
+            flags=MsgPortFlags.PA_IGNORE,
+        )
         # fill DeviceNode dn_Task now that we have a port
         dn = AccessStruct(self.mem, DeviceNodeStruct, self.boot["dn_addr"])
         dn.w_s("dn_Task", port_addr)

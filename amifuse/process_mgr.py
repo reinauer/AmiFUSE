@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from amitools.vamos.astructs import AccessStruct
-from amitools.vamos.libstructs import ProcessStruct
+from amitools.vamos.libstructs import ProcessStruct, MsgPortFlags
 from amitools.vamos.machine.regs import REG_D0, REG_A6
 from amitools.vamos.libstructs.dos import MessageStruct
 
@@ -118,6 +118,7 @@ class ProcessManager:
         )
 
         pending = 0
+        this_task = 0
         try:
             exec_base = self.mem.r32(4)
             if exec_base != 0:
@@ -136,6 +137,20 @@ class ProcessManager:
         for port_addr, port in self.exec_impl.port_mgr.ports.items():
             try:
                 if port.queue is not None and len(port.queue) > 0:
+                    flags = self.mem.r8(
+                        port_addr
+                        + MsgPortStruct.sdef.find_field_def_by_name("mp_Flags").offset
+                    )
+                    if flags != MsgPortFlags.PA_SIGNAL:
+                        continue
+                    sig_task = self.mem.r32(
+                        port_addr
+                        + MsgPortStruct.sdef.find_field_def_by_name(
+                            "mp_SigTask"
+                        ).offset
+                    )
+                    if this_task != 0 and sig_task != this_task:
+                        continue
                     sigbit = self.mem.r8(
                         port_addr
                         + MsgPortStruct.sdef.find_field_def_by_name("mp_SigBit").offset
