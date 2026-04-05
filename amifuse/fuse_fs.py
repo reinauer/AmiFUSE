@@ -2302,6 +2302,7 @@ def mount_fuse(
     write: bool = False,
     partition: Optional[str] = None,
     icons: bool = False,
+    foreground: Optional[bool] = None,
 ):
     _require_fuse()
     import amitools.fs.DosType as DosType
@@ -2392,6 +2393,14 @@ def mount_fuse(
         if not plat.should_auto_create_mountpoint(mountpoint):
             mountpoint.mkdir(parents=True)
 
+    if foreground is None:
+        foreground = plat.mount_runs_in_foreground_by_default()
+    if not foreground and not plat.get_unmount_command(mountpoint):
+        raise SystemExit(
+            "Daemon mode is not supported on this platform yet because there is "
+            "no standalone unmount command. Use --interactive instead."
+        )
+
     # Print startup banner
     print(__banner__)
     if adf_info is not None:
@@ -2403,6 +2412,10 @@ def mount_fuse(
         print(f"Mounting partition '{part_name}' from {image}")
     print(f"Filesystem driver: {driver_desc}")
     print(f"Mount point: {mountpoint}")
+    if foreground:
+        print("[amifuse] interactive mode; press Ctrl+C to unmount")
+    else:
+        print(f"[amifuse] daemon mode; unmount with: amifuse unmount {mountpoint}")
 
     if write:
         # Guard against accidental writes without explicit intent.
@@ -2410,16 +2423,6 @@ def mount_fuse(
 
     if icons:
         print("[amifuse] icon mode enabled; Amiga icons will appear as macOS custom icons")
-
-    def _unmount_mountpoint():
-        if not mountpoint.exists() or not os.path.ismount(mountpoint):
-            return
-        cmd = plat.get_unmount_command(mountpoint)
-        if not cmd:
-            # No unmount command available (e.g. Windows foreground mounts).
-            # The process exit will trigger WinFSP cleanup automatically.
-            return
-        subprocess.run(cmd, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     bridge = HandlerBridge(
         image,
@@ -2446,7 +2449,7 @@ def mount_fuse(
     # Multi-threaded mode with caching to minimize macOS polling.
     use_threads = not write
     fuse_kwargs = {
-        "foreground": True,
+        "foreground": foreground,
         "ro": not write,
         "allow_other": False,
         "nothreads": not use_threads,
@@ -2687,6 +2690,12 @@ def cmd_inspect(args):
 
 def cmd_mount(args):
     """Handle the 'mount' subcommand."""
+    foreground = args.foreground
+    if args.profile and foreground is None:
+        foreground = True
+    if args.profile and not foreground:
+        raise SystemExit("--profile requires --interactive/--foreground.")
+
     if args.profile:
         profiler = cProfile.Profile()
         profiler.enable()
@@ -2695,7 +2704,8 @@ def cmd_mount(args):
         args.image, args.driver, args.mountpoint,
         args.block_size, args.volname, args.debug, args.trace, args.write,
         partition=args.partition,
-        icons=args.icons
+        icons=args.icons,
+        foreground=foreground,
     )
 
     if args.profile:
@@ -2716,6 +2726,28 @@ def cmd_format(args):
     )
 
 
+def cmd_unmount(args):
+    """Handle the 'unmount' subcommand."""
+    from . import platform as plat
+
+    mountpoint = args.mountpoint
+    if not os.path.ismount(mountpoint):
+        raise SystemExit(f"Mountpoint {mountpoint} is not currently mounted.")
+
+    cmd = plat.get_unmount_command(mountpoint)
+    if not cmd:
+        raise SystemExit(
+            "This platform does not provide a standalone unmount command yet. "
+            "Stop the amifuse process that owns the mount instead."
+        )
+
+    result = subprocess.run(cmd, check=False)
+    if result.returncode != 0:
+        raise SystemExit(
+            f"Unmount failed with exit code {result.returncode}: {' '.join(cmd)}"
+        )
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         prog="amifuse",
@@ -2734,11 +2766,15 @@ commands:
     --partition NAME          Partition name (e.g. DH0) or index (defaults to first).
     --block-size N            Override block size (defaults to auto/512).
     --volname NAME            Override volume name (defaults to partition name).
+    --daemon                  Detach after mounting (default on macOS/Linux).
+    --interactive             Stay attached; Ctrl+C unmounts the filesystem.
     --write                   Enable read-write mode (experimental).
     --icons                   Convert Amiga .info icons to native macOS icons (experimental).
     --debug                   Enable debug logging of FUSE operations.
     --trace                   Enable vamos instruction tracing (very noisy).
     --profile                 Enable profiling and write stats to profile.txt.
+
+  unmount <mountpoint>      Unmount an existing AmiFUSE mount.
 
   format <image> <partition> [volname]
                               Format an Amiga partition.
@@ -2783,6 +2819,22 @@ commands:
     mount_parser.add_argument(
         "--volname", type=str, help="Override volume name displayed by the OS (defaults to partition name)."
     )
+    run_mode = mount_parser.add_mutually_exclusive_group()
+    run_mode.add_argument(
+        "--daemon",
+        dest="foreground",
+        action="store_const",
+        const=False,
+        help="Detach after mounting (default on macOS/Linux).",
+    )
+    run_mode.add_argument(
+        "--interactive",
+        "--foreground",
+        dest="foreground",
+        action="store_const",
+        const=True,
+        help="Stay attached to the terminal; press Ctrl+C to unmount.",
+    )
     mount_parser.add_argument(
         "--debug", action="store_true", help="Enable debug logging of FUSE operations."
     )
@@ -2801,7 +2853,14 @@ commands:
         "--icons", action="store_true",
         help="Convert Amiga .info icons to native macOS icons (experimental)."
     )
-    mount_parser.set_defaults(func=cmd_mount)
+    mount_parser.set_defaults(func=cmd_mount, foreground=None)
+
+    # unmount subcommand
+    unmount_parser = subparsers.add_parser(
+        "unmount", help="Unmount an existing AmiFUSE mount."
+    )
+    unmount_parser.add_argument("mountpoint", type=Path, help="Mounted filesystem path")
+    unmount_parser.set_defaults(func=cmd_unmount)
 
     # format subcommand
     format_parser = subparsers.add_parser(

@@ -35,6 +35,44 @@ def fuse_mock(monkeypatch):
     fake_fuse.Operations = type("Operations", (), {})
     monkeypatch.setitem(sys.modules, "fuse", fake_fuse)
 
+    def _stub_module(name, **attrs):
+        mod = types.ModuleType(name)
+        for key, value in attrs.items():
+            setattr(mod, key, value)
+        monkeypatch.setitem(sys.modules, name, mod)
+        return mod
+
+    dummy_cls = type("Dummy", (), {})
+
+    _stub_module("amifuse.driver_runtime", BlockDeviceBackend=dummy_cls)
+    _stub_module("amifuse.vamos_runner", VamosHandlerRuntime=dummy_cls)
+    _stub_module("amifuse.bootstrap", BootstrapAllocator=dummy_cls)
+    _stub_module("amifuse.process_mgr", ProcessManager=dummy_cls)
+    _stub_module(
+        "amifuse.startup_runner",
+        HandlerLauncher=dummy_cls,
+        OFFSET_BEGINNING=0,
+        _get_block_state=lambda *args, **kwargs: None,
+        _clear_all_block_state=lambda *args, **kwargs: None,
+        _snapshot_block_state=lambda *args, **kwargs: None,
+        _restore_block_state=lambda *args, **kwargs: None,
+    )
+
+    _stub_module("amitools", vamos=types.SimpleNamespace())
+    _stub_module("amitools.vamos")
+    _stub_module("amitools.vamos.astructs")
+    _stub_module("amitools.vamos.astructs.access", AccessStruct=dummy_cls)
+    _stub_module("amitools.vamos.libstructs")
+    _stub_module(
+        "amitools.vamos.libstructs.dos",
+        FileInfoBlockStruct=dummy_cls,
+        FileHandleStruct=dummy_cls,
+        DosPacketStruct=dummy_cls,
+    )
+    _stub_module("amitools.vamos.lib")
+    _stub_module("amitools.vamos.lib.dos")
+    _stub_module("amitools.vamos.lib.dos.DosProtection", DosProtection=dummy_cls)
+
 
 @pytest.fixture
 def amitools_mock(monkeypatch):

@@ -93,6 +93,9 @@ amifuse mount pfs.hdf
 # Linux: requires explicit mountpoint
 mkdir -p ./mnt
 amifuse mount pfs.hdf --mountpoint ./mnt
+
+# Keep the process attached to the terminal if you want Ctrl+C to unmount
+amifuse mount pfs.hdf --interactive
 ```
 
 To compare this checkout against `../amifuse-0.2` using the bundled `pfs.hdf`
@@ -148,6 +151,8 @@ amifuse mount /path/to/disk.hdf
 | `--partition` | No | Partition name (e.g., `DH0`) or index (default: first partition) |
 | `--block-size` | No | Override block size (default: auto-detect or 512) |
 | `--volname` | No | Override the volume name shown in Finder |
+| `--daemon` | No | Detach after mounting (default on macOS/Linux) |
+| `--interactive` / `--foreground` | No | Stay attached to the terminal; Ctrl+C unmounts |
 | `--debug` | No | Enable debug logging of FUSE operations |
 | `--profile` | No | Enable cProfile profiling and write stats to `profile.txt` on exit |
 | `--write` | No | Enable read-write mode (experimental, use with caution) |
@@ -178,13 +183,16 @@ amifuse mount workbench.adf --driver L/FastFileSystem
 # Enable native icons (macOS only, converts Amiga .info files)
 amifuse mount disk.hdf --icons
 
+# Keep the mount in the foreground for debugging
+amifuse mount disk.hdf --interactive
+
 # Browse the filesystem
 ls /Volumes/PDH0   # macOS
 ls ./mnt           # Linux
 
-# Unmount when done (Ctrl+C in the terminal, or:)
-umount /Volumes/PDH0   # macOS
-umount ./mnt           # Linux
+# Unmount when done
+amifuse unmount /Volumes/PDH0   # macOS
+amifuse unmount ./mnt           # Linux
 ```
 
 ## Additional Tools
@@ -265,6 +273,6 @@ The `--icons` flag enables conversion of Amiga `.info` icon files to native Find
 ## Notes
 
 - The filesystem is mounted **read-only** by default; use `--write` for experimental read-write support
-- The mount runs in the foreground; press Ctrl+C to unmount
+- Mounts default to daemon mode on macOS/Linux; use `--interactive` if you want Ctrl+C to unmount from the same terminal
 - macOS Finder/Spotlight indexing is automatically disabled to improve performance
 - First directory traversal may be slow as the handler processes each path; subsequent accesses are cached

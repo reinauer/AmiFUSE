@@ -92,6 +92,13 @@ def get_unmount_command(mountpoint: Path) -> List[str]:
     return ["umount", "-f", str(mountpoint)]
 
 
+def mount_runs_in_foreground_by_default() -> bool:
+    """Return the safest default mount mode for the current platform."""
+    # WinFSP foreground mounts do not expose a standalone unmount command.
+    # Keep the process attached by default until we have PID tracking there.
+    return sys.platform.startswith("win")
+
+
 def check_fuse_available() -> None:
     """Verify that the platform's FUSE driver is installed.
 
@@ -157,11 +164,10 @@ def validate_mountpoint(mountpoint: Path) -> Optional[str]:
                 f"or free it first."
             )
     elif os.path.exists(mp_str) and os.path.ismount(mp_str):
-        hint_cmd = " ".join(get_unmount_command(mountpoint))
-        if hint_cmd:
+        if get_unmount_command(mountpoint):
             return (
                 f"Mountpoint {mountpoint} is already a mount; unmount it first "
-                f"(e.g. {hint_cmd})."
+                f"(e.g. amifuse unmount {mountpoint})."
             )
         else:
             return (
