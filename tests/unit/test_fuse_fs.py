@@ -272,3 +272,67 @@ class TestPlatformSpecialFiles:
         """Filtering is based on filename, not full path."""
         monkeypatch.setattr("sys.platform", "win32")
         assert fs_instance._is_platform_special("/some/deep/path/desktop.ini") is True
+
+
+@pytest.fixture
+def fs_with_mock_bridge(fuse_mock):
+    """Create an AmigaFuseFS with a mock bridge for destroy() testing."""
+    from amifuse.fuse_fs import AmigaFuseFS
+    bridge = MagicMock()
+    bridge._write_enabled = False
+    bridge.vh = MagicMock()
+    bridge.backend = MagicMock()
+    fs = AmigaFuseFS(bridge, debug=False, icons=False)
+    return fs, bridge
+
+
+class TestDestroyCleanup:
+    """Tests for AmigaFuseFS.destroy() resource cleanup."""
+
+    def test_destroy_closes_backend(self, fs_with_mock_bridge):
+        fs, bridge = fs_with_mock_bridge
+        fs.destroy("/")
+        bridge.backend.sync.assert_called_once()
+        bridge.backend.close.assert_called_once()
+
+    def test_destroy_shuts_down_runtime(self, fs_with_mock_bridge):
+        fs, bridge = fs_with_mock_bridge
+        fs.destroy("/")
+        bridge.vh.shutdown.assert_called_once()
+
+    def test_destroy_flushes_when_write_enabled(self, fs_with_mock_bridge):
+        fs, bridge = fs_with_mock_bridge
+        bridge._write_enabled = True
+        fs.destroy("/")
+        bridge.flush_volume.assert_called_once()
+
+    def test_destroy_skips_flush_when_read_only(self, fs_with_mock_bridge):
+        fs, bridge = fs_with_mock_bridge
+        bridge._write_enabled = False
+        fs.destroy("/")
+        bridge.flush_volume.assert_not_called()
+
+    def test_destroy_continues_after_flush_failure(self, fs_with_mock_bridge):
+        fs, bridge = fs_with_mock_bridge
+        bridge._write_enabled = True
+        bridge.flush_volume.side_effect = RuntimeError("flush failed")
+        fs.destroy("/")
+        bridge.vh.shutdown.assert_called_once()
+        bridge.backend.close.assert_called_once()
+
+    def test_destroy_continues_after_shutdown_failure(self, fs_with_mock_bridge):
+        fs, bridge = fs_with_mock_bridge
+        bridge.vh.shutdown.side_effect = RuntimeError("shutdown failed")
+        fs.destroy("/")
+        bridge.backend.close.assert_called_once()
+
+    def test_destroy_handles_missing_vh(self, fs_with_mock_bridge):
+        fs, bridge = fs_with_mock_bridge
+        bridge.vh = None
+        fs.destroy("/")
+        bridge.backend.close.assert_called_once()
+
+    def test_destroy_handles_missing_backend(self, fs_with_mock_bridge):
+        fs, bridge = fs_with_mock_bridge
+        bridge.backend = None
+        fs.destroy("/")
