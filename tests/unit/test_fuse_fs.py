@@ -154,3 +154,121 @@ class TestMountFuseOptions:
         kwargs = mock_mount_fuse_deps["fuse_kwargs"]
         assert kwargs is not None, "FUSE was not called"
         assert "subtype" not in kwargs
+
+
+# ---------------------------------------------------------------------------
+# B. TestPlatformSpecialFiles -- platform-aware file filtering tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def fs_instance(fuse_mock):
+    """Create an AmigaFuseFS instance with a mock bridge for testing."""
+    from amifuse.fuse_fs import AmigaFuseFS
+
+    bridge = type("MockBridge", (), {"_write_enabled": False})()
+    return AmigaFuseFS(bridge, debug=False, icons=False)
+
+
+class TestPlatformSpecialFiles:
+    """Tests for _is_platform_special() cross-platform filtering.
+
+    Verifies that macOS special files are only filtered on macOS,
+    Windows Explorer probe files only on Windows, and Linux has
+    no special file filtering (intentional behavioral fix).
+    """
+
+    # -- macOS tests --
+
+    def test_macos_special_ds_store(self, monkeypatch, fs_instance):
+        """On macOS, .DS_Store is filtered."""
+        monkeypatch.setattr("sys.platform", "darwin")
+        assert fs_instance._is_platform_special("/.DS_Store") is True
+
+    def test_macos_special_spotlight(self, monkeypatch, fs_instance):
+        """On macOS, .Spotlight-V100 is filtered."""
+        monkeypatch.setattr("sys.platform", "darwin")
+        assert fs_instance._is_platform_special("/.Spotlight-V100") is True
+
+    def test_macos_special_appledouble(self, monkeypatch, fs_instance):
+        """On macOS, AppleDouble resource fork files (._prefix) are filtered."""
+        monkeypatch.setattr("sys.platform", "darwin")
+        assert fs_instance._is_platform_special("/dir/._file") is True
+
+    def test_macos_normal_file(self, monkeypatch, fs_instance):
+        """On macOS, normal files are not filtered."""
+        monkeypatch.setattr("sys.platform", "darwin")
+        assert fs_instance._is_platform_special("/readme.txt") is False
+
+    # -- Windows tests --
+
+    def test_windows_special_desktop_ini(self, monkeypatch, fs_instance):
+        """On Windows, desktop.ini is filtered."""
+        monkeypatch.setattr("sys.platform", "win32")
+        assert fs_instance._is_platform_special("/desktop.ini") is True
+
+    def test_windows_special_thumbs_db(self, monkeypatch, fs_instance):
+        """On Windows, Thumbs.db is filtered."""
+        monkeypatch.setattr("sys.platform", "win32")
+        assert fs_instance._is_platform_special("/Thumbs.db") is True
+
+    def test_windows_special_recycle_bin(self, monkeypatch, fs_instance):
+        """On Windows, $RECYCLE.BIN is filtered."""
+        monkeypatch.setattr("sys.platform", "win32")
+        assert fs_instance._is_platform_special("/$RECYCLE.BIN") is True
+
+    def test_windows_special_system_volume_info(self, monkeypatch, fs_instance):
+        """On Windows, System Volume Information is filtered."""
+        monkeypatch.setattr("sys.platform", "win32")
+        assert fs_instance._is_platform_special("/System Volume Information") is True
+
+    def test_windows_special_autorun_inf(self, monkeypatch, fs_instance):
+        """On Windows, autorun.inf is filtered."""
+        monkeypatch.setattr("sys.platform", "win32")
+        assert fs_instance._is_platform_special("/autorun.inf") is True
+
+    def test_windows_special_folder_jpg(self, monkeypatch, fs_instance):
+        """On Windows, Folder.jpg is filtered."""
+        monkeypatch.setattr("sys.platform", "win32")
+        assert fs_instance._is_platform_special("/Folder.jpg") is True
+
+    def test_windows_normal_file(self, monkeypatch, fs_instance):
+        """On Windows, normal files are not filtered."""
+        monkeypatch.setattr("sys.platform", "win32")
+        assert fs_instance._is_platform_special("/readme.txt") is False
+
+    # -- Linux tests --
+
+    def test_linux_no_special_files(self, monkeypatch, fs_instance):
+        """On Linux, macOS special files are NOT filtered.
+
+        This is an intentional behavioral fix: the old _is_macos_special()
+        incorrectly filtered macOS files on all platforms. Linux desktop
+        environments don't probe with these files.
+        """
+        monkeypatch.setattr("sys.platform", "linux")
+        assert fs_instance._is_platform_special("/.DS_Store") is False
+
+    def test_linux_normal_file(self, monkeypatch, fs_instance):
+        """On Linux, normal files are not filtered."""
+        monkeypatch.setattr("sys.platform", "linux")
+        assert fs_instance._is_platform_special("/readme.txt") is False
+
+    # -- Cross-platform isolation tests --
+
+    def test_macos_special_not_filtered_on_windows(self, monkeypatch, fs_instance):
+        """On Windows, macOS-specific files (.DS_Store) are NOT filtered."""
+        monkeypatch.setattr("sys.platform", "win32")
+        assert fs_instance._is_platform_special("/.DS_Store") is False
+
+    def test_windows_special_not_filtered_on_macos(self, monkeypatch, fs_instance):
+        """On macOS, Windows-specific files (desktop.ini) are NOT filtered."""
+        monkeypatch.setattr("sys.platform", "darwin")
+        assert fs_instance._is_platform_special("/desktop.ini") is False
+
+    # -- Path handling tests --
+
+    def test_nested_path_extracts_filename(self, monkeypatch, fs_instance):
+        """Filtering is based on filename, not full path."""
+        monkeypatch.setattr("sys.platform", "win32")
+        assert fs_instance._is_platform_special("/some/deep/path/desktop.ini") is True

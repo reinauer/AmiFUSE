@@ -1345,8 +1345,8 @@ class HandlerBridge:
 
 
 class AmigaFuseFS(Operations):
-    # macOS special files we should reject immediately without calling handler
-    # Note: "Icon\r" and ".VolumeIcon.icns" are NOT in this list - we handle them for custom icons
+    # macOS special files we should reject immediately without calling handler.
+    # Note: "Icon\r" and ".VolumeIcon.icns" are NOT in this list - we handle them for custom icons.
     _MACOS_SPECIAL = frozenset([
         "._.", ".hidden", ".Trashes", ".Spotlight-V100", ".fseventsd",
         ".metadata_never_index", ".com.apple.timemachine.donotpresent",
@@ -1356,6 +1356,20 @@ class AmigaFuseFS(Operations):
         ".apdisk", ".com.apple.NetBootX", "mach_kernel", ".PKInstallSandboxManager",
         ".PKInstallSandboxManager-SystemSoftware", ".Trashes.501", "Backups.backupdb",
     ])
+
+    # Windows Explorer probe files we should reject immediately.
+    # Includes common casings since Amiga handler uses case-sensitive lookups.
+    _WINDOWS_SPECIAL = frozenset([
+        "desktop.ini", "Desktop.ini",
+        "Thumbs.db", "thumbs.db",
+        "$RECYCLE.BIN", "$Recycle.Bin",
+        "System Volume Information",
+        "autorun.inf", "Autorun.inf",
+        "RECYCLER", "Recycler",
+        "Folder.jpg", "folder.jpg", "Folder.gif", "folder.gif",
+        "AlbumArtSmall.jpg",
+    ])
+
     def __init__(
         self,
         bridge: HandlerBridge,
@@ -1396,20 +1410,39 @@ class AmigaFuseFS(Operations):
             self._icon_existence_cache = IconExistenceCache()
             self._icon_handler = platform.get_icon_handler(icons_enabled=True, debug=debug)
 
-    def _is_macos_special(self, path: str) -> bool:
-        """Return True if path is a macOS special file we should reject."""
+    def _is_platform_special(self, path: str) -> bool:
+        """Return True if path is an OS special file we should reject.
+
+        Filters macOS system files (Spotlight, .DS_Store, etc.) and Windows
+        Explorer probe files (desktop.ini, Thumbs.db, etc.) to avoid
+        unnecessary handler invocations.
+
+        Note: On Linux, returns False (no special file filtering). The prior
+        code (_is_macos_special) incorrectly filtered macOS special files on
+        ALL platforms. This refactoring fixes that: each platform only filters
+        its own OS-specific probes. Linux desktop environments don't probe
+        mounted filesystems with special files the way macOS and Windows do.
+
+        The AppleDouble (._) prefix check is inside the darwin branch because
+        AppleDouble resource fork files are macOS-specific. On non-macOS
+        platforms, files starting with ._ are not filtered.
+        """
         name = path.rsplit("/", 1)[-1]
-        if name.startswith("._"):  # AppleDouble resource fork files
-            return True
-        # Icon files are handled specially when icons enabled
-        if self._icon_handler:
-            from . import platform
-            icon_file, volume_icon_file = platform.get_icon_file_names()
-            if icon_file and name == icon_file:
-                return False  # Let it through - we handle it in getattr
-            if volume_icon_file and name == volume_icon_file:
-                return False  # Let it through - we handle it in getattr
-        return name in self._MACOS_SPECIAL
+        if sys.platform.startswith("darwin"):
+            if name.startswith("._"):  # AppleDouble resource fork files
+                return True
+            # Icon files are handled specially when icons enabled
+            if self._icon_handler:
+                from . import platform
+                icon_file, volume_icon_file = platform.get_icon_file_names()
+                if icon_file and name == icon_file:
+                    return False  # Let it through - we handle it in getattr
+                if volume_icon_file and name == volume_icon_file:
+                    return False  # Let it through - we handle it in getattr
+            return name in self._MACOS_SPECIAL
+        if sys.platform.startswith("win"):
+            return name in self._WINDOWS_SPECIAL
+        return False
 
     def _is_icon_file(self, path: str) -> bool:
         """Return True if path is the virtual icon file for custom folder icons."""
@@ -1514,8 +1547,8 @@ class AmigaFuseFS(Operations):
     # --- FUSE operations ---
     def getattr(self, path, fh=None):
         self._check_handler_alive()
-        # Reject macOS special files immediately without calling handler
-        if self._is_macos_special(path):
+        # Reject OS special files immediately without calling handler
+        if self._is_platform_special(path):
             self._track_op("getattr", path, cached=True)
             raise FuseOSError(errno.ENOENT)
         if path == "/":
@@ -1794,7 +1827,7 @@ class AmigaFuseFS(Operations):
             self._check_handler_alive()
             if not self.bridge._write_enabled:
                 raise FuseOSError(errno.EROFS)
-            if self._is_macos_special(path):
+            if self._is_platform_special(path):
                 raise FuseOSError(errno.ENOENT)
             opened = self.bridge.open_file(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
             if opened is None:
@@ -1941,7 +1974,7 @@ class AmigaFuseFS(Operations):
 
     def access(self, path, mode):
         self._log_op("access", path, f"mode={mode}")
-        if self._is_macos_special(path):
+        if self._is_platform_special(path):
             raise FuseOSError(errno.ENOENT)
         if not self.bridge._write_enabled and (mode & os.W_OK):
             raise FuseOSError(errno.EROFS)
