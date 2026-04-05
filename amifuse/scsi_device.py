@@ -108,6 +108,29 @@ class ScsiDevice(LibImpl):
         if self.debug:
             print(f"[SCSI] _signal_io_complete: set sigbit={sigbit} (0x{1<<sigbit:x}) tc_SigRecvd: 0x{current_sigs:x} -> 0x{new_sigs:x}")
 
+    def _check_block_bounds(self, block_num: int, num_blocks: int) -> bool:
+        """Return True if the block range is within the image bounds.
+
+        Args:
+            block_num: Starting block number
+            num_blocks: Number of blocks to read/write
+
+        Returns:
+            True if the range is valid, False if out of bounds.
+        """
+        if block_num < 0 or num_blocks < 0:
+            return False
+        if block_num + num_blocks > self.backend.total_blocks:
+            if self.debug:
+                print(
+                    f"[SCSI] Block bounds check FAILED: "
+                    f"block={block_num} count={num_blocks} "
+                    f"total={self.backend.total_blocks}",
+                    flush=True,
+                )
+            return False
+        return True
+
     def get_version(self):
         return 40
 
@@ -205,6 +228,11 @@ class ScsiDevice(LibImpl):
             elif opcode == 0x25:  # READ CAPACITY(10)
                 resp = bytearray(8)
                 last_lba = self.backend.total_blocks - 1
+                # Cap at 0xFFFFFFFF for READ CAPACITY(10) -- the SCSI spec
+                # says to return all-ones when the LBA exceeds 32 bits,
+                # signaling the initiator to use READ CAPACITY(16) instead.
+                if last_lba > 0xFFFFFFFF:
+                    last_lba = 0xFFFFFFFF
                 resp[0:4] = last_lba.to_bytes(4, "big")
                 resp[4:8] = self.backend.block_size.to_bytes(4, "big")
                 mem.w_block(data_ptr, bytes(resp[: data_len if data_len < 8 else 8]))
@@ -216,15 +244,21 @@ class ScsiDevice(LibImpl):
                 else:
                     lba = mem.r32(cdb_ptr + 2)
                     xfer_blocks = mem.r16(cdb_ptr + 7)
-                data = self.backend.read_blocks(lba, xfer_blocks)
-                mem.w_block(data_ptr, data[: data_len])
-                actual = min(len(data), data_len)
+                if not self._check_block_bounds(lba, xfer_blocks):
+                    status = 2  # check condition
+                else:
+                    data = self.backend.read_blocks(lba, xfer_blocks)
+                    mem.w_block(data_ptr, data[: data_len])
+                    actual = min(len(data), data_len)
             elif opcode == 0x2A:  # WRITE(10)
                 lba = mem.r32(cdb_ptr + 2)
                 xfer_blocks = mem.r16(cdb_ptr + 7)
-                data = mem.r_block(data_ptr, min(data_len, xfer_blocks * self.backend.block_size))
-                self.backend.write_blocks(lba, data, xfer_blocks)
-                actual = len(data)
+                if not self._check_block_bounds(lba, xfer_blocks):
+                    status = 2  # check condition
+                else:
+                    data = mem.r_block(data_ptr, min(data_len, xfer_blocks * self.backend.block_size))
+                    self.backend.write_blocks(lba, data, xfer_blocks)
+                    actual = len(data)
             else:
                 # Unsupported command: report check condition
                 status = 2  # check condition
@@ -235,36 +269,54 @@ class ScsiDevice(LibImpl):
             ior.w_s("io_Actual", actual)
         elif cmd == CMD_READ:
             block_num = offset // self.backend.block_size
-            data = self.backend.read_blocks(block_num, length // self.backend.block_size)
-            mem.w_block(buf_ptr, data)
-            ior.w_s("io_Actual", len(data))
+            num_blocks = length // self.backend.block_size
+            if not self._check_block_bounds(block_num, num_blocks):
+                ior.w_s("io_Error", -4)  # IOERR_BADLENGTH
+                ior.w_s("io_Actual", 0)
+            else:
+                data = self.backend.read_blocks(block_num, num_blocks)
+                mem.w_block(buf_ptr, data)
+                ior.w_s("io_Actual", len(data))
         elif cmd == CMD_WRITE:
             if self.backend.read_only:
-                # Silently discard writes in read-only mode so the handler
-                # doesn't crash when it tries to update its activity log.
                 ior.w_s("io_Actual", length)
             else:
-                data = mem.r_block(buf_ptr, length)
                 block_num = offset // self.backend.block_size
-                self.backend.write_blocks(block_num, data, length // self.backend.block_size)
-                ior.w_s("io_Actual", length)
+                num_blocks = length // self.backend.block_size
+                if not self._check_block_bounds(block_num, num_blocks):
+                    ior.w_s("io_Error", -4)  # IOERR_BADLENGTH
+                    ior.w_s("io_Actual", 0)
+                else:
+                    data = mem.r_block(buf_ptr, length)
+                    self.backend.write_blocks(block_num, data, num_blocks)
+                    ior.w_s("io_Actual", length)
         elif cmd == TD_READ64:
             # TD64: 64-bit offset using io_Actual as high 32 bits
             offset64 = (io_actual << 32) | offset
             block_num = offset64 // self.backend.block_size
-            data = self.backend.read_blocks(block_num, length // self.backend.block_size)
-            mem.w_block(buf_ptr, data)
-            ior.w_s("io_Actual", len(data))
+            num_blocks = length // self.backend.block_size
+            if not self._check_block_bounds(block_num, num_blocks):
+                ior.w_s("io_Error", -4)  # IOERR_BADLENGTH
+                ior.w_s("io_Actual", 0)
+            else:
+                data = self.backend.read_blocks(block_num, num_blocks)
+                mem.w_block(buf_ptr, data)
+                ior.w_s("io_Actual", len(data))
         elif cmd == TD_WRITE64:
             # TD64: 64-bit offset using io_Actual as high 32 bits
             if self.backend.read_only:
                 ior.w_s("io_Actual", length)
             else:
                 offset64 = (io_actual << 32) | offset
-                data = mem.r_block(buf_ptr, length)
                 block_num = offset64 // self.backend.block_size
-                self.backend.write_blocks(block_num, data, length // self.backend.block_size)
-                ior.w_s("io_Actual", length)
+                num_blocks = length // self.backend.block_size
+                if not self._check_block_bounds(block_num, num_blocks):
+                    ior.w_s("io_Error", -4)  # IOERR_BADLENGTH
+                    ior.w_s("io_Actual", 0)
+                else:
+                    data = mem.r_block(buf_ptr, length)
+                    self.backend.write_blocks(block_num, data, num_blocks)
+                    ior.w_s("io_Actual", length)
         elif cmd == TD_GETGEOMETRY:
             # DriveGeometry structure from devices/trackdisk.h:
             # All main fields are ULONGs (4 bytes each)!
