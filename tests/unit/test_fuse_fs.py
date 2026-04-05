@@ -336,3 +336,27 @@ class TestDestroyCleanup:
         fs, bridge = fs_with_mock_bridge
         bridge.backend = None
         fs.destroy("/")
+
+
+class TestDirectoryListingCap:
+    """Tests for list_dir() iteration limit.
+
+    Source inspection tests: fragile by design, to be replaced with
+    functional tests when integration test infrastructure is available (Phase 5).
+    """
+
+    def test_list_dir_cap_removed(self, fuse_mock):
+        """Verify list_dir() no longer has a 256-entry hard cap."""
+        import inspect
+        from amifuse.fuse_fs import HandlerBridge
+        source = inspect.getsource(HandlerBridge.list_dir)
+        assert "range(256)" not in source
+        assert "range(65536)" in source
+
+    def test_list_dir_still_has_safety_limit(self, fuse_mock):
+        """Verify list_dir() retains a safety limit (not while True)."""
+        import inspect
+        from amifuse.fuse_fs import HandlerBridge
+        source = inspect.getsource(HandlerBridge.list_dir)
+        assert "for iter_num in range(" in source
+        assert "while True" not in source

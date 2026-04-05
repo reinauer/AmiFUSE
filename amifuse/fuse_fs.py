@@ -1076,7 +1076,11 @@ class HandlerBridge:
                 print(f"[amifuse] list_dir: Examine OK dir_name='{dir_info['name']}' type={dir_info['dir_type']}")
             # Don't add the first entry - it's the directory itself, not a child
             # Iterate via ExamineNext to get actual directory contents
-            for iter_num in range(256):
+            # Safety limit: Amiga filesystems can have thousands of entries per
+            # directory. The old limit of 256 silently truncated large directories.
+            # 65536 is generous; ExamineNext will return ERROR_NO_MORE_ENTRIES
+            # (res1=0) when the directory is exhausted, which breaks the loop.
+            for iter_num in range(65536):
                 self.launcher.send_examine_next(self.state, lock_bptr, fib_mem.addr)
                 replies = self._run_until_replies()
                 if not replies or replies[-1][2] == 0:
