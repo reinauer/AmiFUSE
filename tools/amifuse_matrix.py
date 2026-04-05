@@ -659,13 +659,22 @@ def _exercise_rw_session(bridge):
     }
 
 
-def _verify_rw_session(HandlerBridge, fixture: Fixture, renamed_path: str, payload: bytes):
+def _verify_rw_session(
+    HandlerBridge,
+    fixture: Fixture,
+    renamed_path: str,
+    payload: bytes,
+    adf_info=None,
+    iso_info=None,
+):
     remount_s, verify_bridge = _timed(
         HandlerBridge,
         fixture.image,
         fixture.driver,
         partition=fixture.partition,
         read_only=False,
+        adf_info=adf_info,
+        iso_info=iso_info,
     )
     try:
         verify_stat_s, verify_stat = _timed(verify_bridge.stat_path, renamed_path)
@@ -803,7 +812,12 @@ def _run_rw_fixture(fixture: Fixture, HandlerBridge, adf_info, iso_info, inspect
     finally:
         _shutdown_bridge(bridge)
     verify = _verify_rw_session(
-        HandlerBridge, fixture, session["renamed_path"], session["payload"]
+        HandlerBridge,
+        fixture,
+        session["renamed_path"],
+        session["payload"],
+        adf_info=adf_info,
+        iso_info=iso_info,
     )
     total_s = (
         inspect_s
