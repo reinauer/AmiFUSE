@@ -94,10 +94,6 @@ def get_darwin_mount_options(volname: str, volicon_path: Optional[str] = None,
         "noappledouble": True,  # Disable AppleDouble ._ files
     }
 
-    # Only disable xattrs if icons mode is not enabled
-    if not icons_enabled:
-        options["noapplexattr"] = True
-
     # Use volicon mount option if we have a pre-generated icon
     if volicon_path:
         options["volicon"] = volicon_path

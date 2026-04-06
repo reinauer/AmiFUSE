@@ -226,6 +226,16 @@ class TestGetMountOptions:
         result = get_mount_options("TestVol")
         assert "volname" in result
 
+    def test_mount_options_darwin_keeps_xattrs_enabled(self, monkeypatch):
+        """On darwin, writable copies should not be blocked by noapplexattr."""
+        monkeypatch.setattr("sys.platform", "darwin")
+        from amifuse.platform import get_mount_options
+
+        result = get_mount_options("TestVol")
+        assert result["volname"] == "TestVol"
+        assert result["noappledouble"] is True
+        assert "noapplexattr" not in result
+
 
 # ---------------------------------------------------------------------------
 # E. supports_icons() and get_icon_handler() -- 2 tests
