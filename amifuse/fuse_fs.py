@@ -3147,14 +3147,46 @@ def cmd_hash(args):
 
 def cmd_inspect(args):
     """Handle the 'inspect' subcommand."""
+    import json as _json
     import amitools.fs.DosType as DosType
     from .rdb_inspect import (
-        open_rdisk, format_mbr_info, detect_adf, detect_mbr, MBR_TYPE_AMIGA_RDB,
+        open_rdisk, format_mbr_info, detect_adf, detect_iso, detect_mbr,
+        MBR_TYPE_AMIGA_RDB,
     )
+
+    use_json = getattr(args, "json", False)
+
+    # Check that image exists (before any detection)
+    if not args.image.exists():
+        if use_json:
+            envelope = _json_error("inspect", "IMAGE_NOT_FOUND",
+                                   f"Image not found: {args.image}")
+            envelope["image"] = str(args.image)
+            print(_json.dumps(envelope, indent=2))
+            sys.exit(1)
+        raise SystemExit(f"Error: Image not found: {args.image}")
 
     # First check for ADF
     adf_info = detect_adf(args.image)
     if adf_info is not None:
+        if use_json:
+            dt_str = DosType.num_to_tag_str(adf_info.dos_type)
+            floppy_type = "HD" if adf_info.is_hd else "DD"
+            envelope = _json_result("inspect",
+                image=str(args.image),
+                image_type="adf",
+                floppy_type=floppy_type,
+                sectors_per_track=adf_info.sectors_per_track,
+                cylinders=adf_info.cylinders,
+                heads=adf_info.heads,
+                block_size=adf_info.block_size,
+                total_blocks=adf_info.total_blocks,
+                dos_type=dt_str,
+                dos_type_raw=f"0x{adf_info.dos_type:08x}",
+                note="ADF files don't contain embedded filesystem drivers. Use --driver to specify a handler.",
+            )
+            print(_json.dumps(envelope, indent=2))
+            return
         dt_str = DosType.num_to_tag_str(adf_info.dos_type)
         floppy_type = "HD" if adf_info.is_hd else "DD"
         print(f"ADF Floppy Image: {args.image}")
@@ -3167,6 +3199,25 @@ def cmd_inspect(args):
         print("Use --driver to specify a filesystem handler when mounting.")
         return
 
+    # Check for ISO 9660
+    iso_info = detect_iso(args.image)
+    if iso_info is not None:
+        if use_json:
+            envelope = _json_result("inspect",
+                image=str(args.image),
+                image_type="iso",
+                volume_id=iso_info.volume_id,
+                block_size=iso_info.block_size,
+                total_blocks=iso_info.total_blocks,
+            )
+            print(_json.dumps(envelope, indent=2))
+            return
+        print(f"ISO 9660 Image: {args.image}")
+        print(f"  Volume ID: {iso_info.volume_id}")
+        print(f"  Block size: {iso_info.block_size} bytes")
+        print(f"  Total blocks: {iso_info.total_blocks}")
+        return
+
     # Detect if MBR with multiple 0x76 partitions
     mbr_info = detect_mbr(args.image)
     multi_rdb = False
@@ -3175,6 +3226,65 @@ def cmd_inspect(args):
         amiga_parts = [p for p in mbr_info.partitions if p.partition_type == MBR_TYPE_AMIGA_RDB]
         if len(amiga_parts) > 1:
             multi_rdb = True
+
+    if use_json:
+        # JSON mode: collect all RDBs into a single envelope
+        all_rdbs = []
+        for rdb_idx in range(len(amiga_parts) if multi_rdb else 1):
+            mbr_partition_index = rdb_idx if multi_rdb else None
+            try:
+                blkdev, rdisk, mbr_ctx = open_rdisk(
+                    args.image, block_size=args.block_size,
+                    mbr_partition_index=mbr_partition_index,
+                )
+            except IOError as e:
+                envelope = _json_error("inspect", "OPEN_FAILED", str(e))
+                envelope["image"] = str(args.image)
+                print(_json.dumps(envelope, indent=2))
+                sys.exit(1)
+            try:
+                desc = rdisk.get_desc()
+                if mbr_ctx is not None:
+                    mbr_desc = {
+                        "scheme": mbr_ctx.scheme,
+                        "offset_blocks": mbr_ctx.offset_blocks,
+                        "all_partitions": [
+                            {
+                                "index": p.index,
+                                "type": p.partition_type,
+                                "bootable": p.bootable,
+                                "start_lba": p.start_lba,
+                                "num_sectors": p.num_sectors,
+                            }
+                            for p in mbr_ctx.mbr_info.partitions
+                        ],
+                    }
+                    if mbr_ctx.mbr_partition is not None:
+                        mbr_desc["partition_index"] = mbr_ctx.mbr_partition.index
+                        mbr_desc["partition_size"] = mbr_ctx.mbr_partition.num_sectors
+                    desc["mbr"] = mbr_desc
+                warnings = getattr(rdisk, 'rdb_warnings', [])
+                if warnings:
+                    desc["warnings"] = warnings
+                all_rdbs.append(desc)
+            finally:
+                rdisk.close()
+                blkdev.close()
+
+        if len(all_rdbs) == 1:
+            rdb_data = all_rdbs[0]
+        else:
+            rdb_data = all_rdbs
+        envelope = _json_result("inspect",
+            image=str(args.image),
+            image_type="rdb",
+        )
+        if isinstance(rdb_data, list):
+            envelope["rdbs"] = rdb_data
+        else:
+            envelope.update(rdb_data)
+        print(_json.dumps(envelope, indent=2))
+        return
 
     if multi_rdb:
         # Show MBR table once using first partition's context
@@ -3612,6 +3722,7 @@ commands:
   inspect <image>           Inspect RDB partitions and filesystems.
     --block-size N            Override block size (defaults to auto/512).
     --full                    Show full partition details.
+    --json                    Output machine-readable JSON instead of text.
 
   mount <image>             Mount an Amiga filesystem image via FUSE.
     --driver PATH             Filesystem binary (default: extract from RDB).
@@ -3684,6 +3795,9 @@ commands:
     )
     inspect_parser.add_argument(
         "--full", action="store_true", help="Show full partition details."
+    )
+    inspect_parser.add_argument(
+        "--json", action="store_true", help="Output machine-readable JSON instead of text."
     )
     inspect_parser.set_defaults(func=cmd_inspect)
 

@@ -2238,3 +2238,151 @@ class TestCmdHash:
         # seek and close should still be called
         mock_bridge.seek_handle.assert_called_once_with(0x1000, 0)
         mock_bridge.close_file.assert_called_once_with(0x1000)
+
+
+# ---------------------------------------------------------------------------
+# TestCmdInspectJson -- JSON output for inspect subcommand
+# ---------------------------------------------------------------------------
+
+
+class TestCmdInspectJson:
+    """Tests for --json output from cmd_inspect().
+
+    Uses mock detect_adf / detect_iso to avoid needing real image files.
+    """
+
+    @pytest.fixture
+    def mock_adf_info(self):
+        """Return a mock ADFInfo-like object for DD floppy."""
+        info = MagicMock()
+        info.dos_type = 0x444F5300
+        info.is_hd = False
+        info.cylinders = 80
+        info.heads = 2
+        info.sectors_per_track = 11
+        info.block_size = 512
+        info.total_blocks = 1760
+        return info
+
+    @pytest.fixture
+    def inspect_args(self, tmp_path):
+        """Return a minimal args namespace for cmd_inspect."""
+        image = tmp_path / "test.adf"
+        image.write_bytes(b"\x00" * 512)
+        args = MagicMock()
+        args.image = image
+        args.block_size = None
+        args.full = False
+        args.json = True
+        return args
+
+    @pytest.fixture
+    def mock_inspect_deps(self, monkeypatch, mock_adf_info, fuse_mock):
+        """Wire up amitools + rdb_inspect mocks for cmd_inspect tests."""
+        import types
+
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        fake_amitools = types.ModuleType("amitools")
+        fake_amitools_fs = types.ModuleType("amitools.fs")
+        fake_dostype = MagicMock()
+        fake_dostype.num_to_tag_str.return_value = "DOS0"
+
+        fake_amitools.fs = fake_amitools_fs
+        fake_amitools_fs.DosType = fake_dostype
+
+        monkeypatch.setitem(sys.modules, "amitools", fake_amitools)
+        monkeypatch.setitem(sys.modules, "amitools.fs", fake_amitools_fs)
+        monkeypatch.setitem(sys.modules, "amitools.fs.DosType", fake_dostype)
+
+        fake_rdb_inspect = MagicMock()
+        fake_rdb_inspect.detect_adf.return_value = mock_adf_info
+        fake_rdb_inspect.detect_iso.return_value = None
+        fake_rdb_inspect.detect_mbr.return_value = None
+        fake_rdb_inspect.MBR_TYPE_AMIGA_RDB = 0x76
+        monkeypatch.setitem(sys.modules, "amifuse.rdb_inspect", fake_rdb_inspect)
+
+        return fuse_fs_mod, fake_rdb_inspect
+
+    def test_inspect_adf_json(self, mock_inspect_deps, inspect_args, capsys):
+        """ADF image with --json produces valid JSON envelope."""
+        fuse_fs_mod, _ = mock_inspect_deps
+
+        fuse_fs_mod.cmd_inspect(inspect_args)
+        output = capsys.readouterr().out
+        data = json.loads(output)
+
+        assert data["status"] == "ok"
+        assert data["command"] == "inspect"
+        assert data["image_type"] == "adf"
+        assert data["floppy_type"] == "DD"
+        assert data["cylinders"] == 80
+        assert data["heads"] == 2
+        assert data["sectors_per_track"] == 11
+        assert data["block_size"] == 512
+        assert data["total_blocks"] == 1760
+        assert data["dos_type"] == "DOS0"
+        assert data["dos_type_raw"] == "0x444f5300"
+
+    def test_inspect_adf_human_unchanged(self, mock_inspect_deps, inspect_args, capsys):
+        """Human-readable ADF output is unchanged when --json is not set."""
+        fuse_fs_mod, _ = mock_inspect_deps
+
+        inspect_args.json = False
+
+        fuse_fs_mod.cmd_inspect(inspect_args)
+        output = capsys.readouterr().out
+
+        with pytest.raises(json.JSONDecodeError):
+            json.loads(output)
+
+        assert "ADF Floppy Image:" in output
+        assert "DD" in output
+        assert "11 sectors/track" in output
+
+    def test_inspect_json_image_not_found(self, fuse_mock, monkeypatch, capsys, tmp_path):
+        """When image does not exist and --json is set, emit error envelope."""
+        import types
+
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        fake_amitools = types.ModuleType("amitools")
+        fake_amitools_fs = types.ModuleType("amitools.fs")
+        fake_dostype = MagicMock()
+        fake_amitools.fs = fake_amitools_fs
+        fake_amitools_fs.DosType = fake_dostype
+        monkeypatch.setitem(sys.modules, "amitools", fake_amitools)
+        monkeypatch.setitem(sys.modules, "amitools.fs", fake_amitools_fs)
+        monkeypatch.setitem(sys.modules, "amitools.fs.DosType", fake_dostype)
+
+        fake_rdb_inspect = MagicMock()
+        fake_rdb_inspect.MBR_TYPE_AMIGA_RDB = 0x76
+        monkeypatch.setitem(sys.modules, "amifuse.rdb_inspect", fake_rdb_inspect)
+
+        args = MagicMock()
+        args.image = tmp_path / "nonexistent.hdf"
+        args.block_size = None
+        args.full = False
+        args.json = True
+
+        with pytest.raises(SystemExit) as exc_info:
+            fuse_fs_mod.cmd_inspect(args)
+        assert exc_info.value.code == 1
+        output = capsys.readouterr().out
+        data = json.loads(output)
+
+        assert data["status"] == "error"
+        assert data["command"] == "inspect"
+        assert data["error"]["code"] == "IMAGE_NOT_FOUND"
+        assert "nonexistent.hdf" in data["error"]["message"]
+
+    def test_inspect_json_has_version(self, mock_inspect_deps, inspect_args, capsys):
+        """JSON output includes the version field."""
+        fuse_fs_mod, _ = mock_inspect_deps
+
+        fuse_fs_mod.cmd_inspect(inspect_args)
+        output = capsys.readouterr().out
+        data = json.loads(output)
+
+        assert "version" in data
+        assert data["version"] == fuse_fs_mod.__version__
