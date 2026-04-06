@@ -293,9 +293,10 @@ class TestUnmountCommand:
 
         monkeypatch.setattr(fuse_fs_mod.subprocess, "run", fake_run)
 
-        fuse_fs_mod.cmd_unmount(argparse.Namespace(mountpoint=Path("/mnt/amiga")))
+        mountpoint = Path("/mnt/amiga")
+        fuse_fs_mod.cmd_unmount(argparse.Namespace(mountpoint=mountpoint))
 
-        assert called["cmd"] == ["umount", "-f", "/mnt/amiga"]
+        assert called["cmd"] == ["umount", "-f", str(mountpoint)]
         assert called["check"] is False
 
     def test_unmount_rejects_non_mountpoint(self, monkeypatch, fuse_mock):
@@ -341,9 +342,10 @@ class TestUnmountCommand:
 
         monkeypatch.setattr(fuse_fs_mod.subprocess, "run", fake_run)
 
-        fuse_fs_mod.cmd_unmount(argparse.Namespace(mountpoint=Path("/mnt/broken")))
+        mountpoint = Path("/mnt/broken")
+        fuse_fs_mod.cmd_unmount(argparse.Namespace(mountpoint=mountpoint))
 
-        assert called["cmd"] == ["umount", "-f", "/mnt/broken"]
+        assert called["cmd"] == ["umount", "-f", str(mountpoint)]
 
     def test_unmount_kills_hanging_mount_owner_after_failed_unmount(self, monkeypatch, fuse_mock):
         monkeypatch.setattr("os.path.ismount", lambda path: True)
@@ -369,11 +371,12 @@ class TestUnmountCommand:
             if sig != 0:
                 killed.append((pid, sig))
             else:
-                if any(saved_pid == pid and saved_sig == signal.SIGKILL for saved_pid, saved_sig in killed):
+                if any(saved_pid == pid and saved_sig == fuse_fs_mod._SIGKILL for saved_pid, saved_sig in killed):
                     raise ProcessLookupError()
 
         import amifuse.fuse_fs as fuse_fs_mod
 
+        monkeypatch.setattr("sys.platform", "linux")
         monkeypatch.setattr(fuse_fs_mod.subprocess, "run", fake_run)
         monkeypatch.setattr(fuse_fs_mod.os, "kill", fake_kill)
         monkeypatch.setattr(fuse_fs_mod.os, "getpid", lambda: 999)
@@ -382,6 +385,137 @@ class TestUnmountCommand:
 
         assert run_calls["unmount"] == 2
         assert (123, signal.SIGTERM) in killed
+
+
+class TestPidExists:
+    """Tests for _pid_exists() cross-platform behaviour."""
+
+    def test_pid_exists_returns_true_for_live_process(self, fuse_mock, monkeypatch):
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        monkeypatch.setattr(fuse_fs_mod.os, "kill", lambda pid, sig: None)
+        assert fuse_fs_mod._pid_exists(12345) is True
+
+    def test_pid_exists_returns_false_for_dead_process(self, fuse_mock, monkeypatch):
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        def raise_lookup(pid, sig):
+            raise ProcessLookupError()
+
+        monkeypatch.setattr(fuse_fs_mod.os, "kill", raise_lookup)
+        assert fuse_fs_mod._pid_exists(12345) is False
+
+    def test_pid_exists_returns_true_on_permission_error(self, fuse_mock, monkeypatch):
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        def raise_perm(pid, sig):
+            raise PermissionError("Access denied")
+
+        monkeypatch.setattr(fuse_fs_mod.os, "kill", raise_perm)
+        assert fuse_fs_mod._pid_exists(12345) is True
+
+    def test_pid_exists_returns_false_on_windows_oserror(self, fuse_mock, monkeypatch):
+        """Windows raises generic OSError for invalid PIDs."""
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        def raise_oserror(pid, sig):
+            raise OSError(22, "Invalid argument")
+
+        monkeypatch.setattr(fuse_fs_mod.os, "kill", raise_oserror)
+        assert fuse_fs_mod._pid_exists(12345) is False
+
+
+class TestWindowsProcessDiscovery:
+    """Tests for _find_mount_owner_pids_windows() wmic-based discovery."""
+
+    def test_finds_amifuse_pid_from_wmic_output(self, fuse_mock, monkeypatch):
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        wmic_output = (
+            "\r\n"
+            "CommandLine=python -m amifuse mount disk.hdf --mountpoint Z:\r\n"
+            "ProcessId=4567\r\n"
+            "\r\n"
+        )
+
+        def fake_run(cmd, **kwargs):
+            return argparse.Namespace(returncode=0, stdout=wmic_output)
+
+        monkeypatch.setattr(fuse_fs_mod.subprocess, "run", fake_run)
+        monkeypatch.setattr(fuse_fs_mod.os, "getpid", lambda: 999)
+
+        pids = fuse_fs_mod._find_mount_owner_pids_windows(Path("Z:"))
+        assert 4567 in pids
+
+    def test_excludes_own_pid(self, fuse_mock, monkeypatch):
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        wmic_output = (
+            "CommandLine=python -m amifuse mount disk.hdf --mountpoint Z:\r\n"
+            "ProcessId=999\r\n"
+            "\r\n"
+        )
+
+        def fake_run(cmd, **kwargs):
+            return argparse.Namespace(returncode=0, stdout=wmic_output)
+
+        monkeypatch.setattr(fuse_fs_mod.subprocess, "run", fake_run)
+        monkeypatch.setattr(fuse_fs_mod.os, "getpid", lambda: 999)
+
+        pids = fuse_fs_mod._find_mount_owner_pids_windows(Path("Z:"))
+        assert pids == []
+
+    def test_returns_empty_on_wmic_failure(self, fuse_mock, monkeypatch):
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        def fake_run(cmd, **kwargs):
+            return argparse.Namespace(returncode=1, stdout="")
+
+        monkeypatch.setattr(fuse_fs_mod.subprocess, "run", fake_run)
+
+        pids = fuse_fs_mod._find_mount_owner_pids_windows(Path("Z:"))
+        assert pids == []
+
+    def test_returns_empty_on_wmic_not_found(self, fuse_mock, monkeypatch):
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        def fake_run(cmd, **kwargs):
+            raise OSError("wmic not found")
+
+        monkeypatch.setattr(fuse_fs_mod.subprocess, "run", fake_run)
+
+        pids = fuse_fs_mod._find_mount_owner_pids_windows(Path("Z:"))
+        assert pids == []
+
+    def test_dispatcher_routes_to_windows(self, fuse_mock, monkeypatch):
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        monkeypatch.setattr("sys.platform", "win32")
+        called = {"windows": False}
+
+        def fake_windows(mp):
+            called["windows"] = True
+            return []
+
+        monkeypatch.setattr(fuse_fs_mod, "_find_mount_owner_pids_windows", fake_windows)
+
+        fuse_fs_mod._find_mount_owner_pids(Path("Z:"))
+        assert called["windows"] is True
+
+    def test_dispatcher_routes_to_unix(self, fuse_mock, monkeypatch):
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        monkeypatch.setattr("sys.platform", "linux")
+        called = {"unix": False}
+
+        def fake_unix(mp):
+            called["unix"] = True
+            return []
+
+        monkeypatch.setattr(fuse_fs_mod, "_find_mount_owner_pids_unix", fake_unix)
+
+        fuse_fs_mod._find_mount_owner_pids(Path("/mnt/amiga"))
+        assert called["unix"] is True
 
 
 class TestDriverValidation:

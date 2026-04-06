@@ -84,13 +84,57 @@ def get_unmount_command(mountpoint: Path) -> List[str]:
     if sys.platform.startswith("darwin"):
         return ["umount", "-f", str(mountpoint)]
     if sys.platform.startswith("win"):
-        # WinFSP foreground mounts have no standalone unmount CLI tool.
-        # The filesystem unmounts when the FUSE process exits (Ctrl+C).
-        return []
+        return _get_windows_unmount_command(mountpoint)
     # Linux - prefer fusermount if available
     if shutil.which("fusermount"):
         return ["fusermount", "-u", str(mountpoint)]
     return ["umount", "-f", str(mountpoint)]
+
+
+def _get_winfsp_install_dir() -> Optional[str]:
+    """Locate the WinFSP installation directory.
+
+    Checks (in order): Registry, WINFSP_INSTALL_DIR env var, default path.
+    Returns the directory path string, or None if WinFSP is not found.
+    """
+    # Registry check (most reliable)
+    try:
+        import winreg
+        with winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE,
+            r"SOFTWARE\WOW6432Node\WinFsp",
+        ) as key:
+            install_dir = winreg.QueryValueEx(key, "InstallDir")[0]
+            if install_dir and os.path.isdir(install_dir):
+                return install_dir
+    except Exception:
+        pass
+
+    # Env var fallback
+    winfsp_dir = os.environ.get("WINFSP_INSTALL_DIR", "")
+    if winfsp_dir and os.path.isdir(winfsp_dir):
+        return winfsp_dir
+
+    # Default install path fallback
+    default_dir = r"C:\Program Files (x86)\WinFsp"
+    if os.path.isdir(default_dir):
+        return default_dir
+
+    return None
+
+
+def _get_windows_unmount_command(mountpoint: Path) -> List[str]:
+    """Build a Windows unmount command for the given mountpoint.
+
+    WinFSP drive-letter mounts (e.g. ``Z:``) can be detached with
+    ``net use Z: /delete``.  Non-drive-letter mounts have no standalone
+    unmount CLI -- callers handle the empty-list case by falling back to
+    process termination.
+    """
+    mp_str = str(mountpoint)
+    if len(mp_str) == 2 and mp_str[1] == ":":
+        return ["net", "use", mp_str, "/delete"]
+    return []
 
 
 def mount_runs_in_foreground_by_default() -> bool:
@@ -111,27 +155,8 @@ def check_fuse_available() -> None:
         # Those errors are already clear enough (libfuse not found, etc.)
         return
 
-    # Windows: check for WinFSP via Registry (most reliable)
-    try:
-        import winreg
-        with winreg.OpenKey(
-            winreg.HKEY_LOCAL_MACHINE,
-            r"SOFTWARE\WOW6432Node\WinFsp",
-        ) as key:
-            install_dir = winreg.QueryValueEx(key, "InstallDir")[0]
-            if install_dir and os.path.isdir(install_dir):
-                return
-    except (OSError, FileNotFoundError):
-        pass  # Registry key not found -- WinFSP may not be installed
-
-    # Fallback: check WINFSP_INSTALL_DIR env var
-    winfsp_dir = os.environ.get("WINFSP_INSTALL_DIR", "")
-    if winfsp_dir and os.path.isdir(winfsp_dir):
-        return
-
-    # Fallback: check default install location
-    default_dir = r"C:\Program Files (x86)\WinFsp"
-    if os.path.isdir(default_dir):
+    # Windows: delegate to shared WinFSP detection
+    if _get_winfsp_install_dir() is not None:
         return
 
     # Non-standard installs can set WINFSP_INSTALL_DIR env var

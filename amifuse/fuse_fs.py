@@ -15,6 +15,11 @@ import signal
 import subprocess
 import sys
 import time
+
+# signal.SIGKILL is not defined on Windows; fall back to SIGTERM so that
+# _kill_mount_owner_processes() can still compile and will use the strongest
+# signal available.
+_SIGKILL = getattr(signal, "SIGKILL", signal.SIGTERM)
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -2830,7 +2835,7 @@ def _kill_mount_owner_processes(mountpoint: Path) -> List[int]:
         try:
             os.kill(pid, signal.SIGTERM)
             remaining.append(pid)
-        except ProcessLookupError:
+        except (ProcessLookupError, OSError):
             continue
 
     deadline = time.time() + 1.0
@@ -2846,14 +2851,91 @@ def _kill_mount_owner_processes(mountpoint: Path) -> List[int]:
 
     for pid in remaining:
         try:
-            os.kill(pid, signal.SIGKILL)
-        except ProcessLookupError:
+            os.kill(pid, _SIGKILL)
+        except (ProcessLookupError, OSError):
             continue
 
     return pids
 
 
 def _find_mount_owner_pids(mountpoint: Path) -> List[int]:
+    """Find PIDs of amifuse processes that own the given mountpoint.
+
+    Dispatches to platform-specific discovery: ``ps`` on Unix,
+    ``wmic`` on Windows.
+    """
+    if sys.platform.startswith("win"):
+        return _find_mount_owner_pids_windows(mountpoint)
+    return _find_mount_owner_pids_unix(mountpoint)
+
+
+def _find_mount_owner_pids_windows(mountpoint: Path) -> List[int]:
+    """Find amifuse PIDs on Windows using wmic."""
+    try:
+        result = subprocess.run(
+            ["wmic", "process", "where",
+             "name like '%python%'",
+             "get", "ProcessId,CommandLine",
+             "/FORMAT:LIST"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return []
+    if result.returncode != 0:
+        return []
+
+    current_pid = os.getpid()
+    raw_mountpoint = str(mountpoint)
+    abs_mountpoint = str(mountpoint.resolve(strict=False))
+    pids = []
+
+    # wmic /FORMAT:LIST outputs key=value pairs separated by blank lines
+    current_cmdline = None
+    current_pid_val = None
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            # End of a record -- evaluate what we have
+            if current_cmdline is not None and current_pid_val is not None:
+                pid = current_pid_val
+                command = current_cmdline
+                if pid != current_pid and "amifuse" in command:
+                    try:
+                        tokens = shlex.split(command, posix=False)
+                    except ValueError:
+                        tokens = command.split()
+                    if _command_matches_mountpoint(tokens, raw_mountpoint, abs_mountpoint):
+                        pids.append(pid)
+            current_cmdline = None
+            current_pid_val = None
+            continue
+        if line.startswith("CommandLine="):
+            current_cmdline = line[len("CommandLine="):]
+        elif line.startswith("ProcessId="):
+            try:
+                current_pid_val = int(line[len("ProcessId="):])
+            except ValueError:
+                current_pid_val = None
+
+    # Handle last record if no trailing blank line
+    if current_cmdline is not None and current_pid_val is not None:
+        pid = current_pid_val
+        command = current_cmdline
+        if pid != current_pid and "amifuse" in command:
+            try:
+                tokens = shlex.split(command, posix=False)
+            except ValueError:
+                tokens = command.split()
+            if _command_matches_mountpoint(tokens, raw_mountpoint, abs_mountpoint):
+                pids.append(pid)
+
+    return pids
+
+
+def _find_mount_owner_pids_unix(mountpoint: Path) -> List[int]:
+    """Find amifuse PIDs on Unix using ps."""
     try:
         result = subprocess.run(
             ["ps", "-axo", "pid=,command="],
@@ -2918,6 +3000,9 @@ def _pid_exists(pid: int) -> bool:
         return False
     except PermissionError:
         return True
+    except OSError:
+        # Windows raises a generic OSError for invalid/dead PIDs
+        return False
     return True
 
 

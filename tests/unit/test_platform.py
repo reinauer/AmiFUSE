@@ -164,15 +164,20 @@ class TestGetUnmountCommand:
         result = get_unmount_command(mp)
         assert result == ["umount", "-f", "/mnt/amiga"]
 
-    def test_unmount_command_windows_returns_empty(self, monkeypatch):
-        """On Windows, returns empty list (no standalone unmount CLI tool).
-
-        WinFSP foreground mounts unmount when the FUSE process exits (Ctrl+C).
-        """
+    def test_unmount_command_windows_drive_letter(self, monkeypatch):
+        """On Windows, drive-letter mounts use 'net use /delete'."""
         monkeypatch.setattr("sys.platform", "win32")
         from amifuse.platform import get_unmount_command
 
         result = get_unmount_command(Path("D:"))
+        assert result == ["net", "use", "D:", "/delete"]
+
+    def test_unmount_command_windows_non_drive_returns_empty(self, monkeypatch):
+        """On Windows, non-drive-letter mounts have no standalone unmount CLI."""
+        monkeypatch.setattr("sys.platform", "win32")
+        from amifuse.platform import get_unmount_command
+
+        result = get_unmount_command(Path(r"C:\mnt\amiga"))
         assert result == []
 
 
@@ -696,3 +701,33 @@ class TestMountRunsInForegroundByDefault:
         from amifuse.platform import mount_runs_in_foreground_by_default
 
         assert mount_runs_in_foreground_by_default() is expected
+
+
+# ---------------------------------------------------------------------------
+# K. Windows unmount command tests -- 3 tests
+# ---------------------------------------------------------------------------
+
+
+class TestWindowsUnmountCommand:
+    """Tests for _get_windows_unmount_command() and get_unmount_command() on Windows."""
+
+    def test_drive_letter_returns_net_use_delete(self, monkeypatch):
+        monkeypatch.setattr("sys.platform", "win32")
+        from amifuse.platform import _get_windows_unmount_command
+
+        result = _get_windows_unmount_command(Path("Z:"))
+        assert result == ["net", "use", "Z:", "/delete"]
+
+    def test_non_drive_letter_returns_empty(self, monkeypatch):
+        monkeypatch.setattr("sys.platform", "win32")
+        from amifuse.platform import _get_windows_unmount_command
+
+        result = _get_windows_unmount_command(Path(r"C:\mnt\amiga"))
+        assert result == []
+
+    def test_get_unmount_command_windows_drive_letter(self, monkeypatch):
+        monkeypatch.setattr("sys.platform", "win32")
+        from amifuse.platform import get_unmount_command
+
+        result = get_unmount_command(Path("Z:"))
+        assert result == ["net", "use", "Z:", "/delete"]
