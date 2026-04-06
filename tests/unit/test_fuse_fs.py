@@ -2386,3 +2386,221 @@ class TestCmdInspectJson:
 
         assert "version" in data
         assert data["version"] == fuse_fs_mod.__version__
+
+    # -- Gap 1: ISO JSON path --
+
+    def test_inspect_iso_json(self, mock_inspect_deps, inspect_args, capsys):
+        """ISO 9660 detection produces correct JSON envelope."""
+        fuse_fs_mod, fake_rdb = mock_inspect_deps
+        from dataclasses import dataclass
+
+        @dataclass
+        class ISOInfo:
+            volume_id: str
+            block_size: int
+            total_blocks: int
+
+        fake_rdb.detect_adf.return_value = None
+        fake_rdb.detect_iso.return_value = ISOInfo(
+            volume_id="AMIGA_CD", block_size=2048, total_blocks=5000,
+        )
+
+        fuse_fs_mod.cmd_inspect(inspect_args)
+        output = capsys.readouterr().out
+        data = json.loads(output)
+
+        assert data["status"] == "ok"
+        assert data["command"] == "inspect"
+        assert "version" in data
+        assert data["image_type"] == "iso"
+        assert data["volume_id"] == "AMIGA_CD"
+        assert data["block_size"] == 2048
+        assert data["total_blocks"] == 5000
+        assert data["image"] == str(inspect_args.image)
+
+    # -- Gap 2: RDB JSON path --
+
+    def test_inspect_rdb_json(self, mock_inspect_deps, inspect_args, capsys):
+        """Single-RDB detection produces correct JSON envelope with merged data."""
+        fuse_fs_mod, fake_rdb = mock_inspect_deps
+
+        fake_rdb.detect_adf.return_value = None
+        fake_rdb.detect_iso.return_value = None
+        fake_rdb.detect_mbr.return_value = None
+
+        mock_blkdev = MagicMock()
+        mock_rdisk = MagicMock()
+        mock_rdisk.get_desc.return_value = {
+            "partitions": [{"name": "DH0", "size_blocks": 100}],
+        }
+        mock_rdisk.rdb_warnings = []
+        fake_rdb.open_rdisk.return_value = (mock_blkdev, mock_rdisk, None)
+
+        fuse_fs_mod.cmd_inspect(inspect_args)
+        output = capsys.readouterr().out
+        data = json.loads(output)
+
+        assert data["status"] == "ok"
+        assert data["command"] == "inspect"
+        assert "version" in data
+        assert data["image_type"] == "rdb"
+        assert data["image"] == str(inspect_args.image)
+        # RDB data is merged into envelope (not nested under "rdbs")
+        assert data["partitions"] == [{"name": "DH0", "size_blocks": 100}]
+        assert "rdbs" not in data
+
+    # -- Gap 3: ISO human-readable output --
+
+    def test_inspect_iso_human(self, mock_inspect_deps, inspect_args, capsys):
+        """ISO 9660 detection produces human-readable output (not JSON)."""
+        fuse_fs_mod, fake_rdb = mock_inspect_deps
+        from dataclasses import dataclass
+
+        @dataclass
+        class ISOInfo:
+            volume_id: str
+            block_size: int
+            total_blocks: int
+
+        fake_rdb.detect_adf.return_value = None
+        fake_rdb.detect_iso.return_value = ISOInfo(
+            volume_id="AMIGA_CD", block_size=2048, total_blocks=5000,
+        )
+        inspect_args.json = False
+
+        fuse_fs_mod.cmd_inspect(inspect_args)
+        output = capsys.readouterr().out
+
+        assert "ISO 9660 Image" in output
+        assert "AMIGA_CD" in output
+        assert "2048" in output
+        assert "5000" in output
+        # Human output must not contain JSON braces
+        assert "{" not in output
+        assert "}" not in output
+
+    # -- Gap 4: RDB open failure JSON path --
+
+    def test_inspect_rdb_open_failure_json(self, mock_inspect_deps, inspect_args, capsys):
+        """open_rdisk IOError produces JSON error envelope with exit code 1."""
+        fuse_fs_mod, fake_rdb = mock_inspect_deps
+
+        fake_rdb.detect_adf.return_value = None
+        fake_rdb.detect_iso.return_value = None
+        fake_rdb.detect_mbr.return_value = None
+        fake_rdb.open_rdisk.side_effect = IOError("No valid RDB found")
+
+        with pytest.raises(SystemExit) as exc_info:
+            fuse_fs_mod.cmd_inspect(inspect_args)
+        assert exc_info.value.code == 1
+
+        output = capsys.readouterr().out
+        data = json.loads(output)
+        assert data["status"] == "error"
+        assert data["command"] == "inspect"
+        assert data["error"]["code"] == "OPEN_FAILED"
+        assert "No valid RDB found" in data["error"]["message"]
+        assert data["image"] == str(inspect_args.image)
+
+    # -- Gap 5: Multi-RDB JSON path --
+
+    def test_inspect_multi_rdb_json(self, mock_inspect_deps, inspect_args, capsys):
+        """Multiple 0x76 MBR partitions produce JSON with 'rdbs' array."""
+        fuse_fs_mod, fake_rdb = mock_inspect_deps
+        from dataclasses import dataclass
+
+        @dataclass
+        class FakeMBRPartition:
+            index: int
+            bootable: bool
+            partition_type: int
+            start_lba: int
+            num_sectors: int
+
+        @dataclass
+        class FakeMBRInfo:
+            partitions: list
+            has_amiga_partitions: bool
+
+        part0 = FakeMBRPartition(
+            index=0, bootable=False, partition_type=0x76,
+            start_lba=2048, num_sectors=100000,
+        )
+        part1 = FakeMBRPartition(
+            index=1, bootable=False, partition_type=0x76,
+            start_lba=200000, num_sectors=100000,
+        )
+        mbr_info = FakeMBRInfo(
+            partitions=[part0, part1],
+            has_amiga_partitions=True,
+        )
+
+        fake_rdb.detect_adf.return_value = None
+        fake_rdb.detect_iso.return_value = None
+        fake_rdb.detect_mbr.return_value = mbr_info
+
+        # open_rdisk called twice (once per 0x76 partition)
+        def make_rdisk_result(partition_index):
+            mock_blkdev = MagicMock()
+            mock_rdisk = MagicMock()
+            mock_rdisk.get_desc.return_value = {
+                "partitions": [{"name": f"DH{partition_index}"}],
+            }
+            mock_rdisk.rdb_warnings = []
+            mbr_ctx = MagicMock()
+            mbr_ctx.scheme = "emu68"
+            mbr_ctx.offset_blocks = [part0, part1][partition_index].start_lba
+            mbr_ctx.mbr_info = mbr_info
+            mbr_ctx.mbr_partition = [part0, part1][partition_index]
+            return (mock_blkdev, mock_rdisk, mbr_ctx)
+
+        fake_rdb.open_rdisk.side_effect = [
+            make_rdisk_result(0),
+            make_rdisk_result(1),
+        ]
+
+        fuse_fs_mod.cmd_inspect(inspect_args)
+        output = capsys.readouterr().out
+        data = json.loads(output)
+
+        assert data["status"] == "ok"
+        assert data["command"] == "inspect"
+        assert data["image_type"] == "rdb"
+        assert data["image"] == str(inspect_args.image)
+        # Multi-RDB: data stored as 'rdbs' array, not merged
+        assert "rdbs" in data
+        assert isinstance(data["rdbs"], list)
+        assert len(data["rdbs"]) == 2
+        assert data["rdbs"][0]["partitions"] == [{"name": "DH0"}]
+        assert data["rdbs"][1]["partitions"] == [{"name": "DH1"}]
+
+    # -- Gap 6: Verify image, version, status, command fields --
+
+    def test_inspect_envelope_fields(self, mock_inspect_deps, inspect_args, capsys):
+        """Verify all standard envelope fields are present and correctly typed."""
+        fuse_fs_mod, fake_rdb = mock_inspect_deps
+        from dataclasses import dataclass
+
+        @dataclass
+        class ISOInfo:
+            volume_id: str
+            block_size: int
+            total_blocks: int
+
+        fake_rdb.detect_adf.return_value = None
+        fake_rdb.detect_iso.return_value = ISOInfo(
+            volume_id="TEST", block_size=2048, total_blocks=100,
+        )
+
+        fuse_fs_mod.cmd_inspect(inspect_args)
+        output = capsys.readouterr().out
+        data = json.loads(output)
+
+        # All standard envelope fields
+        assert data["status"] == "ok"
+        assert data["command"] == "inspect"
+        assert isinstance(data["version"], str)
+        assert data["version"].startswith("v")
+        assert data["image"] == str(inspect_args.image)
+        # image_type is always present for successful inspect
+        assert "image_type" in data
