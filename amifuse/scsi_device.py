@@ -5,8 +5,7 @@ startup (OpenDevice + BeginIO/DoIO).
 """
 
 from amitools.vamos.libcore import LibImpl  # type: ignore
-from amitools.vamos.machine.regs import REG_A1, REG_D0, REG_D1  # type: ignore
-from amitools.vamos.astructs.access import AccessStruct  # type: ignore
+from amitools.vamos.machine.regs import REG_D0, REG_D1  # type: ignore
 from amitools.vamos.astructs import AmigaStructDef, AmigaStruct  # type: ignore
 from amitools.vamos.astructs.scalar import UBYTE, UWORD, ULONG  # type: ignore
 from amitools.vamos.libstructs.exec_ import IORequestStruct, UnitStruct  # type: ignore
@@ -52,6 +51,8 @@ class SCSICmdStruct(AmigaStruct):
         (UWORD, "scsi_SenseLength"),
         (UWORD, "scsi_SenseActual"),
     ]
+
+
 # fallbacks: TD_MOTOR/TD_REMCHANGE/TD_ADDCHANGEINT and friends default to success
 
 
@@ -69,8 +70,12 @@ class ScsiDevice(LibImpl):
         reply port in the current task's tc_SigRecvd.
         """
         from amitools.vamos.libstructs.exec_ import (
-            ExecLibraryStruct, TaskStruct, MsgPortStruct, MessageStruct
+            ExecLibraryStruct,
+            TaskStruct,
+            MsgPortStruct,
+            MessageStruct,
         )
+
         mem = ctx.mem
 
         # Get reply port from IORequest's embedded message (io_Message.mn_ReplyPort)
@@ -79,14 +84,18 @@ class ScsiDevice(LibImpl):
         reply_port = mem.r32(req_ptr + 14)  # mn_ReplyPort offset
         if reply_port == 0:
             if self.debug:
-                print(f"[SCSI] _signal_io_complete: no reply_port (req_ptr=0x{req_ptr:x})")
+                print(
+                    f"[SCSI] _signal_io_complete: no reply_port (req_ptr=0x{req_ptr:x})"
+                )
             return
 
         # Get signal bit from reply port (mp_SigBit at offset 15)
         sigbit = mem.r8(reply_port + 15)
         if sigbit >= 32:
             if self.debug:
-                print(f"[SCSI] _signal_io_complete: invalid sigbit={sigbit} (reply_port=0x{reply_port:x})")
+                print(
+                    f"[SCSI] _signal_io_complete: invalid sigbit={sigbit} (reply_port=0x{reply_port:x})"
+                )
             return
 
         # Get ThisTask from ExecBase (address 4)
@@ -106,7 +115,9 @@ class ScsiDevice(LibImpl):
         new_sigs = current_sigs | (1 << sigbit)
         mem.w32(this_task + sigrecvd_off, new_sigs)
         if self.debug:
-            print(f"[SCSI] _signal_io_complete: set sigbit={sigbit} (0x{1<<sigbit:x}) tc_SigRecvd: 0x{current_sigs:x} -> 0x{new_sigs:x}")
+            print(
+                f"[SCSI] _signal_io_complete: set sigbit={sigbit} (0x{1<<sigbit:x}) tc_SigRecvd: 0x{current_sigs:x} -> 0x{new_sigs:x}"
+            )
 
     def _check_block_bounds(self, block_num: int, num_blocks: int) -> bool:
         """Return True if the block range is within the image bounds.
@@ -141,24 +152,35 @@ class ScsiDevice(LibImpl):
     def close_lib(self, ctx, open_cnt):
         return 0
 
-    def BeginIO(self, ctx):
-        # A1 points to IORequest
-        req_ptr = ctx.cpu.r_reg(REG_A1)
+    def BeginIO(self, ctx, io_request):
         mem = ctx.mem
-        ior = AccessStruct(mem, IORequestStruct, req_ptr)
-        cmd = ior.r_s("io_Command")
-        length = ior.r_s("io_Length")
-        offset = ior.r_s("io_Offset")
-        buf_ptr = ior.r_s("io_Data")
+        ior = IORequestStruct(mem, io_request)
+        cmd = ior.command.val
+        length = ior.length.val
+        offset = ior.offset.val
+        buf_ptr = ior.data.val
         # For TD64 commands, io_Actual contains the high 32 bits of the offset
-        io_actual = ior.r_s("io_Actual")
+        io_actual = ior.actual.val
         # SCSI command dispatch
         cmd_names = {
-            2: "CMD_READ", 3: "CMD_WRITE", 4: "CMD_UPDATE", 5: "CMD_CLEAR",
-            9: "TD_MOTOR", 10: "TD_SEEK", 11: "TD_FORMAT", 13: "TD_CHANGENUM",
-            14: "TD_CHANGESTATE", 15: "TD_PROTSTATUS", 18: "TD_GETDRIVETYPE",
-            20: "TD_ADDCHANGEINT", 21: "TD_REMCHANGEINT", 22: "TD_GETGEOMETRY",
-            24: "TD_READ64", 25: "TD_WRITE64", 26: "TD_SEEK64", 27: "TD_FORMAT64",
+            2: "CMD_READ",
+            3: "CMD_WRITE",
+            4: "CMD_UPDATE",
+            5: "CMD_CLEAR",
+            9: "TD_MOTOR",
+            10: "TD_SEEK",
+            11: "TD_FORMAT",
+            13: "TD_CHANGENUM",
+            14: "TD_CHANGESTATE",
+            15: "TD_PROTSTATUS",
+            18: "TD_GETDRIVETYPE",
+            20: "TD_ADDCHANGEINT",
+            21: "TD_REMCHANGEINT",
+            22: "TD_GETGEOMETRY",
+            24: "TD_READ64",
+            25: "TD_WRITE64",
+            26: "TD_SEEK64",
+            27: "TD_FORMAT64",
             28: "HD_SCSICMD",
         }
         if self.debug:
@@ -169,33 +191,44 @@ class ScsiDevice(LibImpl):
             # For TD64, compute 64-bit offset
             if cmd in (TD_READ64, TD_WRITE64):
                 offset64 = (io_actual << 32) | offset
-                block_num = offset64 // self.backend.block_size if self.backend.block_size else 0
-                num_blocks = length // self.backend.block_size if self.backend.block_size else 0
+                block_num = (
+                    offset64 // self.backend.block_size
+                    if self.backend.block_size
+                    else 0
+                )
+                num_blocks = (
+                    length // self.backend.block_size if self.backend.block_size else 0
+                )
                 extra = f" offset64={offset64} block={block_num} count={num_blocks}"
             elif cmd == CMD_READ or cmd == CMD_WRITE:
-                block_num = offset // self.backend.block_size if self.backend.block_size else 0
-                num_blocks = length // self.backend.block_size if self.backend.block_size else 0
+                block_num = (
+                    offset // self.backend.block_size if self.backend.block_size else 0
+                )
+                num_blocks = (
+                    length // self.backend.block_size if self.backend.block_size else 0
+                )
                 extra = f" block={block_num} count={num_blocks}"
             elif cmd == TD_GETGEOMETRY:
                 extra = f" total={self.backend.total_blocks} cyls={self.backend.cyls} heads={self.backend.heads} secs={self.backend.secs}"
-            print(f"[SCSI] {cmd_name} offset={offset} len={length} buf=0x{buf_ptr:x}{extra}")
+            print(
+                f"[SCSI] {cmd_name} offset={offset} len={length} buf=0x{buf_ptr:x}{extra}"
+            )
 
         # Clear error and ensure IOF_QUICK is set (we always complete synchronously)
         # This tells the handler that BeginIO completed immediately - no need to wait
         # for a reply message via WaitIO/CheckIO.
-        ior.w_s("io_Error", 0)
-        flags = ior.r_s("io_Flags")
-        ior.w_s("io_Flags", flags | IOF_QUICK)
+        ior.error.val = 0
+        ior.flags.val |= IOF_QUICK
 
         if cmd == 28:  # HD_SCSICMD
-            scsi = AccessStruct(mem, SCSICmdStruct, buf_ptr)
-            cdb_ptr = scsi.r_s("scsi_Command")
-            cdb_len = scsi.r_s("scsi_CmdLength")
-            data_ptr = scsi.r_s("scsi_Data")
-            data_len = scsi.r_s("scsi_Length")
-            sense_ptr = scsi.r_s("scsi_SenseData")
-            sense_len = scsi.r_s("scsi_SenseLength")
-            flags = scsi.r_s("scsi_Flags")
+            scsi = SCSICmdStruct(mem, buf_ptr)
+            cdb_ptr = scsi.scsi_Command.val
+            cdb_len = scsi.scsi_CmdLength.val
+            data_ptr = scsi.scsi_Data.val
+            data_len = scsi.scsi_Length.val
+            sense_ptr = scsi.scsi_SenseData.val
+            sense_len = scsi.scsi_SenseLength.val
+            flags = scsi.scsi_Flags.val
             opcode = mem.r8(cdb_ptr) if cdb_len > 0 else 0
             cdb_bytes = mem.r_block(cdb_ptr, cdb_len) if cdb_ptr and cdb_len else b""
             actual = 0
@@ -239,7 +272,11 @@ class ScsiDevice(LibImpl):
                 actual = min(data_len, 8)
             elif opcode in (0x08, 0x28):  # READ(6)/READ(10)
                 if opcode == 0x08:
-                    lba = ((mem.r8(cdb_ptr + 1) & 0x1F) << 16) | (mem.r8(cdb_ptr + 2) << 8) | mem.r8(cdb_ptr + 3)
+                    lba = (
+                        ((mem.r8(cdb_ptr + 1) & 0x1F) << 16)
+                        | (mem.r8(cdb_ptr + 2) << 8)
+                        | mem.r8(cdb_ptr + 3)
+                    )
                     xfer_blocks = mem.r8(cdb_ptr + 4) or 256
                 else:
                     lba = mem.r32(cdb_ptr + 2)
@@ -248,7 +285,7 @@ class ScsiDevice(LibImpl):
                     status = 2  # check condition
                 else:
                     data = self.backend.read_blocks(lba, xfer_blocks)
-                    mem.w_block(data_ptr, data[: data_len])
+                    mem.w_block(data_ptr, data[:data_len])
                     actual = min(len(data), data_len)
             elif opcode == 0x2A:  # WRITE(10)
                 lba = mem.r32(cdb_ptr + 2)
@@ -256,7 +293,9 @@ class ScsiDevice(LibImpl):
                 if not self._check_block_bounds(lba, xfer_blocks):
                     status = 2  # check condition
                 else:
-                    data = mem.r_block(data_ptr, min(data_len, xfer_blocks * self.backend.block_size))
+                    data = mem.r_block(
+                        data_ptr, min(data_len, xfer_blocks * self.backend.block_size)
+                    )
                     self.backend.write_blocks(lba, data, xfer_blocks)
                     actual = len(data)
             else:
@@ -334,16 +373,16 @@ class ScsiDevice(LibImpl):
             total_secs = self.backend.total_blocks
             cyls = self.backend.cyls
             cyl_secs = self.backend.secs * self.backend.heads
-            mem.w32(geo_ptr + 0, self.backend.block_size)   # dg_SectorSize
-            mem.w32(geo_ptr + 4, total_secs)                # dg_TotalSectors
-            mem.w32(geo_ptr + 8, cyls)                      # dg_Cylinders
-            mem.w32(geo_ptr + 12, cyl_secs)                 # dg_CylSectors
-            mem.w32(geo_ptr + 16, self.backend.heads)       # dg_Heads
-            mem.w32(geo_ptr + 20, self.backend.secs)        # dg_TrackSectors
-            mem.w32(geo_ptr + 24, 1)                        # dg_BufMemType (MEMF_PUBLIC)
-            mem.w8(geo_ptr + 28, 0)                         # dg_DeviceType
-            mem.w8(geo_ptr + 29, 0)                         # dg_Flags
-            mem.w16(geo_ptr + 30, 0)                        # dg_Reserved
+            mem.w32(geo_ptr + 0, self.backend.block_size)  # dg_SectorSize
+            mem.w32(geo_ptr + 4, total_secs)  # dg_TotalSectors
+            mem.w32(geo_ptr + 8, cyls)  # dg_Cylinders
+            mem.w32(geo_ptr + 12, cyl_secs)  # dg_CylSectors
+            mem.w32(geo_ptr + 16, self.backend.heads)  # dg_Heads
+            mem.w32(geo_ptr + 20, self.backend.secs)  # dg_TrackSectors
+            mem.w32(geo_ptr + 24, 1)  # dg_BufMemType (MEMF_PUBLIC)
+            mem.w8(geo_ptr + 28, 0)  # dg_DeviceType
+            mem.w8(geo_ptr + 29, 0)  # dg_Flags
+            mem.w16(geo_ptr + 30, 0)  # dg_Reserved
             ior.w_s("io_Actual", 0)
         elif cmd == 9:  # TD_MOTOR
             # Turn motor on/off, return old motor state (always 0 for us)
@@ -365,7 +404,7 @@ class ScsiDevice(LibImpl):
             ior.w_s("io_Actual", 0)
         elif cmd == CMD_UPDATE:  # CMD_UPDATE (4)
             # Flush buffers to disk - sync backend
-            if hasattr(self.backend, 'sync'):
+            if hasattr(self.backend, "sync"):
                 self.backend.sync()
             ior.w_s("io_Actual", 0)
         elif cmd == CMD_CLEAR:  # CMD_CLEAR (5)
@@ -396,21 +435,30 @@ class ScsiDevice(LibImpl):
             if buf_ptr and length >= 16:
                 # Write the supported commands table at a fixed high address
                 supported = [
-                    CMD_READ, CMD_WRITE, CMD_UPDATE, CMD_CLEAR,
-                    TD_SEEK, TD_CHANGENUM, TD_ADDCHANGEINT, TD_REMCHANGEINT,
+                    CMD_READ,
+                    CMD_WRITE,
+                    CMD_UPDATE,
+                    CMD_CLEAR,
+                    TD_SEEK,
+                    TD_CHANGENUM,
+                    TD_ADDCHANGEINT,
+                    TD_REMCHANGEINT,
                     TD_GETGEOMETRY,
-                    TD_READ64, TD_WRITE64, TD_SEEK64, TD_FORMAT64,
+                    TD_READ64,
+                    TD_WRITE64,
+                    TD_SEEK64,
+                    TD_FORMAT64,
                     NSCMD_DEVICEQUERY,
                     0,  # terminator
                 ]
                 for i, cmd_id in enumerate(supported):
                     mem.w16(_NSD_CMD_TABLE_ADDR + i * 2, cmd_id)
                 # Fill in NSDeviceQueryResult
-                mem.w32(buf_ptr + 0, 0)                       # DevQueryFormat
-                mem.w32(buf_ptr + 4, 16)                      # SizeAvailable
-                mem.w16(buf_ptr + 8, 0)                       # DeviceType (trackdisk)
-                mem.w16(buf_ptr + 10, 0)                      # DeviceSubType
-                mem.w32(buf_ptr + 12, _NSD_CMD_TABLE_ADDR)    # SupportedCommands
+                mem.w32(buf_ptr + 0, 0)  # DevQueryFormat
+                mem.w32(buf_ptr + 4, 16)  # SizeAvailable
+                mem.w16(buf_ptr + 8, 0)  # DeviceType (trackdisk)
+                mem.w16(buf_ptr + 10, 0)  # DeviceSubType
+                mem.w32(buf_ptr + 12, _NSD_CMD_TABLE_ADDR)  # SupportedCommands
                 ior.w_s("io_Actual", 16)
             else:
                 ior.w_s("io_Error", -3)  # IOERR_NOCMD

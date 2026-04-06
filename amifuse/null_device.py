@@ -1,6 +1,4 @@
 from amitools.vamos.libcore import LibImpl  # type: ignore
-from amitools.vamos.machine.regs import REG_A1  # type: ignore
-from amitools.vamos.astructs.access import AccessStruct  # type: ignore
 from amitools.vamos.libstructs.exec_ import IORequestStruct, NodeType  # type: ignore
 
 
@@ -16,13 +14,12 @@ class NullDevice(LibImpl):
     def close_lib(self, ctx, open_cnt):
         return 0
 
-    def BeginIO(self, ctx):
-        io_ptr = ctx.cpu.r_reg(REG_A1)
-        io = AccessStruct(ctx.mem, IORequestStruct, io_ptr)
-        io.w_s("io_Error", 0)
-        io.w_s("io_Flags", io.r_s("io_Flags") | 1)  # IOF_QUICK
-        io.w_s("io_Actual", 0)
-        io.w_s("io_Message.mn_Node.ln_Type", NodeType.NT_REPLYMSG)
+    def BeginIO(self, ctx, io_request):
+        io = IORequestStruct(ctx.mem, io_request)
+        io.error.val = 0
+        io.flags.val |= 1  # IOF_QUICK
+        io.actual.val = 0
+        io.message.node.type.val = NodeType.NT_REPLYMSG
         return 0
 
     def AbortIO(self, ctx):
