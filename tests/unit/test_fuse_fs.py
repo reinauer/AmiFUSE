@@ -2129,3 +2129,112 @@ class TestCmdHash:
         mock_bridge.read_handle_at.assert_not_called()
         # close_file should always be called
         mock_bridge.close_file.assert_called_once_with(0x1000)
+
+    def test_hash_human_output(self, mock_bridge_for_hash, capsys):
+        """Human-readable output contains file path and hash, not JSON."""
+        import hashlib
+
+        mock_bridge, fuse_fs_mod = mock_bridge_for_hash
+        mock_bridge.stat_path.return_value = {"size": 5, "dir_type": -3}
+        mock_bridge.open_file.return_value = (0x1000, 0x2000)
+        mock_bridge.seek_handle.return_value = None
+        mock_bridge.read_handle.side_effect = [b"hello", b""]
+        mock_bridge.close_file.return_value = None
+
+        args = argparse.Namespace(
+            image=Path("/fake/test.hdf"),
+            json=False,
+            file="S/Startup-Sequence",
+            algorithm="sha256",
+            partition=None,
+            driver=None,
+            block_size=None,
+            debug=False,
+        )
+        fuse_fs_mod.cmd_hash(args)
+        output = capsys.readouterr().out
+
+        expected_hash = hashlib.sha256(b"hello").hexdigest()
+        assert "S/Startup-Sequence" in output
+        assert expected_hash in output
+        # Must not look like JSON
+        assert "status" not in output
+        assert "{" not in output
+
+    def test_hash_open_file_failure(self, mock_bridge_for_hash, capsys):
+        """open_file returning None emits HANDLER_ERROR JSON."""
+        mock_bridge, fuse_fs_mod = mock_bridge_for_hash
+        mock_bridge.stat_path.return_value = {"size": 5, "dir_type": -3}
+        mock_bridge.open_file.return_value = None
+
+        args = argparse.Namespace(
+            image=Path("/fake/test.hdf"),
+            json=True,
+            file="test.txt",
+            algorithm="sha256",
+            partition=None,
+            driver=None,
+            block_size=None,
+            debug=False,
+        )
+        with pytest.raises(SystemExit):
+            fuse_fs_mod.cmd_hash(args)
+        output = capsys.readouterr().out
+        data = json.loads(output)
+        assert data["error"]["code"] == "HANDLER_ERROR"
+
+    def test_hash_bridge_exception_json(self, mock_bridge_for_hash, capsys):
+        """Generic exception from bridge emits HANDLER_ERROR with message."""
+        mock_bridge, fuse_fs_mod = mock_bridge_for_hash
+        mock_bridge.stat_path.side_effect = RuntimeError("handler crashed")
+
+        args = argparse.Namespace(
+            image=Path("/fake/test.hdf"),
+            json=True,
+            file="test.txt",
+            algorithm="sha256",
+            partition=None,
+            driver=None,
+            block_size=None,
+            debug=False,
+        )
+        with pytest.raises(SystemExit):
+            fuse_fs_mod.cmd_hash(args)
+        output = capsys.readouterr().out
+        data = json.loads(output)
+        assert data["error"]["code"] == "HANDLER_ERROR"
+        assert "handler crashed" in data["error"]["message"]
+
+    def test_hash_empty_file(self, mock_bridge_for_hash, capsys):
+        """Empty file (size=0) produces correct empty-data hash."""
+        import hashlib
+
+        mock_bridge, fuse_fs_mod = mock_bridge_for_hash
+        mock_bridge.stat_path.return_value = {"size": 0, "dir_type": -3}
+        mock_bridge.open_file.return_value = (0x1000, 0x2000)
+        mock_bridge.seek_handle.return_value = None
+        mock_bridge.close_file.return_value = None
+
+        args = argparse.Namespace(
+            image=Path("/fake/test.hdf"),
+            json=True,
+            file="empty.txt",
+            algorithm="sha256",
+            partition=None,
+            driver=None,
+            block_size=None,
+            debug=False,
+        )
+        fuse_fs_mod.cmd_hash(args)
+        output = capsys.readouterr().out
+        data = json.loads(output)
+
+        expected = hashlib.sha256(b"").hexdigest()
+        assert data["hash"] == expected
+        assert data["size"] == 0
+        assert data["bytes_read"] == 0
+        # read_handle should NOT be called for empty file
+        mock_bridge.read_handle.assert_not_called()
+        # seek and close should still be called
+        mock_bridge.seek_handle.assert_called_once_with(0x1000, 0)
+        mock_bridge.close_file.assert_called_once_with(0x1000)
