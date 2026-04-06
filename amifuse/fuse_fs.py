@@ -2717,6 +2717,11 @@ def _cleanup_bridge(bridge, temp_driver=None):
             backend = getattr(bridge, "backend", None)
             if backend is not None:
                 backend.sync()
+        except Exception:
+            pass
+        try:
+            backend = getattr(bridge, "backend", None)
+            if backend is not None:
                 backend.close()
         except Exception:
             pass

@@ -779,6 +779,15 @@ class TestCleanupBridge:
         mock_bridge.backend.sync.assert_called_once()
         mock_bridge.backend.close.assert_called_once()
 
+    def test_cleanup_bridge_sync_failure_still_closes(self, fuse_mock):
+        """If backend.sync() raises, backend.close() must still be called."""
+        from amifuse.fuse_fs import _cleanup_bridge
+
+        mock_bridge = MagicMock()
+        mock_bridge.backend.sync.side_effect = OSError("disk error")
+        _cleanup_bridge(mock_bridge)
+        mock_bridge.backend.close.assert_called_once()
+
 
 # ---------------------------------------------------------------------------
 # TestCreateBridgeFromArgs -- bridge creation helper tests
@@ -903,6 +912,97 @@ class TestCreateBridgeFromArgs:
             fuse_fs_mod._create_bridge_from_args(args, "test")
         # Temp driver should be cleaned up
         assert not temp_driver.exists()
+
+    def test_bridge_adf_no_driver_json_error(
+        self, fuse_mock, monkeypatch, tmp_path, capsys,
+    ):
+        """ADF without --driver: verify JSON body."""
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        image = tmp_path / "test.adf"
+        image.write_bytes(b"\x00" * 1024)
+
+        fake_rdb = MagicMock()
+        fake_rdb.detect_adf.return_value = MagicMock()
+        monkeypatch.setitem(sys.modules, "amifuse.rdb_inspect", fake_rdb)
+
+        args = argparse.Namespace(
+            image=image,
+            json=True,
+            partition=None,
+            driver=None,
+            block_size=None,
+            debug=False,
+        )
+        with pytest.raises(SystemExit):
+            fuse_fs_mod._create_bridge_from_args(args, "test")
+        output = capsys.readouterr().out
+        data = json.loads(output)
+        assert data["error"]["code"] == "DRIVER_NOT_FOUND"
+        assert "ADF" in data["error"]["message"]
+        assert "--driver" in data["error"]["message"]
+
+    def test_bridge_iso_no_driver_json_error(
+        self, fuse_mock, monkeypatch, tmp_path, capsys,
+    ):
+        """ISO image without --driver should emit DRIVER_NOT_FOUND JSON error."""
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        image = tmp_path / "test.iso"
+        image.write_bytes(b"\x00" * 1024)
+
+        fake_rdb = MagicMock()
+        fake_rdb.detect_adf.return_value = None
+        fake_rdb.detect_iso.return_value = MagicMock()  # valid ISOInfo
+        monkeypatch.setitem(sys.modules, "amifuse.rdb_inspect", fake_rdb)
+
+        args = argparse.Namespace(
+            image=image,
+            json=True,
+            partition=None,
+            driver=None,
+            block_size=None,
+            debug=False,
+        )
+        with pytest.raises(SystemExit):
+            fuse_fs_mod._create_bridge_from_args(args, "test")
+        output = capsys.readouterr().out
+        data = json.loads(output)
+        assert data["error"]["code"] == "DRIVER_NOT_FOUND"
+        assert "ISO" in data["error"]["message"]
+        assert "--driver" in data["error"]["message"]
+
+    def test_bridge_rdb_no_embedded_driver_json_error(
+        self, fuse_mock, monkeypatch, tmp_path, capsys,
+    ):
+        """RDB image with no embedded driver should emit DRIVER_NOT_FOUND."""
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        image = tmp_path / "test.hdf"
+        image.write_bytes(b"\x00" * 1024)
+
+        fake_rdb = MagicMock()
+        fake_rdb.detect_adf.return_value = None
+        fake_rdb.detect_iso.return_value = None
+        monkeypatch.setitem(sys.modules, "amifuse.rdb_inspect", fake_rdb)
+
+        monkeypatch.setattr(
+            fuse_fs_mod, "extract_embedded_driver", lambda *a, **kw: None,
+        )
+
+        args = argparse.Namespace(
+            image=image,
+            json=True,
+            partition=None,
+            driver=None,
+            block_size=None,
+            debug=False,
+        )
+        with pytest.raises(SystemExit):
+            fuse_fs_mod._create_bridge_from_args(args, "test")
+        output = capsys.readouterr().out
+        data = json.loads(output)
+        assert data["error"]["code"] == "DRIVER_NOT_FOUND"
 
 
 # ---------------------------------------------------------------------------
@@ -1065,6 +1165,28 @@ class TestCmdLs:
         assert len(lines) == 1
         parts = lines[0].split()
         assert len(parts) >= 3  # name, <dir>, protection
+
+    def test_ls_handler_exception_json(self, mock_bridge_for_ls, capsys):
+        """Exception in list_dir_path should produce HANDLER_ERROR JSON."""
+        mock_bridge, fuse_fs_mod = mock_bridge_for_ls
+        mock_bridge.list_dir_path.side_effect = RuntimeError("handler crashed")
+
+        args = argparse.Namespace(
+            image=Path("/fake/test.hdf"),
+            json=True,
+            path="/",
+            recursive=False,
+            partition=None,
+            driver=None,
+            block_size=None,
+            debug=False,
+        )
+        with pytest.raises(SystemExit):
+            fuse_fs_mod.cmd_ls(args)
+        output = capsys.readouterr().out
+        data = json.loads(output)
+        assert data["error"]["code"] == "HANDLER_ERROR"
+        assert "handler crashed" in data["error"]["message"]
 
 
 # ---------------------------------------------------------------------------
