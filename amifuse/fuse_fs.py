@@ -9,6 +9,7 @@ import pstats
 import argparse
 import errno
 import os
+import shlex
 import shutil
 import signal
 import subprocess
@@ -54,6 +55,11 @@ def _require_fuse():
             "Python FUSE bindings not found. Install fusepy (pip install fusepy) "
             "or build the local python-fuse bindings and add them to PYTHONPATH."
         )
+
+
+def _handler_has_crashed(obj) -> bool:
+    state = getattr(obj, "state", None)
+    return getattr(state, "crashed", False) is True
 
 
 def _parse_fib(mem, fib_addr: int) -> Dict:
@@ -362,6 +368,18 @@ class HandlerBridge:
                 f"[amifuse] handler loaded seg_baddr=0x{seg_baddr:x} seg_addr=0x{seg_addr:x} "
                 f"port=0x{self.state.port_addr:x} reply=0x{self.state.reply_port_addr:x}"
             )
+        self._closed = False
+
+    def close(self):
+        if getattr(self, "_closed", False):
+            return
+        self._closed = True
+        shutdown = getattr(getattr(self, "vh", None), "shutdown", None)
+        if shutdown is not None:
+            shutdown()
+        backend = getattr(self, "backend", None)
+        if backend is not None:
+            backend.close()
 
     def _set_saved_main_reg(self, reg_num: int, value: int):
         """Mirror manual register changes into the saved main handler state."""
@@ -1379,9 +1397,11 @@ class AmigaFuseFS(Operations):
         bridge: HandlerBridge,
         debug: bool = False,
         icons: bool = False,
+        mountpoint: Optional[Path] = None,
     ):
         self.bridge = bridge
         self._debug = debug
+        self._mountpoint = mountpoint
         self._uid = getattr(os, 'getuid', lambda: 0)()
         self._gid = getattr(os, 'getgid', lambda: 0)()
         self._stat_cache: Dict[str, Tuple[float, Dict]] = {}  # path -> (timestamp, stat_result)
@@ -1405,6 +1425,7 @@ class AmigaFuseFS(Operations):
         self._icon_cache = None
         self._icon_existence_cache = None
         self._icon_handler = None
+        self._crash_shutdown_started = False
         if icons:
             from .icon_parser import IconParser
             from .icon_cache import IconCache, IconExistenceCache
@@ -1532,12 +1553,30 @@ class AmigaFuseFS(Operations):
 
     def _check_handler_alive(self):
         """Check if handler is alive and raise EIO if crashed."""
-        if self.bridge.state.crashed:
+        if _handler_has_crashed(self.bridge):
             if self._debug and not getattr(self, '_crash_reported', False):
                 import sys
                 print(f"[FUSE] Handler crashed - all operations returning EIO", file=sys.stderr, flush=True)
                 self._crash_reported = True
+            self._schedule_crash_shutdown()
             raise FuseOSError(errno.EIO)
+
+    def _schedule_crash_shutdown(self):
+        if self._crash_shutdown_started:
+            return
+        self._crash_shutdown_started = True
+        thread = threading.Thread(
+            target=self._terminate_mount_after_crash,
+            name="amifuse-crash-shutdown",
+            daemon=True,
+        )
+        thread.start()
+
+    def _terminate_mount_after_crash(self):
+        # Give the failing FUSE operation a moment to return EIO before
+        # terminating the process and letting the kernel drop the mount.
+        time.sleep(0.1)
+        os.kill(os.getpid(), signal.SIGTERM)
 
     def _log_op(self, op: str, path: str, extra: str = ""):
         """Log operation if debug is enabled."""
@@ -2391,7 +2430,16 @@ def mount_fuse(
     # Create mountpoint directory if it doesn't exist
     if not mountpoint.exists():
         if not plat.should_auto_create_mountpoint(mountpoint):
-            mountpoint.mkdir(parents=True)
+            try:
+                mountpoint.mkdir(parents=True, exist_ok=True)
+            except FileExistsError:
+                raise SystemExit(plat._format_stale_mountpoint_error(mountpoint))
+            except OSError as exc:
+                if exc.errno in (errno.EIO, errno.ENOTCONN):
+                    raise SystemExit(plat._format_stale_mountpoint_error(mountpoint))
+                raise SystemExit(
+                    f"Could not create mountpoint {mountpoint}: {exc.strerror or exc}"
+                )
 
     if foreground is None:
         foreground = plat.mount_runs_in_foreground_by_default()
@@ -2435,9 +2483,15 @@ def mount_fuse(
         adf_info=adf_info,
         iso_info=iso_info,
     )
+    if _handler_has_crashed(bridge):
+        bridge.close()
+        raise SystemExit("Filesystem handler crashed during startup; mount aborted.")
 
     # Let default signal handling work - FUSE will call destroy() on unmount
     volname = volname_opt or bridge.volume_name()
+    if _handler_has_crashed(bridge):
+        bridge.close()
+        raise SystemExit("Filesystem handler crashed during startup; mount aborted.")
 
     # Pre-generate volume icon if platform requires it at mount time
     temp_volicon = None
@@ -2471,8 +2525,13 @@ def mount_fuse(
         print(f"[amifuse] FUSE options: {fuse_kwargs}", flush=True)
 
     try:
-        FUSE(AmigaFuseFS(bridge, debug=debug, icons=icons), str(mountpoint), **fuse_kwargs)
+        FUSE(
+            AmigaFuseFS(bridge, debug=debug, icons=icons, mountpoint=mountpoint),
+            str(mountpoint),
+            **fuse_kwargs,
+        )
     finally:
+        bridge.close()
         # Clean up temp driver file if we extracted one
         if temp_driver is not None and temp_driver.exists():
             temp_driver.unlink()
@@ -2690,6 +2749,8 @@ def cmd_inspect(args):
 
 def cmd_mount(args):
     """Handle the 'mount' subcommand."""
+    _validate_driver_path(args.driver)
+
     foreground = args.foreground
     if args.profile and foreground is None:
         foreground = True
@@ -2718,6 +2779,8 @@ def cmd_mount(args):
 
 def cmd_format(args):
     """Handle the 'format' subcommand."""
+    _validate_driver_path(args.driver)
+
     format_volume(
         args.image, args.driver, args.block_size,
         partition=args.partition,
@@ -2731,7 +2794,12 @@ def cmd_unmount(args):
     from . import platform as plat
 
     mountpoint = args.mountpoint
-    if not os.path.ismount(mountpoint):
+    is_mounted = False
+    try:
+        is_mounted = os.path.ismount(mountpoint)
+    except OSError:
+        is_mounted = False
+    if not is_mounted and not plat._is_stale_mountpoint(mountpoint):
         raise SystemExit(f"Mountpoint {mountpoint} is not currently mounted.")
 
     cmd = plat.get_unmount_command(mountpoint)
@@ -2743,9 +2811,123 @@ def cmd_unmount(args):
 
     result = subprocess.run(cmd, check=False)
     if result.returncode != 0:
+        killed_pids = _kill_mount_owner_processes(mountpoint)
+        if killed_pids:
+            result = subprocess.run(cmd, check=False)
+    if result.returncode != 0:
         raise SystemExit(
             f"Unmount failed with exit code {result.returncode}: {' '.join(cmd)}"
         )
+
+
+def _kill_mount_owner_processes(mountpoint: Path) -> List[int]:
+    pids = _find_mount_owner_pids(mountpoint)
+    if not pids:
+        return []
+
+    remaining = []
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+            remaining.append(pid)
+        except ProcessLookupError:
+            continue
+
+    deadline = time.time() + 1.0
+    while remaining and time.time() < deadline:
+        still_alive = []
+        for pid in remaining:
+            if _pid_exists(pid):
+                still_alive.append(pid)
+        if not still_alive:
+            return pids
+        remaining = still_alive
+        time.sleep(0.05)
+
+    for pid in remaining:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            continue
+
+    return pids
+
+
+def _find_mount_owner_pids(mountpoint: Path) -> List[int]:
+    try:
+        result = subprocess.run(
+            ["ps", "-axo", "pid=,command="],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return []
+    if result.returncode != 0:
+        return []
+
+    current_pid = os.getpid()
+    raw_mountpoint = str(mountpoint)
+    abs_mountpoint = str(mountpoint.resolve(strict=False))
+    pids = []
+
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            pid_str, command = line.split(None, 1)
+            pid = int(pid_str)
+        except ValueError:
+            continue
+        if pid == current_pid or "amifuse" not in command:
+            continue
+        try:
+            tokens = shlex.split(command)
+        except ValueError:
+            continue
+        if not _command_matches_mountpoint(tokens, raw_mountpoint, abs_mountpoint):
+            continue
+        pids.append(pid)
+
+    return pids
+
+
+def _command_matches_mountpoint(tokens: List[str], raw_mountpoint: str, abs_mountpoint: str) -> bool:
+    for idx, token in enumerate(tokens):
+        if token != "--mountpoint":
+            continue
+        if idx + 1 >= len(tokens):
+            return False
+        mount_arg = tokens[idx + 1]
+        if mount_arg == raw_mountpoint or mount_arg == abs_mountpoint:
+            return True
+        try:
+            resolved = str(Path(mount_arg).expanduser().resolve(strict=False))
+        except OSError:
+            continue
+        if resolved == abs_mountpoint:
+            return True
+    return False
+
+
+def _pid_exists(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _validate_driver_path(driver: Optional[Path]) -> None:
+    if driver is None:
+        return
+    if not driver.exists():
+        raise SystemExit(f"Filesystem driver not found: {driver}")
+    if not driver.is_file():
+        raise SystemExit(f"Filesystem driver is not a regular file: {driver}")
 
 
 def main(argv=None):
@@ -2879,7 +3061,10 @@ commands:
     format_parser.set_defaults(func=cmd_format)
 
     args = parser.parse_args(argv)
-    args.func(args)
+    try:
+        args.func(args)
+    except FileNotFoundError as exc:
+        raise SystemExit(f"Error: {exc}") from None
 
 if __name__ == "__main__":
     main()

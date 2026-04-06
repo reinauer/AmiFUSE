@@ -10,6 +10,7 @@ Mock targets are patched at the module level where they are looked up:
     - amifuse.platform.shutil.which
 """
 
+import errno
 import sys
 import types
 from pathlib import Path, PurePosixPath
@@ -603,6 +604,24 @@ class TestValidateMountpoint:
 
         result = validate_mountpoint(Path(r"C:\mnt\amiga"))
         assert result is None
+
+    def test_validate_unix_mountpoint_stale_inaccessible(self, monkeypatch):
+        """On Unix, EIO from lstat returns a stale-mount error."""
+        monkeypatch.setattr("sys.platform", "darwin")
+
+        def fake_lstat(path):
+            raise OSError(errno.EIO, "Input/output error")
+
+        monkeypatch.setattr("amifuse.platform.os.lstat", fake_lstat)
+        monkeypatch.setattr(
+            "amifuse.platform.shutil.which",
+            lambda cmd: "/sbin/umount" if cmd == "umount" else None,
+        )
+        from amifuse.platform import validate_mountpoint
+
+        result = validate_mountpoint(PurePosixPath("/mnt/amiga"))
+        assert result is not None
+        assert "stale or broken mount" in result
 
 
 # ---------------------------------------------------------------------------

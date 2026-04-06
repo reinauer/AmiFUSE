@@ -6,6 +6,7 @@ installed.
 """
 
 import argparse
+import signal
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -226,6 +227,51 @@ class TestMountFuseOptions:
 
         assert "Daemon mode is not supported" in str(exc_info.value)
 
+    def test_mount_aborts_if_handler_crashes_before_fuse_starts(self, monkeypatch, fuse_mock):
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        fake_rdb = MagicMock()
+        fake_rdb.detect_adf.return_value = None
+        fake_rdb.detect_iso.return_value = MagicMock(
+            volume_id="TestISO",
+            block_size=2048,
+            cylinders=1,
+            heads=1,
+            sectors_per_track=1,
+            total_blocks=1,
+        )
+        monkeypatch.setitem(sys.modules, "amifuse.rdb_inspect", fake_rdb)
+
+        fake_dostype = MagicMock()
+        monkeypatch.setitem(sys.modules, "amitools", MagicMock())
+        monkeypatch.setitem(sys.modules, "amitools.fs", MagicMock())
+        monkeypatch.setitem(sys.modules, "amitools.fs.DosType", fake_dostype)
+
+        import amifuse.platform as plat_mod
+        monkeypatch.setattr(plat_mod, "check_fuse_available", lambda: None)
+        monkeypatch.setattr(plat_mod, "validate_mountpoint", lambda mp: None)
+        monkeypatch.setattr(plat_mod, "should_auto_create_mountpoint", lambda mp: True)
+        monkeypatch.setattr(plat_mod, "mount_runs_in_foreground_by_default", lambda: True)
+
+        mock_bridge = MagicMock()
+        mock_bridge.state.crashed = True
+        monkeypatch.setattr(fuse_fs_mod, "HandlerBridge", MagicMock(return_value=mock_bridge))
+        mock_fuse = MagicMock()
+        monkeypatch.setattr(fuse_fs_mod, "FUSE", mock_fuse)
+
+        with pytest.raises(SystemExit) as exc_info:
+            fuse_fs_mod.mount_fuse(
+                image=Path("/tmp/test.iso"),
+                driver=Path("/tmp/test.handler"),
+                mountpoint=Path("/mnt/test"),
+                block_size=None,
+                foreground=True,
+            )
+
+        assert "crashed during startup" in str(exc_info.value)
+        mock_bridge.close.assert_called_once()
+        mock_fuse.assert_not_called()
+
 
 class TestUnmountCommand:
     """Tests for the unmount subcommand helper."""
@@ -254,6 +300,7 @@ class TestUnmountCommand:
 
     def test_unmount_rejects_non_mountpoint(self, monkeypatch, fuse_mock):
         monkeypatch.setattr("os.path.ismount", lambda path: False)
+        monkeypatch.setattr("amifuse.platform._is_stale_mountpoint", lambda path: False)
         import amifuse.fuse_fs as fuse_fs_mod
 
         with pytest.raises(SystemExit) as exc_info:
@@ -273,6 +320,173 @@ class TestUnmountCommand:
             fuse_fs_mod.cmd_unmount(argparse.Namespace(mountpoint=Path("/mnt/amiga")))
 
         assert "does not provide a standalone unmount command" in str(exc_info.value)
+
+    def test_unmount_runs_for_stale_mountpoint(self, monkeypatch, fuse_mock):
+        monkeypatch.setattr("os.path.ismount", lambda path: False)
+        monkeypatch.setattr(
+            "amifuse.platform._is_stale_mountpoint",
+            lambda mountpoint: True,
+        )
+        monkeypatch.setattr(
+            "amifuse.platform.get_unmount_command",
+            lambda mountpoint: ["umount", "-f", str(mountpoint)],
+        )
+        called = {}
+
+        def fake_run(cmd, check=False):
+            called["cmd"] = cmd
+            return argparse.Namespace(returncode=0)
+
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        monkeypatch.setattr(fuse_fs_mod.subprocess, "run", fake_run)
+
+        fuse_fs_mod.cmd_unmount(argparse.Namespace(mountpoint=Path("/mnt/broken")))
+
+        assert called["cmd"] == ["umount", "-f", "/mnt/broken"]
+
+    def test_unmount_kills_hanging_mount_owner_after_failed_unmount(self, monkeypatch, fuse_mock):
+        monkeypatch.setattr("os.path.ismount", lambda path: True)
+        monkeypatch.setattr(
+            "amifuse.platform.get_unmount_command",
+            lambda mountpoint: ["umount", "-f", str(mountpoint)],
+        )
+
+        run_calls = {"unmount": 0}
+
+        def fake_run(cmd, check=False, capture_output=False, text=False):
+            if cmd[:2] == ["ps", "-axo"]:
+                return argparse.Namespace(
+                    returncode=0,
+                    stdout="123 python3 -m amifuse mount disk.iso --mountpoint ./mnt\n",
+                )
+            run_calls["unmount"] += 1
+            return argparse.Namespace(returncode=1 if run_calls["unmount"] == 1 else 0)
+
+        killed = []
+
+        def fake_kill(pid, sig):
+            if sig != 0:
+                killed.append((pid, sig))
+            else:
+                if any(saved_pid == pid and saved_sig == signal.SIGKILL for saved_pid, saved_sig in killed):
+                    raise ProcessLookupError()
+
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        monkeypatch.setattr(fuse_fs_mod.subprocess, "run", fake_run)
+        monkeypatch.setattr(fuse_fs_mod.os, "kill", fake_kill)
+        monkeypatch.setattr(fuse_fs_mod.os, "getpid", lambda: 999)
+
+        fuse_fs_mod.cmd_unmount(argparse.Namespace(mountpoint=Path("./mnt")))
+
+        assert run_calls["unmount"] == 2
+        assert (123, signal.SIGTERM) in killed
+
+
+class TestDriverValidation:
+    """Tests for explicit filesystem driver path validation."""
+
+    def test_cmd_mount_rejects_missing_driver(self, monkeypatch, fuse_mock):
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        called = {"mount_fuse": False}
+
+        def fake_mount_fuse(*args, **kwargs):
+            called["mount_fuse"] = True
+
+        monkeypatch.setattr(fuse_fs_mod, "mount_fuse", fake_mount_fuse)
+
+        with pytest.raises(SystemExit) as exc_info:
+            fuse_fs_mod.cmd_mount(
+                argparse.Namespace(
+                    image=Path("/tmp/test.iso"),
+                    driver=Path("/tmp/does-not-exist.handler"),
+                    mountpoint=Path("/tmp/mnt"),
+                    block_size=None,
+                    volname=None,
+                    debug=False,
+                    trace=False,
+                    write=False,
+                    partition=None,
+                    icons=False,
+                    foreground=True,
+                    profile=False,
+                )
+            )
+
+        assert "Filesystem driver not found" in str(exc_info.value)
+        assert called["mount_fuse"] is False
+
+    def test_mount_reports_stale_mountpoint_without_traceback(self, monkeypatch, fuse_mock):
+        import amifuse.fuse_fs as fuse_fs_mod
+        import amifuse.platform as plat_mod
+
+        monkeypatch.setattr("sys.platform", "linux")
+        monkeypatch.setattr(plat_mod, "check_fuse_available", lambda: None)
+        monkeypatch.setattr(plat_mod, "validate_mountpoint", lambda mp: None)
+        monkeypatch.setattr(plat_mod, "should_auto_create_mountpoint", lambda mp: False)
+        monkeypatch.setattr(plat_mod, "mount_runs_in_foreground_by_default", lambda: True)
+        monkeypatch.setattr(plat_mod, "get_unmount_command", lambda mp: ["umount", "-f", str(mp)])
+
+        fake_rdb = MagicMock()
+        fake_rdb.detect_adf.return_value = None
+        fake_rdb.detect_iso.return_value = MagicMock(
+            volume_id="TestISO",
+            block_size=2048,
+            cylinders=1,
+            heads=1,
+            sectors_per_track=1,
+            total_blocks=1,
+        )
+        monkeypatch.setitem(sys.modules, "amifuse.rdb_inspect", fake_rdb)
+        fake_dostype = MagicMock()
+        monkeypatch.setitem(sys.modules, "amitools", MagicMock())
+        monkeypatch.setitem(sys.modules, "amitools.fs", MagicMock())
+        monkeypatch.setitem(sys.modules, "amitools.fs.DosType", fake_dostype)
+
+        class BrokenMountPath(type(Path())):
+            def exists(self):
+                return False
+
+            def mkdir(self, parents=False, exist_ok=False):
+                raise FileExistsError(17, "File exists", str(self))
+
+        with pytest.raises(SystemExit) as exc_info:
+            fuse_fs_mod.mount_fuse(
+                image=Path("/tmp/test.iso"),
+                driver=Path("/tmp/test.handler"),
+                mountpoint=BrokenMountPath("/mnt/broken"),
+                block_size=None,
+                foreground=True,
+            )
+
+        assert "stale or broken mount" in str(exc_info.value)
+
+
+class TestCrashShutdown:
+    def test_check_handler_alive_schedules_shutdown_once(self, monkeypatch, fuse_mock):
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        bridge = type("MockBridge", (), {"state": type("State", (), {"crashed": True})(), "_write_enabled": False})()
+        fs = fuse_fs_mod.AmigaFuseFS(bridge, debug=False, icons=False)
+        calls = {"count": 0}
+
+        class FakeThread:
+            def __init__(self, target=None, name=None, daemon=None):
+                self.target = target
+
+            def start(self):
+                calls["count"] += 1
+
+        monkeypatch.setattr(fuse_fs_mod.threading, "Thread", FakeThread)
+
+        with pytest.raises(fuse_fs_mod.FuseOSError):
+            fs._check_handler_alive()
+        with pytest.raises(fuse_fs_mod.FuseOSError):
+            fs._check_handler_alive()
+
+        assert calls["count"] == 1
 
 
 # ---------------------------------------------------------------------------

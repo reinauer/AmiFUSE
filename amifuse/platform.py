@@ -10,6 +10,7 @@ Platform-specific implementations:
 - Windows: (future) icon_windows.py
 """
 
+import errno
 import os
 import shutil
 import sys
@@ -163,18 +164,61 @@ def validate_mountpoint(mountpoint: Path) -> Optional[str]:
                 f"Drive {mp_str} is already in use; choose a different drive letter "
                 f"or free it first."
             )
-    elif os.path.exists(mp_str) and os.path.ismount(mp_str):
-        if get_unmount_command(mountpoint):
-            return (
-                f"Mountpoint {mountpoint} is already a mount; unmount it first "
-                f"(e.g. amifuse unmount {mountpoint})."
-            )
-        else:
-            return (
-                f"Mountpoint {mountpoint} is already a mount. "
-                f"Stop the amifuse process to unmount (Ctrl+C)."
-            )
+    else:
+        try:
+            path_exists = os.path.exists(mp_str)
+        except OSError as exc:
+            if _is_stale_mount_os_error(exc):
+                return _format_stale_mountpoint_error(mountpoint)
+            return f"Mountpoint {mountpoint} is not accessible: {exc.strerror or exc}."
+        if not path_exists:
+            if not _is_stale_mountpoint(mountpoint):
+                return None
+            return _format_stale_mountpoint_error(mountpoint)
+        try:
+            if os.path.ismount(mp_str):
+                if get_unmount_command(mountpoint):
+                    return (
+                        f"Mountpoint {mountpoint} is already a mount; unmount it first "
+                        f"(e.g. amifuse unmount {mountpoint})."
+                    )
+                else:
+                    return (
+                        f"Mountpoint {mountpoint} is already a mount. "
+                        f"Stop the amifuse process to unmount (Ctrl+C)."
+                    )
+        except OSError as exc:
+            if _is_stale_mount_os_error(exc):
+                return _format_stale_mountpoint_error(mountpoint)
+            return f"Mountpoint {mountpoint} is not accessible: {exc.strerror or exc}."
     return None
+
+
+def _is_stale_mount_os_error(exc: OSError) -> bool:
+    return exc.errno in (errno.EIO, errno.ENOTCONN)
+
+
+def _is_stale_mountpoint(mountpoint: Path) -> bool:
+    try:
+        os.lstat(str(mountpoint))
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        if _is_stale_mount_os_error(exc):
+            return True
+    return False
+
+
+def _format_stale_mountpoint_error(mountpoint: Path) -> str:
+    if get_unmount_command(mountpoint):
+        return (
+            f"Mountpoint {mountpoint} looks like a stale or broken mount; "
+            f"unmount it first (e.g. amifuse unmount {mountpoint})."
+        )
+    return (
+        f"Mountpoint {mountpoint} looks like a stale or broken mount. "
+        f"Stop the amifuse process to unmount (Ctrl+C)."
+    )
 
 
 def get_mount_options(volname: str, volicon_path: Optional[str] = None,
