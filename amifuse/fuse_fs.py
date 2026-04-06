@@ -3171,6 +3171,76 @@ def cmd_hash(args):
         _cleanup_bridge(bridge, temp_driver)
 
 
+def _ensure_parent_dirs(bridge, path: str, use_json: bool = False, debug: bool = False):
+    """Create parent directories for path if they don't exist.
+
+    Walks each path component and creates missing directories via
+    create_dir(). Similar to 'mkdir -p' behavior.
+
+    Args:
+        bridge: HandlerBridge instance with write enabled.
+        path: Absolute Amiga path (e.g. "/S/User-Startup").
+        use_json: If True, emit JSON errors instead of raising SystemExit.
+        debug: If True, print debug messages for directory creation.
+
+    Raises:
+        SystemExit on error if use_json is False.
+    """
+    import json as _json
+
+    parts = [p for p in path.split("/") if p]
+    if len(parts) <= 1:
+        return  # No parent dirs needed (file is in root)
+
+    # Check/create each directory component (all except the last, which is the file)
+    for i in range(1, len(parts)):
+        dir_path = "/" + "/".join(parts[:i])
+        stat = bridge.stat_path(dir_path)
+        if stat is not None:
+            # Already exists -- verify it's a directory
+            if stat.get("dir_type", 0) <= 0:
+                msg = f"Path component is a file, not a directory: {dir_path}"
+                if use_json:
+                    print(_json.dumps(_json_error("write", "HANDLER_ERROR", msg)))
+                    sys.exit(1)
+                raise SystemExit(f"Error: {msg}")
+            continue
+
+        # Need to create this directory
+        parent = "/" + "/".join(parts[:i-1]) if i > 1 else "/"
+        parent_lock, _, locks = bridge.locate_path(parent)
+        if parent == "/" and parent_lock == 0:
+            parent_lock, _ = bridge.locate(0, "")
+            if parent_lock:
+                locks.append(parent_lock)
+        if parent_lock == 0 and parent != "/":
+            msg = f"Cannot locate parent directory: {parent}"
+            if use_json:
+                print(_json.dumps(_json_error("write", "HANDLER_ERROR", msg)))
+                sys.exit(1)
+            raise SystemExit(f"Error: {msg}")
+
+        try:
+            # create_dir(0, name) is valid when parent is root ("/").
+            # locate_path("/") returns lock=0 (empty parts list), and the
+            # handler interprets lock=0 as the volume root. This is the same
+            # pattern used by FUSE mkdir() in AmigaFuseOps.
+            new_lock, res2 = bridge.create_dir(parent_lock, parts[i-1])
+            if new_lock == 0:
+                msg = f"Failed to create directory: {dir_path} (error {res2})"
+                if use_json:
+                    print(_json.dumps(_json_error("write", "HANDLER_ERROR", msg)))
+                    sys.exit(1)
+                raise SystemExit(f"Error: {msg}")
+            # Debug logging matching codebase pattern
+            if debug:
+                print(f"[amifuse] Created directory: {dir_path}", flush=True)
+            bridge.free_lock(new_lock)
+        finally:
+            for l in reversed(locks):
+                bridge.free_lock(l)
+
+
 def cmd_read(args):
     """Handle the 'read' subcommand."""
     import json
@@ -3286,6 +3356,159 @@ def cmd_read(args):
             sys.exit(1)
         raise SystemExit(f"Error extracting file: {e}")
     finally:
+        _cleanup_bridge(bridge, temp_driver)
+
+
+def cmd_write(args):
+    """Handle the 'write' subcommand."""
+    import json
+
+    use_json = getattr(args, "json", False)
+    debug = getattr(args, "debug", False)
+    amiga_path = args.file
+    host_path = Path(args.input)  # --in maps to args.input (dest="input")
+
+    # Validate host source file
+    if not host_path.exists():
+        if use_json:
+            print(json.dumps(_json_error("write", "SOURCE_NOT_FOUND",
+                f"Source file not found: {host_path}")))
+            sys.exit(1)
+        raise SystemExit(f"Error: source file not found: {host_path}")
+
+    if host_path.is_dir():
+        if use_json:
+            print(json.dumps(_json_error("write", "INVALID_ARGUMENT",
+                f"Source is a directory, not a file: {host_path}")))
+            sys.exit(1)
+        raise SystemExit(f"Error: source is a directory: {host_path}")
+
+    host_size = host_path.stat().st_size
+
+    # Safety warning (stderr so it doesn't interfere with JSON output)
+    print(f"WARNING: This will modify the disk image: {args.image}", file=sys.stderr)
+    print(f"  Source: {host_path} ({host_size:,} bytes)", file=sys.stderr)
+    print(f"  Destination: {amiga_path}", file=sys.stderr)
+    print(f"  Ensure you have a backup of the image before proceeding.", file=sys.stderr)
+
+    bridge, temp_driver = _create_bridge_from_args(args, "write", read_only=False)
+    flushed = False  # Guard flag to avoid double flush
+    try:
+        normalized = "/" + amiga_path.lstrip("/")
+
+        # Create parent directories if needed
+        _ensure_parent_dirs(bridge, normalized, use_json=use_json, debug=debug)
+
+        # Open for write (create/truncate)
+        fh_result = bridge.open_file(normalized, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
+        if fh_result is None:
+            if use_json:
+                print(json.dumps(_json_error("write", "HANDLER_ERROR",
+                    f"Failed to open file for writing: {amiga_path}")))
+                sys.exit(1)
+            raise SystemExit(f"Error: failed to open file for writing: {amiga_path}")
+
+        # Note: _dir_lock from open_file() is never freed. This is a
+        # pre-existing pattern also present in cmd_hash().
+        # Not a blocker -- the lock is released when the bridge is destroyed.
+        fh_addr, _dir_lock = fh_result
+        try:
+            # Handler crash safety: If the handler crashes during the
+            # write loop, the error paths handle it gracefully:
+            # - flush_volume() checks state.crashed and returns early (safe)
+            # - close_file() sends a packet that gets no reply (harmless)
+            # - write_handle() returning -1 triggers the error path below
+            chunk_size = 65536
+            bytes_written = 0
+            with open(host_path, "rb") as f:
+                while True:
+                    data = f.read(chunk_size)
+                    if not data:
+                        break
+                    n = bridge.write_handle(fh_addr, data)
+                    # Distinguish write failure modes:
+                    # n < 0:  No reply from handler (crashed or unresponsive)
+                    # n == 0: Handler returned DOSFALSE (write operation failed)
+                    # 0 < n < len(data): Partial write (likely disk full)
+                    # n == len(data): Success
+                    if n < 0:
+                        # No reply from handler
+                        if use_json:
+                            print(json.dumps(_json_error("write", "WRITE_ERROR",
+                                f"Write failed at offset {bytes_written}: "
+                                f"no reply from handler",
+                                {"bytes_written": bytes_written,
+                                 "expected": host_size})))
+                            sys.exit(1)
+                        raise SystemExit(
+                            f"Error: write failed at offset {bytes_written}: "
+                            f"no reply from handler")
+                    if n == 0:
+                        # Handler returned DOSFALSE -- write operation failed
+                        if use_json:
+                            print(json.dumps(_json_error("write", "WRITE_ERROR",
+                                f"Write failed at offset {bytes_written}: "
+                                f"handler returned failure (DOSFALSE)",
+                                {"bytes_written": bytes_written,
+                                 "expected": host_size})))
+                            sys.exit(1)
+                        raise SystemExit(
+                            f"Error: write failed at offset {bytes_written}: "
+                            f"handler returned failure")
+                    if n < len(data):
+                        # Partial write -- handler couldn't write all data
+                        # (likely disk full). Record what was written then error.
+                        bytes_written += n
+                        if use_json:
+                            print(json.dumps(_json_error("write", "WRITE_ERROR",
+                                f"Partial write: wrote {bytes_written} of "
+                                f"{host_size} bytes (disk full?)",
+                                {"bytes_written": bytes_written,
+                                 "expected": host_size})))
+                            sys.exit(1)
+                        raise SystemExit(
+                            f"Error: partial write ({bytes_written}/{host_size} "
+                            f"bytes, disk full?)")
+                    bytes_written += n
+        finally:
+            bridge.close_file(fh_addr)
+
+        # Flush is CRITICAL after writes -- without this, writes cached in
+        # handler memory never reach the image file.
+        bridge.flush_volume()
+        flushed = True  # Mark as flushed to avoid double flush
+
+        if use_json:
+            result = _json_result("write",
+                target=str(args.image),
+                file=amiga_path,
+                source=str(host_path),
+                size=host_size,
+                bytes_written=bytes_written,
+            )
+            print(json.dumps(result, indent=2))
+        else:
+            print(f"Written: {amiga_path}")
+            print(f"  Source: {host_path}")
+            print(f"  Size: {host_size}")
+            print(f"  Bytes written: {bytes_written}")
+    except SystemExit:
+        raise
+    except Exception as e:
+        if use_json:
+            print(json.dumps(_json_error("write", "HANDLER_ERROR",
+                f"Write operation failed: {e}")))
+            sys.exit(1)
+        raise SystemExit(f"Error during write: {e}")
+    finally:
+        # On error paths, we still want to flush what was written to
+        # avoid losing partially-written data. But if flush_volume() already
+        # succeeded on the success path, skip the redundant flush.
+        if not flushed:
+            try:
+                bridge.flush_volume()
+            except Exception:
+                pass
         _cleanup_bridge(bridge, temp_driver)
 
 
@@ -3930,6 +4153,15 @@ commands:
     --block-size N            Override block size (defaults to auto/512).
     --json                    Output results as JSON.
     --debug                   Enable debug logging.
+
+  write <image>             Write a file into an Amiga filesystem image.
+    --file PATH               Destination path within the image (required).
+    --in PATH                 Source file on the host (required).
+    --partition NAME          Partition name (e.g. DH0) or index.
+    --driver PATH             Filesystem binary (default: extract from RDB).
+    --block-size N            Override block size (defaults to auto/512).
+    --json                    Output results as JSON.
+    --debug                   Enable debug logging.
 """,
     )
     parser.add_argument(
@@ -4181,6 +4413,41 @@ commands:
         help="Enable debug logging.",
     )
     read_parser.set_defaults(func=cmd_read)
+
+    # write subcommand
+    write_parser = subparsers.add_parser(
+        "write", help="Write a file into an Amiga filesystem image."
+    )
+    write_parser.add_argument("image", type=Path, help="Disk image file")
+    write_parser.add_argument(
+        "--file", type=str, required=True, dest="file",
+        help="Destination path within the Amiga image.",
+    )
+    write_parser.add_argument(
+        "--in", type=str, required=True, dest="input",
+        help="Source file on the host filesystem.",
+    )
+    write_parser.add_argument(
+        "--partition", type=str,
+        help="Partition name (e.g. DH0) or index (defaults to first).",
+    )
+    write_parser.add_argument(
+        "--driver", type=Path,
+        help="Filesystem binary (default: extract from RDB if available).",
+    )
+    write_parser.add_argument(
+        "--block-size", type=int,
+        help="Override block size (defaults to auto/512).",
+    )
+    write_parser.add_argument(
+        "--json", action="store_true",
+        help="Output results as JSON.",
+    )
+    write_parser.add_argument(
+        "--debug", action="store_true",
+        help="Enable debug logging.",
+    )
+    write_parser.set_defaults(func=cmd_write)
 
     args = parser.parse_args(argv)
     try:
