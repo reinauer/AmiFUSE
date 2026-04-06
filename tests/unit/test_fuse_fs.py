@@ -6,6 +6,7 @@ installed.
 """
 
 import argparse
+import json
 import signal
 import sys
 from pathlib import Path
@@ -693,3 +694,565 @@ class TestDirectoryListingCap:
         source = inspect.getsource(HandlerBridge.list_dir)
         assert "for iter_num in range(" in source
         assert "while True" not in source
+
+
+# ---------------------------------------------------------------------------
+# TestJsonHelpers -- JSON envelope helper tests
+# ---------------------------------------------------------------------------
+
+
+class TestJsonHelpers:
+    """Tests for _json_error() and _json_result() envelope helpers."""
+
+    def test_json_error_structure(self, fuse_mock):
+        from amifuse.fuse_fs import _json_error
+
+        result = _json_error("test", "TEST_ERROR", "something went wrong")
+        assert result["status"] == "error"
+        assert result["command"] == "test"
+        assert "version" in result
+        assert result["error"]["code"] == "TEST_ERROR"
+        assert result["error"]["message"] == "something went wrong"
+        assert "details" not in result["error"]
+
+    def test_json_error_with_details(self, fuse_mock):
+        from amifuse.fuse_fs import _json_error
+
+        result = _json_error("test", "TEST_ERROR", "msg", details={"key": "val"})
+        assert result["error"]["details"]["key"] == "val"
+
+    def test_json_result_structure(self, fuse_mock):
+        from amifuse.fuse_fs import _json_result
+
+        result = _json_result("test", foo="bar")
+        assert result["status"] == "ok"
+        assert result["command"] == "test"
+        assert "version" in result
+        assert result["foo"] == "bar"
+
+
+# ---------------------------------------------------------------------------
+# TestCleanupBridge -- bridge cleanup helper tests
+# ---------------------------------------------------------------------------
+
+
+class TestCleanupBridge:
+    """Tests for _cleanup_bridge() resource cleanup."""
+
+    def test_cleanup_bridge_deletes_temp_driver(self, fuse_mock, tmp_path):
+        from amifuse.fuse_fs import _cleanup_bridge
+
+        temp_file = tmp_path / "test.handler"
+        temp_file.write_text("fake driver")
+        assert temp_file.exists()
+
+        mock_bridge = MagicMock()
+        _cleanup_bridge(mock_bridge, temp_file)
+        assert not temp_file.exists()
+
+    def test_cleanup_bridge_none_bridge_still_deletes_temp(self, fuse_mock, tmp_path):
+        from amifuse.fuse_fs import _cleanup_bridge
+
+        temp_file = tmp_path / "test.handler"
+        temp_file.write_text("fake driver")
+        assert temp_file.exists()
+
+        _cleanup_bridge(None, temp_file)
+        assert not temp_file.exists()
+
+    def test_cleanup_bridge_calls_shutdown_and_close(self, fuse_mock):
+        from amifuse.fuse_fs import _cleanup_bridge
+
+        mock_bridge = MagicMock()
+        _cleanup_bridge(mock_bridge)
+        mock_bridge.vh.shutdown.assert_called_once()
+        mock_bridge.backend.sync.assert_called_once()
+        mock_bridge.backend.close.assert_called_once()
+
+    def test_cleanup_bridge_handles_shutdown_failure(self, fuse_mock):
+        from amifuse.fuse_fs import _cleanup_bridge
+
+        mock_bridge = MagicMock()
+        mock_bridge.vh.shutdown.side_effect = RuntimeError("boom")
+        # Should not raise
+        _cleanup_bridge(mock_bridge)
+        mock_bridge.backend.sync.assert_called_once()
+        mock_bridge.backend.close.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# TestCreateBridgeFromArgs -- bridge creation helper tests
+# ---------------------------------------------------------------------------
+
+
+class TestCreateBridgeFromArgs:
+    """Tests for _create_bridge_from_args() error handling."""
+
+    def test_bridge_image_not_found_json(self, fuse_mock, tmp_path, capsys, monkeypatch):
+        # Mock rdb_inspect so the local import in _create_bridge_from_args works
+        fake_rdb = MagicMock()
+        monkeypatch.setitem(sys.modules, "amifuse.rdb_inspect", fake_rdb)
+
+        from amifuse.fuse_fs import _create_bridge_from_args
+
+        args = argparse.Namespace(
+            image=tmp_path / "nonexistent.hdf",
+            json=True,
+            partition=None,
+            driver=None,
+            block_size=None,
+            debug=False,
+        )
+        with pytest.raises(SystemExit):
+            _create_bridge_from_args(args, "test")
+        output = capsys.readouterr().out
+        data = json.loads(output)
+        assert data["error"]["code"] == "IMAGE_NOT_FOUND"
+
+    def test_bridge_image_not_found_human(self, fuse_mock, tmp_path, monkeypatch):
+        fake_rdb = MagicMock()
+        monkeypatch.setitem(sys.modules, "amifuse.rdb_inspect", fake_rdb)
+
+        from amifuse.fuse_fs import _create_bridge_from_args
+
+        args = argparse.Namespace(
+            image=tmp_path / "nonexistent.hdf",
+            json=False,
+            partition=None,
+            driver=None,
+            block_size=None,
+            debug=False,
+        )
+        with pytest.raises(SystemExit, match="image file not found"):
+            _create_bridge_from_args(args, "test")
+
+    def test_bridge_returns_tuple(self, fuse_mock, monkeypatch, tmp_path):
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        # Create a real image file so exists() passes
+        image = tmp_path / "test.hdf"
+        image.write_bytes(b"\x00" * 1024)
+
+        # Mock detect_adf/detect_iso to return None (treat as RDB)
+        fake_rdb = MagicMock()
+        fake_rdb.detect_adf.return_value = None
+        fake_rdb.detect_iso.return_value = None
+        monkeypatch.setitem(sys.modules, "amifuse.rdb_inspect", fake_rdb)
+
+        # Mock extract_embedded_driver to return a temp path
+        temp_driver = tmp_path / "temp.handler"
+        temp_driver.write_text("fake")
+        monkeypatch.setattr(
+            fuse_fs_mod, "extract_embedded_driver",
+            lambda *a, **kw: (temp_driver, "DOS3", 0x444F5303),
+        )
+
+        # Mock HandlerBridge
+        mock_bridge = MagicMock()
+        monkeypatch.setattr(fuse_fs_mod, "HandlerBridge", lambda *a, **kw: mock_bridge)
+
+        args = argparse.Namespace(
+            image=image,
+            json=False,
+            partition=None,
+            driver=None,
+            block_size=None,
+            debug=False,
+        )
+        result = fuse_fs_mod._create_bridge_from_args(args, "test")
+        assert isinstance(result, tuple)
+        assert len(result) == 2
+        bridge, td = result
+        assert bridge is mock_bridge
+        assert td == temp_driver
+
+    def test_bridge_cleans_temp_driver_on_failure(self, fuse_mock, monkeypatch, tmp_path):
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        image = tmp_path / "test.hdf"
+        image.write_bytes(b"\x00" * 1024)
+
+        # Mock detect_adf/detect_iso
+        fake_rdb = MagicMock()
+        fake_rdb.detect_adf.return_value = None
+        fake_rdb.detect_iso.return_value = None
+        monkeypatch.setitem(sys.modules, "amifuse.rdb_inspect", fake_rdb)
+
+        # Create a real temp file
+        temp_driver = tmp_path / "temp.handler"
+        temp_driver.write_text("fake driver content")
+        monkeypatch.setattr(
+            fuse_fs_mod, "extract_embedded_driver",
+            lambda *a, **kw: (temp_driver, "DOS3", 0x444F5303),
+        )
+
+        # Mock HandlerBridge to raise
+        def fail_init(*a, **kw):
+            raise RuntimeError("init failed")
+        monkeypatch.setattr(fuse_fs_mod, "HandlerBridge", fail_init)
+
+        args = argparse.Namespace(
+            image=image,
+            json=False,
+            partition=None,
+            driver=None,
+            block_size=None,
+            debug=False,
+        )
+        with pytest.raises(SystemExit):
+            fuse_fs_mod._create_bridge_from_args(args, "test")
+        # Temp driver should be cleaned up
+        assert not temp_driver.exists()
+
+
+# ---------------------------------------------------------------------------
+# TestCmdLs -- ls command tests
+# ---------------------------------------------------------------------------
+
+
+class TestCmdLs:
+    """Tests for cmd_ls() subcommand."""
+
+    @pytest.fixture
+    def mock_bridge_for_ls(self, fuse_mock, monkeypatch):
+        """Set up mocked bridge for ls tests."""
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        mock_bridge = MagicMock()
+        monkeypatch.setattr(
+            fuse_fs_mod, "_create_bridge_from_args",
+            lambda args, cmd: (mock_bridge, None),
+        )
+        return mock_bridge, fuse_fs_mod
+
+    def test_ls_json_output_structure(self, mock_bridge_for_ls, capsys):
+        mock_bridge, fuse_fs_mod = mock_bridge_for_ls
+        mock_bridge.list_dir_path.return_value = [
+            {"name": "file1.txt", "dir_type": 0, "size": 100, "protection": 0},
+            {"name": "Devs", "dir_type": 2, "size": 0, "protection": 0},
+        ]
+
+        args = argparse.Namespace(
+            image=Path("/fake/test.hdf"),
+            json=True,
+            path="/",
+            recursive=False,
+            partition=None,
+            driver=None,
+            block_size=None,
+            debug=False,
+        )
+        fuse_fs_mod.cmd_ls(args)
+        output = capsys.readouterr().out
+        data = json.loads(output)
+
+        assert data["status"] == "ok"
+        assert data["command"] == "ls"
+        assert "version" in data
+        assert data["path"] == "/"
+        assert len(data["entries"]) == 2
+        assert data["entries"][0]["name"] == "file1.txt"
+        assert data["entries"][0]["type"] == "file"
+        assert data["entries"][0]["size"] == 100
+        assert data["entries"][1]["name"] == "Devs"
+        assert data["entries"][1]["type"] == "dir"
+
+    def test_ls_recursive_json(self, mock_bridge_for_ls, capsys):
+        mock_bridge, fuse_fs_mod = mock_bridge_for_ls
+
+        def fake_list_dir(path):
+            if path == "/":
+                return [
+                    {"name": "S", "dir_type": 2, "size": 0, "protection": 0},
+                    {"name": "readme.txt", "dir_type": 0, "size": 50, "protection": 0},
+                ]
+            elif path == "/S":
+                return [
+                    {"name": "Startup-Sequence", "dir_type": 0, "size": 200, "protection": 0},
+                ]
+            return []
+
+        mock_bridge.list_dir_path.side_effect = fake_list_dir
+
+        args = argparse.Namespace(
+            image=Path("/fake/test.hdf"),
+            json=True,
+            path="/",
+            recursive=True,
+            partition=None,
+            driver=None,
+            block_size=None,
+            debug=False,
+        )
+        fuse_fs_mod.cmd_ls(args)
+        output = capsys.readouterr().out
+        data = json.loads(output)
+
+        assert data["status"] == "ok"
+        entries = data["entries"]
+        assert len(entries) == 3
+        names = [e["name"] for e in entries]
+        assert "S" in names
+        assert "readme.txt" in names
+        assert "Startup-Sequence" in names
+        ss_entry = next(e for e in entries if e["name"] == "Startup-Sequence")
+        assert ss_entry["path"] == "/S/Startup-Sequence"
+
+    def test_ls_path_not_found_json(self, mock_bridge_for_ls, capsys):
+        mock_bridge, fuse_fs_mod = mock_bridge_for_ls
+        mock_bridge.list_dir_path.return_value = []
+        mock_bridge.stat_path.return_value = None
+
+        args = argparse.Namespace(
+            image=Path("/fake/test.hdf"),
+            json=True,
+            path="/nonexistent",
+            recursive=False,
+            partition=None,
+            driver=None,
+            block_size=None,
+            debug=False,
+        )
+        with pytest.raises(SystemExit):
+            fuse_fs_mod.cmd_ls(args)
+        output = capsys.readouterr().out
+        data = json.loads(output)
+        assert data["error"]["code"] == "FILE_NOT_FOUND"
+
+    def test_ls_normalizes_path(self, mock_bridge_for_ls, capsys):
+        mock_bridge, fuse_fs_mod = mock_bridge_for_ls
+        mock_bridge.list_dir_path.return_value = [
+            {"name": "Startup-Sequence", "dir_type": 0, "size": 100, "protection": 0},
+        ]
+
+        # Test with path "S/" (no leading slash, trailing slash)
+        args = argparse.Namespace(
+            image=Path("/fake/test.hdf"),
+            json=True,
+            path="S/",
+            recursive=False,
+            partition=None,
+            driver=None,
+            block_size=None,
+            debug=False,
+        )
+        fuse_fs_mod.cmd_ls(args)
+
+        # Verify list_dir_path was called with normalized "/S"
+        mock_bridge.list_dir_path.assert_called_with("/S")
+
+    def test_ls_human_shows_protection_for_dirs(self, mock_bridge_for_ls, capsys):
+        mock_bridge, fuse_fs_mod = mock_bridge_for_ls
+        mock_bridge.list_dir_path.return_value = [
+            {"name": "Devs", "dir_type": 2, "size": 0, "protection": 15},
+        ]
+
+        args = argparse.Namespace(
+            image=Path("/fake/test.hdf"),
+            json=False,
+            path="/",
+            recursive=False,
+            partition=None,
+            driver=None,
+            block_size=None,
+            debug=False,
+        )
+        fuse_fs_mod.cmd_ls(args)
+        output = capsys.readouterr().out
+        assert "Devs" in output
+        assert "<dir>" in output
+        lines = output.strip().split("\n")
+        assert len(lines) == 1
+        parts = lines[0].split()
+        assert len(parts) >= 3  # name, <dir>, protection
+
+
+# ---------------------------------------------------------------------------
+# TestCmdVerify -- verify command tests
+# ---------------------------------------------------------------------------
+
+
+class TestCmdVerify:
+    """Tests for cmd_verify() subcommand."""
+
+    @pytest.fixture
+    def mock_bridge_for_verify(self, fuse_mock, monkeypatch):
+        """Set up mocked bridge for verify tests."""
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        mock_bridge = MagicMock()
+        monkeypatch.setattr(
+            fuse_fs_mod, "_create_bridge_from_args",
+            lambda args, cmd: (mock_bridge, None),
+        )
+        return mock_bridge, fuse_fs_mod
+
+    def test_verify_file_json(self, mock_bridge_for_verify, capsys):
+        mock_bridge, fuse_fs_mod = mock_bridge_for_verify
+        mock_bridge.stat_path.return_value = {
+            "dir_type": 0, "size": 1234, "name": "test.txt", "protection": 0,
+        }
+
+        args = argparse.Namespace(
+            image=Path("/fake/test.hdf"),
+            json=True,
+            file="test.txt",
+            expect_size=None,
+            partition=None,
+            driver=None,
+            block_size=None,
+            debug=False,
+        )
+        fuse_fs_mod.cmd_verify(args)
+        output = capsys.readouterr().out
+        data = json.loads(output)
+
+        assert data["status"] == "ok"
+        assert data["command"] == "verify"
+        assert data["exists"] is True
+        assert data["size"] == 1234
+        assert data["type"] == "file"
+
+    def test_verify_file_size_match(self, mock_bridge_for_verify, capsys):
+        mock_bridge, fuse_fs_mod = mock_bridge_for_verify
+        mock_bridge.stat_path.return_value = {
+            "dir_type": 0, "size": 1234, "name": "test.txt", "protection": 0,
+        }
+
+        args = argparse.Namespace(
+            image=Path("/fake/test.hdf"),
+            json=True,
+            file="test.txt",
+            expect_size=1234,
+            partition=None,
+            driver=None,
+            block_size=None,
+            debug=False,
+        )
+        fuse_fs_mod.cmd_verify(args)
+        output = capsys.readouterr().out
+        data = json.loads(output)
+
+        assert data["size_matches"] is True
+        assert data["expected_size"] == 1234
+
+    def test_verify_file_size_mismatch(self, mock_bridge_for_verify, capsys):
+        mock_bridge, fuse_fs_mod = mock_bridge_for_verify
+        mock_bridge.stat_path.return_value = {
+            "dir_type": 0, "size": 1234, "name": "test.txt", "protection": 0,
+        }
+
+        args = argparse.Namespace(
+            image=Path("/fake/test.hdf"),
+            json=True,
+            file="test.txt",
+            expect_size=9999,
+            partition=None,
+            driver=None,
+            block_size=None,
+            debug=False,
+        )
+        fuse_fs_mod.cmd_verify(args)
+        output = capsys.readouterr().out
+        data = json.loads(output)
+
+        assert data["size_matches"] is False
+        assert data["expected_size"] == 9999
+
+    def test_verify_file_not_found_json(self, mock_bridge_for_verify, capsys):
+        mock_bridge, fuse_fs_mod = mock_bridge_for_verify
+        mock_bridge.stat_path.return_value = None
+
+        args = argparse.Namespace(
+            image=Path("/fake/test.hdf"),
+            json=True,
+            file="missing.txt",
+            expect_size=None,
+            partition=None,
+            driver=None,
+            block_size=None,
+            debug=False,
+        )
+        with pytest.raises(SystemExit):
+            fuse_fs_mod.cmd_verify(args)
+        output = capsys.readouterr().out
+        data = json.loads(output)
+        assert data["error"]["code"] == "FILE_NOT_FOUND"
+
+    def test_verify_volume_json(self, mock_bridge_for_verify, monkeypatch, capsys):
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        mock_bridge, _ = mock_bridge_for_verify
+        mock_bridge.volume_name.return_value = "Workbench3.1"
+
+        def fake_list_dir(path):
+            if path == "/":
+                return [
+                    {"name": "S", "dir_type": 2, "size": 0, "protection": 0},
+                    {"name": "readme.txt", "dir_type": 0, "size": 50, "protection": 0},
+                    {"name": "data.bin", "dir_type": 0, "size": 200, "protection": 0},
+                ]
+            elif path == "/S":
+                return [
+                    {"name": "Startup-Sequence", "dir_type": 0, "size": 100, "protection": 0},
+                ]
+            return []
+
+        mock_bridge.list_dir_path.side_effect = fake_list_dir
+
+        args = argparse.Namespace(
+            image=Path("/fake/test.hdf"),
+            json=True,
+            file=None,
+            expect_size=None,
+            partition=None,
+            driver=None,
+            block_size=None,
+            debug=False,
+        )
+        fuse_fs_mod.cmd_verify(args)
+        output = capsys.readouterr().out
+        data = json.loads(output)
+
+        assert data["status"] == "ok"
+        assert data["command"] == "verify"
+        assert data["volume"] == "Workbench3.1"
+        assert data["total_dirs"] == 1
+        assert data["total_files"] == 3
+        assert data["total_size_bytes"] == 350
+        assert data["filesystem_responsive"] is True
+
+    def test_verify_expect_size_without_file_json(self, fuse_mock, capsys):
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        args = argparse.Namespace(
+            image=Path("/fake/test.hdf"),
+            json=True,
+            file=None,
+            expect_size=100,
+            partition=None,
+            driver=None,
+            block_size=None,
+            debug=False,
+        )
+        with pytest.raises(SystemExit):
+            fuse_fs_mod.cmd_verify(args)
+        output = capsys.readouterr().out
+        data = json.loads(output)
+        assert data["error"]["code"] == "INVALID_ARGUMENT"
+
+    def test_verify_expect_size_without_file_human(self, fuse_mock):
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        args = argparse.Namespace(
+            image=Path("/fake/test.hdf"),
+            json=False,
+            file=None,
+            expect_size=100,
+            partition=None,
+            driver=None,
+            block_size=None,
+            debug=False,
+        )
+        with pytest.raises(SystemExit, match="--expect-size requires --file"):
+            fuse_fs_mod.cmd_verify(args)

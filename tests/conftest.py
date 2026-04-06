@@ -69,9 +69,18 @@ def fuse_mock(monkeypatch):
         FileHandleStruct=dummy_cls,
         DosPacketStruct=dummy_cls,
     )
+    # DosProtection needs to be callable with an int arg and str-able
+    # so _format_protection(prot_bits) works in tests.
+    class _FakeDosProtection:
+        def __init__(self, bits=0):
+            self._bits = bits
+
+        def __str__(self):
+            return f"----rwed" if self._bits == 0 else f"p={self._bits}"
+
     _stub_module("amitools.vamos.lib")
     _stub_module("amitools.vamos.lib.dos")
-    _stub_module("amitools.vamos.lib.dos.DosProtection", DosProtection=dummy_cls)
+    _stub_module("amitools.vamos.lib.dos.DosProtection", DosProtection=_FakeDosProtection)
 
 
 @pytest.fixture

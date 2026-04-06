@@ -2667,6 +2667,377 @@ def _inspect_rdisk(rdisk, full=False):
             print(f"  {w}")
 
 
+def _json_error(command: str, code: str, message: str, details: dict = None) -> dict:
+    """Build a JSON error envelope."""
+    result = {
+        "status": "error",
+        "command": command,
+        "version": __version__,
+        "error": {
+            "code": code,
+            "message": message,
+        },
+    }
+    if details:
+        result["error"]["details"] = details
+    return result
+
+
+def _json_result(command: str, **kwargs) -> dict:
+    """Build a JSON success envelope."""
+    result = {
+        "status": "ok",
+        "command": command,
+        "version": __version__,
+    }
+    result.update(kwargs)
+    return result
+
+
+def _cleanup_bridge(bridge, temp_driver=None):
+    """Shut down a HandlerBridge and release all resources.
+
+    Mirrors the cleanup pattern from destroy() -- each step is independent
+    so failures don't cascade.
+
+    Args:
+        bridge: HandlerBridge instance (or None, in which case only
+            temp_driver cleanup is attempted).
+        temp_driver: Optional Path to a temp driver file created by
+            extract_embedded_driver(). Deleted after bridge shutdown.
+    """
+    if bridge is not None:
+        try:
+            shutdown = getattr(getattr(bridge, "vh", None), "shutdown", None)
+            if shutdown is not None:
+                shutdown()
+        except Exception:
+            pass
+        try:
+            backend = getattr(bridge, "backend", None)
+            if backend is not None:
+                backend.sync()
+                backend.close()
+        except Exception:
+            pass
+    if temp_driver is not None:
+        try:
+            temp_driver.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def _create_bridge_from_args(args, command: str):
+    """Create a HandlerBridge from CLI arguments.
+
+    Handles driver resolution (RDB extraction or explicit --driver),
+    ADF/ISO detection, and JSON error reporting.
+
+    Args:
+        args: Parsed argparse namespace. Must have: image, partition, driver,
+              block_size, debug. May have: json.
+        command: Command name for error envelopes.
+
+    Returns:
+        Tuple of (HandlerBridge, temp_driver_path_or_None). The caller must
+        call _cleanup_bridge(bridge, temp_driver) when done.
+
+    Raises:
+        SystemExit on error (with JSON error if args.json is True).
+    """
+    import json as _json
+    from .rdb_inspect import detect_adf, detect_iso
+
+    use_json = getattr(args, "json", False)
+    image = args.image
+
+    # Validate image exists
+    if not image.exists():
+        if use_json:
+            print(_json.dumps(_json_error(command, "IMAGE_NOT_FOUND",
+                f"Image file not found: {image}")))
+            sys.exit(1)
+        raise SystemExit(f"Error: image file not found: {image}")
+
+    # Detect image type
+    adf_info = detect_adf(image)
+    iso_info = None
+    driver = getattr(args, "driver", None)
+    partition = getattr(args, "partition", None)
+    block_size = getattr(args, "block_size", None)
+    debug = getattr(args, "debug", False)
+    temp_driver = None
+
+    if adf_info is not None:
+        if driver is None:
+            msg = ("ADF floppy image detected. Floppy images don't contain "
+                   "embedded filesystem drivers. Use --driver to specify one.")
+            if use_json:
+                print(_json.dumps(_json_error(command, "DRIVER_NOT_FOUND", msg)))
+                sys.exit(1)
+            raise SystemExit(msg)
+    else:
+        iso_info = detect_iso(image)
+        if iso_info is not None:
+            if driver is None:
+                msg = ("ISO 9660 image detected. ISO images don't contain "
+                       "embedded filesystem drivers. Use --driver to specify one.")
+                if use_json:
+                    print(_json.dumps(_json_error(command, "DRIVER_NOT_FOUND", msg)))
+                    sys.exit(1)
+                raise SystemExit(msg)
+        else:
+            # RDB image -- extract embedded driver if not specified
+            if driver is None:
+                try:
+                    result = extract_embedded_driver(image, block_size, partition)
+                except IOError as e:
+                    if use_json:
+                        print(_json.dumps(_json_error(command, "IMAGE_INVALID", str(e))))
+                        sys.exit(1)
+                    raise SystemExit(f"Error: {e}")
+                if result is None:
+                    msg = ("No embedded filesystem driver found. "
+                           "Use --driver to specify one.")
+                    if use_json:
+                        print(_json.dumps(_json_error(command, "DRIVER_NOT_FOUND", msg)))
+                        sys.exit(1)
+                    raise SystemExit(msg)
+                temp_driver, _, _ = result
+                driver = temp_driver
+
+    # Create the bridge
+    try:
+        bridge = HandlerBridge(
+            image,
+            driver,
+            block_size=block_size,
+            read_only=True,
+            debug=debug,
+            partition=partition,
+            adf_info=adf_info,
+            iso_info=iso_info,
+        )
+    except SystemExit as e:
+        if temp_driver is not None:
+            try:
+                temp_driver.unlink(missing_ok=True)
+            except Exception:
+                pass
+        if use_json:
+            print(_json.dumps(_json_error(command, "HANDLER_ERROR", str(e))))
+            sys.exit(1)
+        raise
+    except Exception as e:
+        if temp_driver is not None:
+            try:
+                temp_driver.unlink(missing_ok=True)
+            except Exception:
+                pass
+        if use_json:
+            print(_json.dumps(_json_error(command, "HANDLER_ERROR",
+                f"Failed to initialize filesystem handler: {e}")))
+            sys.exit(1)
+        raise SystemExit(f"Error initializing handler: {e}")
+
+    return bridge, temp_driver
+
+
+def _format_protection(prot_bits: int) -> str:
+    """Format Amiga protection bits as a human-readable string."""
+    prot = DosProtection(prot_bits)
+    return str(prot)
+
+
+def _ls_recursive(bridge, root_path: str) -> list:
+    """Recursively list all entries under root_path."""
+    entries = []
+    stack = [root_path]
+    while stack:
+        current = stack.pop()
+        raw = bridge.list_dir_path(current)
+        dir_children = []
+        for ent in raw:
+            is_dir = ent.get("dir_type", 0) > 0
+            child = "/" + ent["name"] if current == "/" else current + "/" + ent["name"]
+            prot_bits = ent.get("protection", 0)
+            prot_str = _format_protection(prot_bits)
+            entries.append({
+                "name": ent["name"],
+                "path": child,
+                "type": "dir" if is_dir else "file",
+                "size": ent.get("size", 0),
+                "protection": prot_str,
+                "protection_bits": prot_bits,
+            })
+            if is_dir:
+                dir_children.append(child)
+        # Traverse in sorted order for deterministic output
+        stack.extend(reversed(sorted(dir_children)))
+    return entries
+
+
+def cmd_ls(args):
+    """Handle the 'ls' subcommand."""
+    import json
+
+    use_json = getattr(args, "json", False)
+    path = getattr(args, "path", "/")
+    recursive = getattr(args, "recursive", False)
+
+    # Normalize path (strip trailing slash, ensure leading slash)
+    path = "/" + path.strip("/")
+    if path != "/" and path.endswith("/"):
+        path = path.rstrip("/")
+
+    bridge, temp_driver = _create_bridge_from_args(args, "ls")
+    try:
+        if recursive:
+            entries = _ls_recursive(bridge, path)
+        else:
+            raw = bridge.list_dir_path(path)
+            if not raw and path != "/":
+                # Path might not exist -- try stat to distinguish
+                stat = bridge.stat_path(path)
+                if stat is None:
+                    if use_json:
+                        print(json.dumps(_json_error("ls", "FILE_NOT_FOUND",
+                            f"Path not found: {path}")))
+                        sys.exit(1)
+                    raise SystemExit(f"Error: path not found: {path}")
+            entries = []
+            for ent in raw:
+                is_dir = ent.get("dir_type", 0) > 0
+                child = "/" + ent["name"] if path == "/" else path + "/" + ent["name"]
+                prot_bits = ent.get("protection", 0)
+                prot_str = _format_protection(prot_bits)
+                entries.append({
+                    "name": ent["name"],
+                    "path": child,
+                    "type": "dir" if is_dir else "file",
+                    "size": ent.get("size", 0),
+                    "protection": prot_str,
+                    "protection_bits": prot_bits,
+                })
+
+        if use_json:
+            result = _json_result("ls",
+                target=str(args.image),
+                path=path,
+                entries=entries,
+            )
+            print(json.dumps(result, indent=2))
+        else:
+            for ent in entries:
+                if ent["type"] == "dir":
+                    print(f"  {ent['name']:30s}  <dir>     {ent['protection']}")
+                else:
+                    print(f"  {ent['name']:30s}  {ent['size']:>10d}  {ent['protection']}")
+    except SystemExit:
+        raise
+    except Exception as e:
+        if use_json:
+            print(json.dumps(_json_error("ls", "HANDLER_ERROR",
+                f"Directory listing failed: {e}")))
+            sys.exit(1)
+        raise SystemExit(f"Error during directory listing: {e}")
+    finally:
+        _cleanup_bridge(bridge, temp_driver)
+
+
+def cmd_verify(args):
+    """Handle the 'verify' subcommand."""
+    import json
+
+    use_json = getattr(args, "json", False)
+    file_path = getattr(args, "file", None)
+    expect_size = getattr(args, "expect_size", None)
+
+    # Warn if --expect-size used without --file (it has no meaning alone)
+    if expect_size is not None and file_path is None:
+        if use_json:
+            print(json.dumps(_json_error("verify", "INVALID_ARGUMENT",
+                "--expect-size requires --file")))
+            sys.exit(1)
+        raise SystemExit("Error: --expect-size requires --file")
+
+    bridge, temp_driver = _create_bridge_from_args(args, "verify")
+    try:
+        if file_path:
+            # Verify a specific file
+            normalized = "/" + file_path.lstrip("/")
+            stat = bridge.stat_path(normalized)
+            if stat is None:
+                if use_json:
+                    print(json.dumps(_json_error("verify", "FILE_NOT_FOUND",
+                        f"File not found: {file_path}")))
+                    sys.exit(1)
+                raise SystemExit(f"Error: file not found: {file_path}")
+
+            result_data = {
+                "target": str(args.image),
+                "file": file_path,
+                "exists": True,
+                "size": stat.get("size", 0),
+                "type": "dir" if stat.get("dir_type", 0) > 0 else "file",
+            }
+            if expect_size is not None:
+                result_data["expected_size"] = expect_size
+                result_data["size_matches"] = stat.get("size", 0) == expect_size
+
+            if use_json:
+                print(json.dumps(_json_result("verify", **result_data), indent=2))
+            else:
+                print(f"File: {file_path}")
+                print(f"  Exists: yes")
+                print(f"  Type: {result_data['type']}")
+                print(f"  Size: {stat.get('size', 0)}")
+                if expect_size is not None:
+                    match = "yes" if result_data["size_matches"] else "NO"
+                    print(f"  Expected size: {expect_size} ({match})")
+        else:
+            # Verify volume -- count files and dirs
+            total_files = 0
+            total_dirs = 0
+            total_size = 0
+            entries = _ls_recursive(bridge, "/")
+            for ent in entries:
+                if ent["type"] == "dir":
+                    total_dirs += 1
+                else:
+                    total_files += 1
+                    total_size += ent.get("size", 0)
+
+            volname = bridge.volume_name()
+            result_data = {
+                "target": str(args.image),
+                "volume": volname,
+                "total_dirs": total_dirs,
+                "total_files": total_files,
+                "total_size_bytes": total_size,
+                "filesystem_responsive": True,
+            }
+
+            if use_json:
+                print(json.dumps(_json_result("verify", **result_data), indent=2))
+            else:
+                print(f"Volume: {volname}")
+                print(f"  Directories: {total_dirs}")
+                print(f"  Files: {total_files}")
+                print(f"  Total size: {total_size:,} bytes")
+                print(f"  Filesystem responsive: yes")
+    except SystemExit:
+        raise
+    except Exception as e:
+        if use_json:
+            print(json.dumps(_json_error("verify", "HANDLER_ERROR",
+                f"Verification failed: {e}")))
+            sys.exit(1)
+        raise SystemExit(f"Error during verification: {e}")
+    finally:
+        _cleanup_bridge(bridge, temp_driver)
+
+
 def cmd_inspect(args):
     """Handle the 'inspect' subcommand."""
     import amitools.fs.DosType as DosType
@@ -2963,6 +3334,24 @@ commands:
     --driver PATH             Filesystem binary (default: extract from RDB).
     --block-size N            Override block size (defaults to auto/512).
     --debug                   Enable debug logging.
+
+  ls <image> [path]         List files in an Amiga filesystem image.
+    --path PATH               Directory path to list (default: /).
+    --partition NAME          Partition name (e.g. DH0) or index.
+    --driver PATH             Filesystem binary (default: extract from RDB).
+    --block-size N            Override block size (defaults to auto/512).
+    --recursive               List all entries recursively.
+    --json                    Output results as JSON.
+    --debug                   Enable debug logging.
+
+  verify <image>            Verify an Amiga filesystem image.
+    --file PATH               Verify a specific file.
+    --expect-size N           Expected file size in bytes (with --file).
+    --partition NAME          Partition name (e.g. DH0) or index.
+    --driver PATH             Filesystem binary (default: extract from RDB).
+    --block-size N            Override block size (defaults to auto/512).
+    --json                    Output results as JSON.
+    --debug                   Enable debug logging.
 """,
     )
     parser.add_argument(
@@ -3059,6 +3448,76 @@ commands:
         "--debug", action="store_true", help="Enable debug logging."
     )
     format_parser.set_defaults(func=cmd_format)
+
+    # ls subcommand
+    ls_parser = subparsers.add_parser(
+        "ls", help="List files in an Amiga filesystem image (no FUSE needed)."
+    )
+    ls_parser.add_argument("image", type=Path, help="Disk image file")
+    ls_parser.add_argument(
+        "--path", type=str, default="/",
+        help="Directory path to list (default: root).",
+    )
+    ls_parser.add_argument(
+        "--partition", type=str,
+        help="Partition name (e.g. DH0) or index (defaults to first).",
+    )
+    ls_parser.add_argument(
+        "--driver", type=Path,
+        help="Filesystem binary (default: extract from RDB if available).",
+    )
+    ls_parser.add_argument(
+        "--block-size", type=int,
+        help="Override block size (defaults to auto/512).",
+    )
+    ls_parser.add_argument(
+        "--recursive", action="store_true",
+        help="List all entries recursively.",
+    )
+    ls_parser.add_argument(
+        "--json", action="store_true",
+        help="Output results as JSON.",
+    )
+    ls_parser.add_argument(
+        "--debug", action="store_true",
+        help="Enable debug logging.",
+    )
+    ls_parser.set_defaults(func=cmd_ls)
+
+    # verify subcommand
+    verify_parser = subparsers.add_parser(
+        "verify", help="Verify an Amiga filesystem image (no FUSE needed)."
+    )
+    verify_parser.add_argument("image", type=Path, help="Disk image file")
+    verify_parser.add_argument(
+        "--file", type=str, dest="file",
+        help="Verify a specific file exists and get its metadata.",
+    )
+    verify_parser.add_argument(
+        "--expect-size", type=int, dest="expect_size",
+        help="Expected file size in bytes (requires --file).",
+    )
+    verify_parser.add_argument(
+        "--partition", type=str,
+        help="Partition name (e.g. DH0) or index (defaults to first).",
+    )
+    verify_parser.add_argument(
+        "--driver", type=Path,
+        help="Filesystem binary (default: extract from RDB if available).",
+    )
+    verify_parser.add_argument(
+        "--block-size", type=int,
+        help="Override block size (defaults to auto/512).",
+    )
+    verify_parser.add_argument(
+        "--json", action="store_true",
+        help="Output results as JSON.",
+    )
+    verify_parser.add_argument(
+        "--debug", action="store_true",
+        help="Enable debug logging.",
+    )
+    verify_parser.set_defaults(func=cmd_verify)
 
     args = parser.parse_args(argv)
     try:
