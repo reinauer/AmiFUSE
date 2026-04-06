@@ -2737,7 +2737,7 @@ def _cleanup_bridge(bridge, temp_driver=None):
             pass
 
 
-def _create_bridge_from_args(args, command: str):
+def _create_bridge_from_args(args, command: str, read_only: bool = True):
     """Create a HandlerBridge from CLI arguments.
 
     Handles driver resolution (RDB extraction or explicit --driver),
@@ -2747,6 +2747,8 @@ def _create_bridge_from_args(args, command: str):
         args: Parsed argparse namespace. Must have: image, partition, driver,
               block_size, debug. May have: json.
         command: Command name for error envelopes.
+        read_only: Whether the bridge should be read-only (default True).
+            Write commands (e.g. 'write') pass False to enable modifications.
 
     Returns:
         Tuple of (HandlerBridge, temp_driver_path_or_None). The caller must
@@ -2822,7 +2824,7 @@ def _create_bridge_from_args(args, command: str):
             image,
             driver,
             block_size=block_size,
-            read_only=True,
+            read_only=read_only,
             debug=debug,
             partition=partition,
             adf_info=adf_info,
@@ -3141,6 +3143,124 @@ def cmd_hash(args):
                 f"Hash computation failed: {e}")))
             sys.exit(1)
         raise SystemExit(f"Error computing hash: {e}")
+    finally:
+        _cleanup_bridge(bridge, temp_driver)
+
+
+def cmd_read(args):
+    """Handle the 'read' subcommand."""
+    import json
+
+    use_json = getattr(args, "json", False)
+    file_path = args.file
+    out_path = getattr(args, "out", None)
+
+    # Default output name = basename of Amiga path
+    if out_path is None:
+        out_path = os.path.basename(file_path)
+    stdout_mode = (out_path == "-")
+
+    # Reject --out - with --json: binary data on stdout followed by
+    # JSON text is unparseable. Use --out <path> to separate file data
+    # from JSON output.
+    if stdout_mode and use_json:
+        print(json.dumps(_json_error("read", "STDOUT_JSON_CONFLICT",
+            "Cannot use --out - with --json; use --out <path> to separate "
+            "file data from JSON output.")))
+        sys.exit(1)
+
+    bridge, temp_driver = _create_bridge_from_args(args, "read")
+    try:
+        normalized = "/" + file_path.lstrip("/")
+        stat = bridge.stat_path(normalized)
+        if stat is None:
+            if use_json:
+                print(json.dumps(_json_error("read", "FILE_NOT_FOUND",
+                    f"File not found: {file_path}")))
+                sys.exit(1)
+            raise SystemExit(f"Error: file not found: {file_path}")
+
+        if stat.get("dir_type", 0) > 0:
+            if use_json:
+                print(json.dumps(_json_error("read", "IS_DIRECTORY",
+                    f"Cannot read a directory: {file_path}")))
+                sys.exit(1)
+            raise SystemExit(f"Error: cannot read a directory: {file_path}")
+
+        file_size = stat.get("size", 0)
+
+        # Open file for reading
+        fh_result = bridge.open_file(normalized)
+        if fh_result is None:
+            if use_json:
+                print(json.dumps(_json_error("read", "HANDLER_ERROR",
+                    f"Failed to open file: {file_path}")))
+                sys.exit(1)
+            raise SystemExit(f"Error: failed to open file: {file_path}")
+
+        # Note: _dir_lock from open_file() is never freed. This is a
+        # pre-existing pattern also present in cmd_hash().
+        # The lock is released when the bridge is destroyed.
+        fh_addr, _dir_lock = fh_result
+        try:
+            chunk_size = 65536
+            bytes_read = 0
+            # Seek to start once, then use sequential read_handle() calls.
+            bridge.seek_handle(fh_addr, 0)
+
+            if stdout_mode:
+                out_fd = sys.stdout.buffer
+            else:
+                try:
+                    out_fd = open(out_path, "wb")
+                except OSError as e:
+                    if use_json:
+                        print(json.dumps(_json_error("read", "HANDLER_ERROR",
+                            f"Cannot create output file: {e}")))
+                        sys.exit(1)
+                    raise SystemExit(f"Error: cannot create output file: {e}")
+
+            try:
+                while bytes_read < file_size:
+                    to_read = min(chunk_size, file_size - bytes_read)
+                    data = bridge.read_handle(fh_addr, to_read)
+                    if not data:
+                        break
+                    out_fd.write(data)
+                    bytes_read += len(data)
+            finally:
+                if not stdout_mode:
+                    out_fd.close()
+        finally:
+            bridge.close_file(fh_addr)
+
+        if use_json:
+            result = _json_result("read",
+                target=str(args.image),
+                file=file_path,
+                size=file_size,
+                bytes_read=bytes_read,
+                output="-" if stdout_mode else out_path,
+            )
+            print(json.dumps(result, indent=2))
+        else:
+            if stdout_mode:
+                # Don't print metadata when outputting to stdout --
+                # the file data is the only output.
+                pass
+            else:
+                print(f"Extracted: {file_path}")
+                print(f"  Size: {file_size}")
+                print(f"  Bytes read: {bytes_read}")
+                print(f"  Output: {out_path}")
+    except SystemExit:
+        raise
+    except Exception as e:
+        if use_json:
+            print(json.dumps(_json_error("read", "HANDLER_ERROR",
+                f"File extraction failed: {e}")))
+            sys.exit(1)
+        raise SystemExit(f"Error extracting file: {e}")
     finally:
         _cleanup_bridge(bridge, temp_driver)
 
@@ -3776,6 +3896,16 @@ commands:
     --block-size N            Override block size (defaults to auto/512).
     --json                    Output results as JSON.
     --debug                   Enable debug logging.
+
+  read <image>              Extract a file from an Amiga filesystem image.
+    --file PATH               Path to file within the image (required).
+    --out PATH                Output path on host (default: filename, '-' for stdout).
+                              Note: --out - cannot be combined with --json.
+    --partition NAME          Partition name (e.g. DH0) or index.
+    --driver PATH             Filesystem binary (default: extract from RDB).
+    --block-size N            Override block size (defaults to auto/512).
+    --json                    Output results as JSON.
+    --debug                   Enable debug logging.
 """,
     )
     parser.add_argument(
@@ -3991,6 +4121,42 @@ commands:
         help="Enable debug logging.",
     )
     hash_parser.set_defaults(func=cmd_hash)
+
+    # read subcommand
+    read_parser = subparsers.add_parser(
+        "read", help="Extract a file from an Amiga filesystem image (no FUSE needed)."
+    )
+    read_parser.add_argument("image", type=Path, help="Disk image file")
+    read_parser.add_argument(
+        "--file", type=str, required=True, dest="file",
+        help="Path to file within the image.",
+    )
+    read_parser.add_argument(
+        "--out", type=str, default=None,
+        help="Output path on host (default: filename in current dir, '-' for stdout). "
+             "Note: --out - cannot be combined with --json.",
+    )
+    read_parser.add_argument(
+        "--partition", type=str,
+        help="Partition name (e.g. DH0) or index (defaults to first).",
+    )
+    read_parser.add_argument(
+        "--driver", type=Path,
+        help="Filesystem binary (default: extract from RDB if available).",
+    )
+    read_parser.add_argument(
+        "--block-size", type=int,
+        help="Override block size (defaults to auto/512).",
+    )
+    read_parser.add_argument(
+        "--json", action="store_true",
+        help="Output results as JSON.",
+    )
+    read_parser.add_argument(
+        "--debug", action="store_true",
+        help="Enable debug logging.",
+    )
+    read_parser.set_defaults(func=cmd_read)
 
     args = parser.parse_args(argv)
     try:

@@ -1297,7 +1297,7 @@ class TestCmdLs:
         mock_bridge = MagicMock()
         monkeypatch.setattr(
             fuse_fs_mod, "_create_bridge_from_args",
-            lambda args, cmd: (mock_bridge, None),
+            lambda args, cmd, read_only=True: (mock_bridge, None),
         )
         return mock_bridge, fuse_fs_mod
 
@@ -1481,7 +1481,7 @@ class TestCmdVerify:
         mock_bridge = MagicMock()
         monkeypatch.setattr(
             fuse_fs_mod, "_create_bridge_from_args",
-            lambda args, cmd: (mock_bridge, None),
+            lambda args, cmd, read_only=True: (mock_bridge, None),
         )
         return mock_bridge, fuse_fs_mod
 
@@ -1960,7 +1960,7 @@ class TestCmdHash:
         mock_bridge = MagicMock()
         monkeypatch.setattr(
             fuse_fs_mod, "_create_bridge_from_args",
-            lambda args, cmd: (mock_bridge, None),
+            lambda args, cmd, read_only=True: (mock_bridge, None),
         )
         return mock_bridge, fuse_fs_mod
 
@@ -2604,3 +2604,399 @@ class TestCmdInspectJson:
         assert data["image"] == str(inspect_args.image)
         # image_type is always present for successful inspect
         assert "image_type" in data
+
+
+# ---------------------------------------------------------------------------
+# TestCmdRead -- read subcommand tests
+# ---------------------------------------------------------------------------
+
+
+class TestCmdRead:
+    """Tests for cmd_read() subcommand."""
+
+    @pytest.fixture
+    def mock_bridge_for_read(self, fuse_mock, monkeypatch):
+        """Set up mocked bridge for read tests."""
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        mock_bridge = MagicMock()
+        monkeypatch.setattr(
+            fuse_fs_mod, "_create_bridge_from_args",
+            lambda args, cmd, read_only=True: (mock_bridge, None),
+        )
+        return mock_bridge, fuse_fs_mod
+
+    def test_read_json_output_structure(self, mock_bridge_for_read, capsys, tmp_path):
+        mock_bridge, fuse_fs_mod = mock_bridge_for_read
+        mock_bridge.stat_path.return_value = {"size": 5, "dir_type": -3}
+        mock_bridge.open_file.return_value = (0x1000, 0x2000)
+        mock_bridge.seek_handle.return_value = None
+        mock_bridge.read_handle.side_effect = [b"hello", b""]
+        mock_bridge.close_file.return_value = None
+
+        out_file = str(tmp_path / "output.bin")
+        args = argparse.Namespace(
+            image=Path("/fake/test.hdf"),
+            json=True,
+            file="S/Startup-Sequence",
+            out=out_file,
+            partition=None,
+            driver=None,
+            block_size=None,
+            debug=False,
+        )
+        fuse_fs_mod.cmd_read(args)
+        output = capsys.readouterr().out
+        data = json.loads(output)
+
+        assert data["status"] == "ok"
+        assert data["command"] == "read"
+        assert "version" in data
+        assert data["size"] == 5
+        assert data["bytes_read"] == 5
+        assert data["output"] == out_file
+        assert data["file"] == "S/Startup-Sequence"
+        assert data["target"] == str(Path("/fake/test.hdf"))
+
+    def test_read_writes_correct_data(self, mock_bridge_for_read, capsys, tmp_path):
+        mock_bridge, fuse_fs_mod = mock_bridge_for_read
+        mock_bridge.stat_path.return_value = {"size": 11, "dir_type": -3}
+        mock_bridge.open_file.return_value = (0x1000, 0x2000)
+        mock_bridge.seek_handle.return_value = None
+        mock_bridge.read_handle.side_effect = [b"hello world", b""]
+        mock_bridge.close_file.return_value = None
+
+        out_file = tmp_path / "output.bin"
+        args = argparse.Namespace(
+            image=Path("/fake/test.hdf"),
+            json=False,
+            file="test.txt",
+            out=str(out_file),
+            partition=None,
+            driver=None,
+            block_size=None,
+            debug=False,
+        )
+        fuse_fs_mod.cmd_read(args)
+
+        assert out_file.read_bytes() == b"hello world"
+
+    def test_read_stdout_mode(self, mock_bridge_for_read, monkeypatch):
+        from io import BytesIO
+
+        mock_bridge, fuse_fs_mod = mock_bridge_for_read
+        mock_bridge.stat_path.return_value = {"size": 11, "dir_type": -3}
+        mock_bridge.open_file.return_value = (0x1000, 0x2000)
+        mock_bridge.seek_handle.return_value = None
+        mock_bridge.read_handle.side_effect = [b"binary data", b""]
+        mock_bridge.close_file.return_value = None
+
+        fake_buffer = BytesIO()
+        monkeypatch.setattr(sys, "stdout", MagicMock(buffer=fake_buffer))
+
+        args = argparse.Namespace(
+            image=Path("/fake/test.hdf"),
+            json=False,
+            file="test.bin",
+            out="-",
+            partition=None,
+            driver=None,
+            block_size=None,
+            debug=False,
+        )
+        fuse_fs_mod.cmd_read(args)
+
+        assert fake_buffer.getvalue() == b"binary data"
+
+    def test_read_default_output_name(self, mock_bridge_for_read, capsys, tmp_path,
+                                      monkeypatch):
+        mock_bridge, fuse_fs_mod = mock_bridge_for_read
+        mock_bridge.stat_path.return_value = {"size": 5, "dir_type": -3}
+        mock_bridge.open_file.return_value = (0x1000, 0x2000)
+        mock_bridge.seek_handle.return_value = None
+        mock_bridge.read_handle.side_effect = [b"hello", b""]
+        mock_bridge.close_file.return_value = None
+
+        # Change to tmp_path so the default file gets written there
+        monkeypatch.chdir(tmp_path)
+
+        args = argparse.Namespace(
+            image=Path("/fake/test.hdf"),
+            json=True,
+            file="S/Startup-Sequence",
+            out=None,
+            partition=None,
+            driver=None,
+            block_size=None,
+            debug=False,
+        )
+        fuse_fs_mod.cmd_read(args)
+        output = capsys.readouterr().out
+        data = json.loads(output)
+
+        # Default output name should be the basename
+        assert data["output"] == "Startup-Sequence"
+        # Verify the file was actually written
+        assert (tmp_path / "Startup-Sequence").read_bytes() == b"hello"
+
+    def test_read_file_not_found(self, mock_bridge_for_read, capsys):
+        mock_bridge, fuse_fs_mod = mock_bridge_for_read
+        mock_bridge.stat_path.return_value = None
+
+        args = argparse.Namespace(
+            image=Path("/fake/test.hdf"),
+            json=True,
+            file="nonexistent.txt",
+            out="output.bin",
+            partition=None,
+            driver=None,
+            block_size=None,
+            debug=False,
+        )
+        with pytest.raises(SystemExit):
+            fuse_fs_mod.cmd_read(args)
+        output = capsys.readouterr().out
+        data = json.loads(output)
+        assert data["error"]["code"] == "FILE_NOT_FOUND"
+
+    def test_read_directory_rejected(self, mock_bridge_for_read, capsys):
+        mock_bridge, fuse_fs_mod = mock_bridge_for_read
+        mock_bridge.stat_path.return_value = {"dir_type": 2, "size": 0}
+
+        args = argparse.Namespace(
+            image=Path("/fake/test.hdf"),
+            json=True,
+            file="S",
+            out="output.bin",
+            partition=None,
+            driver=None,
+            block_size=None,
+            debug=False,
+        )
+        with pytest.raises(SystemExit):
+            fuse_fs_mod.cmd_read(args)
+        output = capsys.readouterr().out
+        data = json.loads(output)
+        assert data["error"]["code"] == "IS_DIRECTORY"
+
+    def test_read_open_file_fails(self, mock_bridge_for_read, capsys):
+        mock_bridge, fuse_fs_mod = mock_bridge_for_read
+        mock_bridge.stat_path.return_value = {"size": 5, "dir_type": -3}
+        mock_bridge.open_file.return_value = None
+
+        args = argparse.Namespace(
+            image=Path("/fake/test.hdf"),
+            json=True,
+            file="test.txt",
+            out="output.bin",
+            partition=None,
+            driver=None,
+            block_size=None,
+            debug=False,
+        )
+        with pytest.raises(SystemExit):
+            fuse_fs_mod.cmd_read(args)
+        output = capsys.readouterr().out
+        data = json.loads(output)
+        assert data["error"]["code"] == "HANDLER_ERROR"
+
+    def test_read_human_output(self, mock_bridge_for_read, capsys, tmp_path):
+        mock_bridge, fuse_fs_mod = mock_bridge_for_read
+        mock_bridge.stat_path.return_value = {"size": 5, "dir_type": -3}
+        mock_bridge.open_file.return_value = (0x1000, 0x2000)
+        mock_bridge.seek_handle.return_value = None
+        mock_bridge.read_handle.side_effect = [b"hello", b""]
+        mock_bridge.close_file.return_value = None
+
+        out_file = str(tmp_path / "output.bin")
+        args = argparse.Namespace(
+            image=Path("/fake/test.hdf"),
+            json=False,
+            file="S/Startup-Sequence",
+            out=out_file,
+            partition=None,
+            driver=None,
+            block_size=None,
+            debug=False,
+        )
+        fuse_fs_mod.cmd_read(args)
+        output = capsys.readouterr().out
+
+        assert "Extracted:" in output
+        assert "Size:" in output
+        assert "Output:" in output
+
+    def test_read_uses_sequential_read(self, mock_bridge_for_read, capsys, tmp_path):
+        """Verify seek_handle is called once at offset 0, and read_handle
+        (not read_handle_at) is used for chunk reads."""
+        mock_bridge, fuse_fs_mod = mock_bridge_for_read
+        mock_bridge.stat_path.return_value = {"size": 10, "dir_type": -3}
+        mock_bridge.open_file.return_value = (0x1000, 0x2000)
+        mock_bridge.seek_handle.return_value = None
+        mock_bridge.read_handle.side_effect = [b"hello", b"world", b""]
+        mock_bridge.close_file.return_value = None
+
+        out_file = str(tmp_path / "output.bin")
+        args = argparse.Namespace(
+            image=Path("/fake/test.hdf"),
+            json=True,
+            file="test.txt",
+            out=out_file,
+            partition=None,
+            driver=None,
+            block_size=None,
+            debug=False,
+        )
+        fuse_fs_mod.cmd_read(args)
+
+        # seek_handle should be called exactly once at offset 0
+        mock_bridge.seek_handle.assert_called_once_with(0x1000, 0)
+        # read_handle should be used (not read_handle_at)
+        assert mock_bridge.read_handle.call_count >= 2
+        mock_bridge.read_handle_at.assert_not_called()
+        # close_file should always be called
+        mock_bridge.close_file.assert_called_once_with(0x1000)
+
+    def test_read_close_on_error(self, mock_bridge_for_read, capsys, tmp_path):
+        """Verify close_file is called even when read_handle raises."""
+        mock_bridge, fuse_fs_mod = mock_bridge_for_read
+        mock_bridge.stat_path.return_value = {"size": 100, "dir_type": -3}
+        mock_bridge.open_file.return_value = (0x1000, 0x2000)
+        mock_bridge.seek_handle.return_value = None
+        mock_bridge.read_handle.side_effect = RuntimeError("handler crashed")
+        mock_bridge.close_file.return_value = None
+
+        out_file = str(tmp_path / "output.bin")
+        args = argparse.Namespace(
+            image=Path("/fake/test.hdf"),
+            json=True,
+            file="test.txt",
+            out=out_file,
+            partition=None,
+            driver=None,
+            block_size=None,
+            debug=False,
+        )
+        with pytest.raises(SystemExit):
+            fuse_fs_mod.cmd_read(args)
+
+        # close_file must still be called (try/finally)
+        mock_bridge.close_file.assert_called_once_with(0x1000)
+
+    def test_read_stdout_json_conflict(self, fuse_mock, capsys):
+        """--out - with --json is rejected before bridge creation."""
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        args = argparse.Namespace(
+            image=Path("/fake/test.hdf"),
+            json=True,
+            file="test.txt",
+            out="-",
+            partition=None,
+            driver=None,
+            block_size=None,
+            debug=False,
+        )
+        with pytest.raises(SystemExit):
+            fuse_fs_mod.cmd_read(args)
+        output = capsys.readouterr().out
+        data = json.loads(output)
+        assert data["error"]["code"] == "STDOUT_JSON_CONFLICT"
+        assert "Cannot use --out - with --json" in data["error"]["message"]
+
+
+# ---------------------------------------------------------------------------
+# TestCreateBridgeReadOnlyParam -- shared infrastructure tests
+# ---------------------------------------------------------------------------
+
+
+class TestCreateBridgeReadOnlyParam:
+    """Tests for the read_only parameter on _create_bridge_from_args()."""
+
+    def test_bridge_default_read_only(self, fuse_mock, monkeypatch, tmp_path):
+        """Calling without read_only creates a bridge with read_only=True."""
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        captured = {}
+
+        # Create a real image file so exists() passes
+        image = tmp_path / "test.hdf"
+        image.write_bytes(b"\x00" * 1024)
+
+        # Mock detect_adf/detect_iso
+        fake_rdb = MagicMock()
+        fake_rdb.detect_adf.return_value = None
+        fake_rdb.detect_iso.return_value = None
+        monkeypatch.setitem(sys.modules, "amifuse.rdb_inspect", fake_rdb)
+
+        # Mock extract_embedded_driver
+        temp_driver = tmp_path / "temp.handler"
+        temp_driver.write_text("fake")
+        monkeypatch.setattr(
+            fuse_fs_mod, "extract_embedded_driver",
+            lambda *a, **kw: (temp_driver, "DOS3", 0x444F5303),
+        )
+
+        # Mock HandlerBridge to capture kwargs
+        mock_bridge = MagicMock()
+
+        def fake_bridge(*args, **kwargs):
+            captured.update(kwargs)
+            return mock_bridge
+
+        monkeypatch.setattr(fuse_fs_mod, "HandlerBridge", fake_bridge)
+
+        args = argparse.Namespace(
+            image=image,
+            json=False,
+            partition=None,
+            driver=None,
+            block_size=None,
+            debug=False,
+        )
+        fuse_fs_mod._create_bridge_from_args(args, "test")
+        assert captured.get("read_only") is True
+
+    def test_bridge_explicit_read_only_false(self, fuse_mock, monkeypatch, tmp_path):
+        """Passing read_only=False creates a bridge with read_only=False."""
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        captured = {}
+
+        # Create a real image file
+        image = tmp_path / "test.hdf"
+        image.write_bytes(b"\x00" * 1024)
+
+        # Mock detect_adf/detect_iso
+        fake_rdb = MagicMock()
+        fake_rdb.detect_adf.return_value = None
+        fake_rdb.detect_iso.return_value = None
+        monkeypatch.setitem(sys.modules, "amifuse.rdb_inspect", fake_rdb)
+
+        # Mock extract_embedded_driver
+        temp_driver = tmp_path / "temp.handler"
+        temp_driver.write_text("fake")
+        monkeypatch.setattr(
+            fuse_fs_mod, "extract_embedded_driver",
+            lambda *a, **kw: (temp_driver, "DOS3", 0x444F5303),
+        )
+
+        # Mock HandlerBridge to capture kwargs
+        mock_bridge = MagicMock()
+
+        def fake_bridge(*args, **kwargs):
+            captured.update(kwargs)
+            return mock_bridge
+
+        monkeypatch.setattr(fuse_fs_mod, "HandlerBridge", fake_bridge)
+
+        args = argparse.Namespace(
+            image=image,
+            json=False,
+            partition=None,
+            driver=None,
+            block_size=None,
+            debug=False,
+        )
+        fuse_fs_mod._create_bridge_from_args(args, "test", read_only=False)
+        assert captured.get("read_only") is False
