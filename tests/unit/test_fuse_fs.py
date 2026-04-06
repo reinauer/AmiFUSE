@@ -1394,3 +1394,188 @@ class TestCmdVerify:
         )
         with pytest.raises(SystemExit, match="--expect-size requires --file"):
             fuse_fs_mod.cmd_verify(args)
+
+
+# ---------------------------------------------------------------------------
+# TestCmdDoctor -- doctor subcommand tests
+# ---------------------------------------------------------------------------
+
+
+class TestCmdDoctor:
+    """Tests for cmd_doctor() environment diagnostics command.
+
+    Uses monkeypatch to control which packages appear available/unavailable.
+    The fuse_mock fixture allows importing fuse_fs without fusepy installed.
+    """
+
+    @pytest.fixture
+    def doctor_args(self):
+        """Return a minimal args namespace for cmd_doctor."""
+        args = MagicMock()
+        args.json = True
+        return args
+
+    @pytest.fixture
+    def mock_all_imports_ok(self, monkeypatch, fuse_mock):
+        """Mock all dependency imports to succeed.
+
+        Returns the fuse_fs module for calling cmd_doctor.
+        """
+        import types
+
+        import amifuse.fuse_fs as fuse_fs_mod
+        import amifuse.platform as plat_mod
+
+        # amitools available
+        fake_amitools = types.ModuleType("amitools")
+        monkeypatch.setitem(sys.modules, "amitools", fake_amitools)
+
+        # machine68k available
+        fake_machine68k = types.ModuleType("machine68k")
+        monkeypatch.setitem(sys.modules, "machine68k", fake_machine68k)
+
+        # fusepy available (already injected by fuse_mock, but ensure __version__)
+        sys.modules["fuse"].__version__ = "1.0.0"
+
+        # FUSE backend check passes
+        monkeypatch.setattr(plat_mod, "check_fuse_available", lambda: None)
+
+        return fuse_fs_mod
+
+    def test_doctor_json_output_structure(self, mock_all_imports_ok, doctor_args, capsys):
+        """JSON output has all required envelope keys and check categories."""
+        mock_all_imports_ok.cmd_doctor(doctor_args)
+        output = capsys.readouterr().out
+        data = json.loads(output)
+
+        # Required envelope keys
+        for key in ("status", "command", "version", "checks", "overall", "missing", "suggestions"):
+            assert key in data, f"Missing key: {key}"
+
+        # Required check categories
+        for check_name in ("python", "amitools", "machine68k", "fusepy", "fuse_backend"):
+            assert check_name in data["checks"], f"Missing check: {check_name}"
+
+    def test_doctor_overall_ready(self, mock_all_imports_ok, doctor_args, capsys):
+        """When all checks pass, overall is 'ready' with status 'ok'."""
+        mock_all_imports_ok.cmd_doctor(doctor_args)
+        output = capsys.readouterr().out
+        data = json.loads(output)
+
+        assert data["overall"] == "ready"
+        assert data["status"] == "ok"
+        assert data["missing"] == []
+
+    def test_doctor_degraded_without_fusepy(self, fuse_mock, monkeypatch, doctor_args, capsys):
+        """Missing fusepy = degraded status, exit code 2."""
+        import builtins
+        import types
+
+        import amifuse.fuse_fs as fuse_fs_mod
+        import amifuse.platform as plat_mod
+
+        # amitools + machine68k available
+        monkeypatch.setitem(sys.modules, "amitools", types.ModuleType("amitools"))
+        monkeypatch.setitem(sys.modules, "machine68k", types.ModuleType("machine68k"))
+
+        # fusepy NOT available -- patch __import__ to block 'fuse' and remove
+        # from sys.modules so cmd_doctor's `import fuse` hits ImportError
+        monkeypatch.delitem(sys.modules, "fuse", raising=False)
+        real_import = builtins.__import__
+
+        def block_fuse(name, *args, **kwargs):
+            if name == "fuse":
+                raise ImportError("No module named 'fuse'")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", block_fuse)
+
+        # FUSE backend check passes
+        monkeypatch.setattr(plat_mod, "check_fuse_available", lambda: None)
+
+        with pytest.raises(SystemExit) as exc_info:
+            fuse_fs_mod.cmd_doctor(doctor_args)
+
+        assert exc_info.value.code == 2
+
+        output = capsys.readouterr().out
+        data = json.loads(output)
+        assert data["overall"] == "degraded"
+        assert "fusepy" in data["missing"]
+
+    def test_doctor_not_ready_without_amitools(self, fuse_mock, monkeypatch, doctor_args, capsys):
+        """Missing amitools = not_ready status, exit code 1."""
+        import builtins
+        import types
+
+        import amifuse.fuse_fs as fuse_fs_mod
+        import amifuse.platform as plat_mod
+
+        # amitools NOT available -- patch __import__ to block it and remove
+        # from sys.modules so cmd_doctor's `import amitools` hits ImportError
+        monkeypatch.delitem(sys.modules, "amitools", raising=False)
+        real_import = builtins.__import__
+
+        def block_amitools(name, *args, **kwargs):
+            if name == "amitools":
+                raise ImportError("No module named 'amitools'")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", block_amitools)
+
+        # machine68k available
+        monkeypatch.setitem(sys.modules, "machine68k", types.ModuleType("machine68k"))
+
+        # fusepy available
+        sys.modules["fuse"].__version__ = "1.0.0"
+
+        # FUSE backend check passes
+        monkeypatch.setattr(plat_mod, "check_fuse_available", lambda: None)
+
+        with pytest.raises(SystemExit) as exc_info:
+            fuse_fs_mod.cmd_doctor(doctor_args)
+
+        assert exc_info.value.code == 1
+
+        output = capsys.readouterr().out
+        data = json.loads(output)
+        assert data["overall"] == "not_ready"
+        assert "amitools" in data["missing"]
+
+    def test_doctor_human_output(self, mock_all_imports_ok, capsys):
+        """Human-readable output contains expected text."""
+        args = MagicMock()
+        args.json = False
+
+        mock_all_imports_ok.cmd_doctor(args)
+        output = capsys.readouterr().out
+
+        assert "environment check" in output
+        assert "python" in output
+        assert "amitools" in output
+        assert "machine68k" in output
+        assert "fusepy" in output
+        assert "fuse_backend" in output
+        assert "Overall: ready" in output
+
+    def test_doctor_fuse_backend_always_ok_on_non_windows(self, mock_all_imports_ok, monkeypatch, doctor_args, capsys):
+        """On non-Windows, fuse_backend is always reported as OK.
+
+        This documents a known limitation: check_fuse_available() is a no-op
+        on macOS/Linux (platform.py line 101-104), so the doctor check always
+        reports the backend as installed on those platforms. The real FUSE
+        check happens at mount time via fusepy.
+        """
+        monkeypatch.setattr("sys.platform", "linux")
+
+        import amifuse.platform as plat_mod
+        # Use the real check_fuse_available -- on non-Windows it returns immediately
+        monkeypatch.setattr(plat_mod, "check_fuse_available", lambda: None)
+
+        mock_all_imports_ok.cmd_doctor(doctor_args)
+        output = capsys.readouterr().out
+        data = json.loads(output)
+
+        assert data["checks"]["fuse_backend"]["ok"] is True
+        assert data["checks"]["fuse_backend"]["installed"] is True
+        assert data["checks"]["fuse_backend"]["name"] == "libfuse"

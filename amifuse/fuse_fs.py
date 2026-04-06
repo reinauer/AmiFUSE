@@ -3196,6 +3196,119 @@ def cmd_unmount(args):
         )
 
 
+def cmd_doctor(args):
+    """Handle the 'doctor' subcommand."""
+    import json
+
+    checks = {}
+    suggestions = []
+
+    # Check 1: Python version
+    py_ver = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+    py_ok = sys.version_info >= (3, 9)
+    checks["python"] = {
+        "version": py_ver,
+        "minimum": "3.9",
+        "ok": py_ok,
+    }
+    if not py_ok:
+        suggestions.append("Upgrade Python to 3.9 or later.")
+
+    # Check 2: amitools
+    try:
+        import amitools  # type: ignore
+        checks["amitools"] = {"available": True, "ok": True}
+    except ImportError:
+        checks["amitools"] = {"available": False, "ok": False}
+        suggestions.append("Install amitools: pip install amitools-amifuse[vamos]")
+
+    # Check 3: machine68k (m68k CPU emulator)
+    try:
+        import machine68k  # type: ignore
+        checks["machine68k"] = {"available": True, "ok": True}
+    except ImportError:
+        checks["machine68k"] = {"available": False, "ok": False}
+        suggestions.append("Install machine68k (required for m68k emulation).")
+
+    # Check 4: fusepy
+    try:
+        import fuse  # type: ignore
+        fusepy_ver = getattr(fuse, "__version__", "unknown")
+        checks["fusepy"] = {"installed": True, "version": fusepy_ver, "ok": True}
+    except ImportError:
+        checks["fusepy"] = {"installed": False, "ok": False}
+        suggestions.append("Install fusepy: pip install fusepy")
+
+    # Check 5: FUSE backend (platform-specific)
+    # NOTE: check_fuse_available() only performs an active check on Windows
+    # (WinFSP registry/path detection). On macOS/Linux it returns immediately
+    # because fusepy raises its own clear error at mount time if libfuse is
+    # missing (see platform.py line 101-104). This means on non-Windows the
+    # fuse_backend check will always report "installed: true" even if the
+    # native FUSE driver is not actually present -- the real check happens
+    # at mount time, not here.
+    from . import platform as plat
+    try:
+        # check_fuse_available() raises SystemExit (not a regular exception)
+        # when the FUSE backend is missing, so we must catch SystemExit here.
+        plat.check_fuse_available()
+        backend_name = "macFUSE" if sys.platform.startswith("darwin") else (
+            "WinFSP" if sys.platform.startswith("win") else "libfuse"
+        )
+        checks["fuse_backend"] = {"name": backend_name, "installed": True, "ok": True}
+    except SystemExit:
+        backend_name = "macFUSE" if sys.platform.startswith("darwin") else (
+            "WinFSP" if sys.platform.startswith("win") else "libfuse"
+        )
+        checks["fuse_backend"] = {"name": backend_name, "installed": False, "ok": False}
+        suggestions.append(f"Install {backend_name} for FUSE mount support.")
+
+    # Determine overall status
+    missing = [k for k, v in checks.items() if not v["ok"]]
+    # Core requirements: python, amitools, machine68k
+    core_missing = [k for k in missing if k in ("python", "amitools", "machine68k")]
+    if core_missing:
+        overall = "not_ready"
+    elif missing:
+        overall = "degraded"  # fusepy/fuse_backend missing = no mount, but ls/verify/hash work
+    else:
+        overall = "ready"
+
+    result = {
+        "status": "ok" if overall == "ready" else ("warning" if overall == "degraded" else "error"),
+        "command": "doctor",
+        "version": __version__,
+        "checks": checks,
+        "overall": overall,
+        "missing": missing,
+        "suggestions": suggestions,
+    }
+
+    if getattr(args, "json", False):
+        print(json.dumps(result, indent=2))
+    else:
+        print(f"amifuse {__version__} environment check\n")
+        for name, check in checks.items():
+            status_str = "OK" if check["ok"] else "MISSING"
+            detail = ""
+            if "version" in check:
+                detail = f" ({check['version']})"
+            elif "name" in check:
+                detail = f" ({check['name']})"
+            print(f"  {name:20s} {status_str}{detail}")
+        print(f"\nOverall: {overall}")
+        if suggestions:
+            print("\nSuggestions:")
+            for s in suggestions:
+                print(f"  - {s}")
+
+    if overall == "not_ready":
+        sys.exit(1)
+    elif overall == "degraded":
+        sys.exit(2)
+    # else sys.exit(0) -- implicit
+
+
 def _kill_mount_owner_processes(mountpoint: Path) -> List[int]:
     pids = _find_mount_owner_pids(mountpoint)
     if not pids:
@@ -3335,6 +3448,9 @@ commands:
 
   unmount <mountpoint>      Unmount an existing AmiFUSE mount.
 
+  doctor                    Check prerequisites and environment readiness.
+    --json                    Output results as JSON.
+
   format <image> <partition> [volname]
                               Format an Amiga partition.
     --driver PATH             Filesystem binary (default: extract from RDB).
@@ -3438,6 +3554,16 @@ commands:
     )
     unmount_parser.add_argument("mountpoint", type=Path, help="Mounted filesystem path")
     unmount_parser.set_defaults(func=cmd_unmount)
+
+    # doctor subcommand
+    doctor_parser = subparsers.add_parser(
+        "doctor", help="Check prerequisites and environment readiness."
+    )
+    doctor_parser.add_argument(
+        "--json", action="store_true",
+        help="Output results as JSON.",
+    )
+    doctor_parser.set_defaults(func=cmd_doctor)
 
     # format subcommand
     format_parser = subparsers.add_parser(
