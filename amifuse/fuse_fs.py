@@ -419,13 +419,16 @@ class HandlerBridge:
             self.launcher.run_burst(self.state, max_cycles=cycles, debug=self._debug)
             rs = self.state.run_state
             new_pc = self.state.pc
+            parent_block_state = None
 
             if self._debug and i < 3:
                 cycles_run = getattr(rs, "cycles", 0) if rs else 0
                 print(
                     f"[amifuse] startup iter {i}: PC 0x{old_pc:x}->0x{new_pc:x} "
                     f"cycles={cycles_run} done={getattr(rs, 'done', False)} "
-                    f"error={getattr(rs, 'error', None)}"
+                    f"error={getattr(rs, 'error', None)} "
+                    f"kind={getattr(rs, 'error_kind', None)} "
+                    f"detail={getattr(rs, 'error_detail', None)!r}"
                 )
 
             if self.state.crashed:
@@ -455,6 +458,27 @@ class HandlerBridge:
                     _clear_all_block_state()
                 if num_children > 0 and self._debug:
                     print(f"[amifuse] startup ran {num_children} child process(es)")
+
+            parent_wait_blocked = (
+                parent_block_state is not None
+                and (
+                    parent_block_state.get("waitport_blocked_sp") is not None
+                    or parent_block_state.get("wait_blocked_sp") is not None
+                )
+            )
+            children_settled = not (
+                hasattr(self, "proc_mgr") and self.proc_mgr.has_unsettled_children()
+            )
+            parent_blocked = parent_wait_blocked or bool(getattr(rs, "error", None))
+            if replies and parent_blocked and children_settled:
+                if parent_block_state is not None:
+                    _restore_block_state(parent_block_state)
+                if self._debug:
+                    print(
+                        f"[amifuse] startup: returning after {i} iters with "
+                        f"{len(replies)} reply/replies and settled children"
+                    )
+                return replies
 
             if getattr(rs, "error", None):
                 polled = self.launcher.poll_replies(

@@ -27,6 +27,8 @@ class SimpleRunState:
     done: bool = False
     error: bool = False
     cycles: int = 0
+    error_kind: Optional[str] = None
+    error_detail: Optional[str] = None
 
 
 from amitools.vamos.path import VamosPathManager
@@ -204,6 +206,8 @@ class VamosHandlerRuntime:
             total_cycles = 0
             done = False
             error = False
+            error_kind = None
+            error_detail = None
 
             try:
                 er = machine.execute(max_cycles)
@@ -212,9 +216,13 @@ class VamosHandlerRuntime:
             except UnsupportedFeatureError:
                 # WaitPort/WaitPkt blocked - this is expected behavior
                 error = True
-            except Exception:
+                error_kind = "UnsupportedFeatureError"
+                error_detail = None
+            except Exception as exc:
                 # Unexpected error during execution
                 error = True
+                error_kind = type(exc).__name__
+                error_detail = str(exc)
 
             return SimpleRunState(
                 pc=cpu.r_pc(),
@@ -222,6 +230,8 @@ class VamosHandlerRuntime:
                 done=done,
                 error=error,
                 cycles=total_cycles,
+                error_kind=error_kind,
+                error_detail=error_detail,
             )
 
         machine.run = machine_run

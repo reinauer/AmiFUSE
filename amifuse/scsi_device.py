@@ -301,61 +301,61 @@ class ScsiDevice(LibImpl):
             else:
                 # Unsupported command: report check condition
                 status = 2  # check condition
-            scsi.w_s("scsi_CmdActual", cdb_len)
-            scsi.w_s("scsi_Status", status)
-            scsi.w_s("scsi_Actual", actual)
-            scsi.w_s("scsi_SenseActual", 0)
-            ior.w_s("io_Actual", actual)
+            scsi.scsi_CmdActual.val = cdb_len
+            scsi.scsi_Status.val = status
+            scsi.scsi_Actual.val = actual
+            scsi.scsi_SenseActual.val = 0
+            ior.actual.val = actual
         elif cmd == CMD_READ:
             block_num = offset // self.backend.block_size
             num_blocks = length // self.backend.block_size
             if not self._check_block_bounds(block_num, num_blocks):
-                ior.w_s("io_Error", -4)  # IOERR_BADLENGTH
-                ior.w_s("io_Actual", 0)
+                ior.error.val = -4  # IOERR_BADLENGTH
+                ior.actual.val = 0
             else:
                 data = self.backend.read_blocks(block_num, num_blocks)
                 mem.w_block(buf_ptr, data)
-                ior.w_s("io_Actual", len(data))
+                ior.actual.val = len(data)
         elif cmd == CMD_WRITE:
             if self.backend.read_only:
-                ior.w_s("io_Actual", length)
+                ior.actual.val = length
             else:
                 block_num = offset // self.backend.block_size
                 num_blocks = length // self.backend.block_size
                 if not self._check_block_bounds(block_num, num_blocks):
-                    ior.w_s("io_Error", -4)  # IOERR_BADLENGTH
-                    ior.w_s("io_Actual", 0)
+                    ior.error.val = -4  # IOERR_BADLENGTH
+                    ior.actual.val = 0
                 else:
                     data = mem.r_block(buf_ptr, length)
                     self.backend.write_blocks(block_num, data, num_blocks)
-                    ior.w_s("io_Actual", length)
+                    ior.actual.val = length
         elif cmd == TD_READ64:
             # TD64: 64-bit offset using io_Actual as high 32 bits
             offset64 = (io_actual << 32) | offset
             block_num = offset64 // self.backend.block_size
             num_blocks = length // self.backend.block_size
             if not self._check_block_bounds(block_num, num_blocks):
-                ior.w_s("io_Error", -4)  # IOERR_BADLENGTH
-                ior.w_s("io_Actual", 0)
+                ior.error.val = -4  # IOERR_BADLENGTH
+                ior.actual.val = 0
             else:
                 data = self.backend.read_blocks(block_num, num_blocks)
                 mem.w_block(buf_ptr, data)
-                ior.w_s("io_Actual", len(data))
+                ior.actual.val = len(data)
         elif cmd == TD_WRITE64:
             # TD64: 64-bit offset using io_Actual as high 32 bits
             if self.backend.read_only:
-                ior.w_s("io_Actual", length)
+                ior.actual.val = length
             else:
                 offset64 = (io_actual << 32) | offset
                 block_num = offset64 // self.backend.block_size
                 num_blocks = length // self.backend.block_size
                 if not self._check_block_bounds(block_num, num_blocks):
-                    ior.w_s("io_Error", -4)  # IOERR_BADLENGTH
-                    ior.w_s("io_Actual", 0)
+                    ior.error.val = -4  # IOERR_BADLENGTH
+                    ior.actual.val = 0
                 else:
                     data = mem.r_block(buf_ptr, length)
                     self.backend.write_blocks(block_num, data, num_blocks)
-                    ior.w_s("io_Actual", length)
+                    ior.actual.val = length
         elif cmd == TD_GETGEOMETRY:
             # DriveGeometry structure from devices/trackdisk.h:
             # All main fields are ULONGs (4 bytes each)!
@@ -383,47 +383,46 @@ class ScsiDevice(LibImpl):
             mem.w8(geo_ptr + 28, 0)  # dg_DeviceType
             mem.w8(geo_ptr + 29, 0)  # dg_Flags
             mem.w16(geo_ptr + 30, 0)  # dg_Reserved
-            ior.w_s("io_Actual", 0)
+            ior.actual.val = 0
         elif cmd == 9:  # TD_MOTOR
             # Turn motor on/off, return old motor state (always 0 for us)
-            ior.w_s("io_Actual", 0)
+            ior.actual.val = 0
         elif cmd == 11:  # TD_FORMAT
             # Format tracks - no-op for existing disk images
-            ior.w_s("io_Actual", length)
+            ior.actual.val = length
         elif cmd == TD_CHANGENUM:  # TD_CHANGENUM (13)
             # Return disk change count - always 0, disk never changes
-            ior.w_s("io_Actual", 0)
+            ior.actual.val = 0
         elif cmd == 14:  # TD_CHANGESTATE
             # Check if disk is present: io_Actual=0 means disk present
-            ior.w_s("io_Actual", 0)
+            ior.actual.val = 0
         elif cmd == 15:  # TD_PROTSTATUS
             # Check write protect: io_Actual=0 means not protected
-            ior.w_s("io_Actual", 0 if not self.backend.read_only else 1)
+            ior.actual.val = 0 if not self.backend.read_only else 1
         elif cmd == 18:  # TD_GETDRIVETYPE
             # Return drive type: 0 = 3.5" drive
-            ior.w_s("io_Actual", 0)
+            ior.actual.val = 0
         elif cmd == CMD_UPDATE:  # CMD_UPDATE (4)
             # Flush buffers to disk - sync backend
             if hasattr(self.backend, "sync"):
                 self.backend.sync()
-            ior.w_s("io_Actual", 0)
+            ior.actual.val = 0
         elif cmd == CMD_CLEAR:  # CMD_CLEAR (5)
             # Clear buffers - no-op for us
-            ior.w_s("io_Actual", 0)
+            ior.actual.val = 0
         elif cmd == TD_SEEK:  # TD_SEEK (10)
             # Seek to track - no-op for file-backed images
-            ior.w_s("io_Actual", 0)
+            ior.actual.val = 0
         elif cmd == TD_ADDCHANGEINT:  # TD_ADDCHANGEINT (20)
             # Hold disk-change notifications pending. SendIO() must NOT queue an
             # immediate reply for changeint requests; handlers expect this IO to
             # complete only when media actually changes or when TD_REMCHANGEINT
             # tears it down.
-            flags = ior.r_s("io_Flags")
-            ior.w_s("io_Flags", flags & ~IOF_QUICK)
-            ior.w_s("io_Actual", 0)
+            ior.flags.val &= ~IOF_QUICK
+            ior.actual.val = 0
         elif cmd == TD_REMCHANGEINT:  # TD_REMCHANGEINT (21)
             # Remove disk change interrupt - no-op
-            ior.w_s("io_Actual", 0)
+            ior.actual.val = 0
         elif cmd == NSCMD_DEVICEQUERY:
             # New Style Device query: tell the handler which commands we support.
             # NSDeviceQueryResult layout (16 bytes):
@@ -459,13 +458,13 @@ class ScsiDevice(LibImpl):
                 mem.w16(buf_ptr + 8, 0)  # DeviceType (trackdisk)
                 mem.w16(buf_ptr + 10, 0)  # DeviceSubType
                 mem.w32(buf_ptr + 12, _NSD_CMD_TABLE_ADDR)  # SupportedCommands
-                ior.w_s("io_Actual", 16)
+                ior.actual.val = 16
             else:
-                ior.w_s("io_Error", -3)  # IOERR_NOCMD
+                ior.error.val = -3  # IOERR_NOCMD
         else:
             # For unhandled commands, report success.
-            ior.w_s("io_Error", 0)
-            ior.w_s("io_Actual", 0)
+            ior.error.val = 0
+            ior.actual.val = 0
 
         # NOTE: We do NOT signal IO completion because we complete synchronously
         # with IOF_QUICK set. The caller (DoIO/WaitIO) checks IOF_QUICK and returns

@@ -109,6 +109,21 @@ class ProcessManager:
         """Get list of child processes ready to execute."""
         return [p for p in self.ready_queue if not p.exited]
 
+    def has_unsettled_children(self) -> bool:
+        """Return True while any child still needs startup work.
+
+        A child is considered settled once it has either exited or blocked in
+        its steady-state Wait()/WaitPort() loop.  Startup may stop once the
+        parent has replied and all children have reached one of those states.
+        """
+        self.check_for_new_children()
+        for proc in self.processes.values():
+            if not proc.is_child or proc.exited:
+                continue
+            if not proc.started or not proc.blocked:
+                return True
+        return False
+
     def _compute_pending_signals(self, mask: int = 0xFFFFFFFF) -> int:
         """Compute pending signals for the current ThisTask."""
         from amitools.vamos.libstructs.exec_ import (
