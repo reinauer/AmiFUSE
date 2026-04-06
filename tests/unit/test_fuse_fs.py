@@ -1579,3 +1579,107 @@ class TestCmdDoctor:
         assert data["checks"]["fuse_backend"]["ok"] is True
         assert data["checks"]["fuse_backend"]["installed"] is True
         assert data["checks"]["fuse_backend"]["name"] == "libfuse"
+
+    def test_doctor_degraded_fuse_backend_system_exit(self, fuse_mock, monkeypatch, doctor_args, capsys):
+        """FUSE backend raising SystemExit = degraded status, exit code 2.
+
+        check_fuse_available() raises SystemExit (not ImportError) when the
+        native FUSE backend is missing. cmd_doctor catches this explicitly.
+        """
+        import types
+
+        import amifuse.fuse_fs as fuse_fs_mod
+        import amifuse.platform as plat_mod
+
+        # Core deps available
+        monkeypatch.setitem(sys.modules, "amitools", types.ModuleType("amitools"))
+        monkeypatch.setitem(sys.modules, "machine68k", types.ModuleType("machine68k"))
+
+        # fusepy available
+        sys.modules["fuse"].__version__ = "1.0.0"
+
+        # FUSE backend check raises SystemExit (e.g. WinFSP not installed)
+        def raise_system_exit():
+            raise SystemExit("WinFSP not installed")
+
+        monkeypatch.setattr(plat_mod, "check_fuse_available", raise_system_exit)
+        monkeypatch.setattr("sys.platform", "win32")
+
+        with pytest.raises(SystemExit) as exc_info:
+            fuse_fs_mod.cmd_doctor(doctor_args)
+
+        assert exc_info.value.code == 2
+
+        output = capsys.readouterr().out
+        data = json.loads(output)
+        assert data["overall"] == "degraded"
+        assert data["checks"]["fuse_backend"]["ok"] is False
+        assert data["checks"]["fuse_backend"]["installed"] is False
+        assert data["checks"]["fuse_backend"]["name"] == "WinFSP"
+
+    def test_doctor_not_ready_without_machine68k(self, fuse_mock, monkeypatch, doctor_args, capsys):
+        """Missing machine68k alone = not_ready status, exit code 1."""
+        import builtins
+        import types
+
+        import amifuse.fuse_fs as fuse_fs_mod
+        import amifuse.platform as plat_mod
+
+        # amitools available
+        monkeypatch.setitem(sys.modules, "amitools", types.ModuleType("amitools"))
+
+        # machine68k NOT available
+        monkeypatch.delitem(sys.modules, "machine68k", raising=False)
+        real_import = builtins.__import__
+
+        def block_machine68k(name, *args, **kwargs):
+            if name == "machine68k":
+                raise ImportError("No module named 'machine68k'")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", block_machine68k)
+
+        # fusepy available
+        sys.modules["fuse"].__version__ = "1.0.0"
+
+        # FUSE backend check passes
+        monkeypatch.setattr(plat_mod, "check_fuse_available", lambda: None)
+
+        with pytest.raises(SystemExit) as exc_info:
+            fuse_fs_mod.cmd_doctor(doctor_args)
+
+        assert exc_info.value.code == 1
+
+        output = capsys.readouterr().out
+        data = json.loads(output)
+        assert data["overall"] == "not_ready"
+        assert data["checks"]["machine68k"]["ok"] is False
+        assert data["checks"]["machine68k"]["available"] is False
+        assert "machine68k" in data["missing"]
+
+    def test_doctor_fusepy_version_fallback_unknown(self, fuse_mock, monkeypatch, doctor_args, capsys):
+        """fusepy without __version__ reports version as 'unknown'."""
+        import types
+
+        import amifuse.fuse_fs as fuse_fs_mod
+        import amifuse.platform as plat_mod
+
+        # Core deps available
+        monkeypatch.setitem(sys.modules, "amitools", types.ModuleType("amitools"))
+        monkeypatch.setitem(sys.modules, "machine68k", types.ModuleType("machine68k"))
+
+        # fusepy available but WITHOUT __version__
+        fake_fuse = sys.modules["fuse"]
+        if hasattr(fake_fuse, "__version__"):
+            monkeypatch.delattr(fake_fuse, "__version__")
+
+        # FUSE backend check passes
+        monkeypatch.setattr(plat_mod, "check_fuse_available", lambda: None)
+
+        fuse_fs_mod.cmd_doctor(doctor_args)
+        output = capsys.readouterr().out
+        data = json.loads(output)
+
+        assert data["checks"]["fusepy"]["ok"] is True
+        assert data["checks"]["fusepy"]["installed"] is True
+        assert data["checks"]["fusepy"]["version"] == "unknown"
