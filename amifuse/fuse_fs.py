@@ -3048,6 +3048,103 @@ def cmd_verify(args):
         _cleanup_bridge(bridge, temp_driver)
 
 
+def cmd_hash(args):
+    """Handle the 'hash' subcommand."""
+    import hashlib
+    import json
+
+    use_json = getattr(args, "json", False)
+    file_path = args.file
+    algorithm = getattr(args, "algorithm", "sha256")
+
+    # Validate algorithm
+    supported = ("md5", "sha1", "sha256")
+    if algorithm not in supported:
+        if use_json:
+            print(json.dumps(_json_error("hash", "INVALID_ARGUMENT",
+                f"Unsupported algorithm: {algorithm}. Use one of: {', '.join(supported)}")))
+            sys.exit(1)
+        raise SystemExit(
+            f"Unsupported hash algorithm: {algorithm}. "
+            f"Supported: {', '.join(supported)}")
+
+    bridge, temp_driver = _create_bridge_from_args(args, "hash")
+    try:
+        normalized = "/" + file_path.lstrip("/")
+        stat = bridge.stat_path(normalized)
+        if stat is None:
+            if use_json:
+                print(json.dumps(_json_error("hash", "FILE_NOT_FOUND",
+                    f"File not found: {file_path}")))
+                sys.exit(1)
+            raise SystemExit(f"Error: file not found: {file_path}")
+
+        if stat.get("dir_type", 0) > 0:
+            if use_json:
+                print(json.dumps(_json_error("hash", "INVALID_ARGUMENT",
+                    f"Cannot hash a directory: {file_path}")))
+                sys.exit(1)
+            raise SystemExit(f"Error: cannot hash a directory: {file_path}")
+
+        file_size = stat.get("size", 0)
+
+        # Read file in chunks and compute hash
+        h = hashlib.new(algorithm)
+        fh_result = bridge.open_file(normalized)
+        if fh_result is None:
+            if use_json:
+                print(json.dumps(_json_error("hash", "HANDLER_ERROR",
+                    f"Failed to open file: {file_path}")))
+                sys.exit(1)
+            raise SystemExit(f"Error: failed to open file: {file_path}")
+
+        fh_addr, _dir_lock = fh_result
+        try:
+            chunk_size = 65536
+            bytes_read = 0
+            # Seek to start once, then use sequential read_handle() calls.
+            # read_handle() reads from the current file position without
+            # seeking -- much more efficient than read_handle_at() which
+            # does an absolute seek before every read.
+            bridge.seek_handle(fh_addr, 0)
+            while bytes_read < file_size:
+                to_read = min(chunk_size, file_size - bytes_read)
+                data = bridge.read_handle(fh_addr, to_read)
+                if not data:
+                    break
+                h.update(data)
+                bytes_read += len(data)
+        finally:
+            bridge.close_file(fh_addr)
+
+        hash_hex = h.hexdigest()
+
+        if use_json:
+            result = _json_result("hash",
+                target=str(args.image),
+                file=file_path,
+                size=file_size,
+                bytes_read=bytes_read,
+                algorithm=algorithm,
+                hash=hash_hex,
+            )
+            print(json.dumps(result, indent=2))
+        else:
+            print(f"File: {file_path}")
+            print(f"  Size: {file_size}")
+            print(f"  {algorithm}: {hash_hex}")
+    except SystemExit:
+        raise
+    except Exception as e:
+        if use_json:
+            print(json.dumps(_json_error("hash", "HANDLER_ERROR",
+                f"Hash computation failed: {e}")))
+            sys.exit(1)
+        raise SystemExit(f"Error computing hash: {e}")
+    finally:
+        _cleanup_bridge(bridge, temp_driver)
+
+
 def cmd_inspect(args):
     """Handle the 'inspect' subcommand."""
     import amitools.fs.DosType as DosType
@@ -3559,6 +3656,15 @@ commands:
     --block-size N            Override block size (defaults to auto/512).
     --json                    Output results as JSON.
     --debug                   Enable debug logging.
+
+  hash <image>              Compute file hash from an Amiga filesystem image.
+    --file PATH               Path to file within the image (required).
+    --algorithm ALG           Hash algorithm: md5, sha1, sha256 (default: sha256).
+    --partition NAME          Partition name (e.g. DH0) or index.
+    --driver PATH             Filesystem binary (default: extract from RDB).
+    --block-size N            Override block size (defaults to auto/512).
+    --json                    Output results as JSON.
+    --debug                   Enable debug logging.
 """,
     )
     parser.add_argument(
@@ -3735,6 +3841,42 @@ commands:
         help="Enable debug logging.",
     )
     verify_parser.set_defaults(func=cmd_verify)
+
+    # hash subcommand
+    hash_parser = subparsers.add_parser(
+        "hash", help="Compute hash of a file in an Amiga filesystem image (no FUSE needed)."
+    )
+    hash_parser.add_argument("image", type=Path, help="Disk image file")
+    hash_parser.add_argument(
+        "--file", type=str, required=True, dest="file",
+        help="Path to file within the image.",
+    )
+    hash_parser.add_argument(
+        "--algorithm", type=str, default="sha256",
+        choices=["md5", "sha1", "sha256"],
+        help="Hash algorithm (default: sha256).",
+    )
+    hash_parser.add_argument(
+        "--partition", type=str,
+        help="Partition name (e.g. DH0) or index (defaults to first).",
+    )
+    hash_parser.add_argument(
+        "--driver", type=Path,
+        help="Filesystem binary (default: extract from RDB if available).",
+    )
+    hash_parser.add_argument(
+        "--block-size", type=int,
+        help="Override block size (defaults to auto/512).",
+    )
+    hash_parser.add_argument(
+        "--json", action="store_true",
+        help="Output results as JSON.",
+    )
+    hash_parser.add_argument(
+        "--debug", action="store_true",
+        help="Enable debug logging.",
+    )
+    hash_parser.set_defaults(func=cmd_hash)
 
     args = parser.parse_args(argv)
     try:

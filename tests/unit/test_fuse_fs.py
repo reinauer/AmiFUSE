@@ -1943,3 +1943,189 @@ class TestCmdDoctor:
         assert data["checks"]["fusepy"]["ok"] is True
         assert data["checks"]["fusepy"]["installed"] is True
         assert data["checks"]["fusepy"]["version"] == "unknown"
+
+# ---------------------------------------------------------------------------
+# TestCmdHash -- hash command tests
+# ---------------------------------------------------------------------------
+
+
+class TestCmdHash:
+    """Tests for cmd_hash() subcommand."""
+
+    @pytest.fixture
+    def mock_bridge_for_hash(self, fuse_mock, monkeypatch):
+        """Set up mocked bridge for hash tests."""
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        mock_bridge = MagicMock()
+        monkeypatch.setattr(
+            fuse_fs_mod, "_create_bridge_from_args",
+            lambda args, cmd: (mock_bridge, None),
+        )
+        return mock_bridge, fuse_fs_mod
+
+    def test_hash_json_output_structure(self, mock_bridge_for_hash, capsys):
+        import hashlib
+
+        mock_bridge, fuse_fs_mod = mock_bridge_for_hash
+        mock_bridge.stat_path.return_value = {"size": 5, "dir_type": -3}
+        mock_bridge.open_file.return_value = (0x1000, 0x2000)
+        mock_bridge.seek_handle.return_value = None
+        mock_bridge.read_handle.side_effect = [b"hello", b""]
+        mock_bridge.close_file.return_value = None
+
+        args = argparse.Namespace(
+            image=Path("/fake/test.hdf"),
+            json=True,
+            file="S/Startup-Sequence",
+            algorithm="sha256",
+            partition=None,
+            driver=None,
+            block_size=None,
+            debug=False,
+        )
+        fuse_fs_mod.cmd_hash(args)
+        output = capsys.readouterr().out
+        data = json.loads(output)
+
+        assert data["status"] == "ok"
+        assert data["command"] == "hash"
+        assert "version" in data
+        assert "hash" in data
+        assert data["algorithm"] == "sha256"
+        assert data["size"] == 5
+
+    def test_hash_sha256_correct(self, mock_bridge_for_hash, capsys):
+        import hashlib
+
+        mock_bridge, fuse_fs_mod = mock_bridge_for_hash
+        mock_bridge.stat_path.return_value = {"size": 5, "dir_type": -3}
+        mock_bridge.open_file.return_value = (0x1000, 0x2000)
+        mock_bridge.seek_handle.return_value = None
+        mock_bridge.read_handle.side_effect = [b"hello", b""]
+        mock_bridge.close_file.return_value = None
+
+        args = argparse.Namespace(
+            image=Path("/fake/test.hdf"),
+            json=True,
+            file="test.txt",
+            algorithm="sha256",
+            partition=None,
+            driver=None,
+            block_size=None,
+            debug=False,
+        )
+        fuse_fs_mod.cmd_hash(args)
+        output = capsys.readouterr().out
+        data = json.loads(output)
+
+        expected = hashlib.sha256(b"hello").hexdigest()
+        assert data["hash"] == expected
+
+    def test_hash_md5(self, mock_bridge_for_hash, capsys):
+        import hashlib
+
+        mock_bridge, fuse_fs_mod = mock_bridge_for_hash
+        mock_bridge.stat_path.return_value = {"size": 5, "dir_type": -3}
+        mock_bridge.open_file.return_value = (0x1000, 0x2000)
+        mock_bridge.seek_handle.return_value = None
+        mock_bridge.read_handle.side_effect = [b"hello", b""]
+        mock_bridge.close_file.return_value = None
+
+        args = argparse.Namespace(
+            image=Path("/fake/test.hdf"),
+            json=True,
+            file="test.txt",
+            algorithm="md5",
+            partition=None,
+            driver=None,
+            block_size=None,
+            debug=False,
+        )
+        fuse_fs_mod.cmd_hash(args)
+        output = capsys.readouterr().out
+        data = json.loads(output)
+
+        assert data["algorithm"] == "md5"
+        expected = hashlib.md5(b"hello").hexdigest()
+        assert data["hash"] == expected
+
+    def test_hash_file_not_found(self, mock_bridge_for_hash, capsys):
+        mock_bridge, fuse_fs_mod = mock_bridge_for_hash
+        mock_bridge.stat_path.return_value = None
+
+        args = argparse.Namespace(
+            image=Path("/fake/test.hdf"),
+            json=True,
+            file="nonexistent.txt",
+            algorithm="sha256",
+            partition=None,
+            driver=None,
+            block_size=None,
+            debug=False,
+        )
+        with pytest.raises(SystemExit):
+            fuse_fs_mod.cmd_hash(args)
+        output = capsys.readouterr().out
+        data = json.loads(output)
+        assert data["error"]["code"] == "FILE_NOT_FOUND"
+
+    def test_hash_directory_rejected(self, mock_bridge_for_hash, capsys):
+        mock_bridge, fuse_fs_mod = mock_bridge_for_hash
+        mock_bridge.stat_path.return_value = {"dir_type": 2, "size": 0}
+
+        args = argparse.Namespace(
+            image=Path("/fake/test.hdf"),
+            json=True,
+            file="S",
+            algorithm="sha256",
+            partition=None,
+            driver=None,
+            block_size=None,
+            debug=False,
+        )
+        with pytest.raises(SystemExit):
+            fuse_fs_mod.cmd_hash(args)
+        output = capsys.readouterr().out
+        data = json.loads(output)
+        assert data["error"]["code"] == "INVALID_ARGUMENT"
+
+    def test_hash_unsupported_algorithm(self, fuse_mock):
+        """Unsupported algorithm is caught by argparse choices validation."""
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        with pytest.raises(SystemExit) as exc_info:
+            fuse_fs_mod.main(["hash", "test.hdf", "--file", "x", "--algorithm", "blake2"])
+        # argparse exits with code 2 for invalid arguments
+        assert exc_info.value.code == 2
+
+    def test_hash_uses_sequential_read(self, mock_bridge_for_hash, capsys):
+        """Verify seek_handle is called once at offset 0, and read_handle
+        (not read_handle_at) is used for chunk reads."""
+        mock_bridge, fuse_fs_mod = mock_bridge_for_hash
+        mock_bridge.stat_path.return_value = {"size": 10, "dir_type": -3}
+        mock_bridge.open_file.return_value = (0x1000, 0x2000)
+        mock_bridge.seek_handle.return_value = None
+        # Two chunks: 10 bytes total
+        mock_bridge.read_handle.side_effect = [b"hello", b"world", b""]
+        mock_bridge.close_file.return_value = None
+
+        args = argparse.Namespace(
+            image=Path("/fake/test.hdf"),
+            json=True,
+            file="test.txt",
+            algorithm="sha256",
+            partition=None,
+            driver=None,
+            block_size=None,
+            debug=False,
+        )
+        fuse_fs_mod.cmd_hash(args)
+
+        # seek_handle should be called exactly once at offset 0
+        mock_bridge.seek_handle.assert_called_once_with(0x1000, 0)
+        # read_handle should be used (not read_handle_at)
+        assert mock_bridge.read_handle.call_count >= 2
+        mock_bridge.read_handle_at.assert_not_called()
+        # close_file should always be called
+        mock_bridge.close_file.assert_called_once_with(0x1000)
