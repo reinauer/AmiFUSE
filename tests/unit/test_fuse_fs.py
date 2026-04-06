@@ -517,6 +517,76 @@ class TestWindowsProcessDiscovery:
         fuse_fs_mod._find_mount_owner_pids(Path("/mnt/amiga"))
         assert called["unix"] is True
 
+    def test_backslash_mountpoint_preserved_with_posix_false(self, fuse_mock, monkeypatch):
+        r"""Backslash paths like C:\mnt\amiga are preserved by posix=False.
+
+        shlex.split in POSIX mode would interpret \m and \a as escape
+        sequences, mangling the path. This test verifies that the
+        non-POSIX split keeps Windows paths intact.
+        """
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        wmic_output = (
+            "\r\n"
+            "CommandLine=python -m amifuse mount disk.hdf --mountpoint C:\\mnt\\amiga\r\n"
+            "ProcessId=5678\r\n"
+            "\r\n"
+        )
+
+        def fake_run(cmd, **kwargs):
+            return argparse.Namespace(returncode=0, stdout=wmic_output)
+
+        monkeypatch.setattr(fuse_fs_mod.subprocess, "run", fake_run)
+        monkeypatch.setattr(fuse_fs_mod.os, "getpid", lambda: 999)
+
+        pids = fuse_fs_mod._find_mount_owner_pids_windows(Path(r"C:\mnt\amiga"))
+        assert 5678 in pids
+
+    def test_last_record_without_trailing_blank_line(self, fuse_mock, monkeypatch):
+        """Parser flushes the final record even without a trailing blank line."""
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        # No trailing \r\n after ProcessId — output ends abruptly
+        wmic_output = (
+            "\r\n"
+            "CommandLine=python -m amifuse mount disk.hdf --mountpoint Z:\r\n"
+            "ProcessId=7890"
+        )
+
+        def fake_run(cmd, **kwargs):
+            return argparse.Namespace(returncode=0, stdout=wmic_output)
+
+        monkeypatch.setattr(fuse_fs_mod.subprocess, "run", fake_run)
+        monkeypatch.setattr(fuse_fs_mod.os, "getpid", lambda: 999)
+
+        pids = fuse_fs_mod._find_mount_owner_pids_windows(Path("Z:"))
+        assert 7890 in pids
+
+    def test_malformed_quoting_falls_back_to_split(self, fuse_mock, monkeypatch):
+        """Unmatched quotes in CommandLine trigger ValueError fallback to str.split()."""
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        # Unmatched double quote after mount — shlex.split will raise ValueError
+        wmic_output = (
+            "\r\n"
+            'CommandLine=python -m amifuse "mount disk.hdf --mountpoint Z:\r\n'
+            "ProcessId=3456\r\n"
+            "\r\n"
+        )
+
+        def fake_run(cmd, **kwargs):
+            return argparse.Namespace(returncode=0, stdout=wmic_output)
+
+        monkeypatch.setattr(fuse_fs_mod.subprocess, "run", fake_run)
+        monkeypatch.setattr(fuse_fs_mod.os, "getpid", lambda: 999)
+
+        # Should not raise — falls back to command.split()
+        pids = fuse_fs_mod._find_mount_owner_pids_windows(Path("Z:"))
+        # The fallback split will produce tokens that include the quote char,
+        # so --mountpoint matching may or may not succeed, but the function
+        # must not crash.
+        assert isinstance(pids, list)
+
 
 class TestDriverValidation:
     """Tests for explicit filesystem driver path validation."""
@@ -803,6 +873,62 @@ class TestDestroyCleanup:
         fs, bridge = fs_with_mock_bridge
         bridge.backend = None
         fs.destroy("/")
+
+
+class TestCommandMatchesMountpoint:
+    """Direct tests for _command_matches_mountpoint() token matching."""
+
+    def test_matches_literal_mountpoint(self, fuse_mock):
+        """Matches when --mountpoint value equals the raw mountpoint string."""
+        from amifuse.fuse_fs import _command_matches_mountpoint
+
+        tokens = ["python", "-m", "amifuse", "mount", "disk.hdf", "--mountpoint", "/mnt/amiga"]
+        assert _command_matches_mountpoint(tokens, "/mnt/amiga", "/mnt/amiga") is True
+
+    def test_matches_resolved_path(self, fuse_mock, monkeypatch, tmp_path):
+        """Matches when the mountpoint arg resolves to the same absolute path."""
+        from amifuse.fuse_fs import _command_matches_mountpoint
+
+        # Use a relative-looking path that resolves to the abs_mountpoint
+        abs_mp = str(tmp_path / "amiga")
+        tokens = ["python", "-m", "amifuse", "mount", "disk.hdf", "--mountpoint", str(tmp_path / "amiga")]
+        assert _command_matches_mountpoint(tokens, "./amiga", abs_mp) is True
+
+    def test_no_match_different_mountpoint(self, fuse_mock):
+        """Does not match when the mountpoint value differs."""
+        from amifuse.fuse_fs import _command_matches_mountpoint
+
+        tokens = ["python", "-m", "amifuse", "mount", "disk.hdf", "--mountpoint", "/mnt/other"]
+        assert _command_matches_mountpoint(tokens, "/mnt/amiga", "/mnt/amiga") is False
+
+    def test_no_match_without_mountpoint_flag(self, fuse_mock):
+        """Returns False when the command has no --mountpoint flag."""
+        from amifuse.fuse_fs import _command_matches_mountpoint
+
+        tokens = ["python", "-m", "amifuse", "mount", "disk.hdf"]
+        assert _command_matches_mountpoint(tokens, "/mnt/amiga", "/mnt/amiga") is False
+
+
+class TestKillEscalation:
+    """Tests for _kill_mount_owner_processes() edge cases."""
+
+    def test_oserror_during_sigterm_does_not_crash(self, fuse_mock, monkeypatch):
+        """OSError(22) during SIGTERM is caught and the process is skipped."""
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        monkeypatch.setattr(
+            fuse_fs_mod, "_find_mount_owner_pids", lambda mp: [1234]
+        )
+
+        def fake_kill(pid, sig):
+            if sig == signal.SIGTERM:
+                raise OSError(22, "Invalid argument")
+
+        monkeypatch.setattr(fuse_fs_mod.os, "kill", fake_kill)
+
+        # Should not raise; OSError during SIGTERM is caught
+        result = fuse_fs_mod._kill_mount_owner_processes(Path("/mnt/amiga"))
+        assert result == [1234]
 
 
 class TestDirectoryListingCap:
