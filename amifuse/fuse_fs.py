@@ -660,8 +660,10 @@ class HandlerBridge:
                     self.proc_mgr.run_all_ready_children(
                         cycles_per_child=cycles // 2
                     )
-                if self.state.initialized:
-                    _restore_block_state(parent_block_state)
+                    if self.state.initialized:
+                        _restore_block_state(parent_block_state)
+                    else:
+                        _clear_all_block_state()
                 else:
                     _clear_all_block_state()
                 continue
@@ -2300,6 +2302,8 @@ class AmigaFuseFS(Operations):
                 backend.close()
         except Exception as e:
             print(f"[amifuse] WARNING: backend close failed: {e}", flush=True)
+        # Mark bridge as closed so close() becomes a no-op if called after destroy()
+        self.bridge._closed = True
         print("[amifuse] Unmount complete.", flush=True)
 
 
