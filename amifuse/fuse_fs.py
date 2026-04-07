@@ -956,6 +956,8 @@ class HandlerBridge:
 
     def _alloc_read_buf(self, size: int):
         if self._read_buf_mem is None or size > self._read_buf_size:
+            if self._read_buf_mem is not None:
+                self.vh.alloc.free_memory(self._read_buf_mem)
             self._read_buf_mem = self.vh.alloc.alloc_memory(size, label="FUSE_READBUF")
             self._read_buf_size = size
         self.mem.w_block(self._read_buf_mem.addr, b"\x00" * size)
@@ -1616,7 +1618,8 @@ class AmigaFuseFS(Operations):
     def _terminate_mount_after_crash(self):
         # Give the failing FUSE operation a moment to return EIO before
         # terminating the process and letting the kernel drop the mount.
-        time.sleep(0.1)
+        time.sleep(0.5)
+        print("[amifuse] Handler crashed - sending SIGTERM to unmount", flush=True)
         os.kill(os.getpid(), signal.SIGTERM)
 
     def _log_op(self, op: str, path: str, extra: str = ""):
