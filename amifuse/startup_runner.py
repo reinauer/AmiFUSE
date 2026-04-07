@@ -545,7 +545,10 @@ class HandlerLauncher:
         self._stdpkt_index = (idx + 1) % self._stdpkt_ring_size
         sp_mem = self._stdpkt_ring[idx]
         if sp_mem is None or total > self._stdpkt_sizes[idx]:
-            sp_mem = self.alloc.alloc_memory(total, label=f"stdpkt_scratch_{idx}")
+            new_mem = self.alloc.alloc_memory(total, label=f"stdpkt_scratch_{idx}")
+            if sp_mem is not None:
+                self.alloc.free_memory(sp_mem)
+            sp_mem = new_mem
             self._stdpkt_ring[idx] = sp_mem
             self._stdpkt_sizes[idx] = total
         sp_addr = sp_mem.addr

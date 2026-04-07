@@ -1024,6 +1024,73 @@ class TestHandlerBridgeReadBuf:
         mem.w_block.assert_not_called()
 
 
+class TestHandlerBridgeBstrRing:
+    """Verify bstr ring buffer frees old allocation on growth."""
+
+    def test_alloc_bstr_reuses_existing_slot(self, fuse_mock):
+        from amifuse.fuse_fs import HandlerBridge
+
+        existing_mem = SimpleNamespace(addr=0x3000, size=16)
+        alloc = MagicMock()
+        mem = MagicMock()
+        bridge = HandlerBridge.__new__(HandlerBridge)
+        bridge.vh = SimpleNamespace(alloc=alloc)
+        bridge.mem = mem
+        bridge._bstr_ring = [existing_mem] + [None] * 7
+        bridge._bstr_sizes = [16] + [0] * 7
+        bridge._bstr_ring_size = 8
+        bridge._bstr_index = 0
+
+        bridge._alloc_bstr("hi")
+
+        alloc.alloc_memory.assert_not_called()
+        alloc.free_memory.assert_not_called()
+
+    def test_alloc_bstr_grows_and_frees_old_slot(self, fuse_mock):
+        from amifuse.fuse_fs import HandlerBridge
+
+        old_mem = SimpleNamespace(addr=0x3000, size=4)
+        new_mem = SimpleNamespace(addr=0x4000, size=64)
+        alloc = MagicMock()
+        alloc.alloc_memory.return_value = new_mem
+        mem = MagicMock()
+        bridge = HandlerBridge.__new__(HandlerBridge)
+        bridge.vh = SimpleNamespace(alloc=alloc)
+        bridge.mem = mem
+        bridge._bstr_ring = [old_mem] + [None] * 7
+        bridge._bstr_sizes = [4] + [0] * 7
+        bridge._bstr_ring_size = 8
+        bridge._bstr_index = 0
+
+        bridge._alloc_bstr("a" * 50)
+
+        alloc.alloc_memory.assert_called_once()
+        alloc.free_memory.assert_called_once_with(old_mem)
+        assert bridge._bstr_ring[0] is new_mem
+
+    def test_alloc_bstr_failed_growth_keeps_old_slot(self, fuse_mock):
+        from amifuse.fuse_fs import HandlerBridge
+
+        old_mem = SimpleNamespace(addr=0x3000, size=4)
+        alloc = MagicMock()
+        alloc.alloc_memory.side_effect = RuntimeError("oom")
+        mem = MagicMock()
+        bridge = HandlerBridge.__new__(HandlerBridge)
+        bridge.vh = SimpleNamespace(alloc=alloc)
+        bridge.mem = mem
+        bridge._bstr_ring = [old_mem] + [None] * 7
+        bridge._bstr_sizes = [4] + [0] * 7
+        bridge._bstr_ring_size = 8
+        bridge._bstr_index = 0
+
+        with pytest.raises(RuntimeError, match="oom"):
+            bridge._alloc_bstr("a" * 50)
+
+        assert bridge._bstr_ring[0] is old_mem
+        assert bridge._bstr_sizes[0] == 4
+        alloc.free_memory.assert_not_called()
+
+
 class TestCommandMatchesMountpoint:
     """Direct tests for _command_matches_mountpoint() token matching."""
 
