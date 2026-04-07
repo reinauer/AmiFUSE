@@ -274,6 +274,9 @@ class ProcessManager:
         # Switch ThisTask to child process before checking resume conditions.
         self._set_this_task(child.proc_addr)
 
+        # Capture whether child is resuming from a block (equivalent of parent's `resumed`)
+        was_blocked = child.blocked
+
         if child.blocked and not self._resume_child_if_ready(child):
             self._set_this_task(self.parent_addr)
             self.cpu.w_pc(saved_pc)
@@ -296,7 +299,15 @@ class ProcessManager:
         if child.regs is not None:
             for i in range(16):
                 self.cpu.w_reg(i, child.regs[i])
-        self.cpu.w_reg(REG_A6, self.mem.r32(4))
+        seed_execbase = child.regs is None
+        if was_blocked and child.regs is not None and child.regs[REG_A6] == 0:
+            seed_execbase = True
+        if seed_execbase:
+            execbase = self.mem.r32(4)
+            self.cpu.w_reg(REG_A6, execbase)
+            # Keep saved regs consistent so next burst restores the seeded value
+            if child.regs is not None:
+                child.regs[REG_A6] = execbase
 
         # Run child
         try:
