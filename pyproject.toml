@@ -48,6 +48,8 @@ testpaths = ["tests"]
 markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
     "fuse: requires FUSE/WinFSP kernel driver",
+    "integration: integration tests requiring real fixtures and machine68k",
+    "smoke: smoke test wrappers for tools/ scripts (requires external fixtures)",
     "windows: Windows-specific tests",
     "macos: macOS-specific tests",
     "linux: Linux-specific tests",

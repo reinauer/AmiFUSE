@@ -8,3 +8,9 @@ BFFSFilesystem
 FastFileSystem
 SmartFileSystem
 pfs3aio
+
+# Test fixtures (override global ignores for committed fixtures)
+!tests/fixtures/handlers/pfs3aio
+!tests/fixtures/images/pfs3_test.hdf
+!tests/fixtures/images/blank.adf
+!tests/fixtures/images/pfs3_8mb.hdf
