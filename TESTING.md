@@ -271,7 +271,7 @@ python3 tools/amifuse_matrix.py \
 
 Then compare the results with:
 
-[PERFORMANCE.md](/Users/stepan/git/AmiFuse-codex/PERFORMANCE.md)
+[PERFORMANCE.md](PERFORMANCE.md)
 
 Important interpretation rules:
 
@@ -293,7 +293,7 @@ the matrix is the main current performance harness.
 
 The `amitools` submodule has its own test tree and README:
 
-[amitools/test/README.md](/Users/stepan/git/AmiFuse-codex/amitools/test/README.md)
+[amitools/test/README.md](amitools/test/README.md)
 
 The important buckets there are:
 
@@ -341,6 +341,81 @@ In practice:
 - `readme smoke` catches CLI and docs drift
 - `amitools` tests catch lower-level runtime semantics
 
+## Pytest Test Suite
+
+The repo has a structured pytest suite under `tests/` that runs without
+external fixtures or a live FUSE mount.
+
+### Quick Start
+
+```sh
+# all pytest tests (unit + integration, excludes smoke)
+pytest tests/ -v --timeout=60
+
+# unit tests only
+pytest tests/unit/ -v --timeout=30
+
+# integration tests only (no smoke)
+pytest tests/integration/ -v -m "integration and not smoke" --timeout=60
+```
+
+### Test Architecture
+
+Tests are organized into four layers:
+
+| Layer | Directory | What It Covers |
+|-------|-----------|----------------|
+| **Unit** | `tests/unit/` | Pure logic, mocked dependencies, no I/O |
+| **Integration** | `tests/integration/` | Cross-module with committed test fixtures |
+| **Smoke** | `tests/integration/` (marker) | Wrappers for `tools/` scripts, external fixtures |
+| **Legacy** | `tools/*.py` | Original matrix, readme, and format smoke scripts |
+
+Unit and integration tests use committed fixtures under `tests/fixtures/`
+and can run anywhere (local, CI, fresh clone). Smoke tests require the
+external fixture tree at `~/AmigaOS/AmiFuse/` and are skipped when those
+paths are absent.
+
+### Committed Test Fixtures
+
+The `tests/fixtures/` directory contains small images and handler
+binaries checked into the repo:
+
+| Path | Description |
+|------|-------------|
+| `fixtures/images/blank.adf` | Empty ADF floppy image |
+| `fixtures/images/test_ofs.adf` | OFS floppy with known directory tree |
+| `fixtures/images/test_ffs.adf` | FFS floppy with known directory tree |
+| `fixtures/images/pfs3_test.hdf` | PFS3 hard-drive image with test data |
+| `fixtures/images/pfs3_8mb.hdf` | 8 MB PFS3 image for write tests |
+| `fixtures/handlers/pfs3aio` | PFS3 handler binary |
+| `fixtures/icons/` | Reserved for `.info` icon fixtures (currently empty; icon-parser tests use synthetic data) |
+| `fixtures/generate_adf.py` | Script to regenerate ADF fixtures |
+
+These fixtures are generated once and committed so CI does not need
+Amiga toolchains or large external downloads.
+
+### Markers
+
+| Marker | Description |
+|--------|-------------|
+| `integration` | Integration tests requiring real fixtures and machine68k |
+| `smoke` | Smoke test wrappers for `tools/` scripts (requires external fixtures) |
+| `slow` | Long-running tests |
+| `fuse` | Requires FUSE/WinFSP kernel driver |
+| `windows` | Windows-specific tests |
+| `macos` | macOS-specific tests |
+| `linux` | Linux-specific tests |
+
+### CI
+
+GitHub Actions runs on every push to `main` and on pull requests:
+
+- **Unit tests:** 3 OS (Ubuntu, macOS, Windows) x 3 Python (3.11, 3.12, 3.13) = 9 jobs
+- **Integration tests:** 3 OS x Python 3.13 = 3 jobs, depends on unit-tests
+- **Smoke tests:** not in CI (require external fixtures)
+
+Workflow file: `.github/workflows/ci.yml`
+
 ## Current Gaps
 
 The following are still planned, not fully documented as standalone test
@@ -349,4 +424,6 @@ entry points yet:
 - far-end file I/O coverage inside a filesystem that spans a partition
   larger than `4GiB`
 - fuller long-run generated benchmark recipes
-- fixture-layout cleanup for `~/AmigaOS/AmiFuse/`
+- ~~fixture-layout cleanup for `~/AmigaOS/AmiFuse/`~~ (committed test
+  fixtures now live in `tests/fixtures/`; external fixtures still used
+  by smoke tests)

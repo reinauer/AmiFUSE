@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  unit-tests:
+    name: Unit Tests (Python ${{ matrix.python-version }}, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e "./amitools[vamos]"
+          pip install "pytest>=7.0" "pytest-cov>=4.0" "pytest-timeout>=2.0"
+          pip install -e "." --no-deps
+
+      - name: Verify machine68k
+        run: |
+          python -c "import machine68k; print(f'machine68k {machine68k.__version__}')"
+          python -c "import machine68k; machine68k.CPU(1); print('CPU OK')"
+        continue-on-error: true
+
+      - name: Run unit tests
+        run: pytest tests/unit/ -v --timeout=30
+
+  integration-tests:
+    name: Integration Tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    needs: unit-tests
+    strategy:
+      fail-fast: false
+      matrix:
+        # Windows excluded: machine68k segfaults due to opcode table
+        # over-read (cnvogelg/machine68k#8) and JMP/CAS collision (#9).
+        # Re-enable once upstream merges those fixes.
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e "./amitools[vamos]"
+          pip install "pytest>=7.0" "pytest-cov>=4.0" "pytest-timeout>=2.0"
+          pip install -e "." --no-deps
+
+      - name: Run integration tests
+        run: pytest tests/integration/ -v -m "integration and not smoke" --timeout=60
