@@ -13,7 +13,6 @@ import subprocess
 import sys
 import tempfile
 import traceback
-import types
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional
@@ -67,49 +66,16 @@ def _cli_example(name: str, command: List[str], expect: Callable[[subprocess.Com
     return ExampleResult(name=name, mode="cli", status="ok", command=" ".join(command), details=details)
 
 
-def _install_fake_fuse():
-    if "fuse" in sys.modules:
-        del sys.modules["fuse"]
-
-    fake_fuse = types.ModuleType("fuse")
-
-    class _DummyOperations:
-        pass
-
-    class _DummyLoggingMixIn:
-        pass
-
-    class _DummyFuseError(RuntimeError):
-        pass
-
-    fake_fuse.FuseOSError = _DummyFuseError
-    fake_fuse.LoggingMixIn = _DummyLoggingMixIn
-    fake_fuse.Operations = _DummyOperations
-    sys.modules["fuse"] = fake_fuse
-    return fake_fuse
-
-
-def _cleanup_bridge(bridge):
-    shutdown = getattr(getattr(bridge, "vh", None), "shutdown", None)
-    if shutdown is not None:
-        shutdown()
-    backend = getattr(bridge, "backend", None)
-    if backend is not None:
-        backend.close()
-
-
 def _load_mount_runtime():
     if str(REPO_ROOT) not in sys.path:
         sys.path.insert(0, str(REPO_ROOT))
-    fake_fuse = _install_fake_fuse()
     module = importlib.import_module("amifuse.fuse_fs")
-    module = importlib.reload(module)
-    return fake_fuse, module
+    return module
 
 
 def _mount_example_runner() -> Callable:
     invocations: List[Dict[str, object]] = []
-    fake_fuse, module = _load_mount_runtime()
+    module = _load_mount_runtime()
 
     def _fake_fuse(fs, mountpoint, **kwargs):
         root_names = [entry["name"] for entry in fs.bridge.list_dir_path("/")]
@@ -121,10 +87,9 @@ def _mount_example_runner() -> Callable:
             "icons_enabled": getattr(fs, "_icons_enabled", False),
         }
         invocations.append(invocation)
-        _cleanup_bridge(fs.bridge)
+        fs.bridge.close()
         return invocation
 
-    fake_fuse.FUSE = _fake_fuse
     module.FUSE = _fake_fuse
 
     def run(name: str, command: str, check: Callable[[Dict[str, object], object], str], **kwargs) -> ExampleResult:

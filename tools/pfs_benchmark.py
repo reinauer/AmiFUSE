@@ -9,7 +9,6 @@ import statistics
 import subprocess
 import sys
 import time
-import types
 from pathlib import Path
 
 
@@ -45,23 +44,6 @@ def _run_worker(image: str, driver: str, read_size: int, read_count: int):
         sys.path.insert(0, str(amitools_root))
     if str(repo_root) not in sys.path:
         sys.path.insert(0, str(repo_root))
-    if "fuse" not in sys.modules:
-        fake_fuse = types.ModuleType("fuse")
-
-        class _DummyOperations:
-            pass
-
-        class _DummyLoggingMixIn:
-            pass
-
-        class _DummyFuseError(RuntimeError):
-            pass
-
-        fake_fuse.FUSE = object
-        fake_fuse.FuseOSError = _DummyFuseError
-        fake_fuse.LoggingMixIn = _DummyLoggingMixIn
-        fake_fuse.Operations = _DummyOperations
-        sys.modules["fuse"] = fake_fuse
     from amifuse.fuse_fs import HandlerBridge
 
     start = time.perf_counter()

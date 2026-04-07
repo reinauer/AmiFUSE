@@ -5,13 +5,11 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import importlib
 import json
 import os
 import subprocess
 import sys
 import traceback
-import types
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
@@ -126,36 +124,12 @@ def _ensure_import_path():
         sys.path.insert(0, str(AMITOOLS_ROOT))
 
 
-def _install_fake_fuse():
-    if "fuse" in sys.modules:
-        del sys.modules["fuse"]
-
-    fake_fuse = types.ModuleType("fuse")
-
-    class _DummyOperations:
-        pass
-
-    class _DummyLoggingMixIn:
-        pass
-
-    class _DummyFuseError(RuntimeError):
-        pass
-
-    fake_fuse.FuseOSError = _DummyFuseError
-    fake_fuse.LoggingMixIn = _DummyLoggingMixIn
-    fake_fuse.Operations = _DummyOperations
-    sys.modules["fuse"] = fake_fuse
-    return fake_fuse
-
-
 def _load_runtime():
     _ensure_import_path()
-    fake_fuse = _install_fake_fuse()
     from amifuse.rdb_inspect import detect_adf, detect_iso, open_rdisk
     import amifuse.fuse_fs as fuse_fs
 
-    fuse_fs = importlib.reload(fuse_fs)
-    return fake_fuse, fuse_fs, detect_adf, detect_iso, open_rdisk
+    return fuse_fs, detect_adf, detect_iso, open_rdisk
 
 
 def _inspect_case(case: FormatCase, detect_adf, detect_iso, open_rdisk):
@@ -209,16 +183,7 @@ def _inspect_case(case: FormatCase, detect_adf, detect_iso, open_rdisk):
             blkdev.close()
 
 
-def _cleanup_bridge(bridge):
-    shutdown = getattr(getattr(bridge, "vh", None), "shutdown", None)
-    if shutdown is not None:
-        shutdown()
-    backend = getattr(bridge, "backend", None)
-    if backend is not None:
-        backend.close()
-
-
-def _mount_case(case: FormatCase, fake_fuse, fuse_fs):
+def _mount_case(case: FormatCase, fuse_fs):
     invocation: Dict[str, object] = {}
 
     def _fake_mount(fs, mountpoint, **kwargs):
@@ -237,9 +202,8 @@ def _mount_case(case: FormatCase, fake_fuse, fuse_fs):
                 "read_bytes": len(data),
             }
         )
-        _cleanup_bridge(fs.bridge)
+        fs.bridge.close()
 
-    fake_fuse.FUSE = _fake_mount
     fuse_fs.FUSE = _fake_mount
     mountpoint = REPO_ROOT / "run" / "image-format-smoke" / case.key
     mountpoint.parent.mkdir(parents=True, exist_ok=True)
@@ -263,9 +227,9 @@ def _run_case(case: FormatCase) -> FormatResult:
     try:
         if case.download_url:
             ensure_downloaded_fixture(case.image, case.download_url, case.label)
-        fake_fuse, fuse_fs, detect_adf, detect_iso, open_rdisk = _load_runtime()
+        fuse_fs, detect_adf, detect_iso, open_rdisk = _load_runtime()
         inspect_info = _inspect_case(case, detect_adf, detect_iso, open_rdisk)
-        mount_info = _mount_case(case, fake_fuse, fuse_fs)
+        mount_info = _mount_case(case, fuse_fs)
         detail = (
             f"kind={inspect_info['kind']}"
             f", read={mount_info['read_path']} ({mount_info['read_bytes']} bytes)"

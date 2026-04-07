@@ -13,7 +13,6 @@ import subprocess
 import sys
 import time
 import traceback
-import types
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
@@ -414,30 +413,8 @@ def _ensure_import_path():
         sys.path.insert(0, str(REPO_ROOT))
 
 
-def _install_fake_fuse():
-    if "fuse" in sys.modules:
-        return
-    fake_fuse = types.ModuleType("fuse")
-
-    class _DummyOperations:
-        pass
-
-    class _DummyLoggingMixIn:
-        pass
-
-    class _DummyFuseError(RuntimeError):
-        pass
-
-    fake_fuse.FUSE = object
-    fake_fuse.FuseOSError = _DummyFuseError
-    fake_fuse.LoggingMixIn = _DummyLoggingMixIn
-    fake_fuse.Operations = _DummyOperations
-    sys.modules["fuse"] = fake_fuse
-
-
 def _load_runtime():
     _ensure_import_path()
-    _install_fake_fuse()
     logging.getLogger().setLevel(logging.CRITICAL)
     from amifuse.fuse_fs import HandlerBridge, format_volume
     from amifuse.rdb_inspect import detect_adf, detect_iso, open_rdisk
