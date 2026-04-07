@@ -1344,6 +1344,13 @@ def _run_fixture_worker(fixture_key: str):
 def _worker_main(args):
     try:
         result = _run_fixture_worker(args.worker)
+    except SystemExit as exc:  # pragma: no cover - exercised via subprocess wrapper
+        result = {
+            "fixture": args.worker,
+            "status": "error",
+            "error": str(exc),
+            "traceback": traceback.format_exc(),
+        }
     except Exception as exc:  # pragma: no cover - exercised via subprocess wrapper
         result = {
             "fixture": args.worker,

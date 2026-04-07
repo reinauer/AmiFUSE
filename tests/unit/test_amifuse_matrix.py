@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 from pathlib import Path
+
+import pytest
 
 
 def _load_amifuse_matrix():
@@ -117,3 +120,21 @@ def test_render_markdown_includes_load_section():
     assert "Read loop med" in markdown
     assert "create=256x256B" in markdown
     assert "read=1600x1MiB" in markdown
+
+
+def test_worker_main_reports_system_exit_as_error(monkeypatch, capsys):
+    matrix = _load_amifuse_matrix()
+
+    def fake_run_fixture_worker(_fixture_key: str):
+        raise SystemExit("formatter crashed")
+
+    monkeypatch.setattr(matrix, "_run_fixture_worker", fake_run_fixture_worker)
+
+    rc = matrix._worker_main(type("Args", (), {"worker": "sfs-fmt"})())
+
+    assert rc == 0
+    out = capsys.readouterr().out.strip().splitlines()
+    result = json.loads(out[-1])
+    assert result["status"] == "error"
+    assert result["fixture"] == "sfs-fmt"
+    assert "formatter crashed" in result["error"]
