@@ -5,6 +5,13 @@ pending_msgs = {}
 default_msgs = []
 last_wait_port = None
 
+
+def reset():
+    global last_wait_port
+    pending_msgs.clear()
+    default_msgs.clear()
+    last_wait_port = None
+
 def queue_msg(port_addr, msg_addr):
     pending_msgs.setdefault(port_addr, []).append(msg_addr)
 

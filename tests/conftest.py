@@ -6,6 +6,12 @@ from pathlib import Path
 import pytest
 
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+AMITOOLS_ROOT = REPO_ROOT / "amitools"
+if str(AMITOOLS_ROOT) not in sys.path:
+    sys.path.insert(0, str(AMITOOLS_ROOT))
+
+
 @pytest.fixture(scope="session")
 def fixtures_path():
     """Path to the test fixtures directory."""
@@ -54,6 +60,7 @@ def fuse_mock(monkeypatch):
         OFFSET_BEGINNING=0,
         _get_block_state=lambda *args, **kwargs: None,
         _clear_all_block_state=lambda *args, **kwargs: None,
+        _has_blocked_state=lambda *args, **kwargs: False,
         _snapshot_block_state=lambda *args, **kwargs: None,
         _restore_block_state=lambda *args, **kwargs: None,
     )

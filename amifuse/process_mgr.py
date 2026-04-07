@@ -8,16 +8,14 @@ for filesystems like SFS that spawn child processes via CreateNewProc().
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
-from amitools.vamos.astructs import AccessStruct
 from amitools.vamos.libstructs import ProcessStruct, MsgPortFlags
 from amitools.vamos.machine.regs import REG_D0, REG_A6
-from amitools.vamos.libstructs.dos import MessageStruct
 
 from .startup_runner import (
+    _build_resume_frame,
     _clear_all_block_state,
-    _restore_block_state,
+    _has_blocked_state,
     _snapshot_block_state,
-    _unlink_msg_from_m68k_list,
 )
 
 
@@ -87,21 +85,62 @@ class ProcessManager:
 
         new_children = []
         for proc_addr, info in list(DosLibrary._child_processes.items()):
-            if proc_addr not in self.processes:
+            new_entry_pc = info["entry_pc"]
+            new_stack = info.get("stack")
+            new_sp = new_stack.get_initial_sp()
+            new_name = info.get("name", "child")
+            new_port_addr = info.get("port_addr", 0)
+
+            existing = self.processes.get(proc_addr)
+            if existing is None:
                 # Create ProcessState for this child
                 state = ProcessState(
                     proc_addr=proc_addr,
-                    entry_pc=info["entry_pc"],
-                    sp=info["stack"].get_initial_sp(),
-                    name=info.get("name", "child"),
-                    port_addr=info.get("port_addr", 0),
+                    entry_pc=new_entry_pc,
+                    sp=new_sp,
+                    name=new_name,
+                    port_addr=new_port_addr,
                     is_child=True,
                     started=False,
-                    stack=info.get("stack"),
+                    stack=new_stack,
                 )
                 self.processes[proc_addr] = state
                 self.ready_queue.append(state)
                 new_children.append(state)
+                continue
+
+            # Some handlers, notably SFS during format/reopen, can recycle the
+            # same Process address for a fresh child. Refresh the tracked state
+            # so we do not resume the stale blocked child context.
+            needs_refresh = (
+                existing.exited
+                or existing.stack is not new_stack
+            )
+            if needs_refresh:
+                if existing.port_addr and self.exec_impl.port_mgr.has_port(
+                    existing.port_addr
+                ):
+                    self.exec_impl.port_mgr.unregister_port(existing.port_addr)
+                if new_port_addr and not self.exec_impl.port_mgr.has_port(
+                    new_port_addr
+                ):
+                    self.exec_impl.port_mgr.register_port(new_port_addr)
+                existing.entry_pc = new_entry_pc
+                existing.sp = new_sp
+                existing.name = new_name
+                existing.port_addr = new_port_addr
+                existing.blocked = False
+                existing.wait_mask = 0
+                existing.pending_signals = 0
+                existing.is_child = True
+                existing.started = False
+                existing.exited = False
+                existing.stack = new_stack
+                existing.regs = None
+                existing.block_state = None
+                if existing not in self.ready_queue:
+                    self.ready_queue.append(existing)
+                new_children.append(existing)
 
         return new_children
 
@@ -201,56 +240,30 @@ class ProcessManager:
         if not child.blocked or not child.block_state:
             return not child.blocked
 
-        _restore_block_state(child.block_state)
-        waitport_sp = child.block_state.get("waitport_blocked_sp")
-        wait_sp = child.block_state.get("wait_blocked_sp")
-        waitport_ret = child.block_state.get("waitport_blocked_ret")
-        wait_ret = child.block_state.get("wait_blocked_ret")
-        wait_mask = child.block_state.get("wait_blocked_mask")
-        waitpkt_blocked = child.block_state.get("waitpkt_blocked", False)
-
-        blocked_sp = waitport_sp if waitport_sp is not None else wait_sp
-        if blocked_sp is None:
+        if not _has_blocked_state(child.block_state):
             child.blocked = False
+            child.block_state = None
             return True
 
-        if wait_sp is not None and wait_mask is not None:
-            pending = self._compute_pending_signals(wait_mask)
-            if pending == 0:
-                return False
-            all_pending = self._compute_pending_signals(0xFFFFFFFF)
-            blocked_ret = wait_ret
-            d0_val = all_pending
-            self._clear_signals_from_task(all_pending)
-        else:
-            waitport_port = child.block_state.get("waitport_blocked_port") or child.port_addr
-            if not waitport_port or not self.exec_impl.port_mgr.has_msg(waitport_port):
-                return False
-            blocked_ret = waitport_ret
-            msg_addr = self.exec_impl.port_mgr.get_msg(waitport_port)
-            if msg_addr:
-                _unlink_msg_from_m68k_list(self.mem, msg_addr)
-            if waitpkt_blocked and msg_addr:
-                msg = AccessStruct(self.mem, MessageStruct, msg_addr)
-                pkt_addr = msg.r_s("mn_Node.ln_Name")
-                d0_val = pkt_addr if pkt_addr else 0
-            else:
-                d0_val = msg_addr if msg_addr else 0
-
-        try:
-            ret_addr = blocked_ret if blocked_ret is not None else self.mem.r32(blocked_sp)
-        except Exception:
-            ret_addr = 0
-        if ret_addr == 0:
+        resume = _build_resume_frame(
+            child.block_state,
+            default_port_addr=child.port_addr,
+            mem=self.mem,
+            port_mgr=self.exec_impl.port_mgr,
+            compute_pending_signals=self._compute_pending_signals,
+            clear_signals_from_task=self._clear_signals_from_task,
+        )
+        if resume is None:
             return False
 
-        child.entry_pc = ret_addr
-        child.sp = blocked_sp + 4
+        child.entry_pc = resume["pc"]
+        child.sp = resume["sp"]
         if child.regs is None:
             child.regs = [0] * 16
-        child.regs[REG_D0] = d0_val
+        child.regs[REG_D0] = resume["d0"]
         _clear_all_block_state()
         child.blocked = False
+        child.block_state = None
         return True
 
     def run_child_burst(self, child: ProcessState, max_cycles: int = 50000) -> bool:
@@ -273,14 +286,23 @@ class ProcessManager:
 
         # Switch ThisTask to child process before checking resume conditions.
         self._set_this_task(child.proc_addr)
+        # Parent Wait()/WaitPort() snapshots are managed by the caller around
+        # child scheduling. Clear the global Exec/DOS block state before
+        # running a child so it cannot inherit the parent's blocked frame.
+        _clear_all_block_state()
 
-        if child.blocked and not self._resume_child_if_ready(child):
-            self._set_this_task(self.parent_addr)
-            self.cpu.w_pc(saved_pc)
-            self.cpu.w_sp(saved_sp)
-            for i in range(16):
-                self.cpu.w_reg(i, saved_regs[i])
-            return False
+        resumed = False
+        if child.blocked:
+            resumed = self._resume_child_if_ready(child)
+            if not resumed:
+                self._set_this_task(self.parent_addr)
+                self.cpu.w_pc(saved_pc)
+                self.cpu.w_sp(saved_sp)
+                for i in range(16):
+                    self.cpu.w_reg(i, saved_regs[i])
+                return False
+
+        first_run = not child.started
 
         # Set up child's context
         if not child.started:
@@ -296,33 +318,73 @@ class ProcessManager:
         if child.regs is not None:
             for i in range(16):
                 self.cpu.w_reg(i, child.regs[i])
-        self.cpu.w_reg(REG_A6, self.mem.r32(4))
+        seed_execbase = first_run or child.regs is None
+        if resumed and child.regs is not None and child.regs[REG_A6] == 0:
+            seed_execbase = True
+        set_regs = {REG_A6: self.mem.r32(4)} if seed_execbase else None
+        if seed_execbase:
+            self.cpu.w_reg(REG_A6, self.mem.r32(4))
+            if child.regs is None:
+                child.regs = [0] * 16
+            child.regs[REG_A6] = self.mem.r32(4)
+        if not first_run:
+            self.cpu.w_sp(sp)
 
         # Run child
         try:
             run_state = self.machine.run(
                 pc=pc,
                 sp=sp,
+                set_regs=set_regs,
                 max_cycles=max_cycles,
+                cycles_per_run=max_cycles,
                 name=f"child_{child.name}"
             )
+            new_pc = self.cpu.r_pc()
+            new_sp = self.cpu.r_sp()
 
             # Update child state
-            child.entry_pc = run_state.pc
-            child.sp = run_state.sp
             child.regs = [self.cpu.r_reg(i) for i in range(16)]
 
             if run_state.done:
                 child.exited = True
+                from amitools.vamos.lib.DosLibrary import DosLibrary
+
+                if child.port_addr and self.exec_impl.port_mgr.has_port(child.port_addr):
+                    self.exec_impl.port_mgr.unregister_port(child.port_addr)
+                info = DosLibrary._child_processes.get(child.proc_addr)
+                if info is not None and info.get("stack") is child.stack:
+                    DosLibrary._child_processes.pop(child.proc_addr, None)
                 return False
             elif run_state.error:
-                # Child blocked (WaitPort/Wait) - preserve its block state.
-                child.block_state = _snapshot_block_state()
+                # Only treat errors as resumable blocks when Exec/DOS recorded
+                # an actual Wait()/WaitPort() state. Other errors mean this
+                # child is no longer safe to resume.
+                blocked_state = _snapshot_block_state()
+                blocked_sp = blocked_state.get("waitport_blocked_sp")
+                if blocked_sp is None:
+                    blocked_sp = blocked_state.get("wait_blocked_sp")
+                if blocked_sp is None:
+                    child.exited = True
+                    from amitools.vamos.lib.DosLibrary import DosLibrary
+
+                    if child.port_addr and self.exec_impl.port_mgr.has_port(
+                        child.port_addr
+                    ):
+                        self.exec_impl.port_mgr.unregister_port(child.port_addr)
+                    info = DosLibrary._child_processes.get(child.proc_addr)
+                    if info is not None and info.get("stack") is child.stack:
+                        DosLibrary._child_processes.pop(child.proc_addr, None)
+                    _clear_all_block_state()
+                    return False
+                child.block_state = blocked_state
                 _clear_all_block_state()
                 child.blocked = True
                 return False
             else:
                 # Still running, just hit cycle limit
+                child.entry_pc = new_pc
+                child.sp = new_sp
                 child.blocked = False
                 return True
 
@@ -338,8 +400,8 @@ class ProcessManager:
         """Set ExecBase.ThisTask to the given process."""
         from amitools.vamos.libstructs import ExecLibraryStruct
         exec_base = self.exec_impl.exec_lib.get_addr()
-        exec_struct = AccessStruct(self.mem, ExecLibraryStruct, exec_base)
-        exec_struct.w_s("ThisTask", proc_addr)
+        this_task_off = ExecLibraryStruct.sdef.find_field_def_by_name("ThisTask").offset
+        self.mem.w32(exec_base + this_task_off, proc_addr)
         # Also update exec_impl's internal pointer
         self.exec_impl.exec_lib.this_task.aptr = proc_addr
 

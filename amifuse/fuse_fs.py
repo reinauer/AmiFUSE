@@ -49,7 +49,6 @@ from .startup_runner import (
     _snapshot_block_state,
     _restore_block_state,
 )
-from amitools.vamos.astructs.access import AccessStruct  # type: ignore
 from amitools.vamos.libstructs.dos import FileInfoBlockStruct, FileHandleStruct, DosPacketStruct  # type: ignore
 from amitools.vamos.lib.dos.DosProtection import DosProtection  # type: ignore
 
@@ -65,6 +64,11 @@ def _require_fuse():
 def _handler_has_crashed(obj) -> bool:
     state = getattr(obj, "state", None)
     return getattr(state, "crashed", False) is True
+
+
+def _raise_if_handler_crashed(obj, context: str):
+    if _handler_has_crashed(obj):
+        raise SystemExit(f"Filesystem handler crashed during {context}.")
 
 
 def _parse_fib(mem, fib_addr: int) -> Dict:
@@ -231,9 +235,9 @@ class HandlerBridge:
         # Smaller bursts give us more chances to interleave child execution.
         replies = self._run_startup_until_replies(cycles=10_000, max_iters=2000)
         # Check if startup succeeded - res1=0 means the handler rejected the disk
-        pkt = AccessStruct(self.mem, DosPacketStruct, self.state.stdpkt_addr)
-        startup_res1 = pkt.r_s("dp_Res1")
-        startup_res2 = pkt.r_s("dp_Res2")
+        pkt = DosPacketStruct(self.mem, self.state.stdpkt_addr)
+        startup_res1 = pkt.res1.val
+        startup_res2 = pkt.res2.val
         if not replies and startup_res1 == 0 and not self.state.crashed:
             if self._debug:
                 print("[amifuse] No startup reply yet; attempting deferred signal flush before failing")
@@ -263,8 +267,8 @@ class HandlerBridge:
                 self._capture_main_loop_state()
             self._flush_pending_signals()
             replies = self._run_startup_until_replies(cycles=10_000, max_iters=2000)
-            startup_res1 = pkt.r_s("dp_Res1")
-            startup_res2 = pkt.r_s("dp_Res2")
+            startup_res1 = pkt.res1.val
+            startup_res2 = pkt.res2.val
         if self._debug:
             print(f"[amifuse] Startup packet result: res1={startup_res1} res2={startup_res2}")
         if startup_res1 == 0:
@@ -392,6 +396,22 @@ class HandlerBridge:
         """Mirror manual register changes into the saved main handler state."""
         if self.state.regs is not None:
             self.state.regs[reg_num] = value
+
+    def _reserved_port_addrs(self) -> set[int]:
+        reserved = {self.state.port_addr, self.state.reply_port_addr}
+        if hasattr(self, "proc_mgr"):
+            for proc in self.proc_mgr.processes.values():
+                if proc.is_child and not proc.exited and proc.port_addr:
+                    reserved.add(proc.port_addr)
+        return reserved
+
+    def _drain_non_essential_ports(self, pmgr):
+        reserved_ports = self._reserved_port_addrs()
+        for port_addr in list(pmgr.ports.keys()):
+            if port_addr in reserved_ports:
+                continue
+            while pmgr.has_msg(port_addr):
+                pmgr.get_msg(port_addr)
 
     def _run_startup_until_replies(
         self,
@@ -665,12 +685,7 @@ class HandlerBridge:
         # so _flush_pending_signals can deliver them for deferred init.
         if drain_non_essential:
             pmgr = self.vh.slm.exec_impl.port_mgr
-            dos_port = self.state.port_addr
-            reply_port = self.state.reply_port_addr
-            for port_addr in list(pmgr.ports.keys()):
-                if port_addr != dos_port and port_addr != reply_port:
-                    while pmgr.has_msg(port_addr):
-                        pmgr.get_msg(port_addr)
+            self._drain_non_essential_ports(pmgr)
 
         return replies
 
@@ -870,12 +885,7 @@ class HandlerBridge:
         # Drain stale messages from ALL non-essential ports (timer, disk
         # change).  After initialization, timer signals must NOT interfere
         # with normal DOS packet processing.
-        dos_port = self.state.port_addr
-        reply_port = self.state.reply_port_addr
-        for port_addr in list(pmgr.ports.keys()):
-            if port_addr != dos_port and port_addr != reply_port:
-                while pmgr.has_msg(port_addr):
-                    pmgr.get_msg(port_addr)
+        self._drain_non_essential_ports(pmgr)
 
         # Clean up fallback signals to avoid stale signals during normal
         # DOS packet processing.
@@ -893,13 +903,13 @@ class HandlerBridge:
         _clear_all_block_state()
 
     def _update_handler_port_from_startup(self):
-        pkt = AccessStruct(self.mem, DosPacketStruct, self.state.stdpkt_addr)
-        res1 = pkt.r_s("dp_Res1")
-        res2 = pkt.r_s("dp_Res2")
+        pkt = DosPacketStruct(self.mem, self.state.stdpkt_addr)
+        res1 = pkt.res1.val
+        res2 = pkt.res2.val
         if res1:
             # Check dp_Port - many handlers set this to their message port in the reply
-            dp_port = pkt.r_s("dp_Port")
-            alt_port = pkt.r_s("dp_Arg4")
+            dp_port = pkt.port.aptr
+            alt_port = pkt.arg4.val
             if self._debug:
                 print(f"[amifuse] Startup reply: dp_Port=0x{dp_port:x} dp_Arg4=0x{alt_port:x} (current=0x{self.state.port_addr:x})")
             # Prefer dp_Port if it's different and valid
@@ -2620,10 +2630,12 @@ def format_volume(
             debug=debug,
             partition=partition,
         )
+        _raise_if_handler_crashed(bridge, "format startup")
 
         # Inhibit the volume so the handler releases it for formatting
         bridge.launcher.send_inhibit(bridge.state, True)
         replies = bridge._run_until_replies()
+        _raise_if_handler_crashed(bridge, "format inhibit")
         if debug and replies:
             _, _, r1, r2 = replies[-1]
             print(f"[amifuse] INHIBIT reply: res1={r1} res2={r2}")
@@ -2635,6 +2647,7 @@ def format_volume(
         # initialize bitmap and root blocks proportional to partition size.
         # Use generous limits; the loop returns immediately once a reply arrives.
         replies = bridge._run_until_replies(max_iters=2000, cycles=2_000_000)
+        _raise_if_handler_crashed(bridge, "format")
 
         if not replies:
             raise SystemExit("Format failed: no reply from handler.")
@@ -2654,23 +2667,19 @@ def format_volume(
         if debug:
             print(f"[amifuse] FORMAT reply: res1={res1} res2={res2}")
 
-        # Flush first, then uninhibit the new volume. SFS can fault if we
-        # flush the formatter bridge after reopening the volume.
+        # Flush the newly formatted volume, then close this formatter runtime.
+        # Reopening on the same bridge is redundant and has proven unstable for
+        # SFS. Callers that want to verify the new volume should do so in a
+        # fresh HandlerBridge.
         bridge.launcher.send_flush(bridge.state)
         bridge._run_until_replies(max_iters=500, cycles=2_000_000)
-
-        bridge.launcher.send_inhibit(bridge.state, False)
-        bridge._run_until_replies(max_iters=500, cycles=2_000_000)
+        _raise_if_handler_crashed(bridge, "format flush")
+        bridge.backend.sync()
 
         print(f"Format complete. Volume '{volname}' created on partition '{partition}'.")
     finally:
         if bridge is not None:
-            shutdown = getattr(getattr(bridge, "vh", None), "shutdown", None)
-            if shutdown is not None:
-                shutdown()
-            backend = getattr(bridge, "backend", None)
-            if backend is not None:
-                backend.close()
+            bridge.close()
         if temp_driver is not None and temp_driver.exists():
             temp_driver.unlink()
 

@@ -36,6 +36,7 @@ from amitools.vamos.schedule import Scheduler
 from amitools.vamos.libmgr import SetupLibManager
 # local fake scsi.device
 from amifuse.scsi_device import ScsiDevice
+from amifuse.pending_ports import reset as reset_pending_ports
 
 _LOG_SETUP_DONE = False
 
@@ -56,6 +57,19 @@ def _ensure_vamos_logging(levels):
     _LOG_SETUP_DONE = True
 
 
+def _reset_runtime_state():
+    """Clear cross-runtime global state left behind by prior handlers."""
+    from amitools.vamos.lib.DosLibrary import DosLibrary
+    from amitools.vamos.lib.lexec.signalfunc import SignalFunc
+    from amifuse.startup_runner import _clear_all_block_state
+
+    _clear_all_block_state()
+    DosLibrary._child_processes.clear()
+    SignalFunc._fallback_signals = 0
+    SignalFunc._fallback_sig_alloc = 0x0000FFFF
+    reset_pending_ports()
+
+
 class VamosHandlerRuntime:
     def __init__(self):
         self.machine = None
@@ -70,6 +84,7 @@ class VamosHandlerRuntime:
         self._temp_dir: Optional[tempfile.TemporaryDirectory] = None
 
     def setup(self, cpu: Optional[str] = None):
+        _reset_runtime_state()
         # Use default vamos configs (bin argument required, so pass a dummy).
         mp = VamosMainParser()
         mp.parse(paths=None, args=["dummy"], cfg_dict=None)
@@ -257,6 +272,7 @@ class VamosHandlerRuntime:
         return seg_baddr
 
     def shutdown(self):
+        _reset_runtime_state()
         # Handlers may leave internal library/device state in a partially
         # torn-down state by the time AmiFuse unmounts. Calling
         # close_base_libs() here can end up touching stale Library structs
@@ -278,3 +294,4 @@ class VamosHandlerRuntime:
         if self._temp_dir:
             self._temp_dir.cleanup()
             self._temp_dir = None
+        _reset_runtime_state()

@@ -9,7 +9,6 @@ Launch a filesystem handler with a minimal DOS-style bootstrap:
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
-from amitools.vamos.astructs.access import AccessStruct  # type: ignore
 from amitools.vamos.libstructs.exec_ import (  # type: ignore
     ExecLibraryStruct,
     ListStruct,
@@ -128,6 +127,86 @@ def _restore_block_state(state):
     _set_block_state(ExecLibrary, "_wait_blocked_sp", state["wait_blocked_sp"])
     _set_block_state(ExecLibrary, "_wait_blocked_ret", state["wait_blocked_ret"])
     _set_block_state(DosLibrary, "_waitpkt_blocked", state["waitpkt_blocked"])
+
+
+def _has_blocked_state(state):
+    """Return True when a saved Exec/DOS block snapshot contains a wait frame."""
+    if not state:
+        return False
+    return (
+        state.get("waitport_blocked_sp") is not None
+        or state.get("wait_blocked_sp") is not None
+    )
+
+
+def _get_active_block_state(saved_state=None):
+    """Prefer live Exec/DOS block state, then fall back to a saved snapshot."""
+    live_state = _snapshot_block_state()
+    if _has_blocked_state(live_state):
+        return live_state
+    if _has_blocked_state(saved_state):
+        return saved_state
+    return None
+
+
+def _build_resume_frame(
+    block_state,
+    *,
+    default_port_addr,
+    mem,
+    port_mgr,
+    compute_pending_signals,
+    clear_signals_from_task,
+):
+    """Build the PC/SP/D0 frame needed to resume a blocked Wait()/WaitPort()."""
+    if not _has_blocked_state(block_state):
+        return None
+
+    waitport_sp = block_state.get("waitport_blocked_sp")
+    wait_sp = block_state.get("wait_blocked_sp")
+    waitport_ret = block_state.get("waitport_blocked_ret")
+    wait_ret = block_state.get("wait_blocked_ret")
+    wait_mask = block_state.get("wait_blocked_mask")
+    waitpkt_blocked = block_state.get("waitpkt_blocked", False)
+
+    blocked_sp = waitport_sp if waitport_sp is not None else wait_sp
+    if blocked_sp is None:
+        return None
+
+    if wait_sp is not None and wait_mask is not None:
+        pending = compute_pending_signals(wait_mask)
+        if pending == 0:
+            return None
+        d0_val = compute_pending_signals(0xFFFFFFFF)
+        clear_signals_from_task(d0_val)
+        blocked_ret = wait_ret
+    else:
+        waitport_port = block_state.get("waitport_blocked_port") or default_port_addr
+        if not waitport_port or not port_mgr.has_msg(waitport_port):
+            return None
+        msg_addr = port_mgr.get_msg(waitport_port)
+        if msg_addr:
+            _unlink_msg_from_m68k_list(mem, msg_addr)
+        if waitpkt_blocked and msg_addr:
+            msg = MessageStruct(mem, msg_addr)
+            pkt_addr = msg.node.name.aptr
+            d0_val = pkt_addr if pkt_addr else 0
+        else:
+            d0_val = msg_addr if msg_addr else 0
+        blocked_ret = waitport_ret
+
+    try:
+        ret_addr = blocked_ret if blocked_ret is not None else mem.r32(blocked_sp)
+    except Exception:
+        ret_addr = 0
+    if ret_addr == 0:
+        return None
+
+    return {
+        "pc": ret_addr,
+        "sp": blocked_sp + 4,
+        "d0": d0_val,
+    }
 
 
 def _unlink_msg_from_m68k_list(mem, msg_addr):
@@ -338,31 +417,31 @@ class HandlerLauncher:
         sigbit: int = None,
         flags: int = MsgPortFlags.PA_SIGNAL,
     ):
-        mp = AccessStruct(self.mem, MsgPortStruct, port_addr)
+        mp = MsgPortStruct(self.mem, port_addr)
         # zero first to clear garbage
         self.mem.w_block(port_addr, b"\x00" * MsgPortStruct.get_size())
-        mp.w_s("mp_Node.ln_Type", NodeType.NT_MSGPORT)
-        mp.w_s("mp_Flags", flags)
+        mp.node.type.val = NodeType.NT_MSGPORT
+        mp.flags.val = flags
         if sigbit is None:
             sigbit = self._alloc_signal_bit()
         else:
             # Mark the signal bit as allocated in our local tracking
             if 0 <= sigbit < 32:
                 self._signals_allocated |= (1 << sigbit)
-        mp.w_s("mp_SigBit", sigbit)
-        mp.w_s("mp_SigTask", task_addr)
+        mp.sig_bit.val = sigbit
+        mp.sig_task.aptr = task_addr
         # Initialize mp_MsgList as a proper empty Amiga list
         # An empty list has: lh_Head -> &lh_Tail, lh_Tail = 0, lh_TailPred -> &lh_Head
         list_addr = port_addr + self._mp_msglist_offset
-        lst = AccessStruct(self.mem, ListStruct, list_addr)
+        lst = ListStruct(self.mem, list_addr)
         # Get addresses of list header fields
         lh_head_addr = list_addr + self._lh_head_offset
         lh_tail_addr = list_addr + self._lh_tail_offset
         # Empty list: Head points to Tail address, TailPred points to Head address
-        lst.w_s("lh_Head", lh_tail_addr)  # Points to end marker
-        lst.w_s("lh_Tail", 0)             # End marker is 0
-        lst.w_s("lh_TailPred", lh_head_addr)  # Points back to start
-        lst.w_s("lh_Type", NodeType.NT_MESSAGE)
+        lst.head.aptr = lh_tail_addr
+        lst.tail.aptr = 0
+        lst.tail_pred.aptr = lh_head_addr
+        lst.type.val = NodeType.NT_MESSAGE
         return sigbit
 
     def _create_port(
@@ -379,10 +458,10 @@ class HandlerLauncher:
         return port_mem.addr
 
     def _set_exec_this_task(self, proc_addr: int, stack: Stack):
-        exec_struct = AccessStruct(self.mem, ExecLibraryStruct, self.exec_base_addr)
-        exec_struct.w_s("ThisTask", proc_addr)
-        exec_struct.w_s("SysStkLower", stack.get_lower())
-        exec_struct.w_s("SysStkUpper", stack.get_upper())
+        exec_struct = ExecLibraryStruct(self.mem, self.exec_base_addr)
+        exec_struct.sfields.get_field_by_name("ThisTask").aptr = proc_addr
+        exec_struct.sfields.get_field_by_name("SysStkLower").aptr = stack.get_lower()
+        exec_struct.sfields.get_field_by_name("SysStkUpper").aptr = stack.get_upper()
         # keep exec impl in sync for StackSwap
         self.exec_impl.stk_lower = stack.get_lower()
         self.exec_impl.stk_upper = stack.get_upper()
@@ -394,46 +473,46 @@ class HandlerLauncher:
         proc_mem = self.alloc.alloc_memory(ProcessStruct.get_size(), label="HandlerProcess")
         # clear struct to avoid garbage pointers
         self.mem.w_block(proc_mem.addr, b"\x00" * ProcessStruct.get_size())
-        proc = AccessStruct(self.mem, ProcessStruct, proc_mem.addr)
+        proc = ProcessStruct(self.mem, proc_mem.addr)
         name_cstr = self.alloc.alloc_memory(len(name) + 1, label="HandlerName")
         self.mem.w_cstr(name_cstr.addr, name)
-        proc.w_s("pr_Task.tc_Node.ln_Type", NodeType.NT_PROCESS)
-        proc.w_s("pr_Task.tc_Node.ln_Name", name_cstr.addr)
-        proc.w_s("pr_Task.tc_Node.ln_Pri", 0)
-        proc.w_s("pr_Task.tc_State", TaskState.TS_READY)
-        proc.w_s("pr_Task.tc_Flags", 0)
-        proc.w_s("pr_Task.tc_IDNestCnt", 0)
-        proc.w_s("pr_Task.tc_TDNestCnt", 0)
-        proc.w_s("pr_Task.tc_SPReg", stack.get_initial_sp())
-        proc.w_s("pr_Task.tc_SPLower", stack.get_lower())
-        proc.w_s("pr_Task.tc_SPUpper", stack.get_upper())
-        proc.w_s("pr_StackSize", stack.get_size())
+        proc.task.node.type.val = NodeType.NT_PROCESS
+        proc.task.node.name.aptr = name_cstr.addr
+        proc.task.node.pri.val = 0
+        proc.task.state.val = TaskState.TS_READY
+        proc.task.flags.val = 0
+        proc.task.id_nest_cnt.val = 0
+        proc.task.td_nest_cnt.val = 0
+        proc.task.sp_reg.aptr = stack.get_initial_sp()
+        proc.task.sp_lower.aptr = stack.get_lower()
+        proc.task.sp_upper.aptr = stack.get_upper()
+        proc.stack_size.val = stack.get_size()
         # pr_StackBase should be the upper bound (top) of the stack allocation.
         # The 68k stack grows downward, so the "base" for StackSwap/Exit is the
         # highest address.  Note: amitools' DosLibrary.py uses get_lower() but
         # that is inconsistent with how handlers (SFS, PFS3) interpret the field.
-        proc.w_s("pr_StackBase", stack.get_upper())
-        proc.w_s("pr_GlobVec", 0xFFFFFFFF)
+        proc.stack_base.bptr = stack.get_upper() >> 2
+        proc.glob_vec.aptr = 0xFFFFFFFF
         # NOTE: Do NOT set pr_CLI - SFS checks this to distinguish handler vs CLI
         # invocation, and rejects startup if pr_CLI is set.
         # dummy file handles for stdio
         fh_in_mem = self.alloc.alloc_struct(FileHandleStruct, label="NullFHIn")
         fh_out_mem = self.alloc.alloc_struct(FileHandleStruct, label="NullFHOut")
-        fh_in = AccessStruct(self.mem, FileHandleStruct, fh_in_mem.addr)
-        fh_out = AccessStruct(self.mem, FileHandleStruct, fh_out_mem.addr)
-        fh_in.w_s("fh_Type", 0)
-        fh_out.w_s("fh_Type", 0)
-        proc.w_s("pr_CIS", fh_in_mem.addr >> 2)
-        proc.w_s("pr_COS", fh_out_mem.addr >> 2)
-        proc.w_s("pr_ConsoleTask", 0)
-        proc.w_s("pr_WindowPtr", 0xFFFFFFFF)
-        port_addr = proc.s_get_addr("pr_MsgPort")
+        fh_in = FileHandleStruct(self.mem, fh_in_mem.addr)
+        fh_out = FileHandleStruct(self.mem, fh_out_mem.addr)
+        fh_in.type.aptr = 0
+        fh_out.type.aptr = 0
+        proc.cis.bptr = fh_in_mem.addr >> 2
+        proc.cos.bptr = fh_out_mem.addr >> 2
+        proc.console_task.aptr = 0
+        proc.window_ptr.aptr = 0xFFFFFFFF
+        port_addr = proc.msg_port.addr
         # FFS TaskWait uses a fixed SIGMASK (0x100), so set mp_SigBit=8.
         sigbit = self._init_msgport(port_addr, proc_mem.addr, sigbit=8)
         # advertise signal allocation in task
-        proc.w_s("pr_Task.tc_SigAlloc", 1 << sigbit)
-        proc.w_s("pr_Task.tc_SigWait", 0)
-        proc.w_s("pr_Task.tc_SigRecvd", 0)
+        proc.task.sig_alloc.val = 1 << sigbit
+        proc.task.sig_wait.val = 0
+        proc.task.sig_recvd.val = 0
         self._set_exec_this_task(proc_mem.addr, stack)
         # register MsgPort with exec port manager so WaitPort/GetMsg see it
         if not self.exec_impl.port_mgr.has_port(port_addr):
@@ -534,8 +613,8 @@ class HandlerLauncher:
             flags=MsgPortFlags.PA_IGNORE,
         )
         # fill DeviceNode dn_Task now that we have a port
-        dn = AccessStruct(self.mem, DeviceNodeStruct, self.boot["dn_addr"])
-        dn.w_s("dn_Task", port_addr)
+        dn = DeviceNodeStruct(self.mem, self.boot["dn_addr"])
+        dn.sfields.get_field_by_name("dn_Task").val = port_addr
         # startup packet args per pfs3: Arg1=mount name, Arg2=FSSM BPTR, Arg3=DeviceNode BPTR
         startup_pkt, startup_msg = self._build_std_packet(
             port_addr,
@@ -582,98 +661,27 @@ class HandlerLauncher:
         This should be called before run_burst to handle the case where a message
         was queued or signal was set since the last burst. Returns True if resume was set up.
         """
-        from amitools.vamos.lib.ExecLibrary import ExecLibrary
-
-        # Get blocking state from ExecLibrary class variables (may not exist in new amitools)
-        waitport_sp = _get_block_state(ExecLibrary, '_waitport_blocked_sp')
-        wait_sp = _get_block_state(ExecLibrary, '_wait_blocked_sp')
-        waitport_ret = _get_block_state(ExecLibrary, '_waitport_blocked_ret')
-        wait_ret = _get_block_state(ExecLibrary, '_wait_blocked_ret')
-        wait_mask = _get_block_state(ExecLibrary, '_wait_blocked_mask')
-
-        if waitport_sp is None and wait_sp is None and state.block_state:
-            _restore_block_state(state.block_state)
-            waitport_sp = _get_block_state(ExecLibrary, '_waitport_blocked_sp')
-            wait_sp = _get_block_state(ExecLibrary, '_wait_blocked_sp')
-            waitport_ret = _get_block_state(ExecLibrary, '_waitport_blocked_ret')
-            wait_ret = _get_block_state(ExecLibrary, '_wait_blocked_ret')
-            wait_mask = _get_block_state(ExecLibrary, '_wait_blocked_mask')
-
-        blocked_sp = waitport_sp if waitport_sp is not None else wait_sp
-        if blocked_sp is None:
+        block_state = _get_active_block_state(state.block_state)
+        if block_state is None:
             return False
 
-        # Check if there's something pending that would wake the handler
-        has_pending = False
-
-        if wait_sp is not None and wait_mask is not None:
-            # Wait() blocked - check if any signals in the mask are pending
-            # This includes both message port signals AND direct signals (like IO completion)
-            pending = self._compute_pending_signals(wait_mask)
-            has_pending = pending != 0
-        else:
-            # WaitPort blocked - check for message on the specific port
-            waitport_port = _get_block_state(ExecLibrary, '_waitport_blocked_port')
-            if waitport_sp is not None and waitport_port is not None:
-                check_port = waitport_port
-            else:
-                check_port = state.port_addr
-            has_pending = self.exec_impl.port_mgr.has_msg(check_port)
-
-        if not has_pending:
-            return False
-
-        blocked_ret = waitport_ret if waitport_ret is not None else wait_ret
         mem = self.vh.alloc.get_mem()
         cpu = self.vh.machine.cpu
-
-        try:
-            ret_addr = blocked_ret if blocked_ret is not None else mem.r32(blocked_sp)
-        except Exception:
-            ret_addr = 0
-
-        if ret_addr == 0:
+        resume = _build_resume_frame(
+            block_state,
+            default_port_addr=state.port_addr,
+            mem=mem,
+            port_mgr=self.exec_impl.port_mgr,
+            compute_pending_signals=self._compute_pending_signals,
+            clear_signals_from_task=self._clear_signals_from_task,
+        )
+        if resume is None:
             return False
 
-        # Set up resume state
-        state.pc = ret_addr
-        state.sp = blocked_sp + 4
-
-        # Set D0 appropriately for Wait() or WaitPort()
-        if wait_mask is not None:
-            # Wait() resume - set D0 to ALL pending signals (not masked)
-            # We're resuming because there's a message, so report the message signal
-            # even if handler's mask didn't include it - otherwise handler spins forever
-            pending = self._compute_pending_signals(0xFFFFFFFF)
-            cpu.w_reg(REG_D0, pending)
-            self._set_saved_reg(state, REG_D0, pending)
-            # CRITICAL: Clear the returned signals from tc_SigRecvd, just like Wait() would.
-            # If we don't clear, the handler's next Wait() call will see the same signals
-            # and return immediately, causing an infinite GetMsg/Wait loop.
-            self._clear_signals_from_task(pending)
-        elif waitport_sp is not None:
-            # WaitPort()/WaitPkt() resume - set D0 appropriately
-            waitport_port = _get_block_state(ExecLibrary, '_waitport_blocked_port')
-            if waitport_port is not None:
-                # CRITICAL: use get_msg (not peek_msg) to dequeue the message.
-                # peek_msg left the message in the Python queue, so the handler's
-                # next WaitPkt/GetMsg call would return the same packet again,
-                # causing double packet processing.
-                msg_addr = self.exec_impl.port_mgr.get_msg(waitport_port)
-                if msg_addr:
-                    # Also unlink from m68k memory list to prevent the handler's
-                    # direct mp_MsgList read from seeing a stale entry.
-                    _unlink_msg_from_m68k_list(self.mem, msg_addr)
-                if _get_block_state(DosLibrary, '_waitpkt_blocked', False) and msg_addr:
-                    # WaitPkt() resume - extract packet from message
-                    msg = AccessStruct(self.mem, MessageStruct, msg_addr)
-                    pkt_addr = msg.r_s("mn_Node.ln_Name")
-                    d0_val = pkt_addr if pkt_addr else 0
-                else:
-                    # WaitPort() resume - return message address
-                    d0_val = msg_addr if msg_addr else 0
-                cpu.w_reg(REG_D0, d0_val)
-                self._set_saved_reg(state, REG_D0, d0_val)
+        state.pc = resume["pc"]
+        state.sp = resume["sp"]
+        cpu.w_reg(REG_D0, resume["d0"])
+        self._set_saved_reg(state, REG_D0, resume["d0"])
 
         # Clear blocked state
         _clear_all_block_state()
@@ -691,13 +699,8 @@ class HandlerLauncher:
 
         # Check if we need to resume from a blocked Wait/WaitPort
         resumed = self.setup_resume_if_blocked(state, debug=debug)
-        from amitools.vamos.lib.ExecLibrary import ExecLibrary
-
-        blocked_waitport_sp = _get_block_state(ExecLibrary, "_waitport_blocked_sp")
-        blocked_wait_sp = _get_block_state(ExecLibrary, "_wait_blocked_sp")
-        if not resumed and (
-            blocked_waitport_sp is not None or blocked_wait_sp is not None
-        ):
+        active_block_state = _get_active_block_state(state.block_state)
+        if not resumed and active_block_state is not None:
             # The handler is genuinely parked in Wait()/WaitPort() with no
             # wakeup condition yet. Re-entering at the saved return PC would
             # bypass the blocking API and immediately fall into GetMsg(None).
@@ -739,6 +742,16 @@ class HandlerLauncher:
         first_run = not state.started
         seed_execbase = first_run or state.regs is None
         if resumed and state.regs is not None and state.regs[REG_A6] == 0:
+            seed_execbase = True
+        if (
+            state.main_loop_pc
+            and state.pc == state.main_loop_pc
+            and state.regs is not None
+            and state.regs[REG_A6] == 0
+        ):
+            # Some reopen paths restart directly at the saved main loop PC
+            # after the explicit Wait/WaitPort block state has already been
+            # cleared. Treat a NULL A6 there the same as a synthetic wakeup.
             seed_execbase = True
         set_regs = {REG_A6: self.exec_base_addr} if seed_execbase else None
         if seed_execbase:
@@ -788,12 +801,13 @@ class HandlerLauncher:
             state.crashed = True
             state.last_error_pc = new_pc
             return run_state
-        # Check if WaitPort or Wait blocked (saved state in ExecLibrary class variable)
-        waitport_sp = _get_block_state(ExecLibrary, '_waitport_blocked_sp')
-        wait_sp = _get_block_state(ExecLibrary, '_wait_blocked_sp')
-        waitport_ret = _get_block_state(ExecLibrary, '_waitport_blocked_ret')
-        wait_ret = _get_block_state(ExecLibrary, '_wait_blocked_ret')
-        wait_mask = _get_block_state(ExecLibrary, '_wait_blocked_mask')
+        # Check if WaitPort or Wait blocked in the current burst.
+        block_state = _snapshot_block_state()
+        waitport_sp = block_state.get("waitport_blocked_sp")
+        wait_sp = block_state.get("wait_blocked_sp")
+        waitport_ret = block_state.get("waitport_blocked_ret")
+        wait_ret = block_state.get("wait_blocked_ret")
+        wait_mask = block_state.get("wait_blocked_mask")
         # Use whichever blocking call was triggered
         blocked_sp = waitport_sp if waitport_sp is not None else wait_sp
         blocked_ret = waitport_ret if waitport_ret is not None else wait_ret
@@ -806,7 +820,7 @@ class HandlerLauncher:
         if run_state.error:
             # WaitPort/Wait or other blocking call failed - handler is waiting for a message.
             if blocked_sp is not None:
-                state.block_state = _snapshot_block_state()
+                state.block_state = block_state
                 ret_addr = blocked_ret if blocked_ret is not None else mem.r32(blocked_sp)
                 # Save as main loop PC if not yet set - this is where handler waits for messages
                 if (not state.initialized or state.main_loop_pc == 0) and _pc_valid(ret_addr):
@@ -851,16 +865,16 @@ class HandlerLauncher:
                         self._clear_signals_from_task(pending)
                     elif waitport_sp is not None:
                         # WaitPort()/WaitPkt() resume - set D0 appropriately
-                        waitport_port = _get_block_state(ExecLibrary, '_waitport_blocked_port')
+                        waitport_port = block_state.get("waitport_blocked_port")
                         if waitport_port is not None:
                             # CRITICAL: use get_msg (not peek_msg) to dequeue.
                             msg_addr = self.exec_impl.port_mgr.get_msg(waitport_port)
                             if msg_addr:
                                 _unlink_msg_from_m68k_list(self.mem, msg_addr)
-                            if _get_block_state(DosLibrary, '_waitpkt_blocked', False) and msg_addr:
+                            if block_state.get("waitpkt_blocked", False) and msg_addr:
                                 # WaitPkt() resume - extract packet from message
-                                msg = AccessStruct(self.mem, MessageStruct, msg_addr)
-                                pkt_addr = msg.r_s("mn_Node.ln_Name")
+                                msg = MessageStruct(self.mem, msg_addr)
+                                pkt_addr = msg.node.name.aptr
                                 d0_val = pkt_addr if pkt_addr else 0
                             else:
                                 # WaitPort() resume - return message address
@@ -887,7 +901,7 @@ class HandlerLauncher:
             # Handler exited via exit trap.
             # Check if WaitPort/Wait blocked - if so, we can get the return address from the saved SP
             if blocked_sp is not None:
-                state.block_state = _snapshot_block_state()
+                state.block_state = block_state
                 ret_addr = blocked_ret if blocked_ret is not None else mem.r32(blocked_sp)
                 # Save as main loop PC if not yet initialized
                 if (not state.initialized or state.main_loop_pc == 0) and _pc_valid(ret_addr):
@@ -927,16 +941,16 @@ class HandlerLauncher:
                         self._clear_signals_from_task(pending)
                     elif waitport_sp is not None:
                         # WaitPort()/WaitPkt() resume - set D0 appropriately
-                        waitport_port = _get_block_state(ExecLibrary, '_waitport_blocked_port')
+                        waitport_port = block_state.get("waitport_blocked_port")
                         if waitport_port is not None:
                             # CRITICAL: use get_msg (not peek_msg) to dequeue.
                             msg_addr = self.exec_impl.port_mgr.get_msg(waitport_port)
                             if msg_addr:
                                 _unlink_msg_from_m68k_list(self.mem, msg_addr)
-                            if _get_block_state(DosLibrary, '_waitpkt_blocked', False) and msg_addr:
+                            if block_state.get("waitpkt_blocked", False) and msg_addr:
                                 # WaitPkt() resume - extract packet from message
-                                msg = AccessStruct(self.mem, MessageStruct, msg_addr)
-                                pkt_addr = msg.r_s("mn_Node.ln_Name")
+                                msg = MessageStruct(self.mem, msg_addr)
+                                pkt_addr = msg.node.name.aptr
                                 d0_val = pkt_addr if pkt_addr else 0
                             else:
                                 # WaitPort() resume - return message address
@@ -1005,11 +1019,11 @@ class HandlerLauncher:
             print(f"[poll_replies] port=0x{port_addr:x} has_port={has_port} has_msg={has_msg}")
         while has_port and has_msg:
             msg_addr = pmgr.get_msg(port_addr)
-            msg = AccessStruct(self.mem, MessageStruct, msg_addr)
-            pkt_addr = msg.r_s("mn_Node.ln_Name")
-            pkt = AccessStruct(self.mem, DosPacketStruct, pkt_addr)
-            res1 = pkt.r_s("dp_Res1")
-            res2 = pkt.r_s("dp_Res2")
+            msg = MessageStruct(self.mem, msg_addr)
+            pkt_addr = msg.node.name.aptr
+            pkt = DosPacketStruct(self.mem, pkt_addr)
+            res1 = pkt.res1.val
+            res2 = pkt.res2.val
             if debug:
                 print(f"[poll_replies] got msg=0x{msg_addr:x} pkt=0x{pkt_addr:x} res1=0x{res1:x} res2={res2}")
             results.append((msg_addr, pkt_addr, res1, res2))
@@ -1134,8 +1148,8 @@ class HandlerLauncher:
         self, state: HandlerLaunchState, fh_addr: int, buf_addr: int, length_bytes: int
     ):
         """ACTION_READ using a FileHandle filled by FINDINPUT; uses fh_Args as the fileentry pointer."""
-        fh = AccessStruct(self.mem, FileHandleStruct, fh_addr)
-        fileentry_ptr = fh.r_s("fh_Args")
+        fh = FileHandleStruct(self.mem, fh_addr)
+        fileentry_ptr = fh.args.val
         return self.send_packet(
             state,
             ACTION_READ,
@@ -1150,8 +1164,8 @@ class HandlerLauncher:
         self, state: HandlerLaunchState, fh_addr: int, buf_addr: int, length_bytes: int
     ):
         """ACTION_WRITE using a FileHandle filled by FINDOUTPUT/FINDUPDATE."""
-        fh = AccessStruct(self.mem, FileHandleStruct, fh_addr)
-        fileentry_ptr = fh.r_s("fh_Args")
+        fh = FileHandleStruct(self.mem, fh_addr)
+        fileentry_ptr = fh.args.val
         return self.send_packet(
             state,
             ACTION_WRITE,
@@ -1166,8 +1180,8 @@ class HandlerLauncher:
         self, state: HandlerLaunchState, fh_addr: int, size: int, mode: int = OFFSET_BEGINNING
     ):
         """ACTION_SET_FILE_SIZE on a FileHandle; mode defaults to OFFSET_BEGINNING."""
-        fh = AccessStruct(self.mem, FileHandleStruct, fh_addr)
-        fileentry_ptr = fh.r_s("fh_Args")
+        fh = FileHandleStruct(self.mem, fh_addr)
+        fileentry_ptr = fh.args.val
         return self.send_packet(
             state,
             ACTION_SET_FILE_SIZE,
@@ -1180,8 +1194,8 @@ class HandlerLauncher:
 
     def send_seek_handle(self, state: HandlerLaunchState, fh_addr: int, offset: int, mode: int = OFFSET_BEGINNING):
         """ACTION_SEEK on a FileHandle; mode defaults to OFFSET_BEGINNING."""
-        fh = AccessStruct(self.mem, FileHandleStruct, fh_addr)
-        fileentry_ptr = fh.r_s("fh_Args")
+        fh = FileHandleStruct(self.mem, fh_addr)
+        fileentry_ptr = fh.args.val
         return self.send_packet(
             state,
             ACTION_SEEK,
@@ -1194,8 +1208,8 @@ class HandlerLauncher:
 
     def send_end_handle(self, state: HandlerLaunchState, fh_addr: int):
         """ACTION_END on a FileHandle; closes the file handle in the handler."""
-        fh = AccessStruct(self.mem, FileHandleStruct, fh_addr)
-        fileentry_ptr = fh.r_s("fh_Args")
+        fh = FileHandleStruct(self.mem, fh_addr)
+        fileentry_ptr = fh.args.val
         return self.send_packet(
             state,
             ACTION_END,

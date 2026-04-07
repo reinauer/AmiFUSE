@@ -316,6 +316,46 @@ class TestMountFuseOptions:
         mock_fuse.assert_not_called()
 
 
+class TestFormatVolume:
+    def test_format_stops_after_flush_and_syncs_backend(self, monkeypatch, fuse_mock):
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        fake_dostype = MagicMock()
+        fake_dostype.num_to_tag_str.return_value = "SFS0"
+        monkeypatch.setitem(sys.modules, "amitools", MagicMock())
+        monkeypatch.setitem(sys.modules, "amitools.fs", MagicMock())
+        monkeypatch.setitem(sys.modules, "amitools.fs.DosType", fake_dostype)
+
+        monkeypatch.setattr(
+            fuse_fs_mod,
+            "get_partition_info",
+            lambda image, block_size, partition: {"dostype": 0x53465300},
+        )
+
+        mock_bridge = MagicMock()
+        mock_bridge.state.crashed = False
+        mock_bridge.launcher = MagicMock()
+        mock_bridge.launcher.alloc_bstr.return_value = (None, 0x1234)
+        mock_bridge._run_until_replies.return_value = [(0, 0, 1, 0)]
+        monkeypatch.setattr(
+            fuse_fs_mod, "HandlerBridge", MagicMock(return_value=mock_bridge)
+        )
+
+        fuse_fs_mod.format_volume(
+            image=Path("/tmp/test.hdf"),
+            driver=Path("/tmp/test.handler"),
+            block_size=None,
+            partition="SDH0",
+            volname="SFSFmt",
+        )
+
+        assert mock_bridge.launcher.send_inhibit.call_count == 1
+        mock_bridge.launcher.send_inhibit.assert_called_once_with(mock_bridge.state, True)
+        mock_bridge.launcher.send_flush.assert_called_once_with(mock_bridge.state)
+        mock_bridge.backend.sync.assert_called_once_with()
+        mock_bridge.close.assert_called_once()
+
+
 class TestUnmountCommand:
     """Tests for the unmount subcommand helper."""
 
@@ -3557,6 +3597,54 @@ class TestCmdWrite:
 
         expected_hash = hashlib.sha256(original_data).hexdigest()
         assert data["hash"] == expected_hash
+
+
+# ---------------------------------------------------------------------------
+# TestHandlerBridgePortDrain -- port drain helper tests
+# ---------------------------------------------------------------------------
+
+
+class TestHandlerBridgePortDrain:
+    def test_drain_preserves_child_ports(self, fuse_mock):
+        from amifuse.fuse_fs import HandlerBridge
+
+        class FakePortMgr:
+            def __init__(self):
+                self.ports = {
+                    0x10: object(),
+                    0x20: object(),
+                    0x30: object(),
+                    0x40: object(),
+                }
+                self.drained = []
+
+            def has_msg(self, addr):
+                return addr == 0x40 and addr not in self.drained
+
+            def get_msg(self, addr):
+                self.drained.append(addr)
+                return 0xDEADBEEF
+
+        bridge = HandlerBridge.__new__(HandlerBridge)
+        bridge.state = type("State", (), {"port_addr": 0x10, "reply_port_addr": 0x20})()
+        bridge.proc_mgr = type(
+            "ProcMgr",
+            (),
+            {
+                "processes": {
+                    1: type(
+                        "Proc",
+                        (),
+                        {"is_child": True, "exited": False, "port_addr": 0x30},
+                    )()
+                }
+            },
+        )()
+        pmgr = FakePortMgr()
+
+        bridge._drain_non_essential_ports(pmgr)
+
+        assert pmgr.drained == [0x40]
 
 
 # ---------------------------------------------------------------------------
