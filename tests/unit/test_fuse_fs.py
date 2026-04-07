@@ -9,6 +9,7 @@ import argparse
 import json
 import signal
 import sys
+from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -956,6 +957,71 @@ class TestDestroyCleanup:
         fs, bridge = fs_with_mock_bridge
         bridge.backend = None
         fs.destroy("/")
+
+
+class TestHandlerBridgeReadBuf:
+    def test_alloc_read_buf_reuses_existing_buffer(self, fuse_mock):
+        from amifuse.fuse_fs import HandlerBridge
+
+        mem_obj = SimpleNamespace(addr=0x1000, size=16)
+        alloc = MagicMock()
+        mem = MagicMock()
+        bridge = HandlerBridge.__new__(HandlerBridge)
+        bridge.vh = SimpleNamespace(alloc=alloc)
+        bridge.mem = mem
+        bridge._read_buf_mem = mem_obj
+        bridge._read_buf_size = 16
+
+        result = bridge._alloc_read_buf(8)
+
+        assert result is mem_obj
+        alloc.alloc_memory.assert_not_called()
+        alloc.free_memory.assert_not_called()
+        mem.w_block.assert_called_once_with(mem_obj.addr, b"\x00" * 8)
+
+    def test_alloc_read_buf_grows_and_frees_old_buffer(self, fuse_mock):
+        from amifuse.fuse_fs import HandlerBridge
+
+        old_mem = SimpleNamespace(addr=0x1000, size=8)
+        new_mem = SimpleNamespace(addr=0x2000, size=32)
+        alloc = MagicMock()
+        alloc.alloc_memory.return_value = new_mem
+        mem = MagicMock()
+        bridge = HandlerBridge.__new__(HandlerBridge)
+        bridge.vh = SimpleNamespace(alloc=alloc)
+        bridge.mem = mem
+        bridge._read_buf_mem = old_mem
+        bridge._read_buf_size = 8
+
+        result = bridge._alloc_read_buf(32)
+
+        assert result is new_mem
+        assert bridge._read_buf_mem is new_mem
+        assert bridge._read_buf_size == 32
+        alloc.alloc_memory.assert_called_once_with(32, label="FUSE_READBUF")
+        alloc.free_memory.assert_called_once_with(old_mem)
+        mem.w_block.assert_called_once_with(new_mem.addr, b"\x00" * 32)
+
+    def test_alloc_read_buf_failed_growth_keeps_old_buffer(self, fuse_mock):
+        from amifuse.fuse_fs import HandlerBridge
+
+        old_mem = SimpleNamespace(addr=0x1000, size=8)
+        alloc = MagicMock()
+        alloc.alloc_memory.side_effect = RuntimeError("oom")
+        mem = MagicMock()
+        bridge = HandlerBridge.__new__(HandlerBridge)
+        bridge.vh = SimpleNamespace(alloc=alloc)
+        bridge.mem = mem
+        bridge._read_buf_mem = old_mem
+        bridge._read_buf_size = 8
+
+        with pytest.raises(RuntimeError, match="oom"):
+            bridge._alloc_read_buf(32)
+
+        assert bridge._read_buf_mem is old_mem
+        assert bridge._read_buf_size == 8
+        alloc.free_memory.assert_not_called()
+        mem.w_block.assert_not_called()
 
 
 class TestCommandMatchesMountpoint:

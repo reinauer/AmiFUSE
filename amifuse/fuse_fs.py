@@ -955,9 +955,14 @@ class HandlerBridge:
         return self._fib_mem
 
     def _alloc_read_buf(self, size: int):
-        if self._read_buf_mem is None or size > self._read_buf_size:
+        if self._read_buf_mem is None:
             self._read_buf_mem = self.vh.alloc.alloc_memory(size, label="FUSE_READBUF")
             self._read_buf_size = size
+        elif size > self._read_buf_size:
+            old_mem = self._read_buf_mem
+            self._read_buf_mem = self.vh.alloc.alloc_memory(size, label="FUSE_READBUF")
+            self._read_buf_size = size
+            self.vh.alloc.free_memory(old_mem)
         self.mem.w_block(self._read_buf_mem.addr, b"\x00" * size)
         return self._read_buf_mem
 
