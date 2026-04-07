@@ -157,6 +157,7 @@ def _build_resume_frame(
     port_mgr,
     compute_pending_signals,
     clear_signals_from_task,
+    debug=False,
 ):
     """Build the PC/SP/D0 frame needed to resume a blocked Wait()/WaitPort()."""
     if not _has_blocked_state(block_state):
@@ -186,7 +187,7 @@ def _build_resume_frame(
             return None
         msg_addr = port_mgr.get_msg(waitport_port)
         if msg_addr:
-            _unlink_msg_from_m68k_list(mem, msg_addr)
+            _unlink_msg_from_m68k_list(mem, msg_addr, debug=debug)
         if waitpkt_blocked and msg_addr:
             msg = MessageStruct(mem, msg_addr)
             pkt_addr = msg.node.name.aptr
@@ -209,7 +210,7 @@ def _build_resume_frame(
     }
 
 
-def _unlink_msg_from_m68k_list(mem, msg_addr):
+def _unlink_msg_from_m68k_list(mem, msg_addr, debug=False):
     """Remove a message node from its Amiga Exec doubly-linked list in m68k memory.
 
     This mirrors the REMOVE() macro: pred->ln_Succ = succ; succ->ln_Pred = pred.
@@ -222,8 +223,9 @@ def _unlink_msg_from_m68k_list(mem, msg_addr):
         if ln_succ != 0 and ln_pred != 0:
             mem.w32(ln_pred + 0, ln_succ)  # pred->ln_Succ = succ
             mem.w32(ln_succ + 4, ln_pred)  # succ->ln_Pred = pred
-    except Exception:
-        pass
+    except Exception as e:
+        if debug:
+            print(f"[amifuse] WARNING: failed to unlink msg 0x{msg_addr:x}: {e}")
 
 
 # Dos packet opcodes we care about
@@ -318,6 +320,10 @@ class HandlerLauncher:
         self._mp_msglist_offset = MsgPortStruct.sdef.find_field_def_by_name("mp_MsgList").offset
         # Local signal allocation tracking (bits 0-31, lower 16 reserved by system)
         self._signals_allocated = 0x0000FFFF  # Reserve first 16 signals
+        # Debug flag (set by launch_with_startup); consistent with codebase self._debug pattern
+        self._debug = False
+        # Rate-limit warning for tc_SigRecvd read failures (once per instance)
+        self._warned_tc_sigrecvd = False
 
     def _compute_pending_signals(self, mask: int = 0xFFFFFFFF) -> int:
         """Compute pending signals from all message ports AND tc_SigRecvd, ANDed with mask.
@@ -340,8 +346,11 @@ class HandlerLauncher:
                 if this_task != 0:
                     sigrecvd_off = TaskStruct.sdef.find_field_def_by_name("tc_SigRecvd").offset
                     pending = self.mem.r32(this_task + sigrecvd_off)
-        except Exception:
-            pass
+        except Exception as e:
+            if not self._warned_tc_sigrecvd:
+                self._warned_tc_sigrecvd = True
+                if self._debug:
+                    print(f"[amifuse] WARNING: tc_SigRecvd read failed: {e}")
 
         # Then add signals from message ports with pending messages
         port_mgr = self.exec_impl.port_mgr
@@ -571,8 +580,9 @@ class HandlerLauncher:
             if 0 <= sigbit < 32:
                 from amitools.vamos.lib.lexec.signalfunc import SignalFunc
                 SignalFunc._fallback_signals |= 1 << sigbit
-        except Exception:
-            pass
+        except Exception as e:
+            if self._debug:
+                print(f"[amifuse] WARNING: signal delivery failed for port 0x{dest_port_addr:x}: {e}")
         return pkt_addr, sp_addr
 
     def _link_msg_to_port(self, port_addr: int, msg_addr: int):
@@ -603,6 +613,7 @@ class HandlerLauncher:
     # ---- public orchestration ----
 
     def launch_with_startup(self, extra_packets=None, debug=False) -> HandlerLaunchState:
+        self._debug = debug
         proc_addr, port_addr, stack = self._create_process(name="amifuse_handler")
         # The caller reply port is consumed by host-side polling, not by the
         # Amiga handler task. Keep it out of the handler's signal namespace.
@@ -674,6 +685,7 @@ class HandlerLauncher:
             port_mgr=self.exec_impl.port_mgr,
             compute_pending_signals=self._compute_pending_signals,
             clear_signals_from_task=self._clear_signals_from_task,
+            debug=debug,
         )
         if resume is None:
             return False
@@ -870,7 +882,7 @@ class HandlerLauncher:
                             # CRITICAL: use get_msg (not peek_msg) to dequeue.
                             msg_addr = self.exec_impl.port_mgr.get_msg(waitport_port)
                             if msg_addr:
-                                _unlink_msg_from_m68k_list(self.mem, msg_addr)
+                                _unlink_msg_from_m68k_list(self.mem, msg_addr, debug=debug)
                             if block_state.get("waitpkt_blocked", False) and msg_addr:
                                 # WaitPkt() resume - extract packet from message
                                 msg = MessageStruct(self.mem, msg_addr)
@@ -946,7 +958,7 @@ class HandlerLauncher:
                             # CRITICAL: use get_msg (not peek_msg) to dequeue.
                             msg_addr = self.exec_impl.port_mgr.get_msg(waitport_port)
                             if msg_addr:
-                                _unlink_msg_from_m68k_list(self.mem, msg_addr)
+                                _unlink_msg_from_m68k_list(self.mem, msg_addr, debug=debug)
                             if block_state.get("waitpkt_blocked", False) and msg_addr:
                                 # WaitPkt() resume - extract packet from message
                                 msg = MessageStruct(self.mem, msg_addr)
