@@ -958,9 +958,10 @@ class HandlerBridge:
 
     def _alloc_read_buf(self, size: int):
         if self._read_buf_mem is None or size > self._read_buf_size:
+            new_mem = self.vh.alloc.alloc_memory(size, label="FUSE_READBUF")
             if self._read_buf_mem is not None:
                 self.vh.alloc.free_memory(self._read_buf_mem)
-            self._read_buf_mem = self.vh.alloc.alloc_memory(size, label="FUSE_READBUF")
+            self._read_buf_mem = new_mem
             self._read_buf_size = size
         self.mem.w_block(self._read_buf_mem.addr, b"\x00" * size)
         return self._read_buf_mem
@@ -979,7 +980,10 @@ class HandlerBridge:
         self._bstr_index = (idx + 1) % self._bstr_ring_size
         mem_obj = self._bstr_ring[idx]
         if mem_obj is None or len(data) > self._bstr_sizes[idx]:
-            mem_obj = self.vh.alloc.alloc_memory(len(data), label=f"FUSE_BSTR_{idx}")
+            new_mem = self.vh.alloc.alloc_memory(len(data), label=f"FUSE_BSTR_{idx}")
+            if mem_obj is not None:
+                self.vh.alloc.free_memory(mem_obj)
+            mem_obj = new_mem
             self._bstr_ring[idx] = mem_obj
             self._bstr_sizes[idx] = len(data)
         self.mem.w_block(mem_obj.addr, data)
