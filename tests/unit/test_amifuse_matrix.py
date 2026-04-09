@@ -49,6 +49,10 @@ def _make_ok_result(matrix, fixture_key: str, **overrides):
         "load_read_count": fixture.load_read_count,
         "load_read_size_bytes": fixture.load_read_size_bytes,
         "load_read_total_bytes": fixture.load_read_count * fixture.load_read_size_bytes,
+        "meta_dir_count": fixture.meta_dir_count,
+        "meta_files_per_dir": fixture.meta_files_per_dir,
+        "meta_total_files": fixture.meta_dir_count * fixture.meta_files_per_dir,
+        "meta_file_size_bytes": fixture.meta_file_size_bytes,
     }
     for key in matrix.TIMING_KEYS:
         result[key] = 0.0
@@ -62,6 +66,11 @@ def _make_ok_result(matrix, fixture_key: str, **overrides):
             "create_many_s": 0.80,
             "list_load_dir_s": 0.04,
             "read_many_s": 1.25,
+            "mkdir_tree_s": 0.08,
+            "stat_many_s": 0.75,
+            "rename_many_s": 0.60,
+            "list_meta_dirs_s": 0.05,
+            "delete_many_s": 0.70,
             "flush_s": 0.01,
             "steady_s": 2.15,
             "total_s": 2.21,
@@ -77,6 +86,15 @@ def test_parse_args_accepts_load_fixture():
     args = matrix._parse_args(["--fixtures", "pfs3-load", "--runs", "1"])
 
     assert args.fixtures == ["pfs3-load"]
+    assert args.runs == 1
+
+
+def test_parse_args_accepts_meta_fixture():
+    matrix = _load_amifuse_matrix()
+
+    args = matrix._parse_args(["--fixtures", "ofs-meta", "--runs", "1"])
+
+    assert args.fixtures == ["ofs-meta"]
     assert args.runs == 1
 
 
@@ -101,6 +119,55 @@ def test_aggregate_fixture_runs_keeps_load_metrics():
     assert summary["load_read_count"] == fixture.load_read_count
 
 
+def test_aggregate_fixture_runs_keeps_meta_metrics():
+    matrix = _load_amifuse_matrix()
+    fixture = matrix.FIXTURES["ofs-meta"]
+    run_results = [
+        _make_ok_result(
+            matrix,
+            "ofs-meta",
+            create_many_s=1.20,
+            stat_many_s=0.90,
+            rename_many_s=0.70,
+            delete_many_s=0.85,
+            steady_s=3.90,
+            total_s=3.98,
+        ),
+        _make_ok_result(
+            matrix,
+            "ofs-meta",
+            create_many_s=1.10,
+            stat_many_s=0.80,
+            rename_many_s=0.65,
+            delete_many_s=0.80,
+            steady_s=3.60,
+            total_s=3.68,
+        ),
+        _make_ok_result(
+            matrix,
+            "ofs-meta",
+            create_many_s=1.15,
+            stat_many_s=0.85,
+            rename_many_s=0.68,
+            delete_many_s=0.82,
+            steady_s=3.75,
+            total_s=3.83,
+        ),
+    ]
+
+    summary = matrix._aggregate_fixture_runs(fixture, run_results)
+
+    assert summary["status"] == "ok"
+    assert summary["mode"] == "meta"
+    assert summary["runs"] == 3
+    assert summary["create_many_s_median"] == 1.15
+    assert summary["stat_many_s_median"] == 0.85
+    assert summary["rename_many_s_median"] == 0.68
+    assert summary["delete_many_s_median"] == 0.82
+    assert summary["meta_dir_count"] == fixture.meta_dir_count
+    assert summary["meta_total_files"] == fixture.meta_dir_count * fixture.meta_files_per_dir
+
+
 def test_render_markdown_includes_load_section():
     matrix = _load_amifuse_matrix()
     fixture = matrix.FIXTURES["pfs3-load"]
@@ -119,7 +186,54 @@ def test_render_markdown_includes_load_section():
     assert "PFS3 load" in markdown
     assert "Read loop med" in markdown
     assert "create=256x256B" in markdown
-    assert "read=1600x1MiB" in markdown
+    assert "read=3200x1MiB" in markdown
+
+
+def test_render_markdown_includes_meta_section():
+    matrix = _load_amifuse_matrix()
+    fixture = matrix.FIXTURES["ofs-meta"]
+    summary = matrix._aggregate_fixture_runs(
+        fixture,
+        [
+            _make_ok_result(
+                matrix,
+                "ofs-meta",
+                create_many_s=1.20,
+                stat_many_s=0.90,
+                rename_many_s=0.70,
+                delete_many_s=0.85,
+                steady_s=3.90,
+                total_s=3.98,
+            ),
+            _make_ok_result(
+                matrix,
+                "ofs-meta",
+                create_many_s=1.10,
+                stat_many_s=0.80,
+                rename_many_s=0.65,
+                delete_many_s=0.80,
+                steady_s=3.60,
+                total_s=3.68,
+            ),
+            _make_ok_result(
+                matrix,
+                "ofs-meta",
+                create_many_s=1.15,
+                stat_many_s=0.85,
+                rename_many_s=0.68,
+                delete_many_s=0.82,
+                steady_s=3.75,
+                total_s=3.83,
+            ),
+        ],
+    )
+
+    markdown = matrix._render_markdown([summary])
+
+    assert "## Metadata Benchmark" in markdown
+    assert "OFS meta" in markdown
+    assert "Stat files med" in markdown
+    assert "files=512x256B" in markdown
 
 
 def test_worker_main_reports_system_exit_as_error(monkeypatch, capsys):

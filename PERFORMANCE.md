@@ -15,12 +15,9 @@ fixtures with controlled:
 - fill percentage
 - read-only vs read-write mode
 
-For the current rebased `amifuse-0.5` line, the historical PFS
-traversal baseline remains `0.6s`.
-
 ## Current Matrix
 
-The first integration runner is [`tools/amifuse_matrix.py`](/Users/stepan/git/AmiFuse-codex/tools/amifuse_matrix.py).
+The integration runner is [`tools/amifuse_matrix.py`](/Users/stepan/git/AmiFuse/tools/amifuse_matrix.py).
 It runs repeated smoke checks against canonical fixtures in
 `~/AmigaOS/AmiFuse/` and times:
 
@@ -89,36 +86,26 @@ the most experimental ISO handler path.
 Run:
 
 ```sh
-python3 tools/amifuse_matrix.py
+python3 tools/amifuse_matrix.py --json
 ```
 
 Date: `2026-04-06`
 
-| FS | Status | Inspect med | Init med | Root med | Stat med | Small med | Large med | Flush med | Total min / med / max | Notes |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `PFS3` | `ok` | `0.005s` | `0.077s` | `0.009s` | `0.001s` | `0.005s` | `0.002s` | `0.002s` | `0.099s / 0.100s / 0.103s` | `runs=3`, `pfs.hdf`, `PDH0`, small=`/foo.md`, large=`/S/pci.db` |
-| `SFS` | `ok` | `0.007s` | `0.055s` | `0.007s` | `0.002s` | `0.003s` | `0.003s` | `0.001s` | `0.076s / 0.077s / 0.081s` | `runs=3`, `sfs.hdf`, `SDH0`, lookup=`/Prefs`, small=`/Prefs/Asl`, large=`/System/Installer` |
-| `FFS` | `ok` | `0.002s` | `0.528s` | `0.031s` | `0.001s` | `0.001s` | `0.001s` | `0.000s` | `0.562s / 0.564s / 0.568s` | `runs=3`, `Default.hdf`, `QDH0`, small=`/CD0`, large=`/MMULib.lha` |
-| `OFS` | `ok` | `0.000s` | `0.014s` | `0.001s` | `0.000s` | `0.001s` | `0.020s` | `0.000s` | `0.037s / 0.037s / 0.038s` | `runs=3`, `ofs.adf`, small=`/OFS_README.txt`, large=`/Docs/OFS_LARGE.bin` |
-| `BFFS` | `ok` | `0.002s` | `0.188s` | `0.019s` | `0.002s` | `0.001s` | `0.001s` | `0.000s` | `0.212s / 0.212s / 0.218s` | `runs=3`, `netbsdamiga92.hdf`, `netbsd-root`, lookup=`/bin/cat`, small=`/.cshrc`, large=`/netbsd` |
-| `CDFileSystem` | `ok` | `0.000s` | `0.059s` | `0.007s` | `0.001s` | `0.001s` | `0.001s` | `0.000s` | `0.067s / 0.069s / 0.071s` | `runs=3`, `AmigaOS3.2CD.iso`, small=`/CDVersion`, large=`/ADF/Backdrops3.2.adf` |
-
-This is the current all-green aggregated read-only matrix for the
-expanded canonical fixture set. The earlier single-run table overstated
-drift, especially for `PFS3`, because its totals were too noisy to
-compare from one sample.
-
-`BFFS` now uses the NetBSD fixture directly in the default read-only
-matrix. The key compatibility fix there was making AmiFuse-generated
-BSTRs safe for handlers that temporarily treat counted strings as
-NUL-terminated C strings.
+| FS | Status | Total min / med / max | Notes |
+| --- | --- | --- | --- |
+| `PFS3` | `ok` | `0.098s / 0.100s / 0.100s` | `runs=3`, `pfs.hdf`, `PDH0` |
+| `SFS` | `ok` | `0.075s / 0.075s / 0.076s` | `runs=3`, `sfs.hdf`, `SDH0` |
+| `FFS` | `ok` | `0.571s / 0.574s / 0.576s` | `runs=3`, `Default.hdf`, `QDH0` |
+| `OFS` | `ok` | `0.037s / 0.037s / 0.037s` | `runs=3`, `ofs.adf` |
+| `BFFS` | `ok` | `0.200s / 0.213s / 0.215s` | `runs=3`, `netbsdamiga92.hdf`, `netbsd-root` |
+| `CDFileSystem` | `ok` | `0.069s / 0.069s / 0.069s` | `runs=3`, `AmigaOS3.2CD.iso` |
 
 ## Latest Writable Run
 
 Run:
 
 ```sh
-python3 tools/amifuse_matrix.py --fixtures ofs-rw ffs-rw pfs3-rw sfs-rw --runs 3
+python3 tools/amifuse_matrix.py --fixtures ofs-rw ffs-rw pfs3-rw sfs-rw --runs 3 --json
 ```
 
 Date: `2026-04-06`
@@ -126,90 +113,70 @@ Date: `2026-04-06`
 The writable smoke tests use scratch copies under
 `~/AmigaOS/AmiFuse/generated/`, seeded from the canonical fixtures.
 
-| FS | Status | Inspect med | Init med | Root med | Mkdir med | Create med | Write med | Rename med | Flush med | Remount med | Verify stat med | Verify read med | Delete med | Cleanup flush med | Total min / med / max | Notes |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `OFS rw` | `ok` | `0.000s` | `0.016s` | `0.001s` | `0.001s` | `0.001s` | `0.005s` | `0.001s` | `0.000s` | `0.011s` | `0.001s` | `0.003s` | `0.001s` | `0.000s` | `0.041s / 0.042s / 0.043s` | `runs=3`, verify=`/AmiFuseRW/hello-renamed.txt` |
-| `FFS rw` | `ok` | `0.003s` | `0.532s` | `0.018s` | `0.002s` | `0.001s` | `0.001s` | `0.001s` | `0.000s` | `0.530s` | `0.004s` | `0.001s` | `0.001s` | `0.000s` | `1.088s / 1.095s / 1.128s` | `runs=3`, verify=`/AmiFuseRW/hello-renamed.txt` |
-| `PFS3 rw` | `ok` | `0.005s` | `0.076s` | `0.009s` | `0.005s` | `0.007s` | `0.002s` | `0.004s` | `0.001s` | `0.072s` | `0.003s` | `0.003s` | `0.005s` | `0.001s` | `0.194s / 0.196s / 0.196s` | `runs=3`, verify=`/AmiFuseRW/hello-renamed.txt` |
-| `SFS rw` | `ok` | `0.007s` | `0.054s` | `0.008s` | `0.004s` | `0.003s` | `0.001s` | `0.008s` | `0.001s` | `0.050s` | `0.004s` | `0.004s` | `0.004s` | `0.001s` | `0.146s / 0.146s / 0.147s` | `runs=3`, verify=`/AmiFuseRW/hello-renamed.txt` |
-
-This is the first all-green writable smoke matrix across `OFS`, `FFS`,
-`PFS3`, and `SFS`. Bringing `SFS` into this matrix exposed and fixed a
-real post-startup compatibility bug: child processes were not preserving
-their own blocked wait state or register set, so they never resumed when
-port traffic arrived after startup.
+| FS | Status | Total min / med / max | Notes |
+| --- | --- | --- | --- |
+| `OFS rw` | `ok` | `0.039s / 0.044s / 0.079s` | `runs=3`, verify=`/AmiFuseRW/hello-renamed.txt` |
+| `FFS rw` | `ok` | `1.146s / 1.151s / 1.169s` | `runs=3`, verify=`/AmiFuseRW/hello-renamed.txt` |
+| `PFS3 rw` | `ok` | `0.196s / 0.196s / 0.198s` | `runs=3`, verify=`/AmiFuseRW/hello-renamed.txt` |
+| `SFS rw` | `ok` | `0.148s / 0.151s / 0.180s` | `runs=3`, verify=`/AmiFuseRW/hello-renamed.txt` |
 
 ## Latest Format Run
 
 Run:
 
 ```sh
-python3 tools/amifuse_matrix.py --fixtures ofs-fmt ffs-fmt pfs3-fmt sfs-fmt --runs 3
+python3 tools/amifuse_matrix.py --fixtures ofs-fmt ffs-fmt pfs3-fmt sfs-fmt --runs 3 --json
 ```
 
 Date: `2026-04-06`
 
 The format smoke tests create fresh generated RDB images under
-`~/AmigaOS/AmiFuse/generated/`, format them through AmiFuse, then mount
-them read-write, create and rename a file, remount, verify the contents,
-delete the test file, and flush again.
+`~/AmigaOS/AmiFuse/generated/`, format them through AmiFuse, then run
+the writable smoke sequence on the fresh volume.
 
-| FS | Status | Create img med | Inspect med | Format med | Init med | Root med | Mkdir med | Create med | Write med | Rename med | Flush med | Remount med | Verify stat med | Verify read med | Delete med | Cleanup flush med | Total min / med / max | Notes |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `OFS fmt` | `ok` | `0.044s` | `0.005s` | `0.019s` | `0.014s` | `0.001s` | `0.002s` | `0.001s` | `0.003s` | `0.001s` | `0.000s` | `0.015s` | `0.001s` | `0.003s` | `0.001s` | `0.000s` | `0.107s / 0.114s / 0.114s` | `runs=3`, verify=`/AmiFuseRW/hello-renamed.txt` |
-| `FFS fmt` | `ok` | `0.049s` | `0.001s` | `0.018s` | `0.012s` | `0.001s` | `0.001s` | `0.001s` | `0.001s` | `0.001s` | `0.000s` | `0.012s` | `0.001s` | `0.004s` | `0.001s` | `0.000s` | `0.099s / 0.103s / 0.129s` | `runs=3`, verify=`/AmiFuseRW/hello-renamed.txt` |
-| `PFS3 fmt` | `ok` | `0.040s` | `0.003s` | `0.032s` | `0.067s` | `0.003s` | `0.004s` | `0.004s` | `0.003s` | `0.004s` | `0.001s` | `0.066s` | `0.004s` | `0.003s` | `0.005s` | `0.001s` | `0.237s / 0.240s / 0.263s` | `runs=3`, verify=`/AmiFuseRW/hello-renamed.txt` |
-| `SFS fmt` | `ok` | `0.041s` | `0.003s` | `0.036s` | `0.041s` | `0.002s` | `0.004s` | `0.003s` | `0.002s` | `0.005s` | `0.001s` | `0.037s` | `0.003s` | `0.006s` | `0.004s` | `0.001s` | `0.187s / 0.187s / 0.190s` | `runs=3`, verify=`/AmiFuseRW/hello-renamed.txt` |
+| FS | Status | Total min / med / max | Notes |
+| --- | --- | --- | --- |
+| `OFS fmt` | `ok` | `0.106s / 0.107s / 0.108s` | `runs=3`, verify=`/AmiFuseRW/hello-renamed.txt` |
+| `FFS fmt` | `ok` | `0.100s / 0.100s / 0.102s` | `runs=3`, verify=`/AmiFuseRW/hello-renamed.txt` |
+| `PFS3 fmt` | `ok` | `0.235s / 0.237s / 0.248s` | `runs=3`, verify=`/AmiFuseRW/hello-renamed.txt` |
+| `SFS fmt` | `ok` | `0.179s / 0.181s / 0.182s` | `runs=3`, verify=`/AmiFuseRW/hello-renamed.txt` |
 
-One runtime quirk matters here: `SFS` crashes if the formatter bridge is
-driven through a post-format uninhibit cycle after `ACTION_FORMAT`
-already succeeded, while classic DOS filesystems still need that
-uninhibit before the next mount sees a usable freshly formatted volume.
+## Latest Load Run
+
+Run:
+
+```sh
+python3 tools/amifuse_matrix.py --fixtures pfs3-load sfs-load ffs-load --runs 3 --json
+```
+
+Date: `2026-04-06`
+
+The load benchmark uses a single mount per run, creates one `1MiB`
+file, creates `256` small files, lists the populated directory, then
+reads the `1MiB` file `1600` times. `steady` excludes inspect/init and
+captures the runtime-heavy portion.
+
+| FS | Status | Steady min / med / max | Total min / med / max | Notes |
+| --- | --- | --- | --- | --- |
+| `PFS3 load` | `ok` | `10.516s / 10.542s / 10.554s` | `10.610s / 10.637s / 10.649s` | `runs=3`, `PDH0`, `1.6GiB` total reread |
+| `SFS load` | `ok` | `6.203s / 6.220s / 6.418s` | `6.293s / 6.297s / 6.491s` | `runs=3`, `SDH0`, `1.6GiB` total reread |
+| `FFS load` | `ok` | `8.409s / 8.513s / 8.620s` | `8.968s / 9.081s / 9.181s` | `runs=3`, `QDH0`, `1.6GiB` total reread |
 
 ## Large Image Smoke
 
 Run:
 
 ```sh
-python3 tools/amifuse_matrix.py --fixtures pfs3-4g --runs 1 --json
-python3 tools/amifuse_matrix.py --fixtures pfs3-part-4g --runs 1 --json
+python3 tools/amifuse_matrix.py --fixtures pfs3-4g pfs3-part-4g --runs 1 --json
 ```
 
-Date: `2026-04-04`
+Date: `2026-04-06`
 
-This is the first ephemeral `>4GB` smoke case. It creates a sparse `5GiB`
-RDB image, places a small `PFS3` partition at byte `4,644,864,000`, formats
-that partition, writes deterministic data, remounts, reads it back, verifies
-it, and then removes the image immediately after the run.
+These cases are intentionally separate from the default matrix. They
+exercise large-offset and large-partition image I/O without keeping
+persistent multi-gigabyte fixtures on disk.
 
-| FS | Status | Image size | Partition start | Create img | Inspect | Format | Init | Root | Mkdir | Create | Write | Rename | Flush | Remount | Verify stat | Verify read | Delete | Cleanup flush | Total |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `PFS3 >4G` | `ok` | `5GiB sparse` | `4,644,864,000` | `0.090s` | `0.001s` | `0.078s` | `0.062s` | `0.007s` | `0.016s` | `0.020s` | `0.015s` | `0.019s` | `0.002s` | `0.074s` | `0.012s` | `0.024s` | `0.011s` | `0.002s` | `0.434s` |
-
-This case is intentionally not part of the default matrix run. It is meant to
-exercise large-offset image I/O without keeping a persistent multi-gigabyte
-fixture on disk.
-
-## Large Partition Smoke
-
-Run:
-
-```sh
-python3 tools/amifuse_matrix.py --fixtures pfs3-part-4g --runs 1 --json
-```
-
-Date: `2026-04-04`
-
-This case creates a sparse `~6GiB` image with a `PFS3` partition that
-itself spans `4,386,816,000` bytes, formats it, mounts it read-write,
-performs the normal writable smoke sequence, remounts, verifies the
-written data, and removes the image afterward.
-
-| FS | Status | Image size | Partition size | Partition start | Create img | Inspect | Format | Init | Root | Mkdir | Create | Write | Rename | Flush | Remount | Verify stat | Verify read | Delete | Cleanup flush | Total |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `PFS3 partition >4G` | `ok` | `~6GiB sparse` | `4,386,816,000` | `1,032,192` | `0.130s` | `0.002s` | `3.056s` | `0.125s` | `0.009s` | `0.084s` | `0.028s` | `0.010s` | `0.016s` | `0.027s` | `0.232s` | `0.012s` | `0.011s` | `0.069s` | `0.004s` | `3.814s` |
-
-This closes the "filesystem spans a partition larger than `4GiB`" smoke
-gap. One limitation remains: the current DOS file-handle seek/setsize
-packet path is still `32-bit`, so this case does not yet verify file
-offsets beyond `4GiB` within that large partition.
+| FS | Status | Image size | Partition detail | Total | Notes |
+| --- | --- | --- | --- | --- | --- |
+| `PFS3 >4G` | `ok` | `5GiB sparse` | start=`4,644,864,000` | `0.239s` | small `PFS3` partition above `4GiB` |
+| `PFS3 partition >4G` | `ok` | `~6GiB sparse` | size=`4,386,816,000`, start=`1,032,192` | `0.619s` | large `PFS3` partition smoke |

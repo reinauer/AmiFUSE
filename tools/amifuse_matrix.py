@@ -28,8 +28,11 @@ AMITOOLS_ROOT = REPO_ROOT / "amitools"
 DEFAULT_TIMEOUT = 60.0
 LOAD_FILE_COUNT = 256
 LOAD_FILE_SIZE_BYTES = 256
-LOAD_READ_COUNT = 1600
+LOAD_READ_COUNT = 3200
 LOAD_READ_SIZE_BYTES = 1024 * 1024
+META_DIR_COUNT = 8
+META_FILES_PER_DIR = 64
+META_FILE_SIZE_BYTES = 256
 
 
 @dataclass(frozen=True)
@@ -60,6 +63,9 @@ class Fixture:
     load_file_size_bytes: int = 0
     load_read_count: int = 0
     load_read_size_bytes: int = 0
+    meta_dir_count: int = 0
+    meta_files_per_dir: int = 0
+    meta_file_size_bytes: int = 0
 
 
 FIXTURES: Dict[str, Fixture] = {
@@ -104,6 +110,21 @@ FIXTURES: Dict[str, Fixture] = {
         load_file_size_bytes=LOAD_FILE_SIZE_BYTES,
         load_read_count=LOAD_READ_COUNT,
         load_read_size_bytes=LOAD_READ_SIZE_BYTES,
+    ),
+    "pfs3-meta": Fixture(
+        key="pfs3-meta",
+        fs_name="PFS3 meta",
+        image=GENERATED_DIR / "pfs3_meta.hdf",
+        driver=DRIVERS_DIR / "pfs3aio",
+        partition="PDH0",
+        mode="meta",
+        image_kind="rdb-hdf",
+        image_size_mb=8,
+        seed_image=READONLY_DIR / "pfs.hdf",
+        default_run=False,
+        meta_dir_count=META_DIR_COUNT,
+        meta_files_per_dir=META_FILES_PER_DIR,
+        meta_file_size_bytes=META_FILE_SIZE_BYTES,
     ),
     "pfs3-fmt": Fixture(
         key="pfs3-fmt",
@@ -220,6 +241,21 @@ FIXTURES: Dict[str, Fixture] = {
         load_read_count=LOAD_READ_COUNT,
         load_read_size_bytes=LOAD_READ_SIZE_BYTES,
     ),
+    "sfs-meta": Fixture(
+        key="sfs-meta",
+        fs_name="SFS meta",
+        image=GENERATED_DIR / "sfs_meta.hdf",
+        driver=DRIVERS_DIR / "SmartFilesystem",
+        partition="SDH0",
+        mode="meta",
+        image_kind="rdb-hdf",
+        image_size_mb=8,
+        seed_image=READONLY_DIR / "sfs.hdf",
+        default_run=False,
+        meta_dir_count=META_DIR_COUNT,
+        meta_files_per_dir=META_FILES_PER_DIR,
+        meta_file_size_bytes=META_FILE_SIZE_BYTES,
+    ),
     "sfs-fmt": Fixture(
         key="sfs-fmt",
         fs_name="SFS fmt",
@@ -285,6 +321,22 @@ FIXTURES: Dict[str, Fixture] = {
         load_read_count=LOAD_READ_COUNT,
         load_read_size_bytes=LOAD_READ_SIZE_BYTES,
     ),
+    "ffs-meta": Fixture(
+        key="ffs-meta",
+        fs_name="FFS meta",
+        image=GENERATED_DIR / "ffs_meta.hdf",
+        driver=DRIVERS_DIR / "FastFileSystem",
+        partition="QDH0",
+        mode="meta",
+        image_kind="rdb-hdf",
+        image_size_mb=512,
+        seed_image=READONLY_DIR / "Default.hdf",
+        default_run=False,
+        seed_download_url=DEFAULT_HDF_URL,
+        meta_dir_count=META_DIR_COUNT,
+        meta_files_per_dir=META_FILES_PER_DIR,
+        meta_file_size_bytes=META_FILE_SIZE_BYTES,
+    ),
     "ffs-fmt": Fixture(
         key="ffs-fmt",
         fs_name="FFS fmt",
@@ -349,6 +401,21 @@ FIXTURES: Dict[str, Fixture] = {
         image_size_mb=1,
         seed_image=READONLY_DIR / "ofs.adf",
         default_run=False,
+    ),
+    "ofs-meta": Fixture(
+        key="ofs-meta",
+        fs_name="OFS meta",
+        image=GENERATED_DIR / "ofs_meta.adf",
+        driver=DRIVERS_DIR / "FastFileSystem",
+        partition=None,
+        mode="meta",
+        image_kind="adf",
+        image_size_mb=1,
+        seed_image=READONLY_DIR / "ofs.adf",
+        default_run=False,
+        meta_dir_count=META_DIR_COUNT,
+        meta_files_per_dir=META_FILES_PER_DIR,
+        meta_file_size_bytes=META_FILE_SIZE_BYTES,
     ),
     "ofs-fmt": Fixture(
         key="ofs-fmt",
@@ -814,6 +881,96 @@ def _exercise_load_session(bridge, fixture: Fixture):
     }
 
 
+def _exercise_meta_session(bridge, fixture: Fixture):
+    meta_dir = "/AmiFuseMeta"
+    payload = _pattern_bytes(fixture.meta_file_size_bytes, seed=29)
+    dir_names = [f"d{idx:02d}" for idx in range(fixture.meta_dir_count)]
+
+    list_root_s, root_entries = _timed(bridge.list_dir_path, "/")
+    root_names = [entry["name"] for entry in root_entries]
+    mkdir_tree_start = time.perf_counter()
+    _create_dir_path(bridge, meta_dir)
+    for dir_name in dir_names:
+        _create_dir_path(bridge, f"{meta_dir}/{dir_name}")
+    mkdir_tree_s = time.perf_counter() - mkdir_tree_start
+
+    paths = []
+    create_many_start = time.perf_counter()
+    for dir_name in dir_names:
+        for file_idx in range(fixture.meta_files_per_dir):
+            path = f"{meta_dir}/{dir_name}/f{file_idx:03d}.bin"
+            _write_file_path(bridge, path, payload)
+            paths.append(path)
+    create_many_s = time.perf_counter() - create_many_start
+
+    stat_many_start = time.perf_counter()
+    for path in paths:
+        info = bridge.stat_path(path)
+        if info is None:
+            raise RuntimeError(f"stat failed for {path}")
+        if int(info.get("size", -1)) != len(payload):
+            raise RuntimeError(f"stat size mismatch for {path}: {info.get('size')}")
+    stat_many_s = time.perf_counter() - stat_many_start
+
+    renamed_paths = []
+    rename_many_start = time.perf_counter()
+    for path in paths:
+        parent_path, name = _split_parent(path)
+        renamed_path = f"{parent_path}/r-{name}"
+        _rename_path(bridge, path, renamed_path)
+        renamed_paths.append(renamed_path)
+    rename_many_s = time.perf_counter() - rename_many_start
+
+    list_meta_dirs_start = time.perf_counter()
+    total_entries = 0
+    for dir_name in dir_names:
+        entries = bridge.list_dir_path(f"{meta_dir}/{dir_name}")
+        total_entries += len(entries)
+        if len(entries) != fixture.meta_files_per_dir:
+            raise RuntimeError(
+                f"metadata dir entry count mismatch for {dir_name}: "
+                f"{len(entries)} != {fixture.meta_files_per_dir}"
+            )
+    list_meta_dirs_s = time.perf_counter() - list_meta_dirs_start
+
+    delete_many_start = time.perf_counter()
+    for path in renamed_paths:
+        _delete_path(bridge, path)
+    for dir_name in reversed(dir_names):
+        _delete_path(bridge, f"{meta_dir}/{dir_name}")
+    delete_many_s = time.perf_counter() - delete_many_start
+
+    flush_s, _ = _timed(bridge.flush_volume)
+    steady_s = (
+        mkdir_tree_s
+        + create_many_s
+        + stat_many_s
+        + rename_many_s
+        + list_meta_dirs_s
+        + delete_many_s
+        + flush_s
+    )
+    return {
+        "root_entries": root_entries,
+        "root_names": root_names,
+        "list_root_s": list_root_s,
+        "mkdir_tree_s": mkdir_tree_s,
+        "create_many_s": create_many_s,
+        "stat_many_s": stat_many_s,
+        "rename_many_s": rename_many_s,
+        "list_meta_dirs_s": list_meta_dirs_s,
+        "delete_many_s": delete_many_s,
+        "flush_s": flush_s,
+        "steady_s": steady_s,
+        "meta_dir": meta_dir,
+        "meta_dir_count": fixture.meta_dir_count,
+        "meta_files_per_dir": fixture.meta_files_per_dir,
+        "meta_total_files": len(paths),
+        "meta_file_size_bytes": fixture.meta_file_size_bytes,
+        "meta_total_entries": total_entries,
+    }
+
+
 def _verify_rw_session(
     HandlerBridge,
     fixture: Fixture,
@@ -947,6 +1104,11 @@ def _run_ro_fixture(fixture: Fixture, HandlerBridge, adf_info, iso_info, inspect
             "create_many_s": 0.0,
             "list_load_dir_s": 0.0,
             "read_many_s": 0.0,
+            "mkdir_tree_s": 0.0,
+            "stat_many_s": 0.0,
+            "rename_many_s": 0.0,
+            "list_meta_dirs_s": 0.0,
+            "delete_many_s": 0.0,
             "steady_s": 0.0,
             "total_s": total_s,
             "small_read_bytes": small_read_bytes,
@@ -956,6 +1118,10 @@ def _run_ro_fixture(fixture: Fixture, HandlerBridge, adf_info, iso_info, inspect
             "load_read_count": 0,
             "load_read_size_bytes": 0,
             "load_read_total_bytes": 0,
+            "meta_dir_count": 0,
+            "meta_files_per_dir": 0,
+            "meta_total_files": 0,
+            "meta_file_size_bytes": 0,
         }
     finally:
         _shutdown_bridge(bridge)
@@ -1037,6 +1203,11 @@ def _run_rw_fixture(fixture: Fixture, HandlerBridge, adf_info, iso_info, inspect
         "create_many_s": 0.0,
         "list_load_dir_s": 0.0,
         "read_many_s": 0.0,
+        "mkdir_tree_s": 0.0,
+        "stat_many_s": 0.0,
+        "rename_many_s": 0.0,
+        "list_meta_dirs_s": 0.0,
+        "delete_many_s": 0.0,
         "steady_s": 0.0,
         "total_s": total_s,
         "small_read_bytes": len(session["payload"]),
@@ -1046,6 +1217,10 @@ def _run_rw_fixture(fixture: Fixture, HandlerBridge, adf_info, iso_info, inspect
         "load_read_count": 0,
         "load_read_size_bytes": 0,
         "load_read_total_bytes": 0,
+        "meta_dir_count": 0,
+        "meta_files_per_dir": 0,
+        "meta_total_files": 0,
+        "meta_file_size_bytes": 0,
     }
 
 
@@ -1116,6 +1291,11 @@ def _run_load_fixture(
         "create_many_s": session["create_many_s"],
         "list_load_dir_s": session["list_load_dir_s"],
         "read_many_s": session["read_many_s"],
+        "mkdir_tree_s": 0.0,
+        "stat_many_s": 0.0,
+        "rename_many_s": 0.0,
+        "list_meta_dirs_s": 0.0,
+        "delete_many_s": 0.0,
         "steady_s": session["steady_s"],
         "total_s": total_s,
         "small_read_bytes": session["read_size_bytes"],
@@ -1125,6 +1305,92 @@ def _run_load_fixture(
         "load_read_count": session["read_iterations"],
         "load_read_size_bytes": session["read_size_bytes"],
         "load_read_total_bytes": session["read_total_bytes"],
+        "meta_dir_count": 0,
+        "meta_files_per_dir": 0,
+        "meta_total_files": 0,
+        "meta_file_size_bytes": 0,
+    }
+
+
+def _run_meta_fixture(
+    fixture: Fixture,
+    HandlerBridge,
+    adf_info,
+    iso_info,
+    inspect_s,
+    inspect_meta,
+):
+    init_s, bridge = _timed(
+        HandlerBridge,
+        fixture.image,
+        fixture.driver,
+        partition=fixture.partition,
+        read_only=False,
+        adf_info=adf_info,
+        iso_info=iso_info,
+    )
+    try:
+        session = _exercise_meta_session(bridge, fixture)
+    finally:
+        _shutdown_bridge(bridge)
+
+    total_s = inspect_s + init_s + session["list_root_s"] + session["steady_s"]
+    return {
+        "fixture": fixture.key,
+        "fs_name": fixture.fs_name,
+        "image": str(fixture.image),
+        "driver": str(fixture.driver),
+        "partition": fixture.partition,
+        "mode": fixture.mode,
+        "image_kind": fixture.image_kind,
+        "image_size_mb": fixture.image_size_mb,
+        "status": "ok",
+        "inspect": inspect_meta,
+        "root_count": len(session["root_entries"]),
+        "root_names": session["root_names"],
+        "lookup_path": session["meta_dir"],
+        "small_read_path": session["meta_dir"],
+        "large_read_path": session["meta_dir"],
+        "create_image_s": 0.0,
+        "format_s": 0.0,
+        "inspect_s": inspect_s,
+        "init_s": init_s,
+        "list_root_s": session["list_root_s"],
+        "stat_s": 0.0,
+        "small_read_s": 0.0,
+        "large_read_s": 0.0,
+        "mkdir_s": 0.0,
+        "create_s": 0.0,
+        "write_s": 0.0,
+        "rename_s": 0.0,
+        "flush_s": session["flush_s"],
+        "remount_s": 0.0,
+        "verify_stat_s": 0.0,
+        "verify_read_s": 0.0,
+        "delete_s": 0.0,
+        "cleanup_flush_s": 0.0,
+        "create_large_s": 0.0,
+        "create_many_s": session["create_many_s"],
+        "list_load_dir_s": 0.0,
+        "read_many_s": 0.0,
+        "mkdir_tree_s": session["mkdir_tree_s"],
+        "stat_many_s": session["stat_many_s"],
+        "rename_many_s": session["rename_many_s"],
+        "list_meta_dirs_s": session["list_meta_dirs_s"],
+        "delete_many_s": session["delete_many_s"],
+        "steady_s": session["steady_s"],
+        "total_s": total_s,
+        "small_read_bytes": 0,
+        "large_read_bytes": 0,
+        "load_file_count": 0,
+        "load_file_size_bytes": 0,
+        "load_read_count": 0,
+        "load_read_size_bytes": 0,
+        "load_read_total_bytes": 0,
+        "meta_dir_count": session["meta_dir_count"],
+        "meta_files_per_dir": session["meta_files_per_dir"],
+        "meta_total_files": session["meta_total_files"],
+        "meta_file_size_bytes": session["meta_file_size_bytes"],
     }
 
 
@@ -1258,6 +1524,11 @@ def _run_fmt_fixture(
             "create_many_s": 0.0,
             "list_load_dir_s": 0.0,
             "read_many_s": 0.0,
+            "mkdir_tree_s": 0.0,
+            "stat_many_s": 0.0,
+            "rename_many_s": 0.0,
+            "list_meta_dirs_s": 0.0,
+            "delete_many_s": 0.0,
             "steady_s": 0.0,
             "total_s": total_s,
             "small_read_bytes": len(session["payload"]),
@@ -1267,6 +1538,10 @@ def _run_fmt_fixture(
             "load_read_count": 0,
             "load_read_size_bytes": 0,
             "load_read_total_bytes": 0,
+            "meta_dir_count": 0,
+            "meta_files_per_dir": 0,
+            "meta_total_files": 0,
+            "meta_file_size_bytes": 0,
         }
     finally:
         _cleanup_generated_image(fixture)
@@ -1286,7 +1561,7 @@ def _run_fixture_worker(fixture_key: str):
     if fixture.mode == "ro":
         if not fixture.image.exists():
             missing.append(f"image {fixture.image}")
-    elif fixture.mode in ("rw", "load"):
+    elif fixture.mode in ("rw", "load", "meta"):
         if fixture.seed_image is None:
             missing.append(f"seed image missing for {fixture.key}")
         elif not fixture.seed_image.exists():
@@ -1308,7 +1583,7 @@ def _run_fixture_worker(fixture_key: str):
     HandlerBridge, format_volume, detect_adf, detect_iso, open_rdisk = _load_runtime()
     if fixture.mode == "rw":
         _prepare_rw_image(fixture)
-    if fixture.mode == "load":
+    if fixture.mode in ("load", "meta"):
         _prepare_rw_image(fixture)
     if fixture.mode == "fmt":
         return _run_fmt_fixture(
@@ -1334,6 +1609,10 @@ def _run_fixture_worker(fixture_key: str):
         )
     if fixture.mode == "load":
         return _run_load_fixture(
+            fixture, HandlerBridge, adf_info, iso_info, inspect_s, inspect_meta
+        )
+    if fixture.mode == "meta":
+        return _run_meta_fixture(
             fixture, HandlerBridge, adf_info, iso_info, inspect_s, inspect_meta
         )
     return _run_ro_fixture(
@@ -1414,6 +1693,11 @@ TIMING_KEYS = (
     "create_many_s",
     "list_load_dir_s",
     "read_many_s",
+    "mkdir_tree_s",
+    "stat_many_s",
+    "rename_many_s",
+    "list_meta_dirs_s",
+    "delete_many_s",
     "steady_s",
     "total_s",
 )
@@ -1480,6 +1764,10 @@ def _aggregate_fixture_runs(
         "load_read_count",
         "load_read_size_bytes",
         "load_read_total_bytes",
+        "meta_dir_count",
+        "meta_files_per_dir",
+        "meta_total_files",
+        "meta_file_size_bytes",
     ):
         summary[key] = first.get(key)
 
@@ -1505,6 +1793,7 @@ def _render_markdown(results: List[Dict[str, object]]) -> str:
     rw_results = [result for result in results if result.get("mode") == "rw"]
     fmt_results = [result for result in results if result.get("mode") == "fmt"]
     load_results = [result for result in results if result.get("mode") == "load"]
+    meta_results = [result for result in results if result.get("mode") == "meta"]
     lines = [
         "# AmiFuse Matrix Run",
         "",
@@ -1740,6 +2029,72 @@ def _render_markdown(results: List[Dict[str, object]]) -> str:
             row = [
                 FIXTURES[result["fixture"]].fs_name,
                 result["status"],
+                "-",
+                "-",
+                "-",
+                "-",
+                "-",
+                "-",
+                "-",
+                "-",
+                "-",
+                "-",
+                "-",
+                "<br>".join(notes),
+            ]
+        lines.append("| " + " | ".join(row) + " |")
+    if meta_results:
+        lines.extend(
+            [
+                "",
+                "## Metadata Benchmark",
+                "",
+                "| FS | Status | Inspect med | Init med | Root med | Mkdir tree med | Create files med | Stat files med | Rename files med | List dirs med | Delete files med | Flush med | Steady min/med/max | Total min/med/max | Notes |",
+                "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+            ]
+        )
+    for result in meta_results:
+        notes = []
+        if result["status"] == "ok":
+            notes.append(f"runs={result['runs']}")
+            notes.append(f"root={result['root_count']}")
+            notes.append(f"dirs={int(result.get('meta_dir_count', 0))}")
+            notes.append(
+                f"files={int(result.get('meta_total_files', 0))}x{int(result.get('meta_file_size_bytes', 0))}B"
+            )
+            if result.get("lookup_path"):
+                notes.append(f"tree={result['lookup_path']}")
+            steady_range = " / ".join(
+                [
+                    _format_seconds(float(result["steady_s_min"])),
+                    _format_seconds(float(result["steady_s_median"])),
+                    _format_seconds(float(result["steady_s_max"])),
+                ]
+            )
+            row = [
+                result["fs_name"],
+                "ok",
+                _format_seconds(float(result["inspect_s_median"])),
+                _format_seconds(float(result["init_s_median"])),
+                _format_seconds(float(result["list_root_s_median"])),
+                _format_seconds(float(result["mkdir_tree_s_median"])),
+                _format_seconds(float(result["create_many_s_median"])),
+                _format_seconds(float(result["stat_many_s_median"])),
+                _format_seconds(float(result["rename_many_s_median"])),
+                _format_seconds(float(result["list_meta_dirs_s_median"])),
+                _format_seconds(float(result["delete_many_s_median"])),
+                _format_seconds(float(result["flush_s_median"])),
+                steady_range,
+                _format_total_range(result),
+                "<br>".join(notes),
+            ]
+        else:
+            notes.append(f"runs={result.get('runs', 0)}")
+            notes.append(result.get("error", "unknown error"))
+            row = [
+                FIXTURES[result["fixture"]].fs_name,
+                result["status"],
+                "-",
                 "-",
                 "-",
                 "-",
