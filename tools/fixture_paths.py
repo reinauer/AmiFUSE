@@ -14,7 +14,8 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 
 
-FIXTURE_ROOT = Path.home() / "AmigaOS" / "AmiFuse"
+_env_root = os.environ.get("AMIFUSE_FIXTURE_ROOT")
+FIXTURE_ROOT = Path(_env_root) if _env_root else Path.home() / "AmigaOS" / "AmiFuse"
 DRIVERS_DIR = FIXTURE_ROOT / "drivers"
 FIXTURES_DIR = FIXTURE_ROOT / "fixtures"
 READONLY_DIR = FIXTURES_DIR / "readonly"
