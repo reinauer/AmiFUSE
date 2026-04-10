@@ -3,7 +3,7 @@
 Resolves external fixture paths through a cascade:
   1. AMIFUSE_FIXTURE_ROOT env var
   2. ../AmiFUSE-testing sibling directory (relative to repo root)
-  3. ~/AmigaOS/AmiFuse (Stefan's default)
+  3. ~/AmigaOS/AmiFuse (default local path)
   4. None (tests skip gracefully)
 
 This module does NOT import from tools/fixture_paths.py.
@@ -31,7 +31,7 @@ def _resolve_fixture_root() -> Path | None:
     if sibling.is_dir() and (sibling / "drivers").is_dir():
         return sibling
 
-    # 3. Stefan's default local path
+    # 3. Default local path
     default = Path.home() / "AmigaOS" / "AmiFuse"
     if default.is_dir() and (default / "drivers").is_dir():
         return default

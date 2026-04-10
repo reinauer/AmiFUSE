@@ -271,7 +271,7 @@ python3 tools/amifuse_matrix.py \
 
 Then compare the results with:
 
-[PERFORMANCE.md](/Users/stepan/git/AmiFuse-codex/PERFORMANCE.md)
+[PERFORMANCE.md](PERFORMANCE.md)
 
 Important interpretation rules:
 
@@ -293,7 +293,7 @@ the matrix is the main current performance harness.
 
 The `amitools` submodule has its own test tree and README:
 
-[amitools/test/README.md](/Users/stepan/git/AmiFuse-codex/amitools/test/README.md)
+[amitools/test/README.md](amitools/test/README.md)
 
 The important buckets there are:
 
@@ -341,6 +341,85 @@ In practice:
 - `readme smoke` catches CLI and docs drift
 - `amitools` tests catch lower-level runtime semantics
 
+## Pytest Test Suite
+
+The repo has a structured pytest test suite alongside the legacy tools/
+scripts. Tests are organized into two layers:
+
+| Layer | Location | Marker | Requires |
+|-------|----------|--------|----------|
+| Unit | `tests/unit/` | _(none)_ | Python + amifuse installed |
+| Integration | `tests/integration/` | `integration` | machine68k + external fixtures |
+
+### Quick Start
+
+```sh
+# Unit tests (all platforms, no external dependencies)
+pytest tests/unit/ -v --timeout=30
+
+# Integration tests (Linux/macOS, needs fixtures)
+pytest tests/integration/ -v --timeout=60
+
+# All tests
+pytest tests/ -v --timeout=60
+```
+
+### Fixture Resolution
+
+Integration tests need handler binaries and disk images. They resolve
+the fixture directory through a cascade:
+
+1. `AMIFUSE_FIXTURE_ROOT` env var — point this at any directory containing
+   `drivers/` (handler binaries) and `fixtures/readonly/` (disk images)
+2. `../AmiFUSE-testing` sibling directory (relative to repo root)
+3. `~/AmigaOS/AmiFuse` (default local path)
+4. `None` → tests skip gracefully with a clear message
+
+The fixture directory must contain at minimum:
+
+```
+<fixture-root>/
+├── drivers/
+│   ├── pfs3aio              # PFS3 handler binary
+│   └── FastFileSystem        # FFS/OFS handler binary
+└── fixtures/
+    └── readonly/
+        ├── pfs.hdf           # PFS3 hard drive image
+        └── ofs.adf           # OFS floppy image
+```
+
+Set the env var to point at your fixture directory:
+
+```sh
+export AMIFUSE_FIXTURE_ROOT=/path/to/your/fixtures
+pytest tests/integration/ -v
+```
+
+### Markers
+
+| Marker | Meaning |
+|--------|---------|
+| `slow` | Slow tests (deselect with `-m "not slow"`) |
+| `fuse` | Requires FUSE/WinFSP kernel driver |
+| `integration` | Requires external fixtures and machine68k |
+| `windows` / `macos` / `linux` | Platform-specific tests |
+
+### CI (GitHub Actions)
+
+The CI workflow (`.github/workflows/ci.yml`) runs three jobs:
+
+| Job | Platforms | Python | What |
+|-----|-----------|--------|------|
+| `unit-tests` | Linux, macOS, Windows | 3.11, 3.12, 3.13 | `pytest tests/unit/` |
+| `integration-tests` | Linux, macOS | 3.13 | `pytest tests/integration/` with external fixtures |
+| `tools-smoke` | Linux, macOS | 3.13 | `amifuse_matrix.py` + `image_format_smoke.py` |
+
+Windows is excluded from integration and tools-smoke because machine68k
+segfaults on Windows due to opcode table over-read
+([cnvogelg/machine68k#8](https://github.com/cnvogelg/machine68k/issues/8))
+and JMP/CAS collision
+([cnvogelg/machine68k#9](https://github.com/cnvogelg/machine68k/issues/9)).
+
 ## Current Gaps
 
 The following are still planned, not fully documented as standalone test
@@ -349,4 +428,8 @@ entry points yet:
 - far-end file I/O coverage inside a filesystem that spans a partition
   larger than `4GiB`
 - fuller long-run generated benchmark recipes
-- fixture-layout cleanup for `~/AmigaOS/AmiFuse/`
+- ~~fixture-layout cleanup for `~/AmigaOS/AmiFuse/`~~ (resolved:
+  `AMIFUSE_FIXTURE_ROOT` env var + fixture cascade in `tests/fixtures/paths.py`)
+- Windows integration tests pending machine68k upstream fixes
+  ([cnvogelg/machine68k#8](https://github.com/cnvogelg/machine68k/issues/8),
+  [cnvogelg/machine68k#9](https://github.com/cnvogelg/machine68k/issues/9))

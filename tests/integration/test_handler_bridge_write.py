@@ -1,7 +1,7 @@
 """HandlerBridge write-path integration tests.
 
 Uses temporary copies of fixture images to test write operations
-without modifying committed fixtures.
+without modifying source fixture images.
 
 HandlerBridge write API (verified against fuse_fs.py):
   open_file(path, flags) -> Optional[Tuple[fh_addr, dir_lock]]
