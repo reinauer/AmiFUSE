@@ -1007,8 +1007,8 @@ class HandlerLauncher:
         return run_state
 
     def send_disk_info(self, state: HandlerLaunchState, info_buf_addr: int):
-        # Arg1 = InfoData* (APTR)
-        return self.send_packet(state, ACTION_DISK_INFO, [info_buf_addr])
+        # Arg1 = InfoData* (BPTR)
+        return self.send_packet(state, ACTION_DISK_INFO, [info_buf_addr >> 2])
 
     def send_read(self, state: HandlerLaunchState, buf_addr: int, offset_bytes: int, length_bytes: int):
         # Arg1 = window (not used), Arg2 = offset (block), Arg3 = buf, Arg4 = length
