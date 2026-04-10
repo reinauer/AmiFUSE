@@ -40,7 +40,7 @@ def pytest_collection_modifyitems(config, items):
 
     if FIXTURE_ROOT is None:
         skip = pytest.mark.skip(
-            reason="No fixture root found (set AMIFUSE_FIXTURE_ROOT or clone AmiFUSE-testing)"
+            reason="No fixture root found (set AMIFUSE_FIXTURE_ROOT or place fixtures in ~/AmigaOS/AmiFuse)"
         )
         for item in items:
             if item.get_closest_marker("integration") is not None:
