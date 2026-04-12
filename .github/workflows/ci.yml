@@ -43,9 +43,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Windows excluded: machine68k segfaults due to opcode table
-        # over-read (cnvogelg/machine68k#8) and JMP/CAS collision (#9).
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        exclude:
+          # Windows excluded: machine68k segfaults due to opcode table
+          # over-read (cnvogelg/machine68k#8) and JMP/CAS collision (#9).
+          # Remove this exclude block once upstream fixes land.
+          - os: windows-latest
     steps:
       - uses: actions/checkout@v4
         with:
@@ -89,7 +92,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        exclude:
+          # Windows excluded: machine68k segfaults due to opcode table
+          # over-read (cnvogelg/machine68k#8) and JMP/CAS collision (#9).
+          # Remove this exclude block once upstream fixes land.
+          - os: windows-latest
     steps:
       - uses: actions/checkout@v4
         with:
