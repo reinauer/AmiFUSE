@@ -8,6 +8,9 @@ This repo currently has two testing layers:
 `PERFORMANCE.md` records timing policy and current benchmark tables.
 It is not the main "how do I run the tests?" document. This file is.
 
+New to the project? See [CONTRIBUTING.md](CONTRIBUTING.md) for clone,
+setup, and fixture resolution instructions.
+
 ## Fixtures
 
 Top-level AmiFuse tests use images and drivers from:
