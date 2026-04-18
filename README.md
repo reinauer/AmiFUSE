@@ -263,10 +263,12 @@ driver-info --base 0x200000 pfs3aio
 ## Supported Filesystems
 
 Currently tested with:
-- **PFS3** (Professional File System 3) via `pfs3aio` handler
-- **SFS** (Smart File System 1.279) via `SmartFileSystem` handler
-- **FFS/OFS** (Fast/Old File System) via `L:FastFileSystem` from Workbench
+- **FFS/OFS** (Fast/Old File System) via `L:FastFileSystem` from Workbench (tested with 3.2)
+- **CDFileSystem** via `L:CDFileSystem` from Workbench (tested with 3.2)
+- **PFS3** (Professional File System 3) via [pfs3aio](https://github.com/tonioni/pfs3aio) handler
+- **SFS** (Smart File System 1.279) via [SmartFileSystem](https://aminet.net/package/disk/misc/SFS) handler
 - **BFFS** (Berkeley Fast File System) via Chris Hooper's [BFFSFilesystem](https://github.com/cdhooper/bffs) handler
+- **ODFileSystem** (Optical Disc Filesystem) via Stefan Reinauer's [ODFileSystem](https://github.com/reinauer/ODFileSystem) handler
 
 Other Amiga filesystem handlers may work but have not been tested. Reports are
 welcome.
