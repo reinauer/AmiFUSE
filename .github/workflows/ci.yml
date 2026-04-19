@@ -44,11 +44,6 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        exclude:
-          # Windows excluded: machine68k segfaults due to opcode table
-          # over-read (cnvogelg/machine68k#8) and JMP/CAS collision (#9).
-          # Remove this exclude block once upstream fixes land.
-          - os: windows-latest
     steps:
       - uses: actions/checkout@v4
         with:
@@ -66,6 +61,14 @@ jobs:
         run: |
           git clone --depth 1 https://github.com/reinauer/AmiFUSE-testing.git ../AmiFUSE-testing
         continue-on-error: true
+
+      - name: Install machine68k-amifuse (Windows)
+        # Upstream machine68k lacks Windows fixes (cnvogelg/machine68k#8,
+        # #9). The machine68k-amifuse fork includes all fixes with
+        # pre-built Windows wheels.
+        # Remove this step once upstream machine68k merges the fixes.
+        if: runner.os == 'Windows'
+        run: pip install "machine68k-amifuse>=0.4.1.post1"
 
       - name: Install dependencies
         run: |
@@ -93,11 +96,6 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        exclude:
-          # Windows excluded: machine68k segfaults due to opcode table
-          # over-read (cnvogelg/machine68k#8) and JMP/CAS collision (#9).
-          # Remove this exclude block once upstream fixes land.
-          - os: windows-latest
     steps:
       - uses: actions/checkout@v4
         with:
@@ -115,6 +113,14 @@ jobs:
         run: |
           git clone --depth 1 https://github.com/reinauer/AmiFUSE-testing.git ../AmiFUSE-testing
         continue-on-error: true
+
+      - name: Install machine68k-amifuse (Windows)
+        # Upstream machine68k lacks Windows fixes (cnvogelg/machine68k#8,
+        # #9). The machine68k-amifuse fork includes all fixes with
+        # pre-built Windows wheels.
+        # Remove this step once upstream machine68k merges the fixes.
+        if: runner.os == 'Windows'
+        run: pip install "machine68k-amifuse>=0.4.1.post1"
 
       - name: Install dependencies
         run: |
