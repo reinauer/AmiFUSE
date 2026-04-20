@@ -3780,21 +3780,42 @@ def cmd_unmount(args):
         raise SystemExit(f"Mountpoint {mountpoint} is not currently mounted.")
 
     cmd = plat.get_unmount_command(mountpoint)
-    if not cmd:
-        raise SystemExit(
-            "This platform does not provide a standalone unmount command yet. "
-            "Stop the amifuse process that owns the mount instead."
-        )
-
-    result = subprocess.run(cmd, check=False)
-    if result.returncode != 0:
+    if cmd:
+        result = subprocess.run(cmd, check=False)
+        if result.returncode != 0:
+            killed_pids = _kill_mount_owner_processes(mountpoint)
+            if killed_pids:
+                result = subprocess.run(cmd, check=False)
+        if result.returncode != 0:
+            raise SystemExit(
+                f"Unmount failed with exit code {result.returncode}: "
+                f"{' '.join(cmd)}"
+            )
+    else:
+        # No platform unmount command (e.g. Windows/WinFSP) -- go straight
+        # to process termination.
         killed_pids = _kill_mount_owner_processes(mountpoint)
-        if killed_pids:
-            result = subprocess.run(cmd, check=False)
-    if result.returncode != 0:
-        raise SystemExit(
-            f"Unmount failed with exit code {result.returncode}: {' '.join(cmd)}"
-        )
+        if not killed_pids:
+            raise SystemExit(
+                f"No amifuse process found for mountpoint {mountpoint}."
+            )
+        print(f"Unmounted {mountpoint} (terminated "
+              f"{'processes' if len(killed_pids) > 1 else 'process'}"
+              f" {', '.join(str(p) for p in killed_pids)}).")
+
+
+def _truncate_left(s, max_width):
+    """Truncate a string from the left, preserving the rightmost characters.
+
+    The filename at the end of a path is more useful than the directory prefix,
+    so we trim from the left and prepend an ellipsis when truncation occurs.
+
+    >>> _truncate_left("C:/very/long/path/to/file.hdf", 20)
+    '..path/to/file.hdf'
+    """
+    if len(s) <= max_width:
+        return s
+    return ".." + s[-(max_width - 2):]
 
 
 def cmd_status(args):
@@ -3837,7 +3858,7 @@ def cmd_status(args):
                     uptime_str = f"{hrs}h {mins}m {secs}s"
                 else:
                     uptime_str = "N/A"
-                image = m.get("image") or "N/A"
+                image = _truncate_left(m.get("image") or "N/A", 40)
                 mountpoint = m.get("mountpoint") or "N/A"
                 print(f"{m['pid']:<8} {mountpoint:<20} {image:<40} {uptime_str}")
 

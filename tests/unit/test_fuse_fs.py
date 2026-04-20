@@ -393,7 +393,8 @@ class TestUnmountCommand:
 
         assert "is not currently mounted" in str(exc_info.value)
 
-    def test_unmount_rejects_platforms_without_command(self, monkeypatch, fuse_mock):
+    def test_unmount_uses_process_kill_when_no_command(self, monkeypatch, fuse_mock):
+        """When platform returns no unmount command, go straight to process kill."""
         monkeypatch.setattr("os.path.ismount", lambda path: True)
         monkeypatch.setattr(
             "amifuse.platform.get_unmount_command",
@@ -401,10 +402,33 @@ class TestUnmountCommand:
         )
         import amifuse.fuse_fs as fuse_fs_mod
 
+        killed_pids = [42]
+        monkeypatch.setattr(
+            fuse_fs_mod, "_kill_mount_owner_processes",
+            lambda mp: killed_pids,
+        )
+
+        fuse_fs_mod.cmd_unmount(argparse.Namespace(mountpoint=Path("/mnt/amiga")))
+        # Should succeed (no SystemExit)
+
+    def test_unmount_no_command_no_process_found(self, monkeypatch, fuse_mock):
+        """When no unmount command and no process found, report error."""
+        monkeypatch.setattr("os.path.ismount", lambda path: True)
+        monkeypatch.setattr(
+            "amifuse.platform.get_unmount_command",
+            lambda mountpoint: [],
+        )
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        monkeypatch.setattr(
+            fuse_fs_mod, "_kill_mount_owner_processes",
+            lambda mp: [],
+        )
+
         with pytest.raises(SystemExit) as exc_info:
             fuse_fs_mod.cmd_unmount(argparse.Namespace(mountpoint=Path("/mnt/amiga")))
 
-        assert "does not provide a standalone unmount command" in str(exc_info.value)
+        assert "No amifuse process found" in str(exc_info.value)
 
     def test_unmount_runs_for_stale_mountpoint(self, monkeypatch, fuse_mock):
         monkeypatch.setattr("os.path.ismount", lambda path: False)

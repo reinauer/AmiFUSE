@@ -130,14 +130,11 @@ def _get_winfsp_install_dir() -> Optional[str]:
 def _get_windows_unmount_command(mountpoint: Path) -> List[str]:
     """Build a Windows unmount command for the given mountpoint.
 
-    WinFSP drive-letter mounts (e.g. ``Z:``) can be detached with
-    ``net use Z: /delete``.  Non-drive-letter mounts have no standalone
-    unmount CLI -- callers handle the empty-list case by falling back to
-    process termination.
+    WinFSP mounts are not network drives, so ``net use /delete`` does not
+    work for them.  Return an empty list so that ``cmd_unmount`` falls
+    through to process-termination, which is the reliable approach on
+    Windows.
     """
-    mp_str = str(mountpoint)
-    if len(mp_str) == 2 and mp_str[1] == ":":
-        return ["net", "use", mp_str, "/delete"]
     return []
 
 
@@ -419,8 +416,12 @@ def find_amifuse_mounts():
     Returns an empty list if the discovery tool is unavailable.
     """
     if sys.platform.startswith("win"):
-        return _find_amifuse_mounts_windows()
-    return _find_amifuse_mounts_unix()
+        mounts = _find_amifuse_mounts_windows()
+    else:
+        mounts = _find_amifuse_mounts_unix()
+
+    _enrich_null_mountpoints(mounts)
+    return mounts
 
 
 def _parse_mount_tokens(tokens):
@@ -651,6 +652,110 @@ def _find_amifuse_mounts_windows():
     _process_record()
 
     return mounts
+
+
+# ---------------------------------------------------------------------------
+# Mountpoint enrichment for auto-assigned mounts
+# ---------------------------------------------------------------------------
+
+
+def _enrich_null_mountpoints(mounts):
+    """Post-process mounts to fill in mountpoint=None entries.
+
+    When users mount without --mountpoint, the CLI args don't contain
+    the mountpoint, so process scanning yields None.  We heuristically
+    detect the actual mountpoint via OS-specific APIs.
+
+    Limitation: when multiple auto-assigned mounts exist, the pairing
+    of process-to-mountpoint is non-deterministic (we lack PID-to-handle
+    mapping without admin privileges).  For the common single-mount case,
+    the 1:1 match is reliable.
+    """
+    null_mounts = [m for m in mounts if m.get("mountpoint") is None]
+    if not null_mounts:
+        return
+
+    if sys.platform.startswith("win"):
+        _enrich_mountpoints_windows(null_mounts, mounts)
+    elif sys.platform.startswith("darwin"):
+        _enrich_mountpoints_macos(null_mounts, mounts)
+    # Linux requires explicit --mountpoint; no enrichment needed.
+
+
+def _enrich_mountpoints_windows(null_mounts, all_mounts):
+    """Scan drive letters for WinFSP/AmiFUSE volumes and assign to null mounts.
+
+    Uses GetVolumeInformationW to check the filesystem name on each drive.
+    Drives with fs name starting with 'FUSE-AmiFUSE' are amifuse mounts.
+    """
+    try:
+        import ctypes
+    except ImportError:
+        return
+
+    # Collect mountpoints already known (claimed by explicit --mountpoint)
+    claimed = {m["mountpoint"] for m in all_mounts if m.get("mountpoint")}
+
+    amifuse_drives = []
+    fs_name_buf = ctypes.create_unicode_buffer(256)
+    vol_name_buf = ctypes.create_unicode_buffer(256)
+
+    for letter in "DEFGHIJKLMNOPQRSTUVWXYZ":
+        drive = f"{letter}:\\"
+        try:
+            ok = ctypes.windll.kernel32.GetVolumeInformationW(
+                drive,
+                vol_name_buf, 256,
+                None, None, None,
+                fs_name_buf, 256,
+            )
+        except Exception:
+            continue
+        if not ok:
+            continue
+        fs_name = fs_name_buf.value
+        if fs_name.startswith("FUSE-AmiFUSE"):
+            drive_mp = f"{letter}:"
+            if drive_mp not in claimed:
+                amifuse_drives.append(drive_mp)
+
+    # Match null-mountpoint processes to discovered drives.
+    # Non-deterministic for multiple mounts -- best-effort pairing.
+    for mount, drive in zip(null_mounts, amifuse_drives):
+        mount["mountpoint"] = drive
+
+
+def _enrich_mountpoints_macos(null_mounts, all_mounts):
+    """Scan /Volumes/ for amifuse mount points and assign to null mounts.
+
+    Checks entries in /Volumes/ that are actual mount points.
+    """
+    volumes_dir = "/Volumes"
+    if not os.path.isdir(volumes_dir):
+        return
+
+    claimed = {m["mountpoint"] for m in all_mounts if m.get("mountpoint")}
+
+    amifuse_volumes = []
+    try:
+        entries = os.listdir(volumes_dir)
+    except OSError:
+        return
+
+    for entry in sorted(entries):
+        vol_path = volumes_dir + "/" + entry
+        if vol_path in claimed:
+            continue
+        try:
+            if os.path.ismount(vol_path):
+                amifuse_volumes.append(vol_path)
+        except OSError:
+            continue
+
+    # Match null-mountpoint processes to discovered volumes.
+    # Non-deterministic for multiple mounts -- best-effort pairing.
+    for mount, vol in zip(null_mounts, amifuse_volumes):
+        mount["mountpoint"] = vol
 
 
 def _parse_wmic_creation_date_uptime(creation_str):
