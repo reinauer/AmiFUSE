@@ -466,3 +466,146 @@ class TestFindMountOwnerPidsRefactored:
             "amifuse.platform.find_amifuse_mounts", _raise)
         pids = _find_mount_owner_pids(Path("/mnt/a"))
         assert pids == []
+
+
+# ---------------------------------------------------------------------------
+# G. _truncate_left
+# ---------------------------------------------------------------------------
+
+
+class TestTruncateLeft:
+    """Tests for _truncate_left helper."""
+
+    def test_short_string_unchanged(self):
+        from amifuse.fuse_fs import _truncate_left
+
+        assert _truncate_left("short.hdf", 40) == "short.hdf"
+
+    def test_exact_length_unchanged(self):
+        from amifuse.fuse_fs import _truncate_left
+
+        s = "x" * 40
+        assert _truncate_left(s, 40) == s
+
+    def test_long_string_truncated_from_left(self):
+        from amifuse.fuse_fs import _truncate_left
+
+        s = "C:\\GitHub\\AmiFUSE-testing\\fixtures\\readonly\\pfs.hdf"
+        result = _truncate_left(s, 40)
+        assert len(result) == 40
+        assert result.startswith("..")
+        assert result.endswith("pfs.hdf")
+
+    def test_preserves_filename(self):
+        from amifuse.fuse_fs import _truncate_left
+
+        s = "/very/long/path/to/some/deeply/nested/file.hdf"
+        result = _truncate_left(s, 20)
+        assert result.endswith("file.hdf")
+        assert len(result) == 20
+
+    def test_empty_string(self):
+        from amifuse.fuse_fs import _truncate_left
+
+        assert _truncate_left("", 40) == ""
+
+
+# ---------------------------------------------------------------------------
+# H. Mountpoint enrichment
+# ---------------------------------------------------------------------------
+
+
+class TestEnrichNullMountpoints:
+    """Tests for _enrich_null_mountpoints and platform-specific helpers."""
+
+    def test_no_null_mountpoints_is_noop(self):
+        from amifuse.platform import _enrich_null_mountpoints
+
+        mounts = [{"mountpoint": "/mnt/a", "pid": 1}]
+        _enrich_null_mountpoints(mounts)
+        assert mounts[0]["mountpoint"] == "/mnt/a"
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="Windows-only ctypes.windll")
+    def test_enrich_windows_single_mount(self, monkeypatch):
+        from amifuse.platform import _enrich_mountpoints_windows
+
+        # Mock ctypes.windll.kernel32.GetVolumeInformationW
+        mock_kernel32 = MagicMock()
+        call_count = [0]
+        drive_info = {
+            "D:\\": ("PFS3AIO Volume", "FUSE-AmiFUSE"),
+            "E:\\": ("SomeOther", "NTFS"),
+        }
+
+        def fake_get_vol_info(drive, vol_buf, vol_sz, *rest):
+            info = drive_info.get(drive)
+            if info is None:
+                return 0
+            import ctypes
+            # Write to the buffers
+            vol_name, fs_name = info
+            for i, c in enumerate(vol_name):
+                vol_buf[i] = c
+            vol_buf[len(vol_name)] = '\0'
+            # fs_name_buf is rest[-2]
+            fs_buf = rest[-2]
+            for i, c in enumerate(fs_name):
+                fs_buf[i] = c
+            fs_buf[len(fs_name)] = '\0'
+            return 1
+
+        import ctypes
+        monkeypatch.setattr(
+            "ctypes.windll.kernel32.GetVolumeInformationW",
+            fake_get_vol_info,
+        )
+
+        mounts = [{"mountpoint": None, "pid": 123}]
+        _enrich_mountpoints_windows(mounts, mounts)
+        assert mounts[0]["mountpoint"] == "D:"
+
+    def test_enrich_macos(self, monkeypatch):
+        from amifuse.platform import _enrich_mountpoints_macos
+
+        monkeypatch.setattr("os.path.isdir", lambda p: p == "/Volumes")
+        monkeypatch.setattr("os.listdir", lambda p: ["DH0", "Macintosh HD"])
+        monkeypatch.setattr("os.path.ismount", lambda p: True)
+
+        mounts = [{"mountpoint": None, "pid": 456}]
+        all_mounts = mounts[:]
+        _enrich_mountpoints_macos(mounts, all_mounts)
+        assert mounts[0]["mountpoint"] == "/Volumes/DH0"
+
+    def test_enrich_macos_skips_claimed(self, monkeypatch):
+        from amifuse.platform import _enrich_mountpoints_macos
+
+        monkeypatch.setattr("os.path.isdir", lambda p: p == "/Volumes")
+        monkeypatch.setattr("os.listdir", lambda p: ["DH0", "DH1"])
+        monkeypatch.setattr("os.path.ismount", lambda p: True)
+
+        null_mount = {"mountpoint": None, "pid": 456}
+        claimed_mount = {"mountpoint": "/Volumes/DH0", "pid": 789}
+        all_mounts = [claimed_mount, null_mount]
+        _enrich_mountpoints_macos([null_mount], all_mounts)
+        assert null_mount["mountpoint"] == "/Volumes/DH1"
+
+    def test_text_output_uses_truncation(self, monkeypatch, capsys):
+        from amifuse.fuse_fs import cmd_status
+
+        long_path = "C:\\GitHub\\AmiFUSE-testing\\fixtures\\readonly\\pfs.hdf"
+        mounts = [{
+            "mountpoint": "D:",
+            "image": long_path,
+            "pid": 999,
+            "uptime_seconds": 60,
+            "filesystem_type": None,
+        }]
+        monkeypatch.setattr(
+            "amifuse.platform.find_amifuse_mounts", lambda: mounts)
+        args = MagicMock()
+        args.json = False
+        cmd_status(args)
+        out = capsys.readouterr().out
+        # Should contain truncation marker, not the full path
+        assert ".." in out
+        assert "pfs.hdf" in out
