@@ -52,3 +52,20 @@ class TestStatusCli:
         """Text mode (no --json) should also exit 0."""
         proc = _run_amifuse("status")
         assert proc.returncode == 0
+
+    def test_status_text_zero_mounts(self):
+        """Text mode with no active mounts shows informative message."""
+        proc = _run_amifuse("status")
+        assert proc.returncode == 0
+        assert "No active AmiFUSE mounts" in proc.stdout
+
+    def test_status_json_mount_field_types(self):
+        """If any mounts present, validate field types (not just presence)."""
+        proc = _run_amifuse("status", "--json")
+        data = json.loads(proc.stdout)
+        for mount in data["mounts"]:
+            assert isinstance(mount["mountpoint"], str)
+            assert isinstance(mount["image"], str)
+            assert isinstance(mount["pid"], int)
+            assert isinstance(mount["uptime_seconds"], (int, float))
+            assert isinstance(mount["filesystem_type"], str)
