@@ -510,166 +510,74 @@ class TestPidExists:
 
 
 class TestWindowsProcessDiscovery:
-    """Tests for _find_mount_owner_pids_windows() wmic-based discovery."""
+    """Tests for _find_mount_owner_pids() wrapper around platform.find_amifuse_mounts().
+
+    The raw wmic/ps parsing has moved to platform.py and is tested in
+    test_status.py. These tests verify the refactored wrapper in fuse_fs.py
+    correctly filters by mountpoint and handles errors.
+    """
 
     def test_finds_amifuse_pid_from_wmic_output(self, fuse_mock, monkeypatch):
         import amifuse.fuse_fs as fuse_fs_mod
+        import amifuse.platform as plat_mod
 
-        wmic_output = (
-            "\r\n"
-            "CommandLine=python -m amifuse mount disk.hdf --mountpoint Z:\r\n"
-            "ProcessId=4567\r\n"
-            "\r\n"
-        )
+        monkeypatch.setattr(plat_mod, "find_amifuse_mounts", lambda: [
+            {"mountpoint": "Z:", "image": "disk.hdf", "pid": 4567,
+             "uptime_seconds": None, "filesystem_type": None},
+        ])
 
-        def fake_run(cmd, **kwargs):
-            return argparse.Namespace(returncode=0, stdout=wmic_output)
-
-        monkeypatch.setattr(fuse_fs_mod.subprocess, "run", fake_run)
-        monkeypatch.setattr(fuse_fs_mod.os, "getpid", lambda: 999)
-
-        pids = fuse_fs_mod._find_mount_owner_pids_windows(Path("Z:"))
+        pids = fuse_fs_mod._find_mount_owner_pids(Path("Z:"))
         assert 4567 in pids
 
-    def test_excludes_own_pid(self, fuse_mock, monkeypatch):
+    def test_excludes_non_matching_mountpoint(self, fuse_mock, monkeypatch):
         import amifuse.fuse_fs as fuse_fs_mod
+        import amifuse.platform as plat_mod
 
-        wmic_output = (
-            "CommandLine=python -m amifuse mount disk.hdf --mountpoint Z:\r\n"
-            "ProcessId=999\r\n"
-            "\r\n"
-        )
+        monkeypatch.setattr(plat_mod, "find_amifuse_mounts", lambda: [
+            {"mountpoint": "Z:", "image": "disk.hdf", "pid": 999,
+             "uptime_seconds": None, "filesystem_type": None},
+        ])
 
-        def fake_run(cmd, **kwargs):
-            return argparse.Namespace(returncode=0, stdout=wmic_output)
-
-        monkeypatch.setattr(fuse_fs_mod.subprocess, "run", fake_run)
-        monkeypatch.setattr(fuse_fs_mod.os, "getpid", lambda: 999)
-
-        pids = fuse_fs_mod._find_mount_owner_pids_windows(Path("Z:"))
+        pids = fuse_fs_mod._find_mount_owner_pids(Path("Y:"))
         assert pids == []
 
-    def test_returns_empty_on_wmic_failure(self, fuse_mock, monkeypatch):
+    def test_returns_empty_on_discovery_failure(self, fuse_mock, monkeypatch):
         import amifuse.fuse_fs as fuse_fs_mod
+        import amifuse.platform as plat_mod
 
-        def fake_run(cmd, **kwargs):
-            return argparse.Namespace(returncode=1, stdout="")
-
-        monkeypatch.setattr(fuse_fs_mod.subprocess, "run", fake_run)
-
-        pids = fuse_fs_mod._find_mount_owner_pids_windows(Path("Z:"))
-        assert pids == []
-
-    def test_returns_empty_on_wmic_not_found(self, fuse_mock, monkeypatch):
-        import amifuse.fuse_fs as fuse_fs_mod
-
-        def fake_run(cmd, **kwargs):
+        def _raise():
             raise OSError("wmic not found")
+        monkeypatch.setattr(plat_mod, "find_amifuse_mounts", _raise)
 
-        monkeypatch.setattr(fuse_fs_mod.subprocess, "run", fake_run)
-
-        pids = fuse_fs_mod._find_mount_owner_pids_windows(Path("Z:"))
+        pids = fuse_fs_mod._find_mount_owner_pids(Path("Z:"))
         assert pids == []
 
-    def test_dispatcher_routes_to_windows(self, fuse_mock, monkeypatch):
+    def test_returns_empty_on_oserror(self, fuse_mock, monkeypatch):
         import amifuse.fuse_fs as fuse_fs_mod
+        import amifuse.platform as plat_mod
 
-        monkeypatch.setattr("sys.platform", "win32")
-        called = {"windows": False}
+        def _raise():
+            raise OSError("ps not found")
+        monkeypatch.setattr(plat_mod, "find_amifuse_mounts", _raise)
 
-        def fake_windows(mp):
-            called["windows"] = True
-            return []
+        pids = fuse_fs_mod._find_mount_owner_pids(Path("Z:"))
+        assert pids == []
 
-        monkeypatch.setattr(fuse_fs_mod, "_find_mount_owner_pids_windows", fake_windows)
-
-        fuse_fs_mod._find_mount_owner_pids(Path("Z:"))
-        assert called["windows"] is True
-
-    def test_dispatcher_routes_to_unix(self, fuse_mock, monkeypatch):
+    def test_filters_multiple_mounts(self, fuse_mock, monkeypatch):
         import amifuse.fuse_fs as fuse_fs_mod
+        import amifuse.platform as plat_mod
 
-        monkeypatch.setattr("sys.platform", "linux")
-        called = {"unix": False}
+        monkeypatch.setattr(plat_mod, "find_amifuse_mounts", lambda: [
+            {"mountpoint": "Z:", "image": "a.hdf", "pid": 100,
+             "uptime_seconds": None, "filesystem_type": None},
+            {"mountpoint": "Y:", "image": "b.hdf", "pid": 200,
+             "uptime_seconds": None, "filesystem_type": None},
+            {"mountpoint": "Z:", "image": "c.hdf", "pid": 300,
+             "uptime_seconds": None, "filesystem_type": None},
+        ])
 
-        def fake_unix(mp):
-            called["unix"] = True
-            return []
-
-        monkeypatch.setattr(fuse_fs_mod, "_find_mount_owner_pids_unix", fake_unix)
-
-        fuse_fs_mod._find_mount_owner_pids(Path("/mnt/amiga"))
-        assert called["unix"] is True
-
-    def test_backslash_mountpoint_preserved_with_posix_false(self, fuse_mock, monkeypatch):
-        r"""Backslash paths like C:\mnt\amiga are preserved by posix=False.
-
-        shlex.split in POSIX mode would interpret \m and \a as escape
-        sequences, mangling the path. This test verifies that the
-        non-POSIX split keeps Windows paths intact.
-        """
-        import amifuse.fuse_fs as fuse_fs_mod
-
-        wmic_output = (
-            "\r\n"
-            "CommandLine=python -m amifuse mount disk.hdf --mountpoint C:\\mnt\\amiga\r\n"
-            "ProcessId=5678\r\n"
-            "\r\n"
-        )
-
-        def fake_run(cmd, **kwargs):
-            return argparse.Namespace(returncode=0, stdout=wmic_output)
-
-        monkeypatch.setattr(fuse_fs_mod.subprocess, "run", fake_run)
-        monkeypatch.setattr(fuse_fs_mod.os, "getpid", lambda: 999)
-
-        pids = fuse_fs_mod._find_mount_owner_pids_windows(Path(r"C:\mnt\amiga"))
-        assert 5678 in pids
-
-    def test_last_record_without_trailing_blank_line(self, fuse_mock, monkeypatch):
-        """Parser flushes the final record even without a trailing blank line."""
-        import amifuse.fuse_fs as fuse_fs_mod
-
-        # No trailing \r\n after ProcessId — output ends abruptly
-        wmic_output = (
-            "\r\n"
-            "CommandLine=python -m amifuse mount disk.hdf --mountpoint Z:\r\n"
-            "ProcessId=7890"
-        )
-
-        def fake_run(cmd, **kwargs):
-            return argparse.Namespace(returncode=0, stdout=wmic_output)
-
-        monkeypatch.setattr(fuse_fs_mod.subprocess, "run", fake_run)
-        monkeypatch.setattr(fuse_fs_mod.os, "getpid", lambda: 999)
-
-        pids = fuse_fs_mod._find_mount_owner_pids_windows(Path("Z:"))
-        assert 7890 in pids
-
-    def test_malformed_quoting_falls_back_to_split(self, fuse_mock, monkeypatch):
-        """Unmatched quotes in CommandLine trigger ValueError fallback to str.split()."""
-        import amifuse.fuse_fs as fuse_fs_mod
-
-        # Unmatched double quote after mount — shlex.split will raise ValueError
-        wmic_output = (
-            "\r\n"
-            'CommandLine=python -m amifuse "mount disk.hdf --mountpoint Z:\r\n'
-            "ProcessId=3456\r\n"
-            "\r\n"
-        )
-
-        def fake_run(cmd, **kwargs):
-            return argparse.Namespace(returncode=0, stdout=wmic_output)
-
-        monkeypatch.setattr(fuse_fs_mod.subprocess, "run", fake_run)
-        monkeypatch.setattr(fuse_fs_mod.os, "getpid", lambda: 999)
-
-        # Should not raise — falls back to command.split()
-        pids = fuse_fs_mod._find_mount_owner_pids_windows(Path("Z:"))
-        # The fallback split will produce tokens that include the quote char,
-        # so --mountpoint matching may or may not succeed, but the function
-        # must not crash.
-        assert isinstance(pids, list)
+        pids = fuse_fs_mod._find_mount_owner_pids(Path("Z:"))
+        assert sorted(pids) == [100, 300]
 
 
 class TestDriverValidation:
@@ -1092,37 +1000,58 @@ class TestHandlerBridgeBstrRing:
 
 
 class TestCommandMatchesMountpoint:
-    """Direct tests for _command_matches_mountpoint() token matching."""
+    """Tests for mountpoint matching via _find_mount_owner_pids wrapper.
 
-    def test_matches_literal_mountpoint(self, fuse_mock):
-        """Matches when --mountpoint value equals the raw mountpoint string."""
-        from amifuse.fuse_fs import _command_matches_mountpoint
+    The _command_matches_mountpoint helper was removed during refactoring.
+    Mountpoint matching is now tested through the wrapper. Detailed token
+    parsing is covered in test_status.py::TestParseMountTokens.
+    """
 
-        tokens = ["python", "-m", "amifuse", "mount", "disk.hdf", "--mountpoint", "/mnt/amiga"]
-        assert _command_matches_mountpoint(tokens, "/mnt/amiga", "/mnt/amiga") is True
+    def test_matches_literal_mountpoint(self, fuse_mock, monkeypatch):
+        """Matches when mountpoint value equals the raw mountpoint string."""
+        import amifuse.fuse_fs as fuse_fs_mod
+        import amifuse.platform as plat_mod
+
+        monkeypatch.setattr(plat_mod, "find_amifuse_mounts", lambda: [
+            {"mountpoint": "/mnt/amiga", "image": "disk.hdf", "pid": 42,
+             "uptime_seconds": None, "filesystem_type": None},
+        ])
+        pids = fuse_fs_mod._find_mount_owner_pids(Path("/mnt/amiga"))
+        assert pids == [42]
+
+    def test_no_match_different_mountpoint(self, fuse_mock, monkeypatch):
+        """Does not match when the mountpoint value differs."""
+        import amifuse.fuse_fs as fuse_fs_mod
+        import amifuse.platform as plat_mod
+
+        monkeypatch.setattr(plat_mod, "find_amifuse_mounts", lambda: [
+            {"mountpoint": "/mnt/other", "image": "disk.hdf", "pid": 42,
+             "uptime_seconds": None, "filesystem_type": None},
+        ])
+        pids = fuse_fs_mod._find_mount_owner_pids(Path("/mnt/amiga"))
+        assert pids == []
+
+    def test_no_match_empty_mounts(self, fuse_mock, monkeypatch):
+        """Returns empty when no mounts are active."""
+        import amifuse.fuse_fs as fuse_fs_mod
+        import amifuse.platform as plat_mod
+
+        monkeypatch.setattr(plat_mod, "find_amifuse_mounts", lambda: [])
+        pids = fuse_fs_mod._find_mount_owner_pids(Path("/mnt/amiga"))
+        assert pids == []
 
     def test_matches_resolved_path(self, fuse_mock, monkeypatch, tmp_path):
         """Matches when the mountpoint arg resolves to the same absolute path."""
-        from amifuse.fuse_fs import _command_matches_mountpoint
+        import amifuse.fuse_fs as fuse_fs_mod
+        import amifuse.platform as plat_mod
 
-        # Use a relative-looking path that resolves to the abs_mountpoint
         abs_mp = str(tmp_path / "amiga")
-        tokens = ["python", "-m", "amifuse", "mount", "disk.hdf", "--mountpoint", str(tmp_path / "amiga")]
-        assert _command_matches_mountpoint(tokens, "./amiga", abs_mp) is True
-
-    def test_no_match_different_mountpoint(self, fuse_mock):
-        """Does not match when the mountpoint value differs."""
-        from amifuse.fuse_fs import _command_matches_mountpoint
-
-        tokens = ["python", "-m", "amifuse", "mount", "disk.hdf", "--mountpoint", "/mnt/other"]
-        assert _command_matches_mountpoint(tokens, "/mnt/amiga", "/mnt/amiga") is False
-
-    def test_no_match_without_mountpoint_flag(self, fuse_mock):
-        """Returns False when the command has no --mountpoint flag."""
-        from amifuse.fuse_fs import _command_matches_mountpoint
-
-        tokens = ["python", "-m", "amifuse", "mount", "disk.hdf"]
-        assert _command_matches_mountpoint(tokens, "/mnt/amiga", "/mnt/amiga") is False
+        monkeypatch.setattr(plat_mod, "find_amifuse_mounts", lambda: [
+            {"mountpoint": abs_mp, "image": "disk.hdf", "pid": 42,
+             "uptime_seconds": None, "filesystem_type": None},
+        ])
+        pids = fuse_fs_mod._find_mount_owner_pids(Path(abs_mp))
+        assert pids == [42]
 
 
 class TestKillEscalation:

@@ -11,9 +11,13 @@ Platform-specific implementations:
 """
 
 import errno
+import logging
 import os
+import shlex
 import shutil
+import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import List, Optional, TYPE_CHECKING
 
@@ -392,3 +396,282 @@ def pre_generate_volume_icon(bridge, debug: bool = False) -> Optional[Path]:
         print(f"[amifuse] Generated volume icon: {temp_path} ({len(icns_data)} bytes)", flush=True)
 
     return Path(temp_path)
+
+
+# ---------------------------------------------------------------------------
+# Mount discovery
+# ---------------------------------------------------------------------------
+
+logger = logging.getLogger(__name__)
+
+
+def find_amifuse_mounts():
+    """Discover all active amifuse mount processes on the system.
+
+    Returns a list of dicts, each with keys:
+        - mountpoint (str)
+        - image (str or None)
+        - pid (int)
+        - uptime_seconds (int or None)
+        - filesystem_type (None -- reserved for future use)
+
+    Raises OSError if the process discovery command fails unexpectedly.
+    Returns an empty list if the discovery tool is unavailable.
+    """
+    if sys.platform.startswith("win"):
+        return _find_amifuse_mounts_windows()
+    return _find_amifuse_mounts_unix()
+
+
+def _parse_mount_tokens(tokens):
+    """Extract image path and --mountpoint value from amifuse command tokens.
+
+    The image is the first positional arg after the 'mount' subcommand.
+    Handles both 'python -m amifuse mount <image> ...' and
+    'amifuse mount <image> ...' invocation forms.
+
+    Returns (image, mountpoint) where either may be None if not found.
+    """
+    # Find the index of 'mount' subcommand
+    mount_idx = None
+    for i, tok in enumerate(tokens):
+        if tok == "mount":
+            mount_idx = i
+            break
+    if mount_idx is None:
+        return None, None
+
+    # Image is the first positional arg after 'mount' (not starting with '-')
+    image = None
+    mountpoint = None
+    i = mount_idx + 1
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok == "--mountpoint" and i + 1 < len(tokens):
+            mountpoint = tokens[i + 1]
+            i += 2
+            continue
+        if tok.startswith("-"):
+            # Skip flags; if flag takes a value, skip next token too
+            # Known value-taking flags in mount subcommand
+            value_flags = {"--driver", "--partition", "--block-size", "--volname"}
+            if tok in value_flags and i + 1 < len(tokens):
+                i += 2
+            else:
+                i += 1
+            continue
+        if image is None:
+            image = tok
+        i += 1
+
+    return image, mountpoint
+
+
+def _find_amifuse_mounts_unix():
+    """Discover amifuse mounts on macOS/Linux using ps."""
+    is_mac = sys.platform.startswith("darwin")
+
+    # macOS: lstart gives absolute start time; Linux: etimes gives elapsed seconds
+    if is_mac:
+        ps_cmd = ["ps", "-axo", "pid=,lstart=,command="]
+    else:
+        ps_cmd = ["ps", "-axo", "pid=,etimes=,command="]
+
+    try:
+        result = subprocess.run(
+            ps_cmd, check=False, capture_output=True, text=True,
+        )
+    except OSError:
+        logger.debug("ps not available, cannot discover mounts")
+        return []
+    if result.returncode != 0:
+        logger.debug("ps exited with code %d", result.returncode)
+        return []
+
+    current_pid = os.getpid()
+    mounts = []
+
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if "amifuse" not in line or "mount" not in line:
+            continue
+
+        try:
+            if is_mac:
+                # Format: "  PID  DAY MON DD HH:MM:SS YYYY COMMAND..."
+                # lstart is 5 tokens: e.g. "Sat Apr 19 10:30:00 2026"
+                parts = line.split(None, 6)
+                if len(parts) < 7:
+                    continue
+                pid = int(parts[0])
+                lstart_str = " ".join(parts[1:6])
+                command = parts[6]
+                # Parse lstart to compute uptime
+                uptime = _parse_lstart_uptime(lstart_str)
+            else:
+                # Format: "  PID ETIMES COMMAND..."
+                parts = line.split(None, 2)
+                if len(parts) < 3:
+                    continue
+                pid = int(parts[0])
+                command = parts[2]
+                try:
+                    uptime = int(parts[1])
+                except ValueError:
+                    uptime = None
+        except ValueError:
+            logger.debug("Skipping unparseable ps line: %s", line)
+            continue
+
+        if pid == current_pid:
+            continue
+
+        # Must contain "mount" as a subcommand, not just in a path
+        try:
+            tokens = shlex.split(command)
+        except ValueError:
+            logger.debug("Skipping line with unparseable command: %s", line)
+            continue
+
+        if "mount" not in tokens:
+            continue
+
+        image, mountpoint = _parse_mount_tokens(tokens)
+
+        mounts.append({
+            "mountpoint": mountpoint,
+            "image": image,
+            "pid": pid,
+            "uptime_seconds": uptime,
+            "filesystem_type": None,
+        })
+
+    return mounts
+
+
+def _parse_lstart_uptime(lstart_str):
+    """Parse macOS ps lstart string and return uptime in seconds."""
+    import calendar
+
+    try:
+        # lstart format: "Sat Apr 19 10:30:00 2026"
+        # Parse with time.strptime (locale-independent for English month/day names)
+        t = time.strptime(lstart_str, "%a %b %d %H:%M:%S %Y")
+        start_epoch = calendar.timegm(t)
+        return max(0, int(time.time() - start_epoch))
+    except (ValueError, OverflowError):
+        return None
+
+
+def _find_amifuse_mounts_windows():
+    """Discover amifuse mounts on Windows using wmic.
+
+    Note: wmic is deprecated on Windows 11. Future fallback: use
+    Get-CimInstance Win32_Process via PowerShell if wmic is unavailable.
+    """
+    try:
+        result = subprocess.run(
+            ["wmic", "process", "where",
+             "name like '%python%'",
+             "get", "ProcessId,CommandLine,CreationDate",
+             "/FORMAT:LIST"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        # wmic not available (e.g., removed on newer Windows 11 builds)
+        logger.debug("wmic not available, cannot discover mounts")
+        return []
+    if result.returncode != 0:
+        logger.debug("wmic exited with code %d", result.returncode)
+        return []
+
+    current_pid = os.getpid()
+    mounts = []
+
+    # wmic /FORMAT:LIST outputs key=value pairs separated by blank lines
+    current_cmdline = None
+    current_pid_val = None
+    current_creation = None
+
+    def _process_record():
+        if current_cmdline is None or current_pid_val is None:
+            return
+        if current_pid_val == current_pid:
+            return
+        if "amifuse" not in current_cmdline:
+            return
+
+        try:
+            tokens = shlex.split(current_cmdline, posix=False)
+        except ValueError:
+            tokens = current_cmdline.split()
+
+        if "mount" not in tokens:
+            return
+
+        image, mountpoint = _parse_mount_tokens(tokens)
+
+        uptime = _parse_wmic_creation_date_uptime(current_creation)
+
+        mounts.append({
+            "mountpoint": mountpoint,
+            "image": image,
+            "pid": current_pid_val,
+            "uptime_seconds": uptime,
+            "filesystem_type": None,
+        })
+
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            # wmic uses \r\r\n which creates spurious empty lines between
+            # fields within a record.  Only finalise when we have a complete
+            # record (both CommandLine and ProcessId collected).
+            if current_cmdline is not None and current_pid_val is not None:
+                _process_record()
+                current_cmdline = None
+                current_pid_val = None
+                current_creation = None
+            continue
+        if line.startswith("CommandLine="):
+            current_cmdline = line[len("CommandLine="):]
+        elif line.startswith("ProcessId="):
+            try:
+                current_pid_val = int(line[len("ProcessId="):])
+            except ValueError:
+                current_pid_val = None
+        elif line.startswith("CreationDate="):
+            current_creation = line[len("CreationDate="):]
+
+    # Handle last record if no trailing blank line
+    _process_record()
+
+    return mounts
+
+
+def _parse_wmic_creation_date_uptime(creation_str):
+    """Parse wmic CreationDate (yyyymmddHHMMSS.ffffff+ZZZ) to uptime seconds."""
+    if not creation_str:
+        return None
+    try:
+        # Format: 20260419103000.123456+060
+        # Take first 14 chars: yyyymmddHHMMSS
+        dt_str = creation_str[:14]
+        t = time.strptime(dt_str, "%Y%m%d%H%M%S")
+        import calendar
+        start_epoch = calendar.timegm(t)
+        # Adjust for timezone offset in wmic output (+/- minutes)
+        if len(creation_str) > 21:
+            tz_str = creation_str[21:]
+            try:
+                tz_minutes = int(tz_str)
+                start_epoch -= tz_minutes * 60
+            except ValueError:
+                pass
+        return max(0, int(time.time() - start_epoch))
+    except (ValueError, OverflowError):
+        return None

@@ -3797,6 +3797,51 @@ def cmd_unmount(args):
         )
 
 
+def cmd_status(args):
+    """Handle the 'status' subcommand."""
+    import json
+    from . import platform as plat
+
+    try:
+        mounts = plat.find_amifuse_mounts()
+    except OSError as exc:
+        if getattr(args, "json", False):
+            print(json.dumps({
+                "status": "error",
+                "command": "status",
+                "error": f"Process discovery failed: {exc}",
+                "mounts": [],
+            }, indent=2))
+        else:
+            print(f"Error: Process discovery failed: {exc}")
+        sys.exit(1)
+
+    if getattr(args, "json", False):
+        print(json.dumps({
+            "status": "ok",
+            "command": "status",
+            "mounts": mounts,
+        }, indent=2))
+    else:
+        if not mounts:
+            print("No active AmiFUSE mounts.")
+        else:
+            # Tabular output
+            print(f"{'PID':<8} {'Mountpoint':<20} {'Image':<40} {'Uptime'}")
+            print("-" * 80)
+            for m in mounts:
+                uptime = m.get("uptime_seconds")
+                if uptime is not None:
+                    mins, secs = divmod(uptime, 60)
+                    hrs, mins = divmod(mins, 60)
+                    uptime_str = f"{hrs}h {mins}m {secs}s"
+                else:
+                    uptime_str = "N/A"
+                image = m.get("image") or "N/A"
+                mountpoint = m.get("mountpoint") or "N/A"
+                print(f"{m['pid']:<8} {mountpoint:<20} {image:<40} {uptime_str}")
+
+
 def cmd_doctor(args):
     """Handle the 'doctor' subcommand."""
     import json
@@ -3946,136 +3991,35 @@ def _kill_mount_owner_processes(mountpoint: Path) -> List[int]:
 def _find_mount_owner_pids(mountpoint: Path) -> List[int]:
     """Find PIDs of amifuse processes that own the given mountpoint.
 
-    Dispatches to platform-specific discovery: ``ps`` on Unix,
-    ``wmic`` on Windows.
+    Uses platform.find_amifuse_mounts() for process discovery, then
+    filters to those matching the given mountpoint.
     """
-    if sys.platform.startswith("win"):
-        return _find_mount_owner_pids_windows(mountpoint)
-    return _find_mount_owner_pids_unix(mountpoint)
+    from . import platform as plat
 
-
-def _find_mount_owner_pids_windows(mountpoint: Path) -> List[int]:
-    """Find amifuse PIDs on Windows using wmic."""
-    try:
-        result = subprocess.run(
-            ["wmic", "process", "where",
-             "name like '%python%'",
-             "get", "ProcessId,CommandLine",
-             "/FORMAT:LIST"],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-    except OSError:
-        return []
-    if result.returncode != 0:
-        return []
-
-    current_pid = os.getpid()
     raw_mountpoint = str(mountpoint)
     abs_mountpoint = str(mountpoint.resolve(strict=False))
-    pids = []
 
-    # wmic /FORMAT:LIST outputs key=value pairs separated by blank lines
-    current_cmdline = None
-    current_pid_val = None
-    for line in result.stdout.splitlines():
-        line = line.strip()
-        if not line:
-            # End of a record -- evaluate what we have
-            if current_cmdline is not None and current_pid_val is not None:
-                pid = current_pid_val
-                command = current_cmdline
-                if pid != current_pid and "amifuse" in command:
-                    try:
-                        tokens = shlex.split(command, posix=False)
-                    except ValueError:
-                        tokens = command.split()
-                    if _command_matches_mountpoint(tokens, raw_mountpoint, abs_mountpoint):
-                        pids.append(pid)
-            current_cmdline = None
-            current_pid_val = None
-            continue
-        if line.startswith("CommandLine="):
-            current_cmdline = line[len("CommandLine="):]
-        elif line.startswith("ProcessId="):
-            try:
-                current_pid_val = int(line[len("ProcessId="):])
-            except ValueError:
-                current_pid_val = None
-
-    # Handle last record if no trailing blank line
-    if current_cmdline is not None and current_pid_val is not None:
-        pid = current_pid_val
-        command = current_cmdline
-        if pid != current_pid and "amifuse" in command:
-            try:
-                tokens = shlex.split(command, posix=False)
-            except ValueError:
-                tokens = command.split()
-            if _command_matches_mountpoint(tokens, raw_mountpoint, abs_mountpoint):
-                pids.append(pid)
-
-    return pids
-
-
-def _find_mount_owner_pids_unix(mountpoint: Path) -> List[int]:
-    """Find amifuse PIDs on Unix using ps."""
     try:
-        result = subprocess.run(
-            ["ps", "-axo", "pid=,command="],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
+        all_mounts = plat.find_amifuse_mounts()
     except OSError:
         return []
-    if result.returncode != 0:
-        return []
 
-    current_pid = os.getpid()
-    raw_mountpoint = str(mountpoint)
-    abs_mountpoint = str(mountpoint.resolve(strict=False))
     pids = []
-
-    for line in result.stdout.splitlines():
-        line = line.strip()
-        if not line:
+    for mount in all_mounts:
+        mp = mount.get("mountpoint")
+        if mp is None:
+            continue
+        if mp == raw_mountpoint or mp == abs_mountpoint:
+            pids.append(mount["pid"])
             continue
         try:
-            pid_str, command = line.split(None, 1)
-            pid = int(pid_str)
-        except ValueError:
-            continue
-        if pid == current_pid or "amifuse" not in command:
-            continue
-        try:
-            tokens = shlex.split(command)
-        except ValueError:
-            continue
-        if not _command_matches_mountpoint(tokens, raw_mountpoint, abs_mountpoint):
-            continue
-        pids.append(pid)
-
-    return pids
-
-
-def _command_matches_mountpoint(tokens: List[str], raw_mountpoint: str, abs_mountpoint: str) -> bool:
-    for idx, token in enumerate(tokens):
-        if token != "--mountpoint":
-            continue
-        if idx + 1 >= len(tokens):
-            return False
-        mount_arg = tokens[idx + 1]
-        if mount_arg == raw_mountpoint or mount_arg == abs_mountpoint:
-            return True
-        try:
-            resolved = str(Path(mount_arg).expanduser().resolve(strict=False))
+            resolved = str(Path(mp).expanduser().resolve(strict=False))
         except OSError:
             continue
         if resolved == abs_mountpoint:
-            return True
-    return False
+            pids.append(mount["pid"])
+
+    return pids
 
 
 def _pid_exists(pid: int) -> bool:
@@ -4129,6 +4073,9 @@ commands:
     --profile                 Enable profiling and write stats to profile.txt.
 
   unmount <mountpoint>      Unmount an existing AmiFUSE mount.
+
+  status                    Show active AmiFUSE mounts on this system.
+    --json                    Output results as JSON.
 
   doctor                    Check prerequisites and environment readiness.
     --json                    Output results as JSON.
@@ -4267,6 +4214,16 @@ commands:
     )
     unmount_parser.add_argument("mountpoint", type=Path, help="Mounted filesystem path")
     unmount_parser.set_defaults(func=cmd_unmount)
+
+    # status subcommand
+    status_parser = subparsers.add_parser(
+        "status", help="Show active AmiFUSE mounts on this system."
+    )
+    status_parser.add_argument(
+        "--json", action="store_true",
+        help="Output results as JSON.",
+    )
+    status_parser.set_defaults(func=cmd_status)
 
     # doctor subcommand
     doctor_parser = subparsers.add_parser(
