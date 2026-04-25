@@ -353,6 +353,7 @@ scripts. Tests are organized into two layers:
 |-------|----------|--------|----------|
 | Unit | `tests/unit/` | _(none)_ | Python + amifuse installed |
 | Integration | `tests/integration/` | `integration` | machine68k + external fixtures |
+| Mount | `tests/integration/` | `fuse` | FUSE backend (WinFSP/FUSE-T/fuse3) + external fixtures |
 
 ### Quick Start
 
@@ -360,8 +361,11 @@ scripts. Tests are organized into two layers:
 # Unit tests (all platforms, no external dependencies)
 pytest tests/unit/ -v --timeout=30
 
-# Integration tests (Linux/macOS, needs fixtures)
+# Integration tests (needs fixtures + machine68k)
 pytest tests/integration/ -v --timeout=60
+
+# Mount tests only (needs FUSE backend + fixtures)
+pytest tests/integration/ -m fuse -v --timeout=60
 
 # All tests
 pytest tests/ -v --timeout=60
@@ -409,19 +413,27 @@ pytest tests/integration/ -v
 
 ### CI (GitHub Actions)
 
-The CI workflow (`.github/workflows/ci.yml`) runs three jobs:
+The CI workflow (`.github/workflows/ci.yml`) runs four jobs:
 
 | Job | Platforms | Python | What |
 |-----|-----------|--------|------|
 | `unit-tests` | Linux, macOS, Windows | 3.11, 3.12, 3.13 | `pytest tests/unit/` |
-| `integration-tests` | Linux, macOS | 3.13 | `pytest tests/integration/` with external fixtures |
-| `tools-smoke` | Linux, macOS | 3.13 | `amifuse_matrix.py` + `image_format_smoke.py` |
+| `integration-tests` | Linux, macOS, Windows | 3.13 | `pytest tests/integration/` with external fixtures |
+| `tools-smoke` | Linux, macOS, Windows | 3.13 | `amifuse_matrix.py` + `image_format_smoke.py` |
+| `mount-tests` | Linux, macOS, Windows | 3.13 | `pytest tests/integration/ -m fuse` with FUSE backend |
 
-Windows is excluded from integration and tools-smoke because machine68k
-segfaults on Windows due to opcode table over-read
+The `mount-tests` job installs a platform-specific FUSE backend:
+
+- **Linux:** fuse3 + libfuse-dev (fuse2 ABI for fusepy)
+- **macOS:** FUSE-T (user-space, no kext required) with libfuse compatibility symlink
+- **Windows:** WinFSP via chocolatey
+
+Windows integration and tools-smoke jobs use the `machine68k-amifuse` fork
+which includes pre-built wheels with fixes for opcode table over-read
 ([cnvogelg/machine68k#8](https://github.com/cnvogelg/machine68k/issues/8))
 and JMP/CAS collision
 ([cnvogelg/machine68k#9](https://github.com/cnvogelg/machine68k/issues/9)).
+This workaround can be removed once upstream machine68k merges the fixes.
 
 ## Current Gaps
 
@@ -433,6 +445,5 @@ entry points yet:
 - fuller long-run generated benchmark recipes
 - ~~fixture-layout cleanup for `~/AmigaOS/AmiFuse/`~~ (resolved:
   `AMIFUSE_FIXTURE_ROOT` env var + fixture cascade in `tests/fixtures/paths.py`)
-- Windows integration tests pending machine68k upstream fixes
-  ([cnvogelg/machine68k#8](https://github.com/cnvogelg/machine68k/issues/8),
-  [cnvogelg/machine68k#9](https://github.com/cnvogelg/machine68k/issues/9))
+- ~~Windows integration tests pending machine68k upstream fixes~~ (resolved:
+  `machine68k-amifuse` fork with pre-built wheels)
