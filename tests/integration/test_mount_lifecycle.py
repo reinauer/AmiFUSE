@@ -13,7 +13,6 @@ import os
 import subprocess
 import sys
 import time
-from pathlib import Path
 
 import pytest
 
@@ -211,18 +210,6 @@ def test_mount_invalid_image_fails(fuse_available, tmp_path):
     assert len(combined.strip()) > 0, "Expected an error message"
 
 
-@pytest.mark.skip(reason="Cannot test FUSE-absent path when FUSE is installed in CI")
-def test_mount_missing_fuse_detected():
-    """When FUSE is not installed, mount should fail with an actionable message.
-
-    This test is skipped in CI where FUSE is always installed. To verify
-    manually: uninstall the FUSE backend and run:
-        python -m amifuse mount some_image.hdf --interactive
-    Expected: clean error message about missing FUSE backend.
-    """
-    pass
-
-
 @pytest.mark.windows
 def test_windows_teardown_no_file_locks(mount_image, pfs3_image, pfs3_driver):
     """BW7 regression: unmount must release all handles on the image file.
@@ -277,25 +264,3 @@ def test_windows_teardown_no_file_locks(mount_image, pfs3_image, pfs3_driver):
             f"Image file {image_path} is still locked after unmount -- "
             f"stale file handles detected (BW7 regression)"
         )
-
-
-@pytest.mark.windows
-@pytest.mark.skip(reason="Manual verification only -- Explorer eject is a GUI action")
-def test_winfsp_eject_behavior():
-    """R3 empirical: WinFSP Eject behavior documentation.
-
-    WinFSP mounts appear as removable drives in Windows Explorer.
-    Right-click -> Eject triggers a clean unmount via WinFSP's internal
-    mechanism. This is NOT automatable in CI.
-
-    Manual test procedure:
-    1. Mount a PFS3 image: amifuse mount pfs.hdf --interactive
-    2. Open the mount in Explorer (navigate to the drive letter)
-    3. Right-click the drive -> Eject
-    4. Observe: the amifuse process should exit cleanly (rc=0)
-    5. The drive letter should disappear from Explorer
-    6. The image file should have no remaining locks
-
-    Document findings in DECISIONS.md under R3 (WinFSP Eject).
-    """
-    pass
