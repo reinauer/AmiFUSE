@@ -223,10 +223,9 @@ def mount_image(fuse_available, tmp_path):
                     f"Mount process exited early (rc={proc.returncode}).\n"
                     f"stdout: {stdout}\nstderr: {stderr}"
                 )
-            if os.path.ismount(str(mountpoint)):
-                mounted = True
-                break
-            # Fallback: try listdir (catches FUSE-T or Windows edge cases)
+            # On Windows, ismount detects the drive letter before the
+            # filesystem is fully initialized. Use listdir as the
+            # authoritative readiness check on all platforms.
             try:
                 os.listdir(str(mountpoint))
                 mounted = True
