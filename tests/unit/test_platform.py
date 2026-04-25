@@ -147,10 +147,42 @@ class TestGetUnmountCommand:
         result = get_unmount_command(mp)
         assert result == ["fusermount", "-u", "/mnt/amiga"]
 
-    def test_unmount_command_linux_no_fusermount(self, monkeypatch):
-        """Linux without fusermount falls back to ['umount', '-f', path].
+    def test_unmount_command_linux_fusermount3_fallback(self, monkeypatch):
+        """When fusermount is absent but fusermount3 exists, use fusermount3.
 
-        Mocks shutil.which returning None to simulate fusermount not installed.
+        Uses PurePosixPath to avoid Windows path normalization.
+        """
+        monkeypatch.setattr("sys.platform", "linux")
+        monkeypatch.setattr(
+            "amifuse.platform.shutil.which",
+            lambda cmd: "/usr/bin/fusermount3" if cmd == "fusermount3" else None,
+        )
+        from amifuse.platform import get_unmount_command
+
+        mp = PurePosixPath("/mnt/amiga")
+        result = get_unmount_command(mp)
+        assert result == ["fusermount3", "-u", "/mnt/amiga"]
+
+    def test_unmount_command_linux_prefers_fusermount(self, monkeypatch):
+        """When both fusermount and fusermount3 exist, prefer fusermount.
+
+        Uses PurePosixPath to avoid Windows path normalization.
+        """
+        monkeypatch.setattr("sys.platform", "linux")
+        monkeypatch.setattr(
+            "amifuse.platform.shutil.which",
+            lambda cmd: f"/usr/bin/{cmd}" if cmd in ("fusermount", "fusermount3") else None,
+        )
+        from amifuse.platform import get_unmount_command
+
+        mp = PurePosixPath("/mnt/amiga")
+        result = get_unmount_command(mp)
+        assert result == ["fusermount", "-u", "/mnt/amiga"]
+
+    def test_unmount_command_linux_no_fusermount(self, monkeypatch):
+        """Linux without fusermount or fusermount3 falls back to ['umount', '-f', path].
+
+        Mocks shutil.which returning None to simulate neither installed.
         Uses PurePosixPath to avoid Windows path normalization.
         """
         monkeypatch.setattr("sys.platform", "linux")

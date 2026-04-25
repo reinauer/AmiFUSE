@@ -89,9 +89,11 @@ def get_unmount_command(mountpoint: Path) -> List[str]:
         return ["umount", "-f", str(mountpoint)]
     if sys.platform.startswith("win"):
         return _get_windows_unmount_command(mountpoint)
-    # Linux - prefer fusermount if available
+    # Linux - prefer fusermount/fusermount3 if available
     if shutil.which("fusermount"):
         return ["fusermount", "-u", str(mountpoint)]
+    if shutil.which("fusermount3"):
+        return ["fusermount3", "-u", str(mountpoint)]
     return ["umount", "-f", str(mountpoint)]
 
 
