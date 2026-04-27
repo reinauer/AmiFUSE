@@ -55,6 +55,9 @@ markers = [
 ]
 filterwarnings = ["ignore::DeprecationWarning:amitools"]
 
+[tool.setuptools.package-data]
+amifuse = ["drivers/*"]
+
 [tool.setuptools.packages.find]
 include = ["amifuse*"]
 

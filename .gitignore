@@ -4,7 +4,8 @@ attic/
 mnt/
 *.hdf
 *.adf
-BFFSFilesystem
-FastFileSystem
-SmartFileSystem
-pfs3aio
+/BFFSFilesystem
+/FastFileSystem
+/SmartFileSystem
+/pfs3aio
+*.egg-info/
