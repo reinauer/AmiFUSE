@@ -112,7 +112,7 @@ class TestFindAmifuseMountsUnix:
         # Simulate current PID != 12345
         monkeypatch.setattr("amifuse.platform.os.getpid", lambda: 99999)
         self._mock_ps(monkeypatch,
-            "12345   3600 python -m amifuse mount /images/test.hdf --mountpoint /mnt/amiga\n")
+            "12345  1  3600 python -m amifuse mount /images/test.hdf --mountpoint /mnt/amiga\n")
 
         mounts = _find_amifuse_mounts_unix()
         assert len(mounts) == 1
@@ -121,6 +121,7 @@ class TestFindAmifuseMountsUnix:
         assert mounts[0]["mountpoint"] == "/mnt/amiga"
         assert mounts[0]["uptime_seconds"] == 3600
         assert mounts[0]["filesystem_type"] is None
+        assert mounts[0]["parent_pid"] == 1
 
     def test_empty_process_list(self, monkeypatch):
         from amifuse.platform import _find_amifuse_mounts_unix
@@ -134,9 +135,9 @@ class TestFindAmifuseMountsUnix:
 
         monkeypatch.setattr("amifuse.platform.os.getpid", lambda: 99999)
         self._mock_ps(monkeypatch,
-            "111   100 python some_other_script.py\n"
-            "222   200 python -m amifuse doctor --json\n"
-            "333   300 python -m amifuse mount /img.hdf --mountpoint /mnt/x\n")
+            "111  1  100 python some_other_script.py\n"
+            "222  1  200 python -m amifuse doctor --json\n"
+            "333  1  300 python -m amifuse mount /img.hdf --mountpoint /mnt/x\n")
 
         mounts = _find_amifuse_mounts_unix()
         assert len(mounts) == 1
@@ -147,7 +148,7 @@ class TestFindAmifuseMountsUnix:
 
         monkeypatch.setattr("amifuse.platform.os.getpid", lambda: 12345)
         self._mock_ps(monkeypatch,
-            "12345   100 python -m amifuse mount /img.hdf --mountpoint /mnt/x\n")
+            "12345  1  100 python -m amifuse mount /img.hdf --mountpoint /mnt/x\n")
 
         mounts = _find_amifuse_mounts_unix()
         assert mounts == []
@@ -157,8 +158,8 @@ class TestFindAmifuseMountsUnix:
 
         monkeypatch.setattr("amifuse.platform.os.getpid", lambda: 99999)
         self._mock_ps(monkeypatch,
-            "100   60 python -m amifuse mount /a.hdf --mountpoint /mnt/a\n"
-            "200   120 python -m amifuse mount /b.hdf --mountpoint /mnt/b\n")
+            "100  1  60 python -m amifuse mount /a.hdf --mountpoint /mnt/a\n"
+            "200  1  120 python -m amifuse mount /b.hdf --mountpoint /mnt/b\n")
 
         mounts = _find_amifuse_mounts_unix()
         assert len(mounts) == 2
@@ -170,7 +171,7 @@ class TestFindAmifuseMountsUnix:
         monkeypatch.setattr("amifuse.platform.os.getpid", lambda: 99999)
         self._mock_ps(monkeypatch,
             "not_a_pid amifuse mount something\n"
-            "100   60 python -m amifuse mount /a.hdf --mountpoint /mnt/a\n")
+            "100  1  60 python -m amifuse mount /a.hdf --mountpoint /mnt/a\n")
 
         mounts = _find_amifuse_mounts_unix()
         assert len(mounts) == 1
@@ -221,6 +222,7 @@ class TestFindAmifuseMountsWindows:
         self._mock_wmic(monkeypatch,
             "CommandLine=python -m amifuse mount C:/images/test.hdf --mountpoint D:\r\n"
             "CreationDate=20260419103000.123456+000\r\n"
+            "ParentProcessId=1\r\n"
             "ProcessId=12345\r\n"
             "\r\n")
 
@@ -230,6 +232,7 @@ class TestFindAmifuseMountsWindows:
         assert mounts[0]["image"] == "C:/images/test.hdf"
         assert mounts[0]["mountpoint"] == "D:"
         assert mounts[0]["filesystem_type"] is None
+        assert mounts[0]["parent_pid"] == 1
 
     def test_empty_process_list(self, monkeypatch):
         from amifuse.platform import _find_amifuse_mounts_windows
@@ -245,10 +248,12 @@ class TestFindAmifuseMountsWindows:
         self._mock_wmic(monkeypatch,
             "CommandLine=python some_script.py\r\n"
             "CreationDate=20260419100000.000000+000\r\n"
+            "ParentProcessId=1\r\n"
             "ProcessId=111\r\n"
             "\r\n"
             "CommandLine=python -m amifuse mount C:/img.hdf --mountpoint E:\r\n"
             "CreationDate=20260419100000.000000+000\r\n"
+            "ParentProcessId=1\r\n"
             "ProcessId=222\r\n"
             "\r\n")
 
@@ -280,10 +285,12 @@ class TestFindAmifuseMountsWindows:
         self._mock_wmic(monkeypatch,
             "CommandLine=python -m amifuse mount C:/a.hdf --mountpoint D:\r\n"
             "CreationDate=20260419100000.000000+000\r\n"
+            "ParentProcessId=1\r\n"
             "ProcessId=100\r\n"
             "\r\n"
             "CommandLine=python -m amifuse mount C:/b.hdf --mountpoint E:\r\n"
             "CreationDate=20260419100000.000000+000\r\n"
+            "ParentProcessId=1\r\n"
             "ProcessId=200\r\n"
             "\r\n")
 
@@ -429,10 +436,13 @@ class TestCmdStatus:
 
 
 class TestFindMountOwnerPidsRefactored:
-    """Verify the refactored _find_mount_owner_pids wraps find_amifuse_mounts."""
+    """Verify the refactored _find_mount_owner_pids wraps find_amifuse_mounts.
+
+    _find_mount_owner_pids moved to platform.py in Phase 8.
+    """
 
     def test_filters_by_mountpoint(self, monkeypatch):
-        from amifuse.fuse_fs import _find_mount_owner_pids
+        from amifuse.platform import _find_mount_owner_pids
 
         mounts = [
             {"mountpoint": "/mnt/a", "image": "a.hdf", "pid": 100,
@@ -446,7 +456,7 @@ class TestFindMountOwnerPidsRefactored:
         assert pids == [100]
 
     def test_returns_empty_on_no_match(self, monkeypatch):
-        from amifuse.fuse_fs import _find_mount_owner_pids
+        from amifuse.platform import _find_mount_owner_pids
 
         mounts = [
             {"mountpoint": "/mnt/a", "image": "a.hdf", "pid": 100,
@@ -458,7 +468,7 @@ class TestFindMountOwnerPidsRefactored:
         assert pids == []
 
     def test_returns_empty_on_oserror(self, monkeypatch):
-        from amifuse.fuse_fs import _find_mount_owner_pids
+        from amifuse.platform import _find_mount_owner_pids
 
         def _raise():
             raise OSError("ps not found")
