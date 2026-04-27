@@ -111,9 +111,14 @@ class TestBuildMenu:
         assert menu.items[0].text == "D: - image.hdf"
 
     def test_build_menu_mount_label_format(self, tray_app, fake_pystray):
-        """Label format is 'D: - image.hdf'."""
+        """Label format is 'E: - work.adf'."""
+        # Use a platform-appropriate path so Path().name extracts just the filename
+        if sys.platform == "win32":
+            image_path = "C:\\disks\\work.adf"
+        else:
+            image_path = "/disks/work.adf"
         tray_app._mounts = [
-            {"pid": 100, "mountpoint": "E:", "image": "C:\\disks\\work.adf"},
+            {"pid": 100, "mountpoint": "E:", "image": image_path},
         ]
         menu = tray_app._build_menu()
         assert menu.items[0].text == "E: - work.adf"
@@ -289,6 +294,7 @@ class TestAutoExit:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows-only: ctypes.windll")
 class TestSingleInstance:
     def test_single_instance_acquired(self, monkeypatch):
         """CreateMutexW succeeds, GetLastError != 183."""
@@ -519,6 +525,7 @@ class TestMountLabel:
         assert "game.hdf" in mount_label
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows-only: pythonw.exe logic")
 class TestInspectUsesPythonExe:
     def test_inspect_uses_python_exe(self, tray_app, fake_pystray, monkeypatch):
         """Inspect resolves python.exe not pythonw.exe/sys.executable."""
