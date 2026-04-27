@@ -11,6 +11,7 @@ Mock targets are patched at the module level where they are looked up:
 """
 
 import errno
+import signal
 import sys
 import types
 from pathlib import Path, PurePosixPath
@@ -741,3 +742,247 @@ class TestWindowsUnmountCommand:
 
         result = get_unmount_command(Path("Z:"))
         assert result == []
+
+
+# ---------------------------------------------------------------------------
+# L. _pid_exists -- 4 tests
+# ---------------------------------------------------------------------------
+
+
+class TestPidExists:
+    """Tests for _pid_exists() cross-platform behaviour."""
+
+    def test_pid_exists_true_for_live_pid(self, monkeypatch):
+        from amifuse.platform import _pid_exists
+
+        monkeypatch.setattr("amifuse.platform.sys.platform", "linux")
+        monkeypatch.setattr("amifuse.platform.os.kill", lambda pid, sig: None)
+        assert _pid_exists(12345) is True
+
+    def test_pid_exists_false_for_dead_pid(self, monkeypatch):
+        from amifuse.platform import _pid_exists
+
+        monkeypatch.setattr("amifuse.platform.sys.platform", "linux")
+
+        def raise_lookup(pid, sig):
+            raise ProcessLookupError()
+
+        monkeypatch.setattr("amifuse.platform.os.kill", raise_lookup)
+        assert _pid_exists(12345) is False
+
+    def test_pid_exists_true_on_permission_error(self, monkeypatch):
+        from amifuse.platform import _pid_exists
+
+        monkeypatch.setattr("amifuse.platform.sys.platform", "linux")
+
+        def raise_perm(pid, sig):
+            raise PermissionError("Access denied")
+
+        monkeypatch.setattr("amifuse.platform.os.kill", raise_perm)
+        assert _pid_exists(12345) is True
+
+    def test_pid_exists_false_on_generic_oserror(self, monkeypatch):
+        from amifuse.platform import _pid_exists
+
+        monkeypatch.setattr("amifuse.platform.sys.platform", "linux")
+
+        def raise_oserror(pid, sig):
+            raise OSError(22, "Invalid argument")
+
+        monkeypatch.setattr("amifuse.platform.os.kill", raise_oserror)
+        assert _pid_exists(12345) is False
+
+
+# ---------------------------------------------------------------------------
+# M. _deduplicate_fusepy_children -- 2 tests
+# ---------------------------------------------------------------------------
+
+
+class TestDeduplicateFusepyChildren:
+    """Tests for _deduplicate_fusepy_children()."""
+
+    def test_deduplicate_filters_child(self):
+        from amifuse.platform import _deduplicate_fusepy_children
+
+        mounts = [
+            {"pid": 100, "parent_pid": 1, "mountpoint": "/mnt/a"},
+            {"pid": 200, "parent_pid": 100, "mountpoint": None},
+        ]
+        result = _deduplicate_fusepy_children(mounts)
+        assert len(result) == 1
+        assert result[0]["pid"] == 100
+
+    def test_deduplicate_keeps_unrelated_processes(self):
+        from amifuse.platform import _deduplicate_fusepy_children
+
+        mounts = [
+            {"pid": 100, "parent_pid": 1, "mountpoint": "/mnt/a"},
+            {"pid": 200, "parent_pid": 1, "mountpoint": "/mnt/b"},
+        ]
+        result = _deduplicate_fusepy_children(mounts)
+        assert len(result) == 2
+
+
+# ---------------------------------------------------------------------------
+# N. kill_pids -- 4 tests
+# ---------------------------------------------------------------------------
+
+
+class TestKillPids:
+    """Tests for kill_pids() graceful-then-force strategy."""
+
+    def test_kill_pids_sends_sigterm_on_unix(self, monkeypatch):
+        """On Unix, sends SIGTERM then checks pid existence."""
+        import signal
+        from amifuse.platform import kill_pids
+
+        monkeypatch.setattr("sys.platform", "linux")
+        signals_sent = []
+
+        def fake_kill(pid, sig):
+            signals_sent.append((pid, sig))
+            if sig == 0:
+                raise ProcessLookupError()
+
+        monkeypatch.setattr("amifuse.platform.os.kill", fake_kill)
+
+        result = kill_pids([42], timeout=0.1)
+        assert 42 in result
+        assert (42, signal.SIGTERM) in signals_sent
+
+    @pytest.mark.skipif(not hasattr(signal, "SIGKILL"), reason="SIGKILL not available on Windows")
+    def test_kill_pids_force_kills_with_sigkill_unix(self, monkeypatch):
+        """On Unix, sends SIGKILL when pid survives SIGTERM."""
+        import signal
+        from amifuse.platform import kill_pids, _SIGKILL
+
+        monkeypatch.setattr("sys.platform", "linux")
+        signals_sent = []
+        alive = {42}
+
+        def fake_kill(pid, sig):
+            signals_sent.append((pid, sig))
+            if sig == 0:
+                if pid in alive:
+                    return  # still alive
+                raise ProcessLookupError()
+            if sig == _SIGKILL:
+                alive.discard(pid)
+
+        monkeypatch.setattr("amifuse.platform.os.kill", fake_kill)
+        monkeypatch.setattr("amifuse.platform.time.time", lambda: 999999)
+
+        result = kill_pids([42], timeout=0.0)
+        assert 42 in result
+        assert (42, signal.SIGKILL) in signals_sent
+
+    def test_kill_pids_sends_ctrl_break_on_windows(self, monkeypatch):
+        """On Windows, sends CTRL_BREAK_EVENT."""
+        import signal
+        from amifuse.platform import kill_pids
+
+        monkeypatch.setattr("sys.platform", "win32")
+        signals_sent = []
+
+        def fake_kill(pid, sig):
+            signals_sent.append((pid, sig))
+            if sig == 0:
+                raise ProcessLookupError()
+
+        monkeypatch.setattr("amifuse.platform.os.kill", fake_kill)
+
+        result = kill_pids([42], timeout=0.1)
+        assert 42 in result
+        assert (42, signal.CTRL_BREAK_EVENT) in signals_sent
+
+    def test_kill_pids_force_kills_with_taskkill(self, monkeypatch):
+        """On Windows, uses taskkill /F when pid survives CTRL_BREAK."""
+        import signal
+        from unittest.mock import MagicMock
+        from amifuse.platform import kill_pids
+
+        monkeypatch.setattr("sys.platform", "win32")
+        alive = {42}
+        taskkill_called = []
+
+        def fake_kill(pid, sig):
+            if sig == 0:
+                if pid in alive:
+                    return
+                raise ProcessLookupError()
+
+        def fake_run(cmd, check=False, capture_output=False, creationflags=0):
+            taskkill_called.append(cmd)
+            alive.discard(42)
+            return MagicMock(returncode=0)
+
+        monkeypatch.setattr("amifuse.platform.os.kill", fake_kill)
+        monkeypatch.setattr("amifuse.platform.subprocess.run", fake_run)
+        monkeypatch.setattr("amifuse.platform.time.time", lambda: 999999)
+
+        result = kill_pids([42], timeout=0.0)
+        assert 42 in result
+        assert any("taskkill" in cmd[0] for cmd in taskkill_called)
+
+
+# ---------------------------------------------------------------------------
+# O. CIM fallback -- 1 test
+# ---------------------------------------------------------------------------
+
+
+class TestCimFallback:
+    """Tests for _find_amifuse_mounts_cim fallback."""
+
+    def test_wmic_oserror_falls_through_to_cim(self, monkeypatch):
+        from unittest.mock import MagicMock
+        from amifuse.platform import _find_amifuse_mounts_windows
+
+        monkeypatch.setattr("sys.platform", "win32")
+
+        call_count = {"n": 0}
+
+        def fake_run(cmd, **kwargs):
+            call_count["n"] += 1
+            if cmd[0] == "wmic":
+                raise OSError("wmic not found")
+            # powershell fallback
+            result = MagicMock()
+            result.returncode = 0
+            result.stdout = b'[]'
+            return result
+
+        monkeypatch.setattr("amifuse.platform.subprocess.run", fake_run)
+
+        mounts = _find_amifuse_mounts_windows()
+        assert mounts == []
+        # Should have tried wmic then PowerShell
+        assert call_count["n"] >= 2
+
+
+# ---------------------------------------------------------------------------
+# P. find_mounts wmic uses CREATE_NO_WINDOW -- 1 test
+# ---------------------------------------------------------------------------
+
+
+class TestWmicCreationFlags:
+    """Verify wmic subprocess call uses CREATE_NO_WINDOW."""
+
+    def test_find_mounts_wmic_uses_create_no_window(self, monkeypatch):
+        from unittest.mock import MagicMock
+        from amifuse.platform import _find_amifuse_mounts_windows, _CREATE_NO_WINDOW
+
+        monkeypatch.setattr("sys.platform", "win32")
+
+        captured_kwargs = {}
+
+        def fake_run(cmd, **kwargs):
+            captured_kwargs.update(kwargs)
+            result = MagicMock()
+            result.returncode = 0
+            result.stdout = ""
+            return result
+
+        monkeypatch.setattr("amifuse.platform.subprocess.run", fake_run)
+
+        _find_amifuse_mounts_windows()
+        assert captured_kwargs.get("creationflags") == _CREATE_NO_WINDOW

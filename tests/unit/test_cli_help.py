@@ -36,6 +36,7 @@ def _run_amifuse(*args: str, timeout: float = 30.0) -> subprocess.CompletedProce
 ALL_SUBCOMMANDS = [
     "inspect", "mount", "unmount", "doctor", "format",
     "ls", "verify", "hash", "read", "write",
+    "register", "unregister",
 ]
 
 
