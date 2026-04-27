@@ -876,6 +876,7 @@ class TestKillPids:
         assert 42 in result
         assert (42, signal.SIGKILL) in signals_sent
 
+    @pytest.mark.skipif(not hasattr(signal, "CTRL_BREAK_EVENT"), reason="Windows-only signal")
     def test_kill_pids_sends_ctrl_break_on_windows(self, monkeypatch):
         """On Windows, sends CTRL_BREAK_EVENT."""
         import signal
@@ -895,6 +896,7 @@ class TestKillPids:
         assert 42 in result
         assert (42, signal.CTRL_BREAK_EVENT) in signals_sent
 
+    @pytest.mark.skipif(not hasattr(signal, "CTRL_BREAK_EVENT"), reason="Windows-only signal")
     def test_kill_pids_force_kills_with_taskkill(self, monkeypatch):
         """On Windows, uses taskkill /F when pid survives CTRL_BREAK."""
         import signal

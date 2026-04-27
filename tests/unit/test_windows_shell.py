@@ -13,6 +13,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+pytestmark = pytest.mark.skipif(sys.platform != "win32", reason="Windows-only")
+
 
 # ---------------------------------------------------------------------------
 # Fake winreg implementation
