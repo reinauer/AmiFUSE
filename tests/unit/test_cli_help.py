@@ -90,11 +90,14 @@ class TestDoctorJson:
             f"stdout: {text!r}\nstderr: {proc.stderr!r}"
         )
         data = json.loads(text[idx:])
-        assert data["command"] == "doctor"
         assert "checks" in data
-        assert "overall" in data
-        assert data["overall"] in ("ready", "degraded", "not_ready")
-        # Core checks are always present
-        for key in ("python", "amitools", "machine68k"):
-            assert key in data["checks"], f"Missing core check: {key}"
-            assert "ok" in data["checks"][key]
+        assert "overall_status" in data
+        assert data["overall_status"] in ("ready", "degraded", "not_ready")
+        # checks is a list of dicts
+        assert isinstance(data["checks"], list)
+        check_names = {c["name"] for c in data["checks"]}
+        for name in ("python", "amitools", "machine68k"):
+            assert name in check_names, f"Missing core check: {name}"
+        for check in data["checks"]:
+            assert "status" in check
+            assert "name" in check

@@ -17,30 +17,45 @@ AmiFUSE runs actual Amiga filesystem drivers (like PFS3) through m68k CPU emulat
 
 ## Installation
 
+### Quick install (recommended)
+
+The bootstrap scripts handle everything: Python, FUSE provider, virtual
+environment, pip dependencies, and `amifuse doctor --fix`.
+
 ```bash
 # Clone the repository with submodules
+git clone --recursive https://github.com/reinauer/AmiFUSE.git
+cd AmiFUSE
+```
+
+**Windows (PowerShell):**
+
+```powershell
+.\tools\install-windows.ps1
+```
+
+**macOS / Linux:**
+
+```bash
+./tools/install.sh
+```
+
+### From source (for development)
+
+Use this if you are contributing to the project or need a custom setup.
+
+```bash
 git clone --recursive https://github.com/reinauer/AmiFUSE.git
 cd AmiFUSE
 
 # Or if already cloned, initialize submodules
 git submodule update --init
-```
 
-### With virtual environment (recommended)
-
-```bash
 python3 -m venv .venv
 source .venv/bin/activate   # On Windows: .venv\Scripts\activate
 
 pip install -e './amitools[vamos]'   # Install amitools from submodule (includes machine68k)
 pip install -e .                     # Install AmiFUSE
-```
-
-### Without virtual environment
-
-```bash
-pip install --user -e './amitools[vamos]'
-pip install --user -e .
 ```
 
 ### macOS-specific
@@ -117,6 +132,7 @@ amifuse uses subcommands for different operations:
 ```bash
 amifuse inspect <image>                    # Inspect RDB partitions
 amifuse mount <image>                      # Mount a filesystem
+amifuse doctor                             # Check dependencies and configuration
 ```
 
 ### Inspecting Disk Images
@@ -169,6 +185,17 @@ Mount lifecycle:
 - Windows defaults to interactive mode because there is no standalone
   unmount command there yet.
 - `--profile` implies interactive mode.
+
+### Diagnosing Issues
+
+`amifuse doctor` checks that all dependencies (Python, FUSE provider, handlers)
+are correctly installed and configured.
+
+```bash
+amifuse doctor            # Human-readable report
+amifuse doctor --json     # Machine-readable JSON output
+amifuse doctor --fix      # Auto-fix what it can (PATH, shell registration)
+```
 
 ### Examples
 

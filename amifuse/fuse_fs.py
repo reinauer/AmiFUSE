@@ -2413,14 +2413,20 @@ def mount_fuse(
         floppy_type = "HD" if adf_info.is_hd else "DD"
         part_name = "DF0"  # Will use actual volume name from handler later
 
-        # ADF files don't have embedded drivers - user must specify one
+        # ADF files don't have embedded drivers - try auto-resolution
         if driver is None:
-            raise SystemExit(
-                f"ADF floppy image detected ({floppy_type}, {dt_str}).\n"
-                "Floppy images don't contain embedded filesystem drivers.\n"
-                "You need to specify a filesystem handler with --driver\n"
-                "For FFS/OFS floppies, use the L:FastFileSystem from a Workbench disk."
-            )
+            resolved = plat.find_driver_for_dostype(dt_str)
+            if resolved:
+                driver = str(resolved)
+            else:
+                primary_dir = plat.get_primary_driver_dir()
+                raise SystemExit(
+                    f"ADF floppy image detected ({floppy_type}, {dt_str}).\n"
+                    "Floppy images don't contain embedded filesystem drivers.\n"
+                    f"No driver found for DOS type {dt_str}.\n"
+                    f"Place FastFileSystem in {primary_dir}\n"
+                    "or specify a filesystem handler with --driver"
+                )
         driver_desc = str(driver)
         temp_driver = None
     else:
@@ -2698,6 +2704,11 @@ def format_volume(
 
 
 __version__ = "v0.5.0"
+try:
+    from importlib.metadata import version as _pkg_version
+    __version__ = f"v{_pkg_version('amifuse')}"
+except Exception:
+    pass
 __banner__ = f"amifuse {__version__} - Copyright (C) 2025-2026 by Stefan Reinauer"
 
 
@@ -2804,7 +2815,9 @@ def _create_bridge_from_args(args, command: str, read_only: bool = True):
         SystemExit on error (with JSON error if args.json is True).
     """
     import json as _json
+    import amitools.fs.DosType as DosType
     from .rdb_inspect import detect_adf, detect_iso
+    from . import platform as plat
 
     use_json = getattr(args, "json", False)
     image = args.image
@@ -2828,12 +2841,21 @@ def _create_bridge_from_args(args, command: str, read_only: bool = True):
 
     if adf_info is not None:
         if driver is None:
-            msg = ("ADF floppy image detected. Floppy images don't contain "
-                   "embedded filesystem drivers. Use --driver to specify one.")
-            if use_json:
-                print(_json.dumps(_json_error(command, "DRIVER_NOT_FOUND", msg)))
-                sys.exit(1)
-            raise SystemExit(msg)
+            dt_str = DosType.num_to_tag_str(adf_info.dos_type)
+            resolved = plat.find_driver_for_dostype(dt_str)
+            if resolved:
+                driver = str(resolved)
+            else:
+                primary_dir = plat.get_primary_driver_dir()
+                msg = (f"ADF floppy image detected ({dt_str}). "
+                       "Floppy images don't contain embedded filesystem drivers. "
+                       f"No driver found for DOS type {dt_str}. "
+                       f"Place FastFileSystem in {primary_dir} "
+                       "or use --driver to specify one.")
+                if use_json:
+                    print(_json.dumps(_json_error(command, "DRIVER_NOT_FOUND", msg)))
+                    sys.exit(1)
+                raise SystemExit(msg)
     else:
         iso_info = detect_iso(image)
         if iso_info is not None:
@@ -3865,115 +3887,8 @@ def cmd_status(args):
 
 def cmd_doctor(args):
     """Handle the 'doctor' subcommand."""
-    import json
-
-    checks = {}
-    suggestions = []
-
-    # Check 1: Python version
-    py_ver = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
-    py_ok = sys.version_info >= (3, 9)
-    checks["python"] = {
-        "version": py_ver,
-        "minimum": "3.9",
-        "ok": py_ok,
-    }
-    if not py_ok:
-        suggestions.append("Upgrade Python to 3.9 or later.")
-
-    # Check 2: amitools
-    try:
-        import amitools  # type: ignore
-        checks["amitools"] = {"available": True, "ok": True}
-    except ImportError:
-        checks["amitools"] = {"available": False, "ok": False}
-        suggestions.append("Install amitools: pip install amitools-amifuse[vamos]")
-
-    # Check 3: machine68k (m68k CPU emulator)
-    try:
-        import machine68k  # type: ignore
-        checks["machine68k"] = {"available": True, "ok": True}
-    except ImportError:
-        checks["machine68k"] = {"available": False, "ok": False}
-        suggestions.append("Install machine68k (required for m68k emulation).")
-
-    # Check 4: fusepy
-    try:
-        import fuse  # type: ignore
-        fusepy_ver = getattr(fuse, "__version__", "unknown")
-        checks["fusepy"] = {"installed": True, "version": fusepy_ver, "ok": True}
-    except ImportError:
-        checks["fusepy"] = {"installed": False, "ok": False}
-        suggestions.append("Install fusepy: pip install fusepy")
-
-    # Check 5: FUSE backend (platform-specific)
-    # NOTE: check_fuse_available() only performs an active check on Windows
-    # (WinFSP registry/path detection). On macOS/Linux it returns immediately
-    # because fusepy raises its own clear error at mount time if libfuse is
-    # missing (see platform.py line 101-104). This means on non-Windows the
-    # fuse_backend check will always report "installed: true" even if the
-    # native FUSE driver is not actually present -- the real check happens
-    # at mount time, not here.
-    from . import platform as plat
-    try:
-        # check_fuse_available() raises SystemExit (not a regular exception)
-        # when the FUSE backend is missing, so we must catch SystemExit here.
-        plat.check_fuse_available()
-        backend_name = "macFUSE" if sys.platform.startswith("darwin") else (
-            "WinFSP" if sys.platform.startswith("win") else "libfuse"
-        )
-        checks["fuse_backend"] = {"name": backend_name, "installed": True, "ok": True}
-    except SystemExit:
-        backend_name = "macFUSE" if sys.platform.startswith("darwin") else (
-            "WinFSP" if sys.platform.startswith("win") else "libfuse"
-        )
-        checks["fuse_backend"] = {"name": backend_name, "installed": False, "ok": False}
-        suggestions.append(f"Install {backend_name} for FUSE mount support.")
-
-    # Determine overall status
-    missing = [k for k, v in checks.items() if not v["ok"]]
-    # Core requirements: python, amitools, machine68k
-    core_missing = [k for k in missing if k in ("python", "amitools", "machine68k")]
-    if core_missing:
-        overall = "not_ready"
-    elif missing:
-        overall = "degraded"  # fusepy/fuse_backend missing = no mount, but ls/verify/hash work
-    else:
-        overall = "ready"
-
-    result = {
-        "status": "ok" if overall == "ready" else ("warning" if overall == "degraded" else "error"),
-        "command": "doctor",
-        "version": __version__,
-        "checks": checks,
-        "overall": overall,
-        "missing": missing,
-        "suggestions": suggestions,
-    }
-
-    if getattr(args, "json", False):
-        print(json.dumps(result, indent=2))
-    else:
-        print(f"amifuse {__version__} environment check\n")
-        for name, check in checks.items():
-            status_str = "OK" if check["ok"] else "MISSING"
-            detail = ""
-            if "version" in check:
-                detail = f" ({check['version']})"
-            elif "name" in check:
-                detail = f" ({check['name']})"
-            print(f"  {name:20s} {status_str}{detail}")
-        print(f"\nOverall: {overall}")
-        if suggestions:
-            print("\nSuggestions:")
-            for s in suggestions:
-                print(f"  - {s}")
-
-    if overall == "not_ready":
-        sys.exit(1)
-    elif overall == "degraded":
-        sys.exit(2)
-    # else sys.exit(0) -- implicit
+    from .doctor import cmd_doctor as _cmd_doctor
+    _cmd_doctor(args)
 
 
 def _kill_mount_owner_processes(mountpoint: Path) -> List[int]:
@@ -4100,6 +4015,7 @@ commands:
 
   doctor                    Check prerequisites and environment readiness.
     --json                    Output results as JSON.
+    --fix                     Auto-fix what can be fixed.
 
   format <image> <partition> [volname]
                               Format an Amiga partition.
@@ -4253,6 +4169,10 @@ commands:
     doctor_parser.add_argument(
         "--json", action="store_true",
         help="Output results as JSON.",
+    )
+    doctor_parser.add_argument(
+        "--fix", action="store_true",
+        help="Auto-fix what can be fixed.",
     )
     doctor_parser.set_defaults(func=cmd_doctor)
 

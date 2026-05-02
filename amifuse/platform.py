@@ -2,7 +2,8 @@
 Platform abstraction layer for amifuse.
 
 This module provides platform-specific functionality with a unified interface,
-including mount options, default mountpoints, unmount commands, and icon handling.
+including mount options, default mountpoints, unmount commands, icon handling,
+and driver resolution.
 
 Platform-specific implementations:
 - macOS/Darwin: icon_darwin.py
@@ -23,6 +24,87 @@ from typing import List, Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .icon_darwin import DarwinIconHandler
+
+# Prevent subprocess calls from flashing a console window when invoked from
+# pythonw.exe (e.g. tray/launcher).
+_CREATE_NO_WINDOW = 0x08000000
+
+
+# ---------------------------------------------------------------------------
+# Driver resolution
+# ---------------------------------------------------------------------------
+
+# DOS type tag string to handler binary name mapping.
+# DOS0-DOS7 are all handled by FastFileSystem (OFS = DOS0, FFS = DOS1, etc.)
+_DOSTYPE_DRIVER_MAP = {
+    "DOS0": "FastFileSystem",
+    "DOS1": "FastFileSystem",
+    "DOS2": "FastFileSystem",
+    "DOS3": "FastFileSystem",
+    "DOS4": "FastFileSystem",
+    "DOS5": "FastFileSystem",
+    "DOS6": "FastFileSystem",
+    "DOS7": "FastFileSystem",
+}
+
+
+def get_driver_search_dirs() -> List[Path]:
+    """Return list of directories to search for handler binaries.
+
+    Search order:
+    1. Bundled with package (always available after pip install)
+    2. User-installed overrides (platform-specific data directories)
+    3. Dev fallback: AmiFUSE-testing sibling repo
+    """
+    dirs: List[Path] = []
+
+    # 1. Bundled with package (always available)
+    bundled = Path(__file__).parent / "drivers"
+    if bundled.is_dir():
+        dirs.append(bundled)
+
+    # 2. User-installed overrides
+    if sys.platform.startswith("win"):
+        local = os.environ.get("LOCALAPPDATA", "")
+        if local:
+            dirs.append(Path(local) / "amifuse" / "drivers")
+    else:
+        dirs.append(Path.home() / ".local" / "share" / "amifuse" / "drivers")
+
+    # 3. Dev fallback: AmiFUSE-testing sibling
+    testing_drivers = Path(__file__).parent.parent.parent / "AmiFUSE-testing" / "drivers"
+    if testing_drivers.is_dir():
+        dirs.append(testing_drivers)
+
+    return dirs
+
+
+def find_driver_for_dostype(dos_type_str: str) -> Optional[Path]:
+    """Find a driver binary for the given DOS type tag string (e.g. "DOS0").
+
+    Args:
+        dos_type_str: DOS type as a 4-char tag string (e.g. "DOS0", "DOS1").
+
+    Returns:
+        Path to the driver binary, or None if not found.
+    """
+    driver_name = _DOSTYPE_DRIVER_MAP.get(dos_type_str)
+    if not driver_name:
+        return None
+    for search_dir in get_driver_search_dirs():
+        candidate = search_dir / driver_name
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def get_primary_driver_dir() -> Path:
+    """Return the primary (preferred) directory for installing drivers."""
+    if sys.platform.startswith("win"):
+        local = os.environ.get("LOCALAPPDATA", "")
+        if local:
+            return Path(local) / "amifuse" / "drivers"
+    return Path.home() / ".local" / "share" / "amifuse" / "drivers"
 
 
 def get_default_mountpoint(volname: str) -> Optional[Path]:
@@ -781,4 +863,120 @@ def _parse_wmic_creation_date_uptime(creation_str):
                 pass
         return max(0, int(time.time() - start_epoch))
     except (ValueError, OverflowError):
+        return None
+
+
+# ---------------------------------------------------------------------------
+# FUSE backend detection
+# ---------------------------------------------------------------------------
+
+
+def detect_fuse_backend() -> dict:
+    """Detect the installed FUSE backend and return info about it.
+
+    This is a doctor-specific query function. Does NOT raise.
+
+    Returns:
+        {"installed": bool, "name": str, "version": Optional[str]}
+    """
+    if sys.platform.startswith("win"):
+        install_dir = _get_winfsp_install_dir()
+        if install_dir is None:
+            return {"installed": False, "name": "WinFSP", "version": None}
+        version = None
+        # Optionally try to read version from the DLL
+        dll_path = os.path.join(install_dir, "bin", "winfsp-x64.dll")
+        if not os.path.isfile(dll_path):
+            dll_path = os.path.join(install_dir, "bin", "winfsp-x86.dll")
+        if os.path.isfile(dll_path):
+            try:
+                version = _get_file_version_win(dll_path)
+            except Exception:
+                pass
+        return {"installed": True, "name": "WinFSP", "version": version}
+
+    if sys.platform.startswith("darwin"):
+        # Check macFUSE
+        if os.path.isdir("/Library/Filesystems/macfuse.fs/"):
+            version = _read_macfuse_version()
+            return {"installed": True, "name": "macFUSE", "version": version}
+        # Check fuse-t
+        for libpath in ("/usr/local/lib/libfuse-t.dylib", "/opt/homebrew/lib/libfuse-t.dylib"):
+            if os.path.isfile(libpath):
+                return {"installed": True, "name": "fuse-t", "version": None}
+        # Check generic mount_fusefs
+        if shutil.which("mount_fusefs"):
+            return {"installed": True, "name": "FUSE (generic)", "version": None}
+        return {"installed": False, "name": "macFUSE", "version": None}
+
+    # Linux
+    fm = shutil.which("fusermount3") or shutil.which("fusermount")
+    if fm:
+        name = "FUSE3" if "fusermount3" in fm else "FUSE"
+        return {"installed": True, "name": name, "version": None}
+    # Check for libfuse
+    for lib_dir in ("/usr/lib", "/usr/lib64", "/usr/local/lib"):
+        for lib_name in ("libfuse3.so", "libfuse.so"):
+            if os.path.isfile(os.path.join(lib_dir, lib_name)):
+                name = "FUSE3" if "fuse3" in lib_name else "FUSE"
+                return {"installed": True, "name": name, "version": None}
+    return {"installed": False, "name": "FUSE", "version": None}
+
+
+def _read_macfuse_version() -> Optional[str]:
+    """Try to read macFUSE version from its plist."""
+    plist_path = "/Library/Filesystems/macfuse.fs/Contents/Info.plist"
+    try:
+        import plistlib
+        with open(plist_path, "rb") as f:
+            plist = plistlib.load(f)
+        return plist.get("CFBundleVersion")
+    except Exception:
+        return None
+
+
+def _get_file_version_win(filepath: str) -> Optional[str]:
+    """Read file version from a Windows DLL/EXE using GetFileVersionInfoW."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        version_dll = ctypes.windll.version
+        size = version_dll.GetFileVersionInfoSizeW(filepath, None)
+        if not size:
+            return None
+
+        data = ctypes.create_string_buffer(size)
+        if not version_dll.GetFileVersionInfoW(filepath, 0, size, data):
+            return None
+
+        buf = ctypes.c_void_p()
+        buf_len = wintypes.UINT()
+        if not version_dll.VerQueryValueW(
+            data, "\\", ctypes.byref(buf), ctypes.byref(buf_len)
+        ):
+            return None
+
+        class VS_FIXEDFILEINFO(ctypes.Structure):
+            _fields_ = [
+                ("dwSignature", wintypes.DWORD),
+                ("dwStrucVersion", wintypes.DWORD),
+                ("dwFileVersionMS", wintypes.DWORD),
+                ("dwFileVersionLS", wintypes.DWORD),
+                ("dwProductVersionMS", wintypes.DWORD),
+                ("dwProductVersionLS", wintypes.DWORD),
+                ("dwFileFlagsMask", wintypes.DWORD),
+                ("dwFileFlags", wintypes.DWORD),
+                ("dwFileOS", wintypes.DWORD),
+                ("dwFileType", wintypes.DWORD),
+                ("dwFileSubtype", wintypes.DWORD),
+                ("dwFileDateMS", wintypes.DWORD),
+                ("dwFileDateLS", wintypes.DWORD),
+            ]
+
+        info = ctypes.cast(buf, ctypes.POINTER(VS_FIXEDFILEINFO)).contents
+        ms = info.dwFileVersionMS
+        ls = info.dwFileVersionLS
+        return f"{(ms >> 16) & 0xFFFF}.{ms & 0xFFFF}.{(ls >> 16) & 0xFFFF}.{ls & 0xFFFF}"
+    except Exception:
         return None
