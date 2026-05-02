@@ -16,12 +16,10 @@ import subprocess
 import sys
 import time
 
-# signal.SIGKILL is not defined on Windows; fall back to SIGTERM so that
-# _kill_mount_owner_processes() can still compile and will use the strongest
-# signal available.
-_SIGKILL = getattr(signal, "SIGKILL", signal.SIGTERM)
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+
+from .platform import _kill_mount_owner_processes
 
 try:
     from fuse import FUSE, FuseOSError, LoggingMixIn, Operations  # type: ignore
@@ -1583,8 +1581,9 @@ class AmigaFuseFS(Operations):
 
     def _root_stat(self):
         now = int(time.time())
+        perm = 0o777 if self.bridge._write_enabled else 0o755
         return {
-            "st_mode": (0o755 | 0o040000),  # drwxr-xr-x
+            "st_mode": (perm | 0o040000),
             "st_nlink": 2,
             "st_size": 0,
             "st_ctime": now,
@@ -2495,11 +2494,6 @@ def mount_fuse(
 
     if foreground is None:
         foreground = plat.mount_runs_in_foreground_by_default()
-    if not foreground and not plat.get_unmount_command(mountpoint):
-        raise SystemExit(
-            "Daemon mode is not supported on this platform yet because there is "
-            "no standalone unmount command. Use --interactive instead."
-        )
 
     # Print startup banner
     print(__banner__)
@@ -2562,6 +2556,12 @@ def mount_fuse(
         "fsname": f"amifuse:{volname}",
         "default_permissions": True,  # Let kernel handle permission checks
     }
+    # WinFSP maps FUSE uid=0/gid=0 to Windows SID S-1-5-0 (Nobody), blocking
+    # write access for the current user.  uid/gid=-1 tells WinFSP to use the
+    # mounting user's SID instead.
+    if sys.platform.startswith("win"):
+        fuse_kwargs["uid"] = -1
+        fuse_kwargs["gid"] = -1
     # subtype is a Linux-only FUSE option; WinFSP and macFUSE don't support it
     if sys.platform.startswith("linux"):
         fuse_kwargs["subtype"] = "amifuse"
@@ -3780,12 +3780,13 @@ def cmd_unmount(args):
         raise SystemExit(f"Mountpoint {mountpoint} is not currently mounted.")
 
     cmd = plat.get_unmount_command(mountpoint)
+    _no_window = {"creationflags": 0x08000000} if sys.platform.startswith("win") else {}
     if cmd:
-        result = subprocess.run(cmd, check=False)
+        result = subprocess.run(cmd, check=False, **_no_window)
         if result.returncode != 0:
             killed_pids = _kill_mount_owner_processes(mountpoint)
             if killed_pids:
-                result = subprocess.run(cmd, check=False)
+                result = subprocess.run(cmd, check=False, **_no_window)
         if result.returncode != 0:
             raise SystemExit(
                 f"Unmount failed with exit code {result.returncode}: "
@@ -3976,84 +3977,16 @@ def cmd_doctor(args):
     # else sys.exit(0) -- implicit
 
 
-def _kill_mount_owner_processes(mountpoint: Path) -> List[int]:
-    pids = _find_mount_owner_pids(mountpoint)
-    if not pids:
-        return []
-
-    remaining = []
-    for pid in pids:
-        try:
-            os.kill(pid, signal.SIGTERM)
-            remaining.append(pid)
-        except (ProcessLookupError, OSError):
-            continue
-
-    deadline = time.time() + 1.0
-    while remaining and time.time() < deadline:
-        still_alive = []
-        for pid in remaining:
-            if _pid_exists(pid):
-                still_alive.append(pid)
-        if not still_alive:
-            return pids
-        remaining = still_alive
-        time.sleep(0.05)
-
-    for pid in remaining:
-        try:
-            os.kill(pid, _SIGKILL)
-        except (ProcessLookupError, OSError):
-            continue
-
-    return pids
+def cmd_register(args):
+    """Handle the 'register' subcommand."""
+    from .windows_shell import register
+    register()
 
 
-def _find_mount_owner_pids(mountpoint: Path) -> List[int]:
-    """Find PIDs of amifuse processes that own the given mountpoint.
-
-    Uses platform.find_amifuse_mounts() for process discovery, then
-    filters to those matching the given mountpoint.
-    """
-    from . import platform as plat
-
-    raw_mountpoint = str(mountpoint)
-    abs_mountpoint = str(mountpoint.resolve(strict=False))
-
-    try:
-        all_mounts = plat.find_amifuse_mounts()
-    except OSError:
-        return []
-
-    pids = []
-    for mount in all_mounts:
-        mp = mount.get("mountpoint")
-        if mp is None:
-            continue
-        if mp == raw_mountpoint or mp == abs_mountpoint:
-            pids.append(mount["pid"])
-            continue
-        try:
-            resolved = str(Path(mp).expanduser().resolve(strict=False))
-        except OSError:
-            continue
-        if resolved == abs_mountpoint:
-            pids.append(mount["pid"])
-
-    return pids
-
-
-def _pid_exists(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError:
-        # Windows raises a generic OSError for invalid/dead PIDs
-        return False
-    return True
+def cmd_unregister(args):
+    """Handle the 'unregister' subcommand."""
+    from .windows_shell import unregister
+    unregister()
 
 
 def _validate_driver_path(driver: Optional[Path]) -> None:
@@ -4100,6 +4033,9 @@ commands:
 
   doctor                    Check prerequisites and environment readiness.
     --json                    Output results as JSON.
+
+  register                  Add Windows Explorer context menu entries.
+  unregister                Remove Windows Explorer context menu entries.
 
   format <image> <partition> [volname]
                               Format an Amiga partition.
@@ -4255,6 +4191,17 @@ commands:
         help="Output results as JSON.",
     )
     doctor_parser.set_defaults(func=cmd_doctor)
+
+    # register / unregister subcommands (Windows shell integration)
+    register_parser = subparsers.add_parser(
+        "register", help="Register AmiFUSE file associations (Windows)."
+    )
+    register_parser.set_defaults(func=cmd_register)
+
+    unregister_parser = subparsers.add_parser(
+        "unregister", help="Remove AmiFUSE file associations (Windows)."
+    )
+    unregister_parser.set_defaults(func=cmd_unregister)
 
     # format subcommand
     format_parser = subparsers.add_parser(

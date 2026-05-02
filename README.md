@@ -34,6 +34,7 @@ source .venv/bin/activate   # On Windows: .venv\Scripts\activate
 
 pip install -e './amitools[vamos]'   # Install amitools from submodule (includes machine68k)
 pip install -e .                     # Install AmiFUSE
+pip install -e '.[windows]'         # Windows only: adds pystray + Pillow for tray/shell integration
 ```
 
 ### Without virtual environment
@@ -117,6 +118,10 @@ amifuse uses subcommands for different operations:
 ```bash
 amifuse inspect <image>                    # Inspect RDB partitions
 amifuse mount <image>                      # Mount a filesystem
+amifuse unmount <mountpoint>               # Unmount a filesystem
+amifuse doctor                             # Check dependencies and configuration
+amifuse register                           # Add Windows Explorer context menu entries
+amifuse unregister                         # Remove Windows Explorer context menu entries
 ```
 
 ### Inspecting Disk Images
@@ -166,8 +171,10 @@ Mount lifecycle:
 - `--interactive` / `--foreground` keeps AmiFUSE attached to the terminal.
   Use this for debugging or when you want `Ctrl+C` to unmount from the same
   shell.
-- Windows defaults to interactive mode because there is no standalone
-  unmount command there yet.
+- Windows defaults to daemon mode. You can mount via the Explorer context
+  menu (`amifuse register`), unmount from the system tray icon, or use
+  `amifuse unmount <mountpoint>` from the CLI. Note: the WinFSP "Eject"
+  action does not perform a clean unmount — use the tray or CLI instead.
 - `--profile` implies interactive mode.
 
 ### Examples
@@ -284,13 +291,37 @@ The `--icons` flag enables conversion of Amiga `.info` icon files to native Find
 
 *** This feature is experimental and macOS-only. ***
 
+## Windows Shell Integration
+
+On Windows, AmiFUSE can integrate with Explorer for a right-click mount
+experience and a system tray mount manager.
+
+### Context menu registration
+
+```bash
+amifuse register      # Add "Mount with AmiFUSE" to .hdf/.adf context menus
+amifuse unregister    # Remove the context menu entries
+```
+
+Registration writes to `HKCU` (current user only) — no administrator privileges
+are required.
+
+### Tray mount manager
+
+When a filesystem is mounted in daemon mode on Windows, the `amifuse-tray`
+helper appears in the system tray. From the tray icon you can see active mounts
+and unmount them cleanly.
+
+The tray requires optional dependencies: install them with
+`pip install amifuse[windows]` (provides pystray and Pillow).
+
 ## Notes
 
 - The filesystem is mounted **read-only** by default; use `--write` for experimental read-write support
 - macOS and Linux default to daemon mode; use `--interactive` if you want
   Ctrl+C to unmount from the same terminal
 - Use `amifuse unmount <mountpoint>` to tear down daemon mounts
-- Windows defaults to interactive mode until it grows a standalone unmount
-  path
+- Windows defaults to daemon mode; unmount via the system tray icon or
+  `amifuse unmount <mountpoint>`
 - macOS Finder/Spotlight indexing is automatically disabled to improve performance
 - First directory traversal may be slow as the handler processes each path; subsequent accesses are cached

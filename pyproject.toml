@@ -33,6 +33,10 @@ amifuse = "amifuse.fuse_fs:main"
 rdb-inspect = "amifuse.rdb_inspect:main"
 driver-info = "amifuse.driver_info:main"
 
+[project.gui-scripts]
+amifuse-launcher = "amifuse.launcher:main"
+amifuse-tray = "amifuse.tray:main"
+
 [project.urls]
 Homepage = "https://github.com/reinauer/amifuse"
 
@@ -41,6 +45,10 @@ test = [
     "pytest>=7.0",
     "pytest-cov>=4.0",
     "pytest-timeout>=2.0",
+]
+windows = [
+    "pystray>=0.19",
+    "Pillow>=9.0",
 ]
 
 [tool.pytest.ini_options]
