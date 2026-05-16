@@ -2,8 +2,12 @@ Downloads/
 **/__pycache__/
 attic/
 mnt/
+mnt-*/
+dh[0-9]*/
 *.hdf
 *.adf
+*.egg-info/
+.venv/
 BFFSFilesystem
 FastFileSystem
 SmartFileSystem
