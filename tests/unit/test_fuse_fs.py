@@ -3746,3 +3746,170 @@ class TestCreateBridgeReadOnlyParam:
         )
         fuse_fs_mod._create_bridge_from_args(args, "test", read_only=False)
         assert captured.get("read_only") is False
+
+
+# ---------------------------------------------------------------------------
+# TestPinnedStatCache -- regression tests for the create -> getattr race
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def write_fs(fuse_mock):
+    """Write-enabled AmigaFuseFS over a MagicMock bridge.
+
+    Returns (fs, bridge). The bridge has _write_enabled=True so cache TTLs
+    are set to 0 in __init__, which is the configuration where the
+    create -> getattr race manifested.
+    """
+    from amifuse.fuse_fs import AmigaFuseFS
+
+    bridge = MagicMock()
+    bridge._write_enabled = True
+    bridge.state = None  # _check_handler_alive treats this as "not crashed"
+    fs = AmigaFuseFS(bridge, debug=False, icons=False)
+    return fs, bridge
+
+
+class TestPinnedStatCache:
+    """Stat cache must survive the create() -> getattr() -> release() window
+    in write mode. Without pinning, libfuse2's post-create getattr probe
+    falls through to the handler, which returns ERROR_OBJECT_IN_USE on the
+    still-open FINDOUTPUT handle. The kernel then translates that to ENOENT
+    and cp on Linux fails with "No such file or directory" while leaving a
+    zero-byte stub on disk.
+    """
+
+    def test_write_mode_uses_zero_cache_ttls(self, write_fs):
+        """Precondition: write mode does set _cache_ttl to 0 (the trigger)."""
+        fs, _ = write_fs
+        assert fs._cache_ttl == 0.0
+        assert fs._neg_cache_ttl == 0.0
+        assert fs._dir_cache_ttl == 0.0
+
+    def test_create_populates_stat_cache_and_pins_path(self, write_fs):
+        """create() must seed _stat_cache AND add the path to _pinned_stats
+        so the entry survives the TTL=0 check.
+        """
+        fs, bridge = write_fs
+        # bridge.open_file returns (fh_addr, parent_lock)
+        bridge.open_file.return_value = (0x4abbc, 0)
+
+        fh = fs.create("/Makefile", 0o100664)
+
+        assert fh > 0
+        assert "/Makefile" in fs._stat_cache
+        assert "/Makefile" in fs._pinned_stats
+        bridge.open_file.assert_called_once()
+
+    def test_get_cached_stat_returns_pinned_entry_despite_zero_ttl(self, write_fs):
+        """The bug: _get_cached_stat used to return None for entries set
+        in write mode (TTL=0) even when they had just been written. With
+        pinning, the entry survives.
+        """
+        fs, bridge = write_fs
+        bridge.open_file.return_value = (0x4abbc, 0)
+        fs.create("/Makefile", 0o100664)
+
+        cached = fs._get_cached_stat("/Makefile")
+
+        assert cached is not None, (
+            "create()-primed entry must be visible to the immediate "
+            "follow-up getattr; without pinning libfuse2 returns ENOENT "
+            "to userspace and cp errors out."
+        )
+        assert cached["st_mode"] == 0o100644
+
+    def test_getattr_after_create_does_not_hit_handler(self, write_fs):
+        """Whole-stack reproduction: getattr right after create() must be
+        served from the pinned cache, not from bridge.stat_path() (which
+        would return ERROR_OBJECT_IN_USE on the still-open handle).
+        """
+        fs, bridge = write_fs
+        bridge.open_file.return_value = (0x4abbc, 0)
+        fs.create("/Makefile", 0o100664)
+
+        # Tripwire: any call to stat_path means the cache miss happened
+        # and the bug is back. The actual bug path returned None here.
+        bridge.stat_path.side_effect = AssertionError(
+            "post-create getattr fell through to handler instead of "
+            "hitting the pinned stat cache"
+        )
+
+        attrs = fs.getattr("/Makefile")
+
+        assert attrs["st_mode"] == 0o100644
+        bridge.stat_path.assert_not_called()
+
+    def test_release_unpins_path(self, write_fs):
+        """After release(), the file handle is closed and PFS3 can serve
+        fresh stats again; the pinned entry must be dropped so subsequent
+        getattr re-queries the handler (and sees real size, mtime, etc.).
+        """
+        fs, bridge = write_fs
+        bridge.open_file.return_value = (0x4abbc, 0)
+        bridge.close_file.return_value = None
+        fh = fs.create("/Makefile", 0o100664)
+
+        fs.release("/Makefile", fh)
+
+        assert "/Makefile" not in fs._pinned_stats
+        # In write mode (TTL=0) the entry itself is also dropped, so the
+        # next getattr will go to the handler.
+        assert "/Makefile" not in fs._stat_cache
+        bridge.close_file.assert_called_once_with(0x4abbc)
+
+    def test_write_keeps_pinned_size_in_sync(self, write_fs):
+        """While a file is pinned (created but not yet released), write()
+        must update the cached size so a concurrent getattr does not
+        observe size=0 after data has been written.
+        """
+        fs, bridge = write_fs
+        bridge.open_file.return_value = (0x4abbc, 0)
+        # write() picks write_handle_at when entry["pos"] is None (which it
+        # is right after create()).
+        bridge.write_handle_at.return_value = 100
+        fh = fs.create("/Makefile", 0o100664)
+        # Initial primed size is 0.
+        assert fs._stat_cache["/Makefile"][1]["st_size"] == 0
+
+        fs.write("/Makefile", b"x" * 100, 0, fh)
+
+        assert fs._stat_cache["/Makefile"][1]["st_size"] == 100
+
+    def test_unlink_discards_pin(self, write_fs):
+        """unlink() must clean up _pinned_stats so a later create() of the
+        same name starts from a fresh slate.
+        """
+        fs, bridge = write_fs
+        bridge.open_file.return_value = (0x4abbc, 0)
+        bridge.close_file.return_value = None
+        bridge.locate_path.return_value = (0x6855, 0, [])
+        bridge.delete_object.return_value = (-1, 0)  # res1=-1 means success
+        fh = fs.create("/Makefile", 0o100664)
+        fs.release("/Makefile", fh)
+        # Manually re-pin to simulate the "pinned but not yet released" case
+        # so we can prove unlink scrubs it.
+        fs._pinned_stats.add("/Makefile")
+
+        fs.unlink("/Makefile")
+
+        assert "/Makefile" not in fs._pinned_stats
+        assert "/Makefile" not in fs._stat_cache
+
+    def test_rename_discards_pins_on_both_paths(self, write_fs):
+        """rename() must clean both source and destination pin entries to
+        avoid stale stat being served under the new name.
+        """
+        fs, bridge = write_fs
+        bridge.locate_path.return_value = (0x6855, 0, [])
+        bridge.rename_object.return_value = (-1, 0)
+        fs._pinned_stats.update({"/old", "/new"})
+        fs._stat_cache["/old"] = (0.0, {"st_size": 1})
+        fs._stat_cache["/new"] = (0.0, {"st_size": 2})
+
+        fs.rename("/old", "/new")
+
+        assert "/old" not in fs._pinned_stats
+        assert "/new" not in fs._pinned_stats
+        assert "/old" not in fs._stat_cache
+        assert "/new" not in fs._stat_cache

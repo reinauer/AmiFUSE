@@ -21,7 +21,7 @@ import time
 # signal available.
 _SIGKILL = getattr(signal, "SIGKILL", signal.SIGTERM)
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 try:
     from fuse import FUSE, FuseOSError, LoggingMixIn, Operations  # type: ignore
@@ -1461,6 +1461,13 @@ class AmigaFuseFS(Operations):
         self._neg_cache_ttl = 3600.0  # Cache negative results for 1 hour
         self._dir_cache: Dict[str, Tuple[float, List[str]]] = {}  # path -> (timestamp, entries)
         self._dir_cache_ttl = 3600.0  # Cache directory listings for 1 hour
+        # Paths whose stat cache entry must survive even at TTL=0. libfuse2's
+        # high-level API calls getattr immediately after create() to fill the
+        # entry reply; if that probe hit PFS3 it would get ERROR_OBJECT_IN_USE
+        # while the new file's handle is still open, and the kernel would
+        # return ENOENT to userspace. Populated by create(), cleared by
+        # release()/unlink().
+        self._pinned_stats: Set[str] = set()
         if self.bridge._write_enabled:
             self._cache_ttl = 0.0
             self._neg_cache_ttl = 0.0
@@ -1542,7 +1549,7 @@ class AmigaFuseFS(Operations):
         """Return cached stat result if still valid, else None."""
         if path in self._stat_cache:
             ts, result = self._stat_cache[path]
-            if time.time() - ts < self._cache_ttl:
+            if (time.time() - ts < self._cache_ttl) or path in self._pinned_stats:
                 return result
             del self._stat_cache[path]
         return None
@@ -1883,6 +1890,18 @@ class AmigaFuseFS(Operations):
                 raise FuseOSError(errno.EIO)
             entry["pos"] = offset + written
             entry["dirty"] = True  # Mark as needing flush on close
+        # Keep pinned stat cache in sync so a mid-write getattr (e.g. cp -v
+        # checking progress) sees the growing size rather than the size=0
+        # baseline written by create().
+        if path in self._pinned_stats:
+            cached = self._stat_cache.get(path)
+            if cached is not None:
+                ts, stat = cached
+                new_size = max(stat["st_size"], offset + written)
+                if new_size != stat["st_size"]:
+                    stat = dict(stat)
+                    stat["st_size"] = new_size
+                    self._stat_cache[path] = (ts, stat)
         return written
 
     def truncate(self, path, length, fh=None):
@@ -1941,6 +1960,9 @@ class AmigaFuseFS(Operations):
                     "dirty": True,  # New files are always dirty
                 }
             # Prime stat/dir cache so immediate getattr after create doesn't fail.
+            # Pin the entry: in write mode _cache_ttl is 0, so without pinning
+            # libfuse2's post-create getattr probe would fall through to PFS3
+            # and get ERROR_OBJECT_IN_USE on the still-open handle.
             now = time.time()
             self._stat_cache[path] = (
                 now,
@@ -1955,6 +1977,7 @@ class AmigaFuseFS(Operations):
                     "st_gid": self._gid,
                 },
             )
+            self._pinned_stats.add(path)
             parent_path, _ = self._split_path(path)
             self._dir_cache.pop(parent_path, None)
             self._log_op("create", path, f"SUCCESS handle={handle} fh_addr=0x{fh_addr:x}")
@@ -1987,6 +2010,7 @@ class AmigaFuseFS(Operations):
         if res1 == 0:
             raise FuseOSError(errno.EIO)
         self._stat_cache.pop(path, None)
+        self._pinned_stats.discard(path)
         self._dir_cache.pop(dir_path, None)
         for l in reversed(locks):
             self.bridge.free_lock(l)
@@ -2033,6 +2057,8 @@ class AmigaFuseFS(Operations):
             raise FuseOSError(errno.EIO)
         self._stat_cache.pop(old, None)
         self._stat_cache.pop(new, None)
+        self._pinned_stats.discard(old)
+        self._pinned_stats.discard(new)
         self._dir_cache.pop(src_dir, None)
         self._dir_cache.pop(dst_dir, None)
         for l in reversed(src_locks):
@@ -2288,6 +2314,10 @@ class AmigaFuseFS(Operations):
             parent_lock = entry.get("parent_lock", 0)
             if parent_lock:
                 self.bridge.free_lock(parent_lock)
+        # Unpin stat cache so future getattr re-queries PFS3 for current size.
+        self._pinned_stats.discard(path)
+        if self._cache_ttl <= 0:
+            self._stat_cache.pop(path, None)
         return 0
 
     def destroy(self, path):
