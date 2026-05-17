@@ -115,6 +115,7 @@ class HandlerBridge:
         partition: Optional[str] = None,
         adf_info=None,
         iso_info=None,
+        strict_dostype: bool = False,
     ):
         self._lock = threading.RLock()  # Reentrant lock for thread safety
         self._debug = debug
@@ -141,6 +142,7 @@ class HandlerBridge:
         ba = BootstrapAllocator(
             self.vh, image, partition=partition, adf_info=adf_info,
             iso_info=iso_info, mbr_partition_index=mbr_idx,
+            strict_dostype=strict_dostype,
         )
         if adf_info:
             handler_name = "DF0:"
@@ -150,6 +152,15 @@ class HandlerBridge:
             handler_name = "DH0:"
         boot = ba.alloc_all(handler_seglist_baddr=seg_baddr, handler_seglist_bptr=seg_baddr, handler_name=handler_name)
         self._partition_index = boot["part"].num if boot.get("part") else 0
+        self._dostype_remap = ba.remapped_dostype
+        if ba.remapped_dostype is not None:
+            orig, new = ba.remapped_dostype
+            import amitools.fs.DosType as _DosType
+            print(
+                f"[amifuse] dostype remap: {_DosType.num_to_tag_str(orig)} "
+                f"(0x{orig:08x}) -> {_DosType.num_to_tag_str(new)} (0x{new:08x}) "
+                f"for compatibility (pass --strict-dostype to keep the original)"
+            )
 
         # Log partition geometry for debugging.
         if boot.get("part") and debug:
@@ -2394,6 +2405,7 @@ def mount_fuse(
     partition: Optional[str] = None,
     icons: bool = False,
     foreground: Optional[bool] = None,
+    strict_dostype: bool = False,
 ):
     _require_fuse()
     import amitools.fs.DosType as DosType
@@ -2534,6 +2546,7 @@ def mount_fuse(
         partition=partition,
         adf_info=adf_info,
         iso_info=iso_info,
+        strict_dostype=strict_dostype,
     )
     if _handler_has_crashed(bridge):
         bridge.close()
@@ -2599,6 +2612,7 @@ def format_volume(
     partition: str,
     volname: str = "Empty",
     debug: bool = False,
+    strict_dostype: bool = False,
 ):
     import amitools.fs.DosType as DosType
     bridge = None
@@ -2642,6 +2656,7 @@ def format_volume(
             read_only=False,
             debug=debug,
             partition=partition,
+            strict_dostype=strict_dostype,
         )
         _raise_if_handler_crashed(bridge, "format startup")
 
@@ -2701,8 +2716,23 @@ __version__ = "v0.5.0"
 __banner__ = f"amifuse {__version__} - Copyright (C) 2025-2026 by Stefan Reinauer"
 
 
-def _inspect_rdisk(rdisk, full=False):
+def _remap_candidates(rdisk):
+    """Return ``(part, original, remapped)`` tuples for partitions whose
+    dostype would be remapped at mount time.
+    """
+    from .bootstrap import _remap_pds_to_pfs
+    out = []
+    for part in rdisk.parts:
+        dt = part.part_blk.dos_env.dos_type
+        new = _remap_pds_to_pfs(dt)
+        if new != dt:
+            out.append((part, dt, new))
+    return out
+
+
+def _inspect_rdisk(rdisk, full=False, strict_dostype=False):
     """Print RDB info, filesystem drivers, and warnings for a single RDisk."""
+    import amitools.fs.DosType as DosType
     from .rdb_inspect import format_fs_summary
     for line in rdisk.get_info(full=full):
         print(line)
@@ -2716,6 +2746,24 @@ def _inspect_rdisk(rdisk, full=False):
         print("\nWarnings:")
         for w in warnings:
             print(f"  {w}")
+    candidates = _remap_candidates(rdisk)
+    if candidates:
+        print()
+        if strict_dostype:
+            for part, orig, new in candidates:
+                print(
+                    f"Note: partition {part.get_drive_name()} uses "
+                    f"{DosType.num_to_tag_str(orig)} (0x{orig:08x}); "
+                    f"--strict-dostype will keep this dostype at mount."
+                )
+        else:
+            for part, orig, new in candidates:
+                print(
+                    f"Note: partition {part.get_drive_name()} "
+                    f"({DosType.num_to_tag_str(orig)}/0x{orig:08x}) "
+                    f"will mount as {DosType.num_to_tag_str(new)}/0x{new:08x} "
+                    f"for compatibility (pass --strict-dostype to keep the original)."
+                )
 
 
 def _json_error(command: str, code: str, message: str, details: dict = None) -> dict:
@@ -2865,6 +2913,7 @@ def _create_bridge_from_args(args, command: str, read_only: bool = True):
                 driver = temp_driver
 
     # Create the bridge
+    strict_dostype = getattr(args, "strict_dostype", False)
     try:
         bridge = HandlerBridge(
             image,
@@ -2875,6 +2924,7 @@ def _create_bridge_from_args(args, command: str, read_only: bool = True):
             partition=partition,
             adf_info=adf_info,
             iso_info=iso_info,
+            strict_dostype=strict_dostype,
         )
     except SystemExit as e:
         if temp_driver is not None:
@@ -3655,6 +3705,21 @@ def cmd_inspect(args):
                 warnings = getattr(rdisk, 'rdb_warnings', [])
                 if warnings:
                     desc["warnings"] = warnings
+                remap_list = _remap_candidates(rdisk)
+                if remap_list:
+                    desc["dostype_remap"] = {
+                        "strict": bool(getattr(args, "strict_dostype", False)),
+                        "partitions": [
+                            {
+                                "name": str(p.get_drive_name()),
+                                "original": DosType.num_to_tag_str(orig),
+                                "original_raw": f"0x{orig:08x}",
+                                "remapped": DosType.num_to_tag_str(new),
+                                "remapped_raw": f"0x{new:08x}",
+                            }
+                            for p, orig, new in remap_list
+                        ],
+                    }
                 all_rdbs.append(desc)
             finally:
                 rdisk.close()
@@ -3698,7 +3763,7 @@ def cmd_inspect(args):
             try:
                 print(f"\n=== Amiga RDB in MBR partition [{mbr_ctx.mbr_partition.index}]"
                       f" (offset: {mbr_ctx.offset_blocks} sectors) ===\n")
-                _inspect_rdisk(rdisk, full=args.full)
+                _inspect_rdisk(rdisk, full=args.full, strict_dostype=getattr(args, "strict_dostype", False))
             finally:
                 rdisk.close()
                 blkdev.close()
@@ -3716,7 +3781,7 @@ def cmd_inspect(args):
                 for line in format_mbr_info(mbr_ctx):
                     print(line)
                 print()
-            _inspect_rdisk(rdisk, full=args.full)
+            _inspect_rdisk(rdisk, full=args.full, strict_dostype=getattr(args, "strict_dostype", False))
         finally:
             if rdisk is not None:
                 rdisk.close()
@@ -3744,6 +3809,7 @@ def cmd_mount(args):
         partition=args.partition,
         icons=args.icons,
         foreground=foreground,
+        strict_dostype=getattr(args, "strict_dostype", False),
     )
 
     if args.profile:
@@ -3763,6 +3829,7 @@ def cmd_format(args):
         partition=args.partition,
         volname=args.volname,
         debug=args.debug,
+        strict_dostype=getattr(args, "strict_dostype", False),
     )
 
 
@@ -4161,6 +4228,19 @@ commands:
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
+    def _add_strict_dostype(p):
+        p.add_argument(
+            "--strict-dostype",
+            dest="strict_dostype",
+            action="store_true",
+            help=(
+                "Keep the partition's original dostype when mounting. By default "
+                "PDS\\1 and PDS\\3 are remapped to PFS\\1/PFS\\3 because they share "
+                "an identical on-disk format and avoid the unimplemented "
+                "Direct-SCSI (ACCESS_DS) code path."
+            ),
+        )
+
     # inspect subcommand
     inspect_parser = subparsers.add_parser(
         "inspect", help="Inspect RDB partitions and filesystems."
@@ -4175,6 +4255,7 @@ commands:
     inspect_parser.add_argument(
         "--json", action="store_true", help="Output machine-readable JSON instead of text."
     )
+    _add_strict_dostype(inspect_parser)
     inspect_parser.set_defaults(func=cmd_inspect)
 
     # mount subcommand
@@ -4227,6 +4308,7 @@ commands:
         "--icons", action="store_true",
         help="Convert Amiga .info icons to native macOS icons (experimental)."
     )
+    _add_strict_dostype(mount_parser)
     mount_parser.set_defaults(func=cmd_mount, foreground=None)
 
     # unmount subcommand
@@ -4270,6 +4352,7 @@ commands:
     format_parser.add_argument(
         "--debug", action="store_true", help="Enable debug logging."
     )
+    _add_strict_dostype(format_parser)
     format_parser.set_defaults(func=cmd_format)
 
     # ls subcommand
@@ -4305,6 +4388,7 @@ commands:
         "--debug", action="store_true",
         help="Enable debug logging.",
     )
+    _add_strict_dostype(ls_parser)
     ls_parser.set_defaults(func=cmd_ls)
 
     # verify subcommand
@@ -4340,6 +4424,7 @@ commands:
         "--debug", action="store_true",
         help="Enable debug logging.",
     )
+    _add_strict_dostype(verify_parser)
     verify_parser.set_defaults(func=cmd_verify)
 
     # hash subcommand
@@ -4376,6 +4461,7 @@ commands:
         "--debug", action="store_true",
         help="Enable debug logging.",
     )
+    _add_strict_dostype(hash_parser)
     hash_parser.set_defaults(func=cmd_hash)
 
     # read subcommand
@@ -4412,6 +4498,7 @@ commands:
         "--debug", action="store_true",
         help="Enable debug logging.",
     )
+    _add_strict_dostype(read_parser)
     read_parser.set_defaults(func=cmd_read)
 
     # write subcommand
@@ -4447,6 +4534,7 @@ commands:
         "--debug", action="store_true",
         help="Enable debug logging.",
     )
+    _add_strict_dostype(write_parser)
     write_parser.set_defaults(func=cmd_write)
 
     args = parser.parse_args(argv)

@@ -20,6 +20,33 @@ def _scalar_field(struct, name: str):
     return field
 
 
+# PFS/PDS family share an identical on-disk layout — the dostype only steers
+# pfs3aio's I/O access mode at mount (see PDS3_MOUNT_BUG.md).
+_PFS_FAMILY_PREFIX = 0x50465300  # 'PFS\0'
+_PDS_FAMILY_PREFIX = 0x50445300  # 'PDS\0'
+_PFS_PDS_VERSIONS = (0x01, 0x03)  # \1 and \3 — versions known to share format
+
+
+def _remap_pds_to_pfs(dostype: int) -> int:
+    """Return ``dostype`` with the family prefix rewritten from ``PDS`` to
+    ``PFS`` for known-compatible versions (\\1 and \\3).
+
+    Other dostypes — including unknown PDS\\? versions, AFS, OFS, SFS — are
+    returned unchanged.
+    """
+    if (dostype & 0xFFFFFF00) != _PDS_FAMILY_PREFIX:
+        return dostype
+    version = dostype & 0xFF
+    if version not in _PFS_PDS_VERSIONS:
+        return dostype
+    return _PFS_FAMILY_PREFIX | version
+
+
+def is_remapped_dostype(dostype: int) -> bool:
+    """True iff ``_remap_pds_to_pfs`` would change ``dostype``."""
+    return _remap_pds_to_pfs(dostype) != dostype
+
+
 class SyntheticDosEnv:
     """Synthetic DosEnvec-like object for ADF (floppy) images."""
     def __init__(self, adf_info: ADFInfo):
@@ -93,7 +120,7 @@ class SyntheticIsoPartition:
 class BootstrapAllocator:
     def __init__(self, vh, image_path: Path, block_size=512, partition=None,
                  adf_info: Optional[ADFInfo] = None, iso_info: Optional[ISOInfo] = None,
-                 mbr_partition_index=None):
+                 mbr_partition_index=None, strict_dostype: bool = False):
         self.vh = vh
         self.alloc = vh.alloc
         self.mem = vh.alloc.get_mem()
@@ -103,6 +130,8 @@ class BootstrapAllocator:
         self.adf_info = adf_info  # Pre-detected ADF info, if any
         self.iso_info = iso_info  # Pre-detected ISO info, if any
         self.mbr_partition_index = mbr_partition_index  # For MBR disks with multiple 0x76 partitions
+        self.strict_dostype = strict_dostype  # If False, PDS\1/\3 dostypes are remapped to PFS\1/\3
+        self.remapped_dostype: Optional[tuple] = None  # (original, remapped) iff remap fired
 
     def _read_partition_env(self):
         from .rdb_inspect import open_rdisk
@@ -167,7 +196,10 @@ class BootstrapAllocator:
         # Relax mask: allow any address to avoid handler memorymask complaints
         _scalar_field(env, "de_Mask").val = 0xFFFFFFFF
         _scalar_field(env, "de_BootPri").val = de.boot_pri
-        _scalar_field(env, "de_DosType").val = de.dos_type
+        effective_dostype = de.dos_type if self.strict_dostype else _remap_pds_to_pfs(de.dos_type)
+        if effective_dostype != de.dos_type:
+            self.remapped_dostype = (de.dos_type, effective_dostype)
+        _scalar_field(env, "de_DosType").val = effective_dostype
         _scalar_field(env, "de_Baud").val = de.baud
         _scalar_field(env, "de_Control").val = de.control
         _scalar_field(env, "de_BootBlocks").val = de.boot_blocks
