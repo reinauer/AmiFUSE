@@ -1473,6 +1473,7 @@ class AmigaFuseFS(Operations):
         self._fh_lock = threading.Lock()
         self._fh_cache: Dict[int, Dict[str, object]] = {}
         self._next_fh = 1
+        self._pending_deletes: set = set()
         self._last_op_time = time.time()
         self._op_count = 0
         # Icon support - use platform-specific handler
@@ -1833,6 +1834,7 @@ class AmigaFuseFS(Operations):
                 "lock": threading.Lock(),
                 "closed": False,
                 "dirty": False,  # Track if file was written to
+                "path": path,
             }
         return handle
 
@@ -1957,6 +1959,7 @@ class AmigaFuseFS(Operations):
                     "lock": threading.Lock(),
                     "closed": False,
                     "dirty": True,  # New files are always dirty
+                    "path": path,
                 }
             # Prime stat/dir cache so immediate getattr after create doesn't fail.
             # Pin the entry: in write mode _cache_ttl is 0, so without pinning
@@ -2007,6 +2010,20 @@ class AmigaFuseFS(Operations):
         res1, res2 = self.bridge.delete_object(lock_bptr, name)
         self._log_op("unlink", path, f"delete_object res1={res1} res2={res2}")
         if res1 == 0:
+            if res2 == 202:
+                # ERROR_OBJECT_IN_USE: file has an active handle (WinFSP calls
+                # unlink before release). Defer deletion to release().
+                has_handle = any(v.get("path") == path for v in self._fh_cache.values())
+                if has_handle:
+                    self._pending_deletes.add(path)
+                    self._stat_cache.pop(path, None)
+                    self._dir_cache.pop(dir_path, None)
+                    for l in reversed(locks):
+                        self.bridge.free_lock(l)
+                    return 0
+            # Free locks before raising (fixes a lock leak on error)
+            for l in reversed(locks):
+                self.bridge.free_lock(l)
             raise FuseOSError(errno.EIO)
         self._stat_cache.pop(path, None)
         self._pinned_stats.discard(path)
@@ -2317,6 +2334,27 @@ class AmigaFuseFS(Operations):
         self._pinned_stats.discard(path)
         if self._cache_ttl <= 0:
             self._stat_cache.pop(path, None)
+        # Resolve path: use FUSE-provided path, fall back to cached path
+        resolved_path = path if path else entry.get("path")
+        # Check for deferred deletes (WinFSP unlink-before-release pattern)
+        if resolved_path and resolved_path in self._pending_deletes:
+            self._pending_deletes.discard(resolved_path)
+            try:
+                dir_path, name = self._split_path(resolved_path)
+                lock_bptr, _, locks = self.bridge.locate_path(dir_path)
+                if dir_path == "/" and lock_bptr == 0:
+                    lock_bptr, _ = self.bridge.locate(0, "")
+                    if lock_bptr:
+                        locks.append(lock_bptr)
+                if lock_bptr != 0:
+                    res1, res2 = self.bridge.delete_object(lock_bptr, name)
+                    self._log_op("release", resolved_path, f"deferred delete res1={res1} res2={res2}")
+                for l in reversed(locks):
+                    self.bridge.free_lock(l)
+                self._stat_cache.pop(resolved_path, None)
+                self._dir_cache.pop(dir_path, None)
+            except Exception:
+                pass  # Best-effort deferred delete
         return 0
 
     def destroy(self, path):

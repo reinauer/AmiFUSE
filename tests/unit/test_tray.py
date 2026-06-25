@@ -324,7 +324,7 @@ class TestSingleInstance:
 
 class TestQuitLifecycle:
     def test_quit_calls_icon_stop_not_unmount_all(self, tray_app, fake_pystray, monkeypatch):
-        """BUG FIX: _quit only stops icon, doesn't unmount."""
+        """BUG FIX: _quit signals stop, doesn't unmount or call icon.stop() directly."""
         icon = _FakeIcon("test", None, "test")
         tray_app._icon = icon
         tray_app._mounts = [{"pid": 1, "mountpoint": "D:", "image": "x.hdf"}]
@@ -334,7 +334,8 @@ class TestQuitLifecycle:
 
         tray_app._quit(icon, None)
 
-        assert icon._stopped
+        assert tray_app._stop_event.is_set()
+        assert tray_app._wake_event.is_set()
         assert kill_calls == []  # unmount NOT called in _quit
 
     def test_main_calls_unmount_all_after_icon_run(self, fake_pystray, fake_pil, monkeypatch):
