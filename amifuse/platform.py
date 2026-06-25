@@ -355,6 +355,7 @@ def get_mount_options(volname: str, volicon_path: Optional[str] = None,
         return {
             "volname": volname,
             "FileSystemName": "AmiFUSE",
+            "FileInfoTimeout": "1000",
         }
     # Linux doesn't need special mount options
     return {}
