@@ -133,6 +133,22 @@ def _resolve_extensions(extensions: list[str] | None) -> list[str]:
 
 
 def _get_launcher_path() -> str:
+    import shutil
+    import sysconfig
+    found = shutil.which("amifuse-launcher")
+    if found:
+        return found
+    candidate = Path(sys.executable).parent / "amifuse-launcher.exe"
+    if candidate.exists():
+        return str(candidate)
+    for scheme in (None, "nt_user"):
+        try:
+            scripts = Path(sysconfig.get_path("scripts", scheme))
+        except KeyError:
+            continue
+        candidate = scripts / "amifuse-launcher.exe"
+        if candidate.exists():
+            return str(candidate)
     return str(Path(sys.executable).parent / "amifuse-launcher.exe")
 
 

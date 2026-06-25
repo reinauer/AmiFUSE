@@ -149,7 +149,36 @@ def run_checks() -> List[CheckResult]:
         except ImportError:
             pass  # windows_shell not available, skip check
 
-    # 8. PATH check
+    # 8. Tray dependencies (Windows only, when shell registered)
+    if sys.platform.startswith("win"):
+        try:
+            from .windows_shell import is_registered
+            if is_registered():
+                import importlib.util
+                missing = []
+                if importlib.util.find_spec("pystray") is None:
+                    missing.append("pystray")
+                if importlib.util.find_spec("PIL") is None:
+                    missing.append("Pillow")
+                if missing:
+                    pkgs = " ".join(missing)
+                    results.append(CheckResult(
+                        "tray_deps", "warning",
+                        f"Tray dependencies missing: {pkgs}",
+                        fixable=True,
+                        fix_fn=lambda: __import__("subprocess").check_call(
+                            [sys.executable, "-m", "pip", "install"] + pkgs.split()),
+                        fix_description=f"Run: pip install {pkgs}",
+                    ))
+                else:
+                    results.append(CheckResult(
+                        "tray_deps", "ok",
+                        "Tray dependencies installed (pystray, Pillow)",
+                    ))
+        except ImportError:
+            pass
+
+    # 9. PATH check
     if shutil.which("amifuse"):
         results.append(CheckResult("path", "ok", "amifuse is on PATH"))
     else:

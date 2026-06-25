@@ -69,12 +69,16 @@ class TrayApp:
                     self._grace_start = time.monotonic()
                 elif time.monotonic() - self._grace_start > self.GRACE_PERIOD:
                     self._icon.stop()
+                    return
             else:
                 self._grace_start = None
 
-            # Event.wait allows instant wakeup after unmount
+            # Event.wait allows instant wakeup after unmount or quit
             self._wake_event.wait(self.POLL_INTERVAL)
             self._wake_event.clear()
+
+        # _quit was called — stop the icon from this thread (safe, not in callback)
+        self._icon.stop()
 
     def _build_menu(self):
         import pystray
@@ -167,8 +171,10 @@ class TrayApp:
         )
 
     def _quit(self, icon, item):
-        # Only stop the icon; unmounting happens after icon.run() returns
-        self._icon.stop()
+        # Signal the poll loop to call icon.stop() — calling it directly from
+        # a pystray callback deadlocks the Win32 message pump.
+        self._stop_event.set()
+        self._wake_event.set()
 
 
 def _check_single_instance() -> bool:
