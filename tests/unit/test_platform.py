@@ -231,12 +231,12 @@ class TestGetMountOptions:
         assert result == {}
 
     def test_mount_options_windows_volname(self, monkeypatch):
-        """On Windows, returns dict with volname and FileSystemName."""
+        """On Windows, returns dict with volname, FileSystemName, and FileInfoTimeout."""
         monkeypatch.setattr("sys.platform", "win32")
         from amifuse.platform import get_mount_options
 
         result = get_mount_options("TestVol")
-        assert result == {"volname": "TestVol", "FileSystemName": "AmiFUSE"}
+        assert result == {"volname": "TestVol", "FileSystemName": "AmiFUSE", "FileInfoTimeout": "1000"}
 
     def test_mount_options_windows_ignores_icon_args(self, monkeypatch):
         """On Windows, icon args are ignored (macOS-only)."""
@@ -246,7 +246,7 @@ class TestGetMountOptions:
         result = get_mount_options(
             "TestVol", volicon_path="/tmp/icon.icns", icons_enabled=True
         )
-        assert result == {"volname": "TestVol", "FileSystemName": "AmiFUSE"}
+        assert result == {"volname": "TestVol", "FileSystemName": "AmiFUSE", "FileInfoTimeout": "1000"}
 
     def test_mount_options_darwin_unchanged(self, monkeypatch):
         """On darwin, get_mount_options returns a dict containing 'volname' key.
