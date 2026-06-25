@@ -113,7 +113,7 @@ def run_checks() -> List[CheckResult]:
     driver_path = None
     for search_dir in plat.get_driver_search_dirs():
         candidate = search_dir / "FastFileSystem"
-        if candidate.is_file():
+        if candidate.is_file() and candidate.stat().st_size > 0:
             driver_found = True
             driver_path = candidate
             break
