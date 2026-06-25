@@ -93,7 +93,7 @@ def find_driver_for_dostype(dos_type_str: str) -> Optional[Path]:
         return None
     for search_dir in get_driver_search_dirs():
         candidate = search_dir / driver_name
-        if candidate.is_file():
+        if candidate.is_file() and candidate.stat().st_size > 0:
             return candidate
     return None
 
