@@ -62,7 +62,7 @@ def _wait_for_unmount(drive: str, timeout: float = 10.0) -> bool:
 class TestLauncherE2E:
     """Full mount/unmount cycle tests."""
 
-    def test_launcher_mount_creates_drive_letter(self, ofs_adf_image):
+    def test_launcher_mount_creates_drive_letter(self, pfs3_image, pfs3_driver):
         """Mounting a test image should make a drive letter appear."""
         from amifuse.platform import kill_pids
 
@@ -71,9 +71,12 @@ class TestLauncherE2E:
             [
                 sys.executable, "-m", "amifuse", "mount",
                 "--mountpoint", drive,
-                str(ofs_adf_image),
+                "--driver", str(pfs3_driver),
+                str(pfs3_image),
             ],
             creationflags=DETACHED_FLAGS,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
         try:
             assert _wait_for_mount(drive), f"Drive {drive} did not become ready"
@@ -84,7 +87,7 @@ class TestLauncherE2E:
                 proc.wait(timeout=5)
             _wait_for_unmount(drive)
 
-    def test_launcher_mount_visible_in_status(self, ofs_adf_image):
+    def test_launcher_mount_visible_in_status(self, pfs3_image, pfs3_driver):
         """After mounting, find_amifuse_mounts() should include the mount."""
         from amifuse.platform import find_amifuse_mounts, kill_pids
 
@@ -93,9 +96,12 @@ class TestLauncherE2E:
             [
                 sys.executable, "-m", "amifuse", "mount",
                 "--mountpoint", drive,
-                str(ofs_adf_image),
+                "--driver", str(pfs3_driver),
+                str(pfs3_image),
             ],
             creationflags=DETACHED_FLAGS,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
         try:
             assert _wait_for_mount(drive), f"Drive {drive} did not become ready"
@@ -112,7 +118,7 @@ class TestLauncherE2E:
                 proc.wait(timeout=5)
             _wait_for_unmount(drive)
 
-    def test_launcher_unmount_cleans_up(self, ofs_adf_image):
+    def test_launcher_unmount_cleans_up(self, pfs3_image, pfs3_driver):
         """After kill_pids, drive letter should disappear."""
         from amifuse.platform import kill_pids
 
@@ -121,9 +127,12 @@ class TestLauncherE2E:
             [
                 sys.executable, "-m", "amifuse", "mount",
                 "--mountpoint", drive,
-                str(ofs_adf_image),
+                "--driver", str(pfs3_driver),
+                str(pfs3_image),
             ],
             creationflags=DETACHED_FLAGS,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
         try:
             assert _wait_for_mount(drive), f"Drive {drive} did not become ready"
