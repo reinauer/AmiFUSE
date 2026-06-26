@@ -19,7 +19,7 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
-from .platform import _kill_mount_owner_processes
+from .platform import kill_mount_owner_processes
 
 try:
     from fuse import FUSE, FuseOSError, LoggingMixIn, Operations  # type: ignore
@@ -1442,6 +1442,13 @@ class HandlerBridge:
             self.launcher.send_flush(self.state)
             replies = self._run_until_replies()
             self._log_replies("flush_volume", replies)
+            # Sync the underlying file to disk
+            self.backend.sync()
+            if self._debug:
+                if replies and replies[-1][2] != 0:
+                    print("[amifuse] Volume flush complete", flush=True)
+                else:
+                    print("[amifuse] Volume flush may have failed", flush=True)
 
     def inhibit_cycle(self):
         """Inhibit then uninhibit the handler to clear all internal state."""
@@ -1726,7 +1733,9 @@ class AmigaFuseFS(Operations):
             self._track_op("getattr", path, cached=True)
             raise FuseOSError(errno.ENOENT)
         # Check if path has a pending (deferred) delete - hide from callers
-        if path in self._pending_deletes:
+        with self._fh_lock:
+            pending = path in self._pending_deletes
+        if pending:
             self._track_op("getattr", path, cached=True)
             raise FuseOSError(errno.ENOENT)
         # Check positive cache
@@ -1808,27 +1817,38 @@ class AmigaFuseFS(Operations):
         resolved_path = path if path else entry.get("path")
         if not resolved_path:
             return 0
-        if resolved_path in self._pending_deletes:
+        with self._fh_lock:
+            if resolved_path not in self._pending_deletes:
+                return 0
+            still_open = any(
+                v.get("dir_handle") and v.get("path") == resolved_path
+                for v in self._fh_cache.values()
+            )
+            if still_open:
+                return 0
+            self._pending_deletes.discard(resolved_path)
+        # Guard: skip deferred delete if handler is dead or read-only
+        if self.bridge.state.crashed or not self.bridge._write_enabled:
+            return 0
+        try:
+            self.bridge.flush_volume()
+            self.bridge.inhibit_cycle()
+            res1, res2 = self.bridge.delete_dir_atomic(resolved_path)
+            if res1 == 0:
+                with self._fh_lock:
+                    self._pending_deletes.add(resolved_path)
+                self._log_op("releasedir", resolved_path, "deferred delete failed permanently, path hidden until unmount")
+            else:
+                self._stat_cache.pop(resolved_path, None)
+                parent_path = resolved_path.rsplit("/", 1)[0] or "/"
+                self._dir_cache.pop(parent_path, None)
+        except Exception as e:
+            self._log_op("releasedir", resolved_path, f"deferred delete exception: {type(e).__name__}: {e}")
             with self._fh_lock:
-                still_open = any(
-                    v.get("dir_handle") and v.get("path") == resolved_path
-                    for v in self._fh_cache.values()
-                )
-            if not still_open:
-                self._pending_deletes.discard(resolved_path)
-                try:
-                    self.bridge.flush_volume()
-                    self.bridge.inhibit_cycle()
-                    res1, res2 = self.bridge.delete_dir_atomic(resolved_path)
-                    if res1 == 0:
-                        self._pending_deletes.add(resolved_path)
-                    else:
-                        self._stat_cache.pop(resolved_path, None)
-                        parent_path = resolved_path.rsplit("/", 1)[0] or "/"
-                        self._dir_cache.pop(parent_path, None)
-                except Exception:
-                    pass
-                self._resolve_pending_dir_deletes(resolved_path)
+                self._pending_deletes.add(resolved_path)
+        # Only resolve parent dir deletes if deletion succeeded
+        if resolved_path not in self._pending_deletes:
+            self._resolve_pending_dir_deletes(resolved_path)
         return 0
 
     def readdir(self, path, fh):
@@ -1839,14 +1859,15 @@ class AmigaFuseFS(Operations):
             if time.time() - ts < self._dir_cache_ttl:
                 self._track_op("readdir", path, cached=True)
                 # Filter pending deletes from cached results
-                if self._pending_deletes:
-                    cached_entries = [
-                        e for e in cached_entries
-                        if e in (".", "..") or (
-                            (path.rstrip("/") + "/" + e if path != "/" else "/" + e)
-                            not in self._pending_deletes
-                        )
-                    ]
+                with self._fh_lock:
+                    if self._pending_deletes:
+                        cached_entries = [
+                            e for e in cached_entries
+                            if e in (".", "..") or (
+                                (path.rstrip("/") + "/" + e if path != "/" else "/" + e)
+                                not in self._pending_deletes
+                            )
+                        ]
                 return cached_entries
             del self._dir_cache[path]
 
@@ -1899,14 +1920,15 @@ class AmigaFuseFS(Operations):
                 entries.append(volume_icon_file)
 
         # Filter out entries with pending (deferred) deletes
-        if self._pending_deletes:
-            entries = [
-                e for e in entries
-                if e in (".", "..") or (
-                    (path.rstrip("/") + "/" + e if path != "/" else "/" + e)
-                    not in self._pending_deletes
-                )
-            ]
+        with self._fh_lock:
+            if self._pending_deletes:
+                entries = [
+                    e for e in entries
+                    if e in (".", "..") or (
+                        (path.rstrip("/") + "/" + e if path != "/" else "/" + e)
+                        not in self._pending_deletes
+                    )
+                ]
 
         # Cache the directory listing
         self._dir_cache[path] = (now, entries)
@@ -2146,9 +2168,11 @@ class AmigaFuseFS(Operations):
             if res2 == 202:
                 # ERROR_OBJECT_IN_USE: file has an active handle (WinFSP calls
                 # unlink before release). Defer deletion to release().
-                has_handle = any(v.get("path") == path for v in self._fh_cache.values())
+                with self._fh_lock:
+                    has_handle = any(v.get("path") == path for v in self._fh_cache.values())
+                    if has_handle:
+                        self._pending_deletes.add(path)
                 if has_handle:
-                    self._pending_deletes.add(path)
                     self._stat_cache.pop(path, None)
                     self._dir_cache.pop(dir_path, None)
                     for l in reversed(locks):
@@ -2174,13 +2198,17 @@ class AmigaFuseFS(Operations):
         dir_path, name = self._split_path(path)
         if not name:
             raise FuseOSError(errno.EINVAL)
-        self.bridge.inhibit_cycle()
         res1, res2 = self.bridge.delete_dir_atomic(path)
+        if res1 == 0 and res2 == 202:
+            # OBJECT_IN_USE — inhibit cycle clears handler internal state, retry
+            self.bridge.inhibit_cycle()
+            res1, res2 = self.bridge.delete_dir_atomic(path)
         self._log_op("rmdir", path, f"delete_dir_atomic res1={res1} res2={res2}")
         if res1 == 0:
             if res2 == 202:
                 # OBJECT_IN_USE — defer unconditionally; releasedir will retry
-                self._pending_deletes.add(path)
+                with self._fh_lock:
+                    self._pending_deletes.add(path)
                 self._stat_cache.pop(path, None)
                 self._dir_cache.pop(dir_path, None)
                 self._dir_cache.pop(path, None)
@@ -2195,10 +2223,10 @@ class AmigaFuseFS(Operations):
                     for d in self._pending_dir_deletes:
                         if d.startswith(path + "/"):
                             pending_children.add(d)
-                if pending_children:
-                    with self._fh_lock:
+                    if pending_children:
                         self._pending_dir_deletes[path] = pending_children.copy()
                         self._pending_deletes.add(path)
+                if pending_children:
                     self._stat_cache.pop(path, None)
                     self._dir_cache.pop(dir_path, None)
                     self._dir_cache.pop(path, None)
@@ -2496,7 +2524,7 @@ class AmigaFuseFS(Operations):
         blocking children have been deleted.
         """
         parent_dir = deleted_child_path.rsplit("/", 1)[0] or "/"
-        while parent_dir in self._pending_dir_deletes:
+        while True:
             with self._fh_lock:
                 if parent_dir not in self._pending_dir_deletes:
                     break
@@ -2504,9 +2532,9 @@ class AmigaFuseFS(Operations):
                 if self._pending_dir_deletes[parent_dir]:
                     # Still has other pending children - stop here
                     break
-                # All children resolved - attempt the directory delete
+                # All children resolved - remove from dir_deletes to prevent re-entry
+                # but keep in _pending_deletes until delete confirmed
                 del self._pending_dir_deletes[parent_dir]
-                self._pending_deletes.discard(parent_dir)
             # Attempt the actual directory deletion outside the lock
             try:
                 dir_path, name = self._split_path(parent_dir)
@@ -2524,13 +2552,21 @@ class AmigaFuseFS(Operations):
                         self._log_op("release", parent_dir, "deferred rmdir failed (dir not empty), discarding")
                         for l in reversed(locks):
                             self.bridge.free_lock(l)
+                        # Delete failed - _pending_deletes still has it, just stop
                         break
+                else:
+                    # Could not locate parent - _pending_deletes still has it, just stop
+                    break
                 for l in reversed(locks):
                     self.bridge.free_lock(l)
+                # Delete succeeded - now remove from _pending_deletes
+                with self._fh_lock:
+                    self._pending_deletes.discard(parent_dir)
                 self._stat_cache.pop(parent_dir, None)
                 self._dir_cache.pop(dir_path, None)
             except Exception:
                 self._log_op("release", parent_dir, "deferred rmdir exception, discarding")
+                # Delete failed - _pending_deletes still has it, just stop
                 break
             # Successfully deleted this directory - walk up to check its parent
             deleted_child_path = parent_dir
@@ -2563,8 +2599,19 @@ class AmigaFuseFS(Operations):
         # Resolve path: use FUSE-provided path, fall back to cached path
         resolved_path = path if path else entry.get("path")
         # Check for deferred deletes (WinFSP unlink-before-release pattern)
-        if resolved_path and resolved_path in self._pending_deletes:
-            self._pending_deletes.discard(resolved_path)
+        if resolved_path:
+            with self._fh_lock:
+                if resolved_path not in self._pending_deletes:
+                    return 0
+                # Check if another handle for this path is still open
+                still_open = any(
+                    v.get("path") == resolved_path and not v.get("closed")
+                    for v in self._fh_cache.values()
+                )
+                if still_open:
+                    return 0
+                self._pending_deletes.discard(resolved_path)
+            delete_succeeded = False
             try:
                 dir_path, name = self._split_path(resolved_path)
                 lock_bptr, _, locks = self.bridge.locate_path(dir_path)
@@ -2575,14 +2622,26 @@ class AmigaFuseFS(Operations):
                 if lock_bptr != 0:
                     res1, res2 = self.bridge.delete_object(lock_bptr, name)
                     self._log_op("release", resolved_path, f"deferred delete res1={res1} res2={res2}")
+                    if res1 != 0:
+                        delete_succeeded = True
+                    else:
+                        with self._fh_lock:
+                            self._pending_deletes.add(resolved_path)
+                else:
+                    with self._fh_lock:
+                        self._pending_deletes.add(resolved_path)
                 for l in reversed(locks):
                     self.bridge.free_lock(l)
-                self._stat_cache.pop(resolved_path, None)
-                self._dir_cache.pop(dir_path, None)
-            except Exception:
-                pass
-            # Resolve any deferred parent directory deletes
-            self._resolve_pending_dir_deletes(resolved_path)
+                if delete_succeeded:
+                    self._stat_cache.pop(resolved_path, None)
+                    self._dir_cache.pop(dir_path, None)
+            except Exception as e:
+                self._log_op("release", resolved_path, f"deferred delete exception: {type(e).__name__}: {e}")
+                with self._fh_lock:
+                    self._pending_deletes.add(resolved_path)
+            # Resolve any deferred parent directory deletes only on success
+            if delete_succeeded:
+                self._resolve_pending_dir_deletes(resolved_path)
         return 0
 
     def destroy(self, path):
@@ -4102,7 +4161,7 @@ def cmd_unmount(args):
     if cmd:
         result = subprocess.run(cmd, check=False, **_no_window)
         if result.returncode != 0:
-            killed_pids = _kill_mount_owner_processes(mountpoint)
+            killed_pids = kill_mount_owner_processes(mountpoint)
             if killed_pids:
                 result = subprocess.run(cmd, check=False, **_no_window)
         if result.returncode != 0:
@@ -4113,7 +4172,7 @@ def cmd_unmount(args):
     else:
         # No platform unmount command (e.g. Windows/WinFSP) -- go straight
         # to process termination.
-        killed_pids = _kill_mount_owner_processes(mountpoint)
+        killed_pids = kill_mount_owner_processes(mountpoint)
         if not killed_pids:
             raise SystemExit(
                 f"No amifuse process found for mountpoint {mountpoint}."

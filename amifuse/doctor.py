@@ -166,14 +166,32 @@ def run_checks() -> List[CheckResult]:
                         "tray_deps", "warning",
                         f"Tray dependencies missing: {pkgs}",
                         fixable=True,
-                        fix_fn=lambda: __import__("subprocess").check_call(
-                            [sys.executable, "-m", "pip", "install"] + pkgs.split()),
+                        fix_fn=lambda _pkgs=pkgs: __import__("subprocess").check_call(
+                            [sys.executable, "-m", "pip", "install"] + _pkgs.split()),
                         fix_description=f"Run: pip install {pkgs}",
                     ))
                 else:
                     results.append(CheckResult(
                         "tray_deps", "ok",
                         "Tray dependencies installed (pystray, Pillow)",
+                    ))
+        except ImportError:
+            pass
+
+    # 8b. WScript availability (Windows only, when shell registered)
+    if sys.platform.startswith("win"):
+        try:
+            from .windows_shell import is_registered
+            if is_registered():
+                if not shutil.which("wscript.exe"):
+                    results.append(CheckResult(
+                        "wscript", "warning",
+                        "wscript.exe not found on PATH; context menu actions will not work",
+                    ))
+                else:
+                    results.append(CheckResult(
+                        "wscript", "ok",
+                        "wscript.exe available for context menu actions",
                     ))
         except ImportError:
             pass

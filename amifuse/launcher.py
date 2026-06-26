@@ -101,13 +101,21 @@ def _do_mount(args) -> None:
 
 
 def _do_inspect(args) -> None:
-    cmd = ["cmd", "/k", sys.executable, "-m", "amifuse", "inspect", args.image]
-    subprocess.Popen(cmd, creationflags=CREATE_NEW_CONSOLE)
+    # Launch python directly with CREATE_NEW_CONSOLE to avoid cmd.exe
+    # metacharacter injection. The -c script uses sys.argv for the path
+    # (never interpolated into code) and waits for a keypress so the user
+    # can read output before the console closes.
+    wrapper = [
+        sys.executable, "-c",
+        "import sys; from amifuse.fuse_fs import main; main(['inspect'] + sys.argv[1:]); input('\\nPress Enter to close...')",
+        args.image,
+    ]
+    subprocess.Popen(wrapper, creationflags=CREATE_NEW_CONSOLE)
 
 
 def _ensure_tray_running() -> None:
     handle = ctypes.windll.kernel32.OpenMutexW(
-        0x00100000, False, "AmiFUSE_Tray_Mutex"
+        0x00100000, False, "Local\\AmiFUSE_Tray_Mutex"
     )
     if handle != 0:
         ctypes.windll.kernel32.CloseHandle(handle)

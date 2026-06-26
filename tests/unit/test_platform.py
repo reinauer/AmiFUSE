@@ -736,7 +736,7 @@ class TestMountRunsInForegroundByDefault:
         [
             ("darwin", False),
             ("linux", False),
-            ("win32", True),
+            ("win32", False),
         ],
     )
     def test_default_mode_by_platform(self, monkeypatch, platform, expected):
@@ -909,28 +909,33 @@ class TestKillPids:
         assert (42, signal.SIGKILL) in signals_sent
 
     @pytest.mark.skipif(not hasattr(signal, "CTRL_BREAK_EVENT"), reason="Windows-only signal")
-    def test_kill_pids_sends_ctrl_break_on_windows(self, monkeypatch):
-        """On Windows, sends CTRL_BREAK_EVENT."""
-        import signal
+    def test_kill_pids_sends_taskkill_graceful_on_windows(self, monkeypatch):
+        """On Windows, uses taskkill /PID (graceful WM_CLOSE) instead of CTRL_BREAK_EVENT."""
+        from unittest.mock import MagicMock
         from amifuse.platform import kill_pids
 
         monkeypatch.setattr("sys.platform", "win32")
-        signals_sent = []
+        taskkill_calls = []
 
-        def fake_kill(pid, sig):
-            signals_sent.append((pid, sig))
-            if sig == 0:
-                raise ProcessLookupError()
+        def fake_run(cmd, check=False, capture_output=False, creationflags=0):
+            taskkill_calls.append(cmd)
+            return MagicMock(returncode=0)
 
-        monkeypatch.setattr("amifuse.platform.os.kill", fake_kill)
+        def fake_pid_exists(pid):
+            return False
+
+        monkeypatch.setattr("amifuse.platform.subprocess.run", fake_run)
+        monkeypatch.setattr("amifuse.platform._pid_exists", fake_pid_exists)
+        monkeypatch.setattr("amifuse.platform._verify_amifuse_process", lambda pid: True)
 
         result = kill_pids([42], timeout=0.1)
         assert 42 in result
-        assert (42, signal.CTRL_BREAK_EVENT) in signals_sent
+        # Phase 1 should call taskkill without /F (graceful)
+        assert ["taskkill", "/PID", "42"] in taskkill_calls
 
     @pytest.mark.skipif(not hasattr(signal, "CTRL_BREAK_EVENT"), reason="Windows-only signal")
     def test_kill_pids_force_kills_with_taskkill(self, monkeypatch):
-        """On Windows, uses taskkill /F when pid survives CTRL_BREAK."""
+        """On Windows, uses taskkill /F when pid survives graceful taskkill."""
         import signal
         from unittest.mock import MagicMock
         from amifuse.platform import kill_pids
@@ -939,24 +944,23 @@ class TestKillPids:
         alive = {42}
         taskkill_called = []
 
-        def fake_kill(pid, sig):
-            if sig == 0:
-                if pid in alive:
-                    return
-                raise ProcessLookupError()
-
         def fake_run(cmd, check=False, capture_output=False, creationflags=0):
             taskkill_called.append(cmd)
-            alive.discard(42)
+            if "/F" in cmd:
+                alive.discard(42)
             return MagicMock(returncode=0)
 
-        monkeypatch.setattr("amifuse.platform.os.kill", fake_kill)
+        def fake_pid_exists(pid):
+            return pid in alive
+
         monkeypatch.setattr("amifuse.platform.subprocess.run", fake_run)
+        monkeypatch.setattr("amifuse.platform._pid_exists", fake_pid_exists)
+        monkeypatch.setattr("amifuse.platform._verify_amifuse_process", lambda pid: True)
         monkeypatch.setattr("amifuse.platform.time.time", lambda: 999999)
 
         result = kill_pids([42], timeout=0.0)
         assert 42 in result
-        assert any("taskkill" in cmd[0] for cmd in taskkill_called)
+        assert any("/F" in cmd for cmd in taskkill_called)
 
 
 # ---------------------------------------------------------------------------

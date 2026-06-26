@@ -217,8 +217,8 @@ class TestMountFuseOptions:
         assert kwargs is not None, "FUSE was not called"
         assert kwargs["foreground"] is False
 
-    def test_mount_defaults_to_foreground_on_windows(self, monkeypatch, mock_mount_fuse_deps):
-        """Windows keeps the mount attached by default."""
+    def test_mount_defaults_to_daemon_on_windows(self, monkeypatch, mock_mount_fuse_deps):
+        """Windows defaults to daemon mode now that unmount is available."""
         monkeypatch.setattr("sys.platform", "win32")
         from amifuse.fuse_fs import mount_fuse
 
@@ -231,7 +231,7 @@ class TestMountFuseOptions:
 
         kwargs = mock_mount_fuse_deps["fuse_kwargs"]
         assert kwargs is not None, "FUSE was not called"
-        assert kwargs["foreground"] is True
+        assert kwargs["foreground"] is False
 
     def test_mount_respects_explicit_interactive_mode(self, monkeypatch, mock_mount_fuse_deps):
         """An explicit foreground request overrides the platform default."""
@@ -383,7 +383,7 @@ class TestUnmountCommand:
 
         killed_pids = [42]
         monkeypatch.setattr(
-            fuse_fs_mod, "_kill_mount_owner_processes",
+            fuse_fs_mod, "kill_mount_owner_processes",
             lambda mp: killed_pids,
         )
 
@@ -400,7 +400,7 @@ class TestUnmountCommand:
         import amifuse.fuse_fs as fuse_fs_mod
 
         monkeypatch.setattr(
-            fuse_fs_mod, "_kill_mount_owner_processes",
+            fuse_fs_mod, "kill_mount_owner_processes",
             lambda mp: [],
         )
 
@@ -1067,9 +1067,9 @@ class TestCommandMatchesMountpoint:
 
 
 class TestKillEscalation:
-    """Tests for _kill_mount_owner_processes() edge cases.
+    """Tests for kill_mount_owner_processes() edge cases.
 
-    _kill_mount_owner_processes moved to platform.py in Phase 8.
+    kill_mount_owner_processes moved to platform.py in Phase 8.
     """
 
     def test_oserror_during_sigterm_does_not_crash(self, fuse_mock, monkeypatch):
@@ -1087,7 +1087,7 @@ class TestKillEscalation:
         monkeypatch.setattr(plat_mod.os, "kill", fake_kill)
 
         # Should not raise; OSError during SIGTERM is caught
-        result = plat_mod._kill_mount_owner_processes(Path("/mnt/amiga"))
+        result = plat_mod.kill_mount_owner_processes(Path("/mnt/amiga"))
         assert result == [1234]
 
 

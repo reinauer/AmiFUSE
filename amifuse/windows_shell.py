@@ -29,7 +29,16 @@ Set a = WScript.Arguments
 cmd = ""
 For i = 0 To a.Count - 1
     If i > 0 Then cmd = cmd & " "
-    cmd = cmd & """" & a(i) & """"
+    s = a(i)
+    s = Replace(s, """", """""")
+    ' Double trailing backslashes (MSVCRT: 2N \\ + " = N \\ + end-of-arg)
+    j = Len(s)
+    Do While j > 0
+        If Mid(s, j, 1) <> "\\" Then Exit Do
+        j = j - 1
+    Loop
+    s = s & String(Len(s) - j, "\\")
+    cmd = cmd & """" & s & """"
 Next
 CreateObject("WScript.Shell").Run cmd, 0, False
 '''
@@ -44,6 +53,8 @@ def register(extensions: list[str] | None = None) -> None:
     """Register file associations and context menu verbs for AmiFUSE."""
     if not sys.platform.startswith("win"):
         raise SystemExit("Shell registration is only supported on Windows.")
+    if not os.environ.get("APPDATA"):
+        raise SystemExit("APPDATA environment variable is not set. Cannot determine icon/config directory.")
 
     import winreg
 
@@ -73,6 +84,8 @@ def unregister(extensions: list[str] | None = None) -> None:
     """Remove AmiFUSE file associations and context menu verbs."""
     if not sys.platform.startswith("win"):
         raise SystemExit("Shell registration is only supported on Windows.")
+    if not os.environ.get("APPDATA"):
+        raise SystemExit("APPDATA environment variable is not set. Cannot determine icon/config directory.")
 
     import winreg
 
@@ -187,10 +200,19 @@ def _register_extension(winreg, ext: str, progid: str) -> None:
         winreg.CloseKey(owp_key)
 
 
+def _ensure_vbs_launcher() -> None:
+    """Write the VBS launcher, overwriting any existing file."""
+    _LAUNCH_VBS.parent.mkdir(parents=True, exist_ok=True)
+    _LAUNCH_VBS.write_text(_LAUNCH_VBS_CONTENT, encoding="utf-8")
+
+
 def _register_progid(winreg, progid: str, launcher: str) -> None:
     """Create ProgID with flat verb entries and icon."""
     base = rf"Software\Classes\{progid}"
     description = PROGID_DESCRIPTIONS[progid]
+
+    # Ensure VBS launcher exists with expected content before referencing it
+    _ensure_vbs_launcher()
 
     # (Default) = description
     key = winreg.CreateKey(winreg.HKEY_CURRENT_USER, base)
