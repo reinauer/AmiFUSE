@@ -229,9 +229,8 @@ def _get_windows_unmount_command(mountpoint: Path) -> List[str]:
 
 def mount_runs_in_foreground_by_default() -> bool:
     """Return the safest default mount mode for the current platform."""
-    # WinFSP foreground mounts do not expose a standalone unmount command.
-    # Keep the process attached by default until we have PID tracking there.
-    return sys.platform.startswith("win")
+    # All platforms now support daemon mode with `amifuse unmount`.
+    return False
 
 
 def check_fuse_available() -> None:
@@ -594,13 +593,13 @@ def _find_amifuse_mounts_unix():
             if is_mac:
                 # Format: "  PID  PPID  DAY MON DD HH:MM:SS YYYY COMMAND..."
                 # lstart is 5 tokens: e.g. "Sat Apr 19 10:30:00 2026"
-                parts = line.split(None, 8)
-                if len(parts) < 9:
+                parts = line.split(None, 7)
+                if len(parts) < 8:
                     continue
                 pid = int(parts[0])
                 ppid = int(parts[1])
                 lstart_str = " ".join(parts[2:7])
-                command = parts[8]
+                command = parts[7]
                 # Parse lstart to compute uptime
                 uptime = _parse_lstart_uptime(lstart_str)
             else:
@@ -669,6 +668,10 @@ def _find_amifuse_mounts_cim():
     """Discover amifuse mounts on Windows using PowerShell Get-CimInstance.
 
     Fallback for when wmic is unavailable (removed on newer Windows 11 builds).
+
+    Note: The CIM filter does not restrict by session, so on multi-user systems
+    this may return processes from other logged-in users.  A SessionId filter
+    could be added if this becomes a practical issue.
     """
     ps_cmd = [
         "powershell", "-NoProfile", "-Command",
@@ -681,8 +684,12 @@ def _find_amifuse_mounts_cim():
             ps_cmd,
             check=False,
             capture_output=True,
+            timeout=15,
             creationflags=_CREATE_NO_WINDOW if sys.platform.startswith("win") else 0,
         )
+    except subprocess.TimeoutExpired:
+        logger.debug("PowerShell CIM query timed out")
+        return []
     except OSError:
         logger.debug("PowerShell not available for CIM fallback")
         return []
@@ -843,10 +850,55 @@ def _find_mount_owner_pids(mountpoint: Path) -> List[int]:
     return pids
 
 
+def _verify_amifuse_process(pid: int) -> bool:
+    """Verify that the given PID is still a python/amifuse process.
+
+    Guards against PID reuse: between discovery and kill, the OS may have
+    recycled the PID for an unrelated process.  Returns True if the process
+    executable looks like python or amifuse, False otherwise.
+
+    On non-Windows or if verification cannot be performed, returns True
+    (optimistic -- better to attempt kill than silently skip).
+    """
+    if not sys.platform.startswith("win"):
+        return True
+    try:
+        import ctypes
+        import ctypes.wintypes
+
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        handle = ctypes.windll.kernel32.OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION, False, pid,
+        )
+        if not handle:
+            # Cannot open -- process is gone or inaccessible
+            return False
+
+        try:
+            # QueryFullProcessImageNameW to get the executable path
+            buf = ctypes.create_unicode_buffer(1024)
+            size = ctypes.wintypes.DWORD(1024)
+            success = ctypes.windll.kernel32.QueryFullProcessImageNameW(
+                handle, 0, buf, ctypes.byref(size),
+            )
+            if not success:
+                # Can't query name -- optimistically assume it's ours
+                return True
+            exe_path = buf.value.lower()
+            return "python" in exe_path or "amifuse" in exe_path
+        finally:
+            ctypes.windll.kernel32.CloseHandle(handle)
+    except Exception:
+        # Any failure in verification -- be optimistic
+        return True
+
+
 def kill_pids(pids: List[int], timeout: float = 10.0) -> List[int]:
     """Kill a list of PIDs with graceful-then-force strategy.
 
-    On Windows: sends CTRL_BREAK_EVENT (graceful), then taskkill /F (force).
+    On Windows: uses taskkill /PID (graceful, sends WM_CLOSE), then
+    taskkill /F /PID (force).  CTRL_BREAK_EVENT is not used because it is
+    ineffective for detached processes launched with CREATE_NEW_PROCESS_GROUP.
     On Unix: sends SIGTERM (graceful), then SIGKILL (force).
 
     Args:
@@ -865,20 +917,40 @@ def kill_pids(pids: List[int], timeout: float = 10.0) -> List[int]:
     # Phase 1: graceful signal
     remaining = []
     for pid in pids:
+        # Guard against PID reuse -- verify the process is still ours
+        if not _verify_amifuse_process(pid):
+            logger.debug("PID %d is no longer an amifuse process (reused); skipping", pid)
+            killed.append(pid)
+            continue
+
         try:
             if is_win:
-                os.kill(pid, signal.CTRL_BREAK_EVENT)
+                # taskkill without /F sends WM_CLOSE -- works for detached
+                # and GUI processes unlike CTRL_BREAK_EVENT.
+                result = subprocess.run(
+                    ["taskkill", "/PID", str(pid)],
+                    check=False,
+                    capture_output=True,
+                    creationflags=_CREATE_NO_WINDOW,
+                )
+                if result.returncode == 0:
+                    remaining.append(pid)
+                else:
+                    # taskkill failed -- process may already be dead
+                    if not _pid_exists(pid):
+                        killed.append(pid)
+                    else:
+                        # Still alive but taskkill rejected it; force-kill later
+                        remaining.append(pid)
             else:
                 os.kill(pid, signal.SIGTERM)
-            remaining.append(pid)
+                remaining.append(pid)
         except ProcessLookupError:
             # Already dead -- count as killed
             killed.append(pid)
         except OSError:
             if is_win:
-                # CTRL_BREAK_EVENT fails with OSError (WinError 87) for
-                # detached processes we didn't spawn.  The process is still
-                # alive -- add to remaining so Phase 3 (taskkill /F) runs.
+                # Unexpected OS error; still try force-kill in Phase 3
                 remaining.append(pid)
             else:
                 # On Unix, OSError from os.kill usually means the process
@@ -903,24 +975,25 @@ def kill_pids(pids: List[int], timeout: float = 10.0) -> List[int]:
     for pid in remaining:
         try:
             if is_win:
-                # os.kill(pid, SIGKILL) maps to SIGTERM on Windows -- useless retry.
-                # Use taskkill /F for reliable force-kill.
-                subprocess.run(
+                result = subprocess.run(
                     ["taskkill", "/F", "/PID", str(pid)],
                     check=False,
                     capture_output=True,
                     creationflags=_CREATE_NO_WINDOW,
                 )
+                if result.returncode == 0:
+                    killed.append(pid)
             else:
                 os.kill(pid, signal.SIGKILL)
-            killed.append(pid)
+                killed.append(pid)
         except (ProcessLookupError, OSError):
+            # Process already dead = success
             killed.append(pid)
 
     return killed
 
 
-def _kill_mount_owner_processes(mountpoint: Path) -> List[int]:
+def kill_mount_owner_processes(mountpoint: Path) -> List[int]:
     """Kill all amifuse processes that own the given mountpoint.
 
     Returns list of PIDs that were targeted (whether or not each one died).
@@ -930,6 +1003,8 @@ def _kill_mount_owner_processes(mountpoint: Path) -> List[int]:
         return []
     kill_pids(pids, timeout=1.0)
     return pids
+
+
 def _find_amifuse_mounts_windows():
     """Discover amifuse mounts on Windows using wmic.
 

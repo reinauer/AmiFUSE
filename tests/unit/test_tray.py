@@ -294,27 +294,31 @@ class TestAutoExit:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(sys.platform != "win32", reason="Windows-only: ctypes.windll")
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows-only: ctypes mutex")
 class TestSingleInstance:
     def test_single_instance_acquired(self, monkeypatch):
-        """CreateMutexW succeeds, GetLastError != 183."""
-        mock_windll = MagicMock()
+        """CreateMutexW succeeds, get_last_error != 183."""
+        import amifuse.tray as tray_mod
         import ctypes
-        monkeypatch.setattr(ctypes, "windll", mock_windll)
-        mock_windll.kernel32.GetLastError.return_value = 0
 
-        from amifuse.tray import _check_single_instance
-        assert _check_single_instance() is True
+        mock_k32 = MagicMock()
+        mock_k32.CreateMutexW.return_value = 1  # non-zero handle = success
+        monkeypatch.setattr(tray_mod, '_kernel32', mock_k32)
+        monkeypatch.setattr(ctypes, 'get_last_error', lambda: 0)
+
+        assert tray_mod._check_single_instance() is True
 
     def test_single_instance_already_running(self, monkeypatch):
-        """GetLastError returns 183 -> already running."""
-        mock_windll = MagicMock()
+        """get_last_error returns 183 -> already running."""
+        import amifuse.tray as tray_mod
         import ctypes
-        monkeypatch.setattr(ctypes, "windll", mock_windll)
-        mock_windll.kernel32.GetLastError.return_value = 183
 
-        from amifuse.tray import _check_single_instance
-        assert _check_single_instance() is False
+        mock_k32 = MagicMock()
+        mock_k32.CreateMutexW.return_value = 1  # handle still returned
+        monkeypatch.setattr(tray_mod, '_kernel32', mock_k32)
+        monkeypatch.setattr(ctypes, 'get_last_error', lambda: 183)
+
+        assert tray_mod._check_single_instance() is False
 
 
 # ---------------------------------------------------------------------------

@@ -162,13 +162,18 @@ class TrayApp:
         python_exe = str(python_dir / "python.exe")
         if not os.path.isfile(python_exe):
             python_exe = sys.executable  # fallback
-        cmd = [python_exe, "-m", "amifuse", "inspect", abs_image_path]
-        logger.info("Inspect: sys.executable=%s python_exe=%s cmd=%s",
-                     sys.executable, python_exe, cmd)
-        subprocess.Popen(
-            ["cmd", "/k"] + cmd,
-            creationflags=_CREATE_NEW_CONSOLE,
-        )
+        # Launch python directly with CREATE_NEW_CONSOLE to avoid cmd.exe
+        # metacharacter injection. The -c script uses sys.argv for the path
+        # (never interpolated into code) and waits for a keypress so the user
+        # can read output before the console closes.
+        wrapper = [
+            python_exe, "-c",
+            "import sys; from amifuse.fuse_fs import main; main(['inspect'] + sys.argv[1:]); input('\\nPress Enter to close...')",
+            abs_image_path,
+        ]
+        logger.info("Inspect: sys.executable=%s python_exe=%s wrapper=%s",
+                     sys.executable, python_exe, wrapper)
+        subprocess.Popen(wrapper, creationflags=_CREATE_NEW_CONSOLE)
 
     def _quit(self, icon, item):
         # Signal the poll loop to call icon.stop() — calling it directly from
@@ -177,12 +182,22 @@ class TrayApp:
         self._wake_event.set()
 
 
+_mutex_handle = None
+_kernel32 = None
+
+
 def _check_single_instance() -> bool:
     """Return True if this is the only instance, False if another exists."""
+    global _mutex_handle, _kernel32
     import ctypes
 
-    ctypes.windll.kernel32.CreateMutexW(None, False, "AmiFUSE_Tray_Mutex")
-    return ctypes.windll.kernel32.GetLastError() != _ERROR_ALREADY_EXISTS
+    if _kernel32 is None:
+        _kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+
+    _mutex_handle = _kernel32.CreateMutexW(None, False, "Local\\AmiFUSE_Tray_Mutex")
+    if not _mutex_handle:
+        return False
+    return ctypes.get_last_error() != _ERROR_ALREADY_EXISTS
 
 
 def main():

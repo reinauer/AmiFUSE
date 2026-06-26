@@ -105,14 +105,16 @@ class TestInspectCommand:
         kwargs = mock_popen.call_args_list[0][1]
         assert kwargs["creationflags"] == CREATE_NEW_CONSOLE
 
-    def test_inspect_command_uses_cmd_k(self, mock_popen, mock_windll, mock_exit):
-        """Inspect command starts with ["cmd", "/k", ...]."""
+    def test_inspect_command_launches_python_directly(self, mock_popen, mock_windll, mock_exit):
+        """Inspect launches python -c wrapper directly (no cmd.exe for security)."""
         from amifuse.launcher import main
         main(["inspect", "test.hdf"])
 
         cmd = mock_popen.call_args_list[0][0][0]
-        assert cmd[0] == "cmd"
-        assert cmd[1] == "/k"
+        assert cmd[0] == sys.executable
+        assert cmd[1] == "-c"
+        # Image path passed as positional arg (sys.argv), not interpolated into code
+        assert cmd[-1] == "test.hdf"
 
 
 class TestEnsureTrayRunning:
