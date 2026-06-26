@@ -211,6 +211,11 @@ def mount_image(fuse_available, tmp_path):
             ),
         )
 
+        # Cache parent device ID for Unix mount detection (st_dev changes
+        # when FUSE attaches).
+        if not sys.platform.startswith("win"):
+            parent_dev = os.stat(os.path.dirname(str(mountpoint))).st_dev
+
         # Poll until mount is detected or timeout
         deadline = time.monotonic() + timeout
         mounted = False
@@ -223,11 +228,22 @@ def mount_image(fuse_available, tmp_path):
                     f"Mount process exited early (rc={proc.returncode}).\n"
                     f"stdout: {stdout}\nstderr: {stderr}"
                 )
-            # On Windows, ismount detects the drive letter before the
-            # filesystem is fully initialized. Use listdir as the
-            # authoritative readiness check on all platforms.
+            # Platform-aware readiness detection:
+            # - Windows: drive letter doesn't exist until WinFSP creates it,
+            #   so listdir not throwing means the mount appeared.
+            # - Unix: mountpoint directory already exists, so listdir would
+            #   succeed immediately. Instead check st_dev -- FUSE attaches a
+            #   new device, so st_dev will differ from the parent directory.
             try:
-                os.listdir(str(mountpoint))
+                if sys.platform.startswith("win"):
+                    os.listdir(str(mountpoint))
+                else:
+                    if os.stat(str(mountpoint)).st_dev != parent_dev:
+                        mounted = True
+                        break
+                    else:
+                        time.sleep(_MOUNT_POLL_INTERVAL)
+                        continue
                 mounted = True
                 break
             except OSError:
@@ -235,12 +251,14 @@ def mount_image(fuse_available, tmp_path):
             time.sleep(_MOUNT_POLL_INTERVAL)
 
         if not mounted:
-            # Clean up the failed mount attempt
+            # Clean up the failed mount attempt and capture diagnostics
             proc.kill()
             proc.wait(timeout=_PROCESS_KILL_TIMEOUT)
+            stdout = proc.stdout.read().decode(errors="replace")
+            stderr = proc.stderr.read().decode(errors="replace")
             raise RuntimeError(
-                f"Mount not detected at {mountpoint} within {timeout}s. "
-                f"Process still running: {proc.poll() is None}"
+                f"Mount not detected at {mountpoint} within {timeout}s.\n"
+                f"stdout: {stdout}\nstderr: {stderr}"
             )
 
         _active_mounts.append((proc, mountpoint))
