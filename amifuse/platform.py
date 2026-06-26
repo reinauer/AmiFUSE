@@ -563,10 +563,11 @@ def _find_amifuse_mounts_unix():
     is_mac = sys.platform.startswith("darwin")
 
     # macOS: lstart gives absolute start time; Linux: etimes gives elapsed seconds
+    # -ww prevents truncation of long command lines in headless environments
     if is_mac:
-        ps_cmd = ["ps", "-axo", "pid=,ppid=,lstart=,command="]
+        ps_cmd = ["ps", "-axwwo", "pid=,ppid=,lstart=,command="]
     else:
-        ps_cmd = ["ps", "-axo", "pid=,ppid=,etimes=,command="]
+        ps_cmd = ["ps", "-axwwo", "pid=,ppid=,etimes=,command="]
 
     try:
         result = subprocess.run(

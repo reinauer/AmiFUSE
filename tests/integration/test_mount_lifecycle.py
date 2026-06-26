@@ -147,16 +147,22 @@ def test_unmount_cleans_up(mount_image, pfs3_image, pfs3_driver):
         proc.wait(timeout=5)
 
     # Poll until unmount detected
-    # On Windows, os.path.ismount on a drive letter may remain True briefly
-    # after the FUSE process exits. Use listdir failure as the signal.
     deadline = time.monotonic() + 10.0
     unmounted = False
     while time.monotonic() < deadline:
-        try:
-            os.listdir(mp_str)
-        except OSError:
-            unmounted = True
-            break
+        if sys.platform.startswith("win"):
+            # Windows: drive letter disappears, listdir throws
+            try:
+                os.listdir(mp_str)
+            except OSError:
+                unmounted = True
+                break
+        else:
+            # Unix: mountpoint reverts to empty dir after FUSE detaches,
+            # so listdir won't throw. Use ismount (st_dev comparison).
+            if not os.path.ismount(mp_str):
+                unmounted = True
+                break
         time.sleep(0.5)
 
     assert unmounted, (
