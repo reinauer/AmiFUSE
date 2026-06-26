@@ -19,7 +19,13 @@ DETACHED_FLAGS = 0x00000008 | 0x00000200 | 0x08000000
 
 @pytest.fixture(autouse=True)
 def require_winfsp():
-    """Skip if WinFSP is not installed."""
+    """Skip if WinFSP or fusepy is not installed."""
+    try:
+        from fuse import FUSE  # noqa: F401
+    except ImportError:
+        pytest.skip("fusepy not installed")
+    except EnvironmentError as exc:
+        pytest.skip(f"FUSE backend not available: {exc}")
     try:
         from amifuse.platform import _get_winfsp_install_dir
         if not _get_winfsp_install_dir():

@@ -193,6 +193,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e "./amitools[vamos]"
           pip install "pytest>=7.0" "pytest-cov>=4.0" "pytest-timeout>=2.0"
+          pip install fusepy
           pip install -e "." --no-deps
 
       - name: Verify FUSE backend
