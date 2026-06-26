@@ -444,7 +444,7 @@ class TestUnmountCommand:
         run_calls = {"unmount": 0}
 
         def fake_run(cmd, check=False, capture_output=False, text=False, **kwargs):
-            if cmd[:2] == ["ps", "-axo"]:
+            if cmd[0] == "ps":
                 return argparse.Namespace(
                     returncode=0,
                     stdout="123  1 python3 -m amifuse mount disk.iso --mountpoint ./mnt\n",
