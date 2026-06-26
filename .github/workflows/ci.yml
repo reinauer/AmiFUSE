@@ -199,13 +199,29 @@ jobs:
       - name: Verify FUSE backend
         run: |
           python -c "
+          import sys, os
           try:
               from fuse import FUSE
               print('fusepy: OK (FUSE class imported)')
           except EnvironmentError as e:
               print(f'fusepy: FUSE backend not found: {e}')
+              sys.exit(0)
           except ImportError:
               print('fusepy: not installed')
+              sys.exit(0)
+          # Verify /dev/fuse accessible on Linux
+          if sys.platform.startswith('linux'):
+              if os.path.exists('/dev/fuse'):
+                  mode = oct(os.stat('/dev/fuse').st_mode)
+                  print(f'/dev/fuse exists, mode={mode}')
+                  try:
+                      fd = os.open('/dev/fuse', os.O_RDWR)
+                      os.close(fd)
+                      print('/dev/fuse: read-write access OK')
+                  except PermissionError as e:
+                      print(f'/dev/fuse: access denied: {e}')
+              else:
+                  print('/dev/fuse: NOT FOUND')
           "
         continue-on-error: true
 
