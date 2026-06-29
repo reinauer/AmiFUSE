@@ -47,7 +47,7 @@ from .startup_runner import (
     _snapshot_block_state,
     _restore_block_state,
 )
-from amitools.vamos.libstructs.dos import FileInfoBlockStruct, FileHandleStruct, DosPacketStruct  # type: ignore
+from amitools.vamos.libstructs.dos import FileInfoBlockStruct, FileHandleStruct, DosPacketStruct, InfoDataStruct  # type: ignore
 from amitools.vamos.lib.dos.DosProtection import DosProtection  # type: ignore
 
 
@@ -1197,6 +1197,40 @@ class HandlerBridge:
                 self.free_lock(l)
             return info
 
+    def get_disk_info(self) -> Optional[Dict]:
+        """Query filesystem geometry via ACTION_DISK_INFO.
+
+        Returns dict with keys: num_blocks, num_blocks_used, bytes_per_block.
+        Returns None if the handler doesn't respond.
+        """
+        with self._lock:
+            # Allocate InfoDataStruct (9 LONGs = 36 bytes)
+            info_mem = self.vh.alloc.alloc_memory(InfoDataStruct.get_size(), label="InfoData")
+            self.mem.w_block(info_mem.addr, b"\x00" * InfoDataStruct.get_size())
+
+            # send_disk_info takes the buffer address (passes as BPTR internally)
+            self.launcher.send_disk_info(self.state, info_mem.addr)
+            replies = self._run_until_replies()
+
+            if not replies or replies[-1][2] == 0:
+                self.vh.alloc.free_memory(info_mem)
+                return None
+
+            # Read InfoDataStruct fields (all LONGs at known offsets):
+            # id_NumBlocks: offset 12
+            # id_NumBlocksUsed: offset 16
+            # id_BytesPerBlock: offset 20
+            num_blocks = self.mem.r32(info_mem.addr + 12)
+            num_blocks_used = self.mem.r32(info_mem.addr + 16)
+            bytes_per_block = self.mem.r32(info_mem.addr + 20)
+
+            self.vh.alloc.free_memory(info_mem)
+            return {
+                "num_blocks": num_blocks,
+                "num_blocks_used": num_blocks_used,
+                "bytes_per_block": bytes_per_block,
+            }
+
     def volume_name(self) -> str:
         """Best-effort name: RDB drive name, else first dir entry, else fallback."""
         with self._lock:
@@ -1523,6 +1557,12 @@ class AmigaFuseFS(Operations):
             self._cache_ttl = 0.0
             self._neg_cache_ttl = 0.0
             self._dir_cache_ttl = 0.0
+        # Disk info cache: infinite for read-only (geometry never changes),
+        # 30s for writable (free space changes as files are written)
+        self._disk_info_ttl = -1  # -1 means infinite (cache forever)
+        self._disk_info_cache = None  # (timestamp, result) tuple
+        if self.bridge._write_enabled:
+            self._disk_info_ttl = 30.0
         self._cache_lock = threading.RLock()  # Protects _stat_cache, _dir_cache, _neg_cache
         self._fh_lock = threading.Lock()
         self._fh_cache: Dict[int, Dict[str, object]] = {}
@@ -2689,6 +2729,56 @@ class AmigaFuseFS(Operations):
         # Mark bridge as closed so close() becomes a no-op if called after destroy()
         self.bridge._closed = True
         print("[amifuse] Unmount complete.", flush=True)
+
+    def statfs(self, path):
+        """Return filesystem statistics (disk space info).
+
+        Maps Amiga InfoData to POSIX statvfs fields for Explorer/df.
+        """
+        # Check disk info cache
+        now = time.time()
+        cached = self._disk_info_cache
+        if cached is not None:
+            cache_ts, cache_result = cached
+            ttl = self._disk_info_ttl
+            if ttl < 0 or (now - cache_ts < ttl):
+                return cache_result
+
+        info = self.bridge.get_disk_info()
+        if info is None:
+            # Fallback: return zeros (better than raising an error)
+            result = {
+                'f_bsize': 512,
+                'f_frsize': 512,
+                'f_blocks': 0,
+                'f_bfree': 0,
+                'f_bavail': 0,
+                'f_files': 0,
+                'f_ffree': 0,
+                'f_favail': 0,
+                'f_namemax': 107,  # Amiga FFS/PFS3 max filename length
+            }
+        else:
+            bsize = info['bytes_per_block']
+            total = info['num_blocks']
+            used = info['num_blocks_used']
+            free = total - used
+
+            result = {
+                'f_bsize': bsize,
+                'f_frsize': bsize,
+                'f_blocks': total,
+                'f_bfree': free,
+                'f_bavail': free,  # No reserved blocks concept in AmigaOS
+                'f_files': 0,      # Amiga FS doesn't have inode limits
+                'f_ffree': 0,
+                'f_favail': 0,
+                'f_namemax': 107,  # BSTR max: 255 minus length byte, but FFS uses 30, PFS3 uses 107
+            }
+
+        # Cache the result
+        self._disk_info_cache = (now, result)
+        return result
 
 
 def get_partition_info(image: Path, block_size: Optional[int], partition: Optional[str]) -> dict:

@@ -73,6 +73,7 @@ def fuse_mock(monkeypatch):
         FileInfoBlockStruct=dummy_cls,
         FileHandleStruct=dummy_cls,
         DosPacketStruct=dummy_cls,
+        InfoDataStruct=dummy_cls,
     )
     # DosProtection needs to be callable with an int arg and str-able
     # so _format_protection(prot_bits) works in tests.

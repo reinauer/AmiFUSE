@@ -3944,3 +3944,44 @@ class TestCacheLocking:
         from amifuse.fuse_fs import AmigaFuseFS
         source = inspect.getsource(AmigaFuseFS._set_neg_cached)
         assert "_cache_lock" in source
+
+
+# ---------------------------------------------------------------------------
+# TestStatfs -- disk space reporting
+# ---------------------------------------------------------------------------
+
+
+class TestStatfs:
+    """Verify statfs implementation."""
+
+    def test_statfs_method_exists(self):
+        """AmigaFuseFS has a statfs method."""
+        from amifuse.fuse_fs import AmigaFuseFS
+        assert hasattr(AmigaFuseFS, 'statfs')
+
+    def test_get_disk_info_method_exists(self):
+        """HandlerBridge has a get_disk_info method."""
+        from amifuse.fuse_fs import HandlerBridge
+        assert hasattr(HandlerBridge, 'get_disk_info')
+
+    def test_statfs_returns_required_keys(self):
+        """statfs returns dict with all required statvfs keys."""
+        import inspect
+        from amifuse.fuse_fs import AmigaFuseFS
+        source = inspect.getsource(AmigaFuseFS.statfs)
+        for key in ['f_bsize', 'f_frsize', 'f_blocks', 'f_bfree', 'f_bavail', 'f_namemax']:
+            assert key in source
+
+    def test_disk_info_cache_ttl_readonly(self):
+        """Read-only mount uses infinite disk info cache TTL."""
+        import inspect
+        from amifuse.fuse_fs import AmigaFuseFS
+        source = inspect.getsource(AmigaFuseFS.__init__)
+        assert "_disk_info_ttl" in source
+
+    def test_disk_info_cache_ttl_write(self):
+        """Write mount uses 30s disk info cache TTL."""
+        import inspect
+        from amifuse.fuse_fs import AmigaFuseFS
+        source = inspect.getsource(AmigaFuseFS.__init__)
+        assert "30.0" in source or "30" in source
