@@ -5,9 +5,24 @@
 .DESCRIPTION
     Installs Python, WinFSP, creates a venv, installs AmiFUSE and dependencies,
     then runs amifuse doctor --fix.  Idempotent -- safe to run multiple times.
+.PARAMETER Uninstall
+    Remove AmiFUSE venv, registry keys, and shell extensions.
 #>
 
+param(
+    [switch]$Uninstall
+)
+
 $ErrorActionPreference = "Stop"
+
+# Ensure script can run even with restricted execution policy
+if ((Get-ExecutionPolicy -Scope Process) -eq 'Restricted') {
+    Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+}
+
+# ---------------------------------------------------------------------------
+# Helper functions
+# ---------------------------------------------------------------------------
 
 function Write-Banner {
     Write-Host ""
@@ -27,6 +42,113 @@ function Write-Ok($msg) {
 
 function Write-Err($msg) {
     Write-Host "[!] $msg" -ForegroundColor Red
+}
+
+function Test-IsAdmin {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = [Security.Principal.WindowsPrincipal]$identity
+    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+# ---------------------------------------------------------------------------
+# Admin privilege check
+# ---------------------------------------------------------------------------
+if (-not (Test-IsAdmin)) {
+    Write-Err "This script requires administrator privileges."
+    Write-Host ""
+    Write-Host "Right-click PowerShell and select 'Run as Administrator'," -ForegroundColor White
+    Write-Host "or run: Start-Process powershell -Verb RunAs -ArgumentList '-File', '$PSCommandPath'" -ForegroundColor White
+    exit 1
+}
+
+# ---------------------------------------------------------------------------
+# Uninstall mode
+# ---------------------------------------------------------------------------
+if ($Uninstall) {
+    Write-Banner
+    Write-Host "  Uninstalling AmiFUSE..." -ForegroundColor Yellow
+    Write-Host ""
+
+    $removed = @()
+
+    # 1. Remove venv (run unregister first while amifuse is still available)
+    $venvPath = Join-Path $env:LOCALAPPDATA "amifuse\venv"
+    if (Test-Path $venvPath) {
+        $venvPython = Join-Path $venvPath "Scripts\python.exe"
+        if (Test-Path $venvPython) {
+            Write-Step "Unregistering shell extensions..."
+            try {
+                & $venvPython -m amifuse unregister 2>&1 | Out-Null
+                $removed += "Shell extensions (unregistered)"
+            } catch { }
+        }
+        Write-Step "Removing virtual environment..."
+        Remove-Item -Recurse -Force $venvPath
+        $removed += "Venv: $venvPath"
+    }
+
+    # 2. Remove registry keys (ProgID and file associations)
+    $regKeys = @(
+        "HKCU:\Software\Classes\AmiFUSE.DiskImage",
+        "HKCU:\Software\Classes\AmiFUSE.DiskImage.HDF",
+        "HKCU:\Software\Classes\AmiFUSE.DiskImage.ADF",
+        "HKCU:\Software\Classes\.hdf\OpenWithProgids",
+        "HKCU:\Software\Classes\.adf\OpenWithProgids"
+    )
+    foreach ($key in $regKeys) {
+        if (Test-Path $key) {
+            # For OpenWithProgids, only remove our entries, not the whole key
+            if ($key -match 'OpenWithProgids$') {
+                try {
+                    Remove-ItemProperty -Path $key -Name "AmiFUSE.DiskImage.HDF" -ErrorAction SilentlyContinue
+                    Remove-ItemProperty -Path $key -Name "AmiFUSE.DiskImage.ADF" -ErrorAction SilentlyContinue
+                    Remove-ItemProperty -Path $key -Name "AmiFUSE.DiskImage" -ErrorAction SilentlyContinue
+                    $removed += "Registry: $key (AmiFUSE entries)"
+                } catch { }
+            } else {
+                Remove-Item -Recurse -Force $key -ErrorAction SilentlyContinue
+                $removed += "Registry: $key"
+            }
+        }
+    }
+
+    # 3. Remove scheduled tasks
+    try {
+        $tasks = Get-ScheduledTask -TaskPath "\AmiFUSE\" -ErrorAction SilentlyContinue
+        if ($tasks) {
+            foreach ($task in $tasks) {
+                Unregister-ScheduledTask -TaskName $task.TaskName -TaskPath $task.TaskPath -Confirm:$false
+                $removed += "Scheduled task: $($task.TaskName)"
+            }
+        }
+    } catch { }
+
+    # 4. Remove amifuse app data directory (if empty after venv removal)
+    $appDir = Join-Path $env:LOCALAPPDATA "amifuse"
+    if ((Test-Path $appDir) -and ((Get-ChildItem $appDir -Force | Measure-Object).Count -eq 0)) {
+        Remove-Item -Force $appDir
+        $removed += "App directory: $appDir"
+    }
+
+    # 5. Summary
+    Write-Host ""
+    Write-Host "========================================" -ForegroundColor Cyan
+    Write-Host "  Uninstall Complete" -ForegroundColor Cyan
+    Write-Host "========================================" -ForegroundColor Cyan
+    Write-Host ""
+    if ($removed.Count -gt 0) {
+        Write-Host "  Removed:" -ForegroundColor White
+        foreach ($item in $removed) {
+            Write-Host "    - $item" -ForegroundColor White
+        }
+    } else {
+        Write-Host "  Nothing to remove (AmiFUSE was not installed)." -ForegroundColor White
+    }
+    Write-Host ""
+    Write-Host "  Note: WinFSP was NOT removed (shared dependency)." -ForegroundColor Yellow
+    Write-Host "  To remove WinFSP: winget uninstall WinFsp.WinFsp" -ForegroundColor White
+    Write-Host ""
+    exit 0
 }
 
 # ---------------------------------------------------------------------------
@@ -141,12 +263,14 @@ if ($env:VIRTUAL_ENV) {
     $activateScript = Join-Path $venvPath "Scripts\Activate.ps1"
 
     if (Test-Path $venvPath) {
-        if (Test-Path $activateScript) {
-            Write-Ok "Existing venv found at $venvPath"
-        } else {
-            Write-Step "Venv at $venvPath is broken (missing Activate.ps1). Removing..."
+        $venvPython = Join-Path $venvPath "Scripts\python.exe"
+        $venvPip = Join-Path $venvPath "Scripts\pip.exe"
+        if (-not (Test-Path $activateScript) -or -not (Test-Path $venvPython)) {
+            Write-Step "Venv at $venvPath is broken (missing core files). Removing..."
             Remove-Item -Recurse -Force $venvPath
             Write-Ok "Removed broken venv."
+        } else {
+            Write-Ok "Existing venv found at $venvPath"
         }
     }
 
