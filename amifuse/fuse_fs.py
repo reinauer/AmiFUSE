@@ -1523,6 +1523,7 @@ class AmigaFuseFS(Operations):
             self._cache_ttl = 0.0
             self._neg_cache_ttl = 0.0
             self._dir_cache_ttl = 0.0
+        self._cache_lock = threading.RLock()  # Protects _stat_cache, _dir_cache, _neg_cache
         self._fh_lock = threading.Lock()
         self._fh_cache: Dict[int, Dict[str, object]] = {}
         self._next_fh = 1
@@ -1600,32 +1601,36 @@ class AmigaFuseFS(Operations):
 
     def _get_cached_stat(self, path: str) -> Optional[Dict]:
         """Return cached stat result if still valid, else None."""
-        if path in self._stat_cache:
-            ts, result = self._stat_cache[path]
-            if (time.time() - ts < self._cache_ttl) or path in self._pinned_stats:
-                return result
-            del self._stat_cache[path]
+        with self._cache_lock:
+            if path in self._stat_cache:
+                ts, result = self._stat_cache[path]
+                if (time.time() - ts < self._cache_ttl) or path in self._pinned_stats:
+                    return result
+                del self._stat_cache[path]
         return None
 
     def _set_cached_stat(self, path: str, result: Dict):
         """Cache a stat result."""
-        self._stat_cache[path] = (time.time(), result)
+        with self._cache_lock:
+            self._stat_cache[path] = (time.time(), result)
 
     def _is_neg_cached(self, path: str) -> bool:
         """Return True if path is in negative cache (known non-existent)."""
         if self._neg_cache_ttl <= 0:
             return False
-        if path in self._neg_cache:
-            if time.time() - self._neg_cache[path] < self._neg_cache_ttl:
-                return True
-            del self._neg_cache[path]
+        with self._cache_lock:
+            if path in self._neg_cache:
+                if time.time() - self._neg_cache[path] < self._neg_cache_ttl:
+                    return True
+                del self._neg_cache[path]
         return False
 
     def _set_neg_cached(self, path: str):
         """Cache a negative (ENOENT) result."""
         if self._neg_cache_ttl <= 0:
             return
-        self._neg_cache[path] = time.time()
+        with self._cache_lock:
+            self._neg_cache[path] = time.time()
 
     def _track_op(self, op: str, path: str, cached: bool = False):
         """Track operations for debugging."""
@@ -1839,9 +1844,10 @@ class AmigaFuseFS(Operations):
                     self._pending_deletes.add(resolved_path)
                 self._log_op("releasedir", resolved_path, "deferred delete failed permanently, path hidden until unmount")
             else:
-                self._stat_cache.pop(resolved_path, None)
-                parent_path = resolved_path.rsplit("/", 1)[0] or "/"
-                self._dir_cache.pop(parent_path, None)
+                with self._cache_lock:
+                    self._stat_cache.pop(resolved_path, None)
+                    parent_path = resolved_path.rsplit("/", 1)[0] or "/"
+                    self._dir_cache.pop(parent_path, None)
         except Exception as e:
             self._log_op("releasedir", resolved_path, f"deferred delete exception: {type(e).__name__}: {e}")
             with self._fh_lock:
@@ -1854,22 +1860,23 @@ class AmigaFuseFS(Operations):
     def readdir(self, path, fh):
         self._check_handler_alive()
         # Check directory cache first
-        if path in self._dir_cache:
-            ts, cached_entries = self._dir_cache[path]
-            if time.time() - ts < self._dir_cache_ttl:
-                self._track_op("readdir", path, cached=True)
-                # Filter pending deletes from cached results
-                with self._fh_lock:
-                    if self._pending_deletes:
-                        cached_entries = [
-                            e for e in cached_entries
-                            if e in (".", "..") or (
-                                (path.rstrip("/") + "/" + e if path != "/" else "/" + e)
-                                not in self._pending_deletes
-                            )
-                        ]
-                return cached_entries
-            del self._dir_cache[path]
+        with self._cache_lock:
+            if path in self._dir_cache:
+                ts, cached_entries = self._dir_cache[path]
+                if time.time() - ts < self._dir_cache_ttl:
+                    self._track_op("readdir", path, cached=True)
+                    # Filter pending deletes from cached results
+                    with self._fh_lock:
+                        if self._pending_deletes:
+                            cached_entries = [
+                                e for e in cached_entries
+                                if e in (".", "..") or (
+                                    (path.rstrip("/") + "/" + e if path != "/" else "/" + e)
+                                    not in self._pending_deletes
+                                )
+                            ]
+                    return cached_entries
+                del self._dir_cache[path]
 
         self._track_op("readdir", path, cached=False)
         entries = [".", ".."]
@@ -1903,7 +1910,8 @@ class AmigaFuseFS(Operations):
             # Set UF_HIDDEN on .info files when icons mode is enabled
             if self._icons_enabled and (name.endswith(".info") or name.lower().endswith(".info")):
                 stat_result["st_flags"] = 0x8000  # UF_HIDDEN
-            self._stat_cache[child_path] = (now, stat_result)
+            with self._cache_lock:
+                self._stat_cache[child_path] = (now, stat_result)
 
         # Add virtual icon files if this directory has a custom icon
         if self._icon_handler and self._has_valid_icon(path):
@@ -1931,7 +1939,8 @@ class AmigaFuseFS(Operations):
                 ]
 
         # Cache the directory listing
-        self._dir_cache[path] = (now, entries)
+        with self._cache_lock:
+            self._dir_cache[path] = (now, entries)
         return entries
 
     def open(self, path, flags):
@@ -2050,14 +2059,15 @@ class AmigaFuseFS(Operations):
         # checking progress) sees the growing size rather than the size=0
         # baseline written by create().
         if path in self._pinned_stats:
-            cached = self._stat_cache.get(path)
-            if cached is not None:
-                ts, stat = cached
-                new_size = max(stat["st_size"], offset + written)
-                if new_size != stat["st_size"]:
-                    stat = dict(stat)
-                    stat["st_size"] = new_size
-                    self._stat_cache[path] = (ts, stat)
+            with self._cache_lock:
+                cached = self._stat_cache.get(path)
+                if cached is not None:
+                    ts, stat = cached
+                    new_size = max(stat["st_size"], offset + written)
+                    if new_size != stat["st_size"]:
+                        stat = dict(stat)
+                        stat["st_size"] = new_size
+                        self._stat_cache[path] = (ts, stat)
         return written
 
     def truncate(self, path, length, fh=None):
@@ -2121,22 +2131,23 @@ class AmigaFuseFS(Operations):
             # libfuse2's post-create getattr probe would fall through to PFS3
             # and get ERROR_OBJECT_IN_USE on the still-open handle.
             now = time.time()
-            self._stat_cache[path] = (
-                now,
-                {
-                    "st_mode": 0o100644,
-                    "st_nlink": 1,
-                    "st_size": 0,
-                    "st_ctime": int(now),
-                    "st_mtime": int(now),
-                    "st_atime": int(now),
-                    "st_uid": self._uid,
-                    "st_gid": self._gid,
-                },
-            )
-            self._pinned_stats.add(path)
-            parent_path, _ = self._split_path(path)
-            self._dir_cache.pop(parent_path, None)
+            with self._cache_lock:
+                self._stat_cache[path] = (
+                    now,
+                    {
+                        "st_mode": 0o100644,
+                        "st_nlink": 1,
+                        "st_size": 0,
+                        "st_ctime": int(now),
+                        "st_mtime": int(now),
+                        "st_atime": int(now),
+                        "st_uid": self._uid,
+                        "st_gid": self._gid,
+                    },
+                )
+                self._pinned_stats.add(path)
+                parent_path, _ = self._split_path(path)
+                self._dir_cache.pop(parent_path, None)
             self._log_op("create", path, f"SUCCESS handle={handle} fh_addr=0x{fh_addr:x}")
             return handle
         except FuseOSError:
@@ -2173,8 +2184,9 @@ class AmigaFuseFS(Operations):
                     if has_handle:
                         self._pending_deletes.add(path)
                 if has_handle:
-                    self._stat_cache.pop(path, None)
-                    self._dir_cache.pop(dir_path, None)
+                    with self._cache_lock:
+                        self._stat_cache.pop(path, None)
+                        self._dir_cache.pop(dir_path, None)
                     for l in reversed(locks):
                         self.bridge.free_lock(l)
                     return 0
@@ -2182,9 +2194,10 @@ class AmigaFuseFS(Operations):
             for l in reversed(locks):
                 self.bridge.free_lock(l)
             raise FuseOSError(errno.EIO)
-        self._stat_cache.pop(path, None)
+        with self._cache_lock:
+            self._stat_cache.pop(path, None)
+            self._dir_cache.pop(dir_path, None)
         self._pinned_stats.discard(path)
-        self._dir_cache.pop(dir_path, None)
         for l in reversed(locks):
             self.bridge.free_lock(l)
         return 0
@@ -2209,9 +2222,10 @@ class AmigaFuseFS(Operations):
                 # OBJECT_IN_USE — defer unconditionally; releasedir will retry
                 with self._fh_lock:
                     self._pending_deletes.add(path)
-                self._stat_cache.pop(path, None)
-                self._dir_cache.pop(dir_path, None)
-                self._dir_cache.pop(path, None)
+                with self._cache_lock:
+                    self._stat_cache.pop(path, None)
+                    self._dir_cache.pop(dir_path, None)
+                    self._dir_cache.pop(path, None)
                 return 0
             if res2 == 216:
                 # DIRECTORY_NOT_EMPTY — defer only if pending children exist
@@ -2227,9 +2241,10 @@ class AmigaFuseFS(Operations):
                         self._pending_dir_deletes[path] = pending_children.copy()
                         self._pending_deletes.add(path)
                 if pending_children:
-                    self._stat_cache.pop(path, None)
-                    self._dir_cache.pop(dir_path, None)
-                    self._dir_cache.pop(path, None)
+                    with self._cache_lock:
+                        self._stat_cache.pop(path, None)
+                        self._dir_cache.pop(dir_path, None)
+                        self._dir_cache.pop(path, None)
                     self._log_op("rmdir", path, "deferred (pending child deletes)")
                     return 0
                 # No pending children — genuinely not empty
@@ -2237,9 +2252,10 @@ class AmigaFuseFS(Operations):
             # Unrecognized error
             raise FuseOSError(errno.EIO)
         # Immediate success
-        self._stat_cache.pop(path, None)
-        self._dir_cache.pop(dir_path, None)
-        self._dir_cache.pop(path, None)
+        with self._cache_lock:
+            self._stat_cache.pop(path, None)
+            self._dir_cache.pop(dir_path, None)
+            self._dir_cache.pop(path, None)
         return 0
 
     def mkdir(self, path, mode):
@@ -2256,7 +2272,8 @@ class AmigaFuseFS(Operations):
         if new_lock == 0:
             raise FuseOSError(errno.EIO)
         self.bridge.free_lock(new_lock)
-        self._dir_cache.pop(dir_path, None)
+        with self._cache_lock:
+            self._dir_cache.pop(dir_path, None)
         for l in reversed(locks):
             self.bridge.free_lock(l)
         return 0
@@ -2278,12 +2295,13 @@ class AmigaFuseFS(Operations):
         res1, _ = self.bridge.rename_object(src_lock, src_name, dst_lock, dst_name)
         if res1 == 0:
             raise FuseOSError(errno.EIO)
-        self._stat_cache.pop(old, None)
-        self._stat_cache.pop(new, None)
+        with self._cache_lock:
+            self._stat_cache.pop(old, None)
+            self._stat_cache.pop(new, None)
+            self._dir_cache.pop(src_dir, None)
+            self._dir_cache.pop(dst_dir, None)
         self._pinned_stats.discard(old)
         self._pinned_stats.discard(new)
-        self._dir_cache.pop(src_dir, None)
-        self._dir_cache.pop(dst_dir, None)
         for l in reversed(src_locks):
             self.bridge.free_lock(l)
         for l in reversed(dst_locks):
@@ -2562,8 +2580,9 @@ class AmigaFuseFS(Operations):
                 # Delete succeeded - now remove from _pending_deletes
                 with self._fh_lock:
                     self._pending_deletes.discard(parent_dir)
-                self._stat_cache.pop(parent_dir, None)
-                self._dir_cache.pop(dir_path, None)
+                with self._cache_lock:
+                    self._stat_cache.pop(parent_dir, None)
+                    self._dir_cache.pop(dir_path, None)
             except Exception:
                 self._log_op("release", parent_dir, "deferred rmdir exception, discarding")
                 # Delete failed - _pending_deletes still has it, just stop
@@ -2595,7 +2614,8 @@ class AmigaFuseFS(Operations):
         # Unpin stat cache so future getattr re-queries PFS3 for current size.
         self._pinned_stats.discard(path)
         if self._cache_ttl <= 0:
-            self._stat_cache.pop(path, None)
+            with self._cache_lock:
+                self._stat_cache.pop(path, None)
         # Resolve path: use FUSE-provided path, fall back to cached path
         resolved_path = path if path else entry.get("path")
         # Check for deferred deletes (WinFSP unlink-before-release pattern)
@@ -2633,8 +2653,9 @@ class AmigaFuseFS(Operations):
                 for l in reversed(locks):
                     self.bridge.free_lock(l)
                 if delete_succeeded:
-                    self._stat_cache.pop(resolved_path, None)
-                    self._dir_cache.pop(dir_path, None)
+                    with self._cache_lock:
+                        self._stat_cache.pop(resolved_path, None)
+                        self._dir_cache.pop(dir_path, None)
             except Exception as e:
                 self._log_op("release", resolved_path, f"deferred delete exception: {type(e).__name__}: {e}")
                 with self._fh_lock:
