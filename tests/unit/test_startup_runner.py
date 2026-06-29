@@ -212,3 +212,21 @@ class TestStdpktRingBuffer:
         assert launcher._stdpkt_ring[0] is old_mem
         assert launcher._stdpkt_sizes[0] == 32
         launcher.alloc.free_memory.assert_not_called()
+
+
+class TestFinalizeBurstBlocked:
+    """Verify _finalize_burst_blocked helper exists and is used."""
+
+    def test_method_exists(self):
+        """HandlerLauncher has _finalize_burst_blocked method."""
+        from amifuse.startup_runner import HandlerLauncher
+        assert hasattr(HandlerLauncher, '_finalize_burst_blocked')
+
+    def test_run_burst_uses_helper(self):
+        """run_burst delegates blocked-state handling to _finalize_burst_blocked."""
+        import inspect
+        from amifuse.startup_runner import HandlerLauncher
+        source = inspect.getsource(HandlerLauncher.run_burst)
+        assert "_finalize_burst_blocked" in source
+        # Should appear at least twice (error branch + done branch)
+        assert source.count("_finalize_burst_blocked") >= 2
