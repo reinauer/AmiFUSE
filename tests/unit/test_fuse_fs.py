@@ -3904,3 +3904,43 @@ class TestPinnedStatCache:
         assert "/new" not in fs._pinned_stats
         assert "/old" not in fs._stat_cache
         assert "/new" not in fs._stat_cache
+
+
+class TestCacheLocking:
+    """Verify _cache_lock protects cache dicts from concurrent access."""
+
+    def test_cache_lock_exists_in_init(self):
+        """AmigaFuseFS.__init__ creates a _cache_lock RLock."""
+        import inspect
+        from amifuse.fuse_fs import AmigaFuseFS
+        source = inspect.getsource(AmigaFuseFS.__init__)
+        assert "_cache_lock" in source
+        assert "RLock()" in source
+
+    def test_get_cached_stat_uses_lock(self):
+        """_get_cached_stat acquires _cache_lock."""
+        import inspect
+        from amifuse.fuse_fs import AmigaFuseFS
+        source = inspect.getsource(AmigaFuseFS._get_cached_stat)
+        assert "_cache_lock" in source
+
+    def test_set_cached_stat_uses_lock(self):
+        """_set_cached_stat acquires _cache_lock."""
+        import inspect
+        from amifuse.fuse_fs import AmigaFuseFS
+        source = inspect.getsource(AmigaFuseFS._set_cached_stat)
+        assert "_cache_lock" in source
+
+    def test_is_neg_cached_uses_lock(self):
+        """_is_neg_cached acquires _cache_lock."""
+        import inspect
+        from amifuse.fuse_fs import AmigaFuseFS
+        source = inspect.getsource(AmigaFuseFS._is_neg_cached)
+        assert "_cache_lock" in source
+
+    def test_set_neg_cached_uses_lock(self):
+        """_set_neg_cached acquires _cache_lock."""
+        import inspect
+        from amifuse.fuse_fs import AmigaFuseFS
+        source = inspect.getsource(AmigaFuseFS._set_neg_cached)
+        assert "_cache_lock" in source
