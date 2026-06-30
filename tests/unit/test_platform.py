@@ -1024,3 +1024,24 @@ class TestWmicCreationFlags:
 
         _find_amifuse_mounts_windows()
         assert captured_kwargs.get("creationflags") == _CREATE_NO_WINDOW
+
+
+# ---------------------------------------------------------------------------
+# TestNotifyShellDriveChange
+# ---------------------------------------------------------------------------
+
+
+class TestNotifyShellDriveChange:
+    """Verify notify_shell_drive_change function."""
+
+    def test_function_exists(self):
+        from amifuse.platform import notify_shell_drive_change
+        assert callable(notify_shell_drive_change)
+
+    def test_noop_on_non_windows(self, monkeypatch):
+        """Does not crash on non-Windows platforms."""
+        import amifuse.platform as plat
+        monkeypatch.setattr(sys, "platform", "linux")
+        # Should return without error
+        plat.notify_shell_drive_change("D:", added=True)
+        plat.notify_shell_drive_change("D:", added=False)

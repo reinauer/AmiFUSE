@@ -3985,3 +3985,22 @@ class TestStatfs:
         from amifuse.fuse_fs import AmigaFuseFS
         source = inspect.getsource(AmigaFuseFS.__init__)
         assert "30.0" in source or "30" in source
+
+
+# ---------------------------------------------------------------------------
+# TestFuseInit -- shell notification integration
+# ---------------------------------------------------------------------------
+
+
+class TestFuseInit:
+    """Verify init() method exists for shell notification."""
+
+    def test_init_method_exists(self):
+        from amifuse.fuse_fs import AmigaFuseFS
+        assert hasattr(AmigaFuseFS, "init")
+
+    def test_destroy_has_notification(self):
+        import inspect
+        from amifuse.fuse_fs import AmigaFuseFS
+        source = inspect.getsource(AmigaFuseFS.destroy)
+        assert "notify_shell_drive_change" in source
