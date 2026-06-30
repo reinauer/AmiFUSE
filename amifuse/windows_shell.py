@@ -20,6 +20,9 @@ PROGID_DESCRIPTIONS = {
 
 ICON_DIR = Path(os.environ.get("APPDATA", "")) / "AmiFUSE" / "icons"
 _AMIFUSE_DIR = Path(os.environ.get("APPDATA", "")) / "AmiFUSE"
+# Security note: launch.vbs is user-writable (%APPDATA%). Shell verb
+# registration trusts this path — integrity depends on the user account
+# not being compromised. Acceptable for a user-space tool.
 _LAUNCH_VBS = _AMIFUSE_DIR / "launch.vbs"
 
 # VBScript launcher: runs a command with hidden window and no wait,

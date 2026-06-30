@@ -788,7 +788,7 @@ class HandlerLauncher:
             # Clear both blocking states
             _clear_all_block_state()
             state.block_state = None
-            state.exit_count = 0
+            state.exit_count = 0  # Reset for both callers (field is vestigial)
         else:
             # No message pending - save restart point for later
             if _pc_valid(ret_addr):

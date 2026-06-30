@@ -1563,7 +1563,14 @@ class AmigaFuseFS(Operations):
         self._disk_info_cache = None  # (timestamp, result) tuple
         if self.bridge._write_enabled:
             self._disk_info_ttl = 30.0
-        self._cache_lock = threading.RLock()  # Protects _stat_cache, _dir_cache, _neg_cache
+        # Protects _stat_cache, _dir_cache, _neg_cache.
+        # Note: _disk_info_cache is intentionally excluded -- it uses a simpler
+        # atomic-assignment pattern (single tuple pointer write under CPython GIL,
+        # acceptable since statfs is a single-value cache with no compound
+        # read-modify-write).
+        # Lock ordering invariant: _cache_lock must always be acquired before
+        # _fh_lock, never in reverse, to prevent deadlocks.
+        self._cache_lock = threading.RLock()
         self._fh_lock = threading.Lock()
         self._fh_cache: Dict[int, Dict[str, object]] = {}
         self._next_fh = 1
@@ -2745,6 +2752,7 @@ class AmigaFuseFS(Operations):
 
         Maps Amiga InfoData to POSIX statvfs fields for Explorer/df.
         """
+        self._check_handler_alive()
         # Check disk info cache
         now = time.time()
         cached = self._disk_info_cache
@@ -2772,7 +2780,7 @@ class AmigaFuseFS(Operations):
             bsize = info['bytes_per_block']
             total = info['num_blocks']
             used = info['num_blocks_used']
-            free = total - used
+            free = max(0, total - used)
 
             result = {
                 'f_bsize': bsize,
