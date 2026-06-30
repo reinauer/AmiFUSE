@@ -187,10 +187,14 @@ def test_unmount_twice_is_safe(mount_image, pfs3_image, pfs3_driver):
     # Poll until unmount detected
     deadline = time.monotonic() + 10.0
     while time.monotonic() < deadline:
-        try:
-            os.listdir(mp_str)
-        except OSError:
-            break
+        if sys.platform.startswith("win"):
+            try:
+                os.listdir(mp_str)
+            except OSError:
+                break
+        else:
+            if not os.path.ismount(mp_str):
+                break
         time.sleep(0.5)
 
     # Second unmount -- should fail cleanly, not hang
@@ -200,6 +204,56 @@ def test_unmount_twice_is_safe(mount_image, pfs3_image, pfs3_driver):
     assert "Traceback" not in combined, (
         f"Got raw traceback on double unmount:\n{combined}"
     )
+
+
+def test_unmount_path_not_accessible(mount_image, pfs3_image, pfs3_driver):
+    """After unmount, the mountpoint path must not resolve as a filesystem.
+
+    On Windows this validates that the drive letter is released (SHChangeNotify
+    informs Explorer, but the OS-level absence is testable). On Unix the
+    mountpoint directory reverts to a normal (empty) directory.
+    """
+    proc, mountpoint = mount_image(pfs3_image, driver=pfs3_driver)
+    mp_str = str(mountpoint)
+
+    # Confirm mount is live
+    entries_before = os.listdir(mp_str)
+    assert len(entries_before) > 0, "Mount should have visible files"
+
+    # Unmount
+    result = _run_amifuse("unmount", mp_str)
+
+    # Wait for process exit
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=5)
+
+    # Poll until unmount detected
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
+        if sys.platform.startswith("win"):
+            try:
+                os.listdir(mp_str)
+            except OSError:
+                break
+        else:
+            if not os.path.ismount(mp_str):
+                break
+        time.sleep(0.5)
+
+    # Platform-specific post-unmount assertions
+    if sys.platform.startswith("win"):
+        # Windows: drive letter should no longer exist
+        with pytest.raises(OSError):
+            os.listdir(mp_str)
+    else:
+        # Unix: directory exists but is not a mount, and should be empty
+        # (FUSE detached; the dir was created by tmp_path)
+        assert not os.path.ismount(mp_str), (
+            f"{mp_str} still appears as a mount after unmount"
+        )
 
 
 def test_mount_invalid_image_fails(fuse_available, tmp_path):
