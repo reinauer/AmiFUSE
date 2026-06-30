@@ -187,3 +187,97 @@ class TestLauncherUsesFileLogging:
         assert log_file.exists()
         content = log_file.read_text()
         assert "test message" in content
+
+
+class TestOpenCommand:
+    """Verify the open (mount + Explorer) command."""
+
+    def test_open_subparser_exists(self, mock_popen, mock_windll, mock_exit, monkeypatch):
+        """Launcher accepts 'open' subcommand without error."""
+        # Simulate: only Z:\ is available
+        poll_count = [0]
+        orig_exists = os.path.exists
+
+        def fake_exists(p):
+            p = str(p)
+            if p == "Z:\\":
+                poll_count[0] += 1
+                return poll_count[0] > 1  # drive search = False, poll = True
+            if len(p) == 3 and p[1:] == ":\\":
+                return True
+            return orig_exists(p)
+
+        monkeypatch.setattr("amifuse.launcher.os.path.exists", fake_exists)
+        monkeypatch.setattr("amifuse.launcher.os.startfile", lambda p: None)
+        import time
+        monkeypatch.setattr("time.sleep", lambda s: None)
+        mock_windll.kernel32.OpenMutexW.return_value = 1
+
+        from amifuse.launcher import main
+        main(["open", "test.hdf"])
+
+        # Mount subprocess was launched
+        assert mock_popen.call_count >= 1
+        cmd = mock_popen.call_args_list[0][0][0]
+        assert "--mountpoint" in cmd
+
+    def test_do_open_function_exists(self):
+        """_do_open function is defined."""
+        from amifuse import launcher
+        assert hasattr(launcher, '_do_open')
+        assert callable(launcher._do_open)
+
+    def test_show_error_function_exists(self):
+        """_show_error function is defined."""
+        from amifuse import launcher
+        assert hasattr(launcher, '_show_error')
+        assert callable(launcher._show_error)
+
+    def test_open_shows_error_on_no_drive(self, mock_popen, mock_windll, mock_exit, monkeypatch):
+        """Shows error when no drive letter is available."""
+        # All drives "exist"
+        monkeypatch.setattr("amifuse.launcher.os.path.exists", lambda p: True)
+        monkeypatch.setattr("amifuse.launcher.os.path.isfile", lambda p: False)
+        mock_windll.kernel32.OpenMutexW.return_value = 1
+
+        from amifuse.launcher import main
+        main(["open", "test.hdf"])
+
+        # MessageBoxW should have been called with error
+        mock_windll.user32.MessageBoxW.assert_called_once()
+        call_args = mock_windll.user32.MessageBoxW.call_args[0]
+        assert "No available drive letter" in call_args[1]
+
+    def test_open_includes_daemon_and_mountpoint(self, mock_popen, mock_windll, mock_exit, monkeypatch):
+        """Open command passes --mountpoint and --daemon to mount subprocess."""
+        # Simulate: only Z:\ is available (all others "exist")
+        target_drive = "Z:"
+        poll_count = [0]
+        orig_exists = os.path.exists
+
+        def fake_exists(p):
+            p = str(p)
+            if p == f"{target_drive}\\":
+                poll_count[0] += 1
+                # First call is drive search (return False = available)
+                # Second call is poll (return True = mounted)
+                return poll_count[0] > 1
+            # All other drive letters "exist" (not available)
+            if len(p) == 3 and p[1:] == ":\\":
+                return True
+            return orig_exists(p)
+
+        monkeypatch.setattr("amifuse.launcher.os.path.exists", fake_exists)
+        monkeypatch.setattr("amifuse.launcher.os.startfile", lambda p: None)
+        import time
+        monkeypatch.setattr("time.sleep", lambda s: None)
+        mock_windll.kernel32.OpenMutexW.return_value = 1
+
+        from amifuse.launcher import main
+        main(["open", "test.hdf"])
+
+        cmd = mock_popen.call_args_list[0][0][0]
+        assert "--daemon" in cmd
+        assert "--mountpoint" in cmd
+        mp_idx = cmd.index("--mountpoint")
+        assert cmd[mp_idx + 1] == target_drive

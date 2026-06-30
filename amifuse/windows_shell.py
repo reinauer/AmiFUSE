@@ -221,8 +221,24 @@ def _register_progid(winreg, progid: str, launcher: str) -> None:
     finally:
         winreg.CloseKey(key)
 
-    # Flat verb: mount — wscript runs VBS launcher invisibly (no cmd.exe flash)
+    # Set default verb to "open" so double-click triggers mount
     vbs = str(_LAUNCH_VBS)
+    shell_key = winreg.CreateKey(winreg.HKEY_CURRENT_USER, rf"{base}\shell")
+    try:
+        winreg.SetValueEx(shell_key, "", 0, winreg.REG_SZ, "open")
+    finally:
+        winreg.CloseKey(shell_key)
+
+    # Flat verb: open — mount and open Explorer (default action for double-click)
+    _set_verb(
+        winreg,
+        base,
+        "open",
+        "Mount && Open with AmiFUSE",
+        f'wscript.exe //nologo //b "{vbs}" "{launcher}" open "%1"',
+    )
+
+    # Flat verb: mount — wscript runs VBS launcher invisibly (no cmd.exe flash)
     _set_verb(
         winreg,
         base,

@@ -56,6 +56,9 @@ def main(argv=None) -> None:
     mount_p.add_argument("image")
     mount_p.add_argument("--write", action="store_true")
 
+    open_p = sub.add_parser("open", help="Mount and open in Explorer")
+    open_p.add_argument("image")
+
     inspect_p = sub.add_parser("inspect", help="Open inspect in a new console")
     inspect_p.add_argument("image")
 
@@ -63,6 +66,8 @@ def main(argv=None) -> None:
 
     if args.command == "mount":
         _do_mount(args)
+    elif args.command == "open":
+        _do_open(args)
     elif args.command == "inspect":
         _do_inspect(args)
 
@@ -111,6 +116,77 @@ def _do_inspect(args) -> None:
         args.image,
     ]
     subprocess.Popen(wrapper, creationflags=CREATE_NEW_CONSOLE)
+
+
+def _do_open(args) -> None:
+    """Mount an image and open Explorer to the mounted drive."""
+    import time
+
+    # Find an available drive letter
+    drive_letter = None
+    for letter in "DEFGHIJKLMNOPQRSTUVWXYZ":
+        candidate = f"{letter}:"
+        if not os.path.exists(candidate + "\\"):
+            drive_letter = candidate
+            break
+
+    if drive_letter is None:
+        _log("No available drive letter found")
+        _show_error("AmiFUSE", "No available drive letter found. Cannot mount.")
+        return
+
+    # Launch mount with explicit mountpoint
+    python_dir = Path(sys.executable).parent
+    python_exe = str(python_dir / "pythonw.exe")
+    if not os.path.isfile(python_exe):
+        python_exe = sys.executable
+
+    cmd = [python_exe, "-m", "amifuse", "mount", "--mountpoint", drive_letter, "--daemon", args.image]
+
+    _log(f"Launching open-mount: {cmd}")
+    try:
+        _spawn_detached(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+        )
+    except Exception as exc:
+        _log(f"Failed to launch mount: {exc}")
+        _show_error("AmiFUSE", f"Failed to launch mount process:\n{exc}")
+        return
+
+    # Poll for mount to become ready
+    mount_path = f"{drive_letter}\\"
+    timeout = 15.0
+    poll_interval = 0.25
+    elapsed = 0.0
+
+    while elapsed < timeout:
+        time.sleep(poll_interval)
+        elapsed += poll_interval
+        if os.path.exists(mount_path):
+            _log(f"Mount ready at {drive_letter} after {elapsed:.1f}s, opening Explorer")
+            os.startfile(mount_path)
+            _ensure_tray_running()
+            return
+
+    # Timeout — mount may have failed
+    _log(f"Mount timed out after {timeout}s for {drive_letter}")
+    _show_error(
+        "AmiFUSE",
+        f"Mount timed out waiting for {drive_letter}.\n\n"
+        "The image may be invalid or the filesystem handler failed to start.",
+    )
+
+
+def _show_error(title: str, message: str) -> None:
+    """Show a Windows MessageBox error. Best-effort; never raises."""
+    try:
+        ctypes.windll.user32.MessageBoxW(0, message, title, 0x10)  # MB_ICONERROR
+    except Exception:
+        pass
 
 
 def _ensure_tray_running() -> None:
