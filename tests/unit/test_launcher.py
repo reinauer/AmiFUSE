@@ -281,5 +281,6 @@ class TestOpenCommand:
         cmd = mock_popen.call_args_list[0][0][0]
         assert "--daemon" in cmd
         assert "--mountpoint" in cmd
+        assert "--write" in cmd
         mp_idx = cmd.index("--mountpoint")
         assert cmd[mp_idx + 1] == target_drive

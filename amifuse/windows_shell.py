@@ -241,22 +241,17 @@ def _register_progid(winreg, progid: str, launcher: str) -> None:
         f'wscript.exe //nologo //b "{vbs}" "{launcher}" open "%1"',
     )
 
-    # Flat verb: mount — wscript runs VBS launcher invisibly (no cmd.exe flash)
-    _set_verb(
-        winreg,
-        base,
-        "mount",
-        "Mount with AmiFUSE",
-        f'wscript.exe //nologo //b "{vbs}" "{launcher}" mount "%1"',
-    )
+    # Clean up stale verb keys from previous registrations
+    for stale_verb in ("mount", "mountrw"):
+        _delete_key_recursive(winreg.HKEY_CURRENT_USER, rf"{base}\shell\{stale_verb}")
 
-    # Flat verb: mountrw
+    # Flat verb: mountro — read-only mount without opening Explorer
     _set_verb(
         winreg,
         base,
-        "mountrw",
-        "Mount Read-Write with AmiFUSE",
-        f'wscript.exe //nologo //b "{vbs}" "{launcher}" mount --write "%1"',
+        "mountro",
+        "Mount Read-Only with AmiFUSE",
+        f'wscript.exe //nologo //b "{vbs}" "{launcher}" mount "%1"',
     )
 
     # DefaultIcon

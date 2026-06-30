@@ -189,7 +189,7 @@ class TestRegister:
         assert reg.key_exists(reg.HKEY_CURRENT_USER, r"Software\Classes\AmiFUSE.FloppyImage")
 
     def test_register_creates_flat_verb_keys(self, fake_registry, tmp_path, monkeypatch):
-        """mount and mountrw verbs created under ProgID."""
+        """mountro verb created under ProgID."""
         reg, _ = fake_registry
         monkeypatch.setattr("amifuse.windows_shell.ICON_DIR", tmp_path / "icons")
 
@@ -197,10 +197,8 @@ class TestRegister:
         register()
 
         base = r"Software\Classes\AmiFUSE.DiskImage"
-        assert reg.key_exists(reg.HKEY_CURRENT_USER, rf"{base}\shell\mount")
-        assert reg.key_exists(reg.HKEY_CURRENT_USER, rf"{base}\shell\mount\command")
-        assert reg.key_exists(reg.HKEY_CURRENT_USER, rf"{base}\shell\mountrw")
-        assert reg.key_exists(reg.HKEY_CURRENT_USER, rf"{base}\shell\mountrw\command")
+        assert reg.key_exists(reg.HKEY_CURRENT_USER, rf"{base}\shell\mountro")
+        assert reg.key_exists(reg.HKEY_CURRENT_USER, rf"{base}\shell\mountro\command")
 
     def test_register_creates_open_with_progids(self, fake_registry, tmp_path, monkeypatch):
         """OpenWithProgids entry created for each extension."""

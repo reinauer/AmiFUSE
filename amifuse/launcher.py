@@ -141,7 +141,7 @@ def _do_open(args) -> None:
     if not os.path.isfile(python_exe):
         python_exe = sys.executable
 
-    cmd = [python_exe, "-m", "amifuse", "mount", "--mountpoint", drive_letter, "--daemon", args.image]
+    cmd = [python_exe, "-m", "amifuse", "mount", "--write", "--mountpoint", drive_letter, "--daemon", args.image]
 
     _log(f"Launching open-mount: {cmd}")
     try:
