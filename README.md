@@ -186,10 +186,10 @@ Mount lifecycle:
 - `--interactive` / `--foreground` keeps AmiFUSE attached to the terminal.
   Use this for debugging or when you want `Ctrl+C` to unmount from the same
   shell.
-- Windows defaults to daemon mode. You can mount via the Explorer context
-  menu (`amifuse register`), unmount from the system tray icon, or use
-  `amifuse unmount <mountpoint>` from the CLI. Note: the WinFSP "Eject"
-  action does not perform a clean unmount — use the tray or CLI instead.
+- Windows defaults to daemon mode. Double-click `.hdf`/`.adf` files to mount
+  and open Explorer (requires `amifuse register`). Unmount from the system
+  tray icon or with `amifuse unmount <drive>:`. The WinFSP "Eject" action
+  does not perform a clean unmount — use the tray or CLI instead.
 - `--profile` implies interactive mode.
 
 ### Diagnosing Issues
@@ -319,8 +319,8 @@ The `--icons` flag enables conversion of Amiga `.info` icon files to native Find
 
 ## Windows Shell Integration
 
-On Windows, AmiFUSE can integrate with Explorer for a right-click mount
-experience and a system tray mount manager.
+On Windows, AmiFUSE can integrate with Explorer for double-click mounting,
+right-click context menus, and a system tray mount manager.
 
 ### Context menu registration
 
@@ -332,14 +332,34 @@ amifuse unregister    # Remove the context menu entries
 Registration writes to `HKCU` (current user only) — no administrator privileges
 are required.
 
+After registering:
+
+- **Double-click** an `.hdf` or `.adf` file to mount it and open Explorer at the
+  mounted drive
+- **Right-click** for "Mount with AmiFUSE" (read-only) or "Mount Read-Write with
+  AmiFUSE"
+
 ### Tray mount manager
 
 When a filesystem is mounted in daemon mode on Windows, the `amifuse-tray`
 helper appears in the system tray. From the tray icon you can see active mounts
-and unmount them cleanly.
+and unmount them cleanly. Each mount shows its drive letter, image name, and
+provides Inspect/Unmount actions.
 
 The tray requires optional dependencies: install them with
 `pip install amifuse[windows]` (provides pystray and Pillow).
+
+### Removing shell integration
+
+```bash
+amifuse unregister
+```
+
+Or use the installer's uninstall mode:
+
+```powershell
+.\tools\install-windows.ps1 -Uninstall
+```
 
 ## Notes
 
