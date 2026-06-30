@@ -1345,3 +1345,34 @@ def _get_file_version_win(filepath: str) -> Optional[str]:
         return f"{(ms >> 16) & 0xFFFF}.{ms & 0xFFFF}.{(ls >> 16) & 0xFFFF}.{ls & 0xFFFF}"
     except Exception:
         return None
+
+
+def notify_shell_drive_change(drive_letter: str, added: bool) -> None:
+    """Notify Windows Explorer that a drive was added or removed.
+
+    Uses SHChangeNotify to trigger immediate Explorer sidebar refresh.
+    No-op on non-Windows platforms.
+
+    Args:
+        drive_letter: Drive letter with colon (e.g., "D:" or "D:\\")
+        added: True for mount (SHCNE_DRIVEADD), False for unmount (SHCNE_DRIVEREMOVED)
+    """
+    if not sys.platform.startswith("win"):
+        return
+
+    import ctypes
+
+    # SHChangeNotify constants
+    SHCNE_DRIVEADD = 0x00000100
+    SHCNE_DRIVEREMOVED = 0x00000080
+    SHCNF_PATH = 0x0005
+
+    event = SHCNE_DRIVEADD if added else SHCNE_DRIVEREMOVED
+    # SHChangeNotify expects a null-terminated path string
+    # Normalize to "X:\" format
+    path = drive_letter.rstrip("\\") + "\\"
+
+    try:
+        ctypes.windll.shell32.SHChangeNotify(event, SHCNF_PATH, path, None)
+    except Exception:
+        pass  # Best-effort; don't crash if shell notification fails

@@ -2705,6 +2705,12 @@ class AmigaFuseFS(Operations):
                 self._resolve_pending_dir_deletes(resolved_path)
         return 0
 
+    def init(self, path):
+        """Called when filesystem is mounted. Notify shell on Windows."""
+        if sys.platform.startswith("win") and self._mountpoint:
+            from .platform import notify_shell_drive_change
+            notify_shell_drive_change(str(self._mountpoint), added=True)
+
     def destroy(self, path):
         """Called when filesystem is unmounted. Flush and release all resources."""
         print("[amifuse] Unmounting - flushing volume...", flush=True)
@@ -2728,6 +2734,10 @@ class AmigaFuseFS(Operations):
             print(f"[amifuse] WARNING: backend close failed: {e}", flush=True)
         # Mark bridge as closed so close() becomes a no-op if called after destroy()
         self.bridge._closed = True
+        # Notify Explorer that drive was removed
+        if sys.platform.startswith("win") and self._mountpoint:
+            from .platform import notify_shell_drive_change
+            notify_shell_drive_change(str(self._mountpoint), added=False)
         print("[amifuse] Unmount complete.", flush=True)
 
     def statfs(self, path):
