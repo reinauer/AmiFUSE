@@ -1373,6 +1373,6 @@ def notify_shell_drive_change(drive_letter: str, added: bool) -> None:
     path = drive_letter.rstrip("\\") + "\\"
 
     try:
-        ctypes.windll.shell32.SHChangeNotify(event, SHCNF_PATH, path, None)
+        ctypes.windll.shell32.SHChangeNotify(event, SHCNF_PATH, ctypes.c_wchar_p(path), None)
     except Exception:
         pass  # Best-effort; don't crash if shell notification fails

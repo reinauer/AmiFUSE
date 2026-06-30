@@ -246,7 +246,9 @@ class TestOpenCommand:
         # MessageBoxW should have been called with error
         mock_windll.user32.MessageBoxW.assert_called_once()
         call_args = mock_windll.user32.MessageBoxW.call_args[0]
-        assert "No available drive letter" in call_args[1]
+        # call_args[1] is ctypes.c_wchar_p; extract .value for string comparison
+        msg = call_args[1].value if hasattr(call_args[1], 'value') else call_args[1]
+        assert "No available drive letter" in msg
 
     def test_open_includes_daemon_and_mountpoint(self, mock_popen, mock_windll, mock_exit, monkeypatch):
         """Open command passes --mountpoint and --daemon to mount subprocess."""

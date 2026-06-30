@@ -184,7 +184,7 @@ def _do_open(args) -> None:
 def _show_error(title: str, message: str) -> None:
     """Show a Windows MessageBox error. Best-effort; never raises."""
     try:
-        ctypes.windll.user32.MessageBoxW(0, message, title, 0x10)  # MB_ICONERROR
+        ctypes.windll.user32.MessageBoxW(0, ctypes.c_wchar_p(message), ctypes.c_wchar_p(title), 0x10)  # MB_ICONERROR
     except Exception:
         pass
 
