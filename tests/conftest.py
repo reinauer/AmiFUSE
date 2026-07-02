@@ -41,6 +41,17 @@ def fuse_mock(monkeypatch):
     fake_fuse.Operations = type("Operations", (), {})
     monkeypatch.setitem(sys.modules, "fuse", fake_fuse)
 
+    # If amifuse.fuse_fs was already imported without this mock (e.g. by an
+    # earlier test in a different order), it permanently bound FUSE=None at
+    # import time. Rebind its module-level symbols so those tests can't leave
+    # fuse_fs in an unusable state. setattr auto-reverts at teardown.
+    mod = sys.modules.get("amifuse.fuse_fs")
+    if mod is not None:
+        monkeypatch.setattr(mod, "FUSE", fake_fuse.FUSE)
+        monkeypatch.setattr(mod, "FuseOSError", fake_fuse.FuseOSError)
+        monkeypatch.setattr(mod, "LoggingMixIn", fake_fuse.LoggingMixIn)
+        monkeypatch.setattr(mod, "Operations", fake_fuse.Operations)
+
     def _stub_module(name, **attrs):
         mod = types.ModuleType(name)
         for key, value in attrs.items():
