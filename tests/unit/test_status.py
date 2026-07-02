@@ -330,6 +330,8 @@ class TestFindAmifuseMountsDispatch:
 # ---------------------------------------------------------------------------
 
 
+# requests fuse_mock so importing amifuse.fuse_fs here cannot pin FUSE=None for later tests
+@pytest.mark.usefixtures("fuse_mock")
 class TestCmdStatus:
     """Test the cmd_status handler in fuse_fs."""
 
@@ -483,6 +485,8 @@ class TestFindMountOwnerPidsRefactored:
 # ---------------------------------------------------------------------------
 
 
+# requests fuse_mock so importing amifuse.fuse_fs here cannot pin FUSE=None for later tests
+@pytest.mark.usefixtures("fuse_mock")
 class TestTruncateLeft:
     """Tests for _truncate_left helper."""
 
@@ -525,6 +529,8 @@ class TestTruncateLeft:
 # ---------------------------------------------------------------------------
 
 
+# requests fuse_mock so importing amifuse.fuse_fs here cannot pin FUSE=None for later tests
+@pytest.mark.usefixtures("fuse_mock")
 class TestEnrichNullMountpoints:
     """Tests for _enrich_null_mountpoints and platform-specific helpers."""
 
