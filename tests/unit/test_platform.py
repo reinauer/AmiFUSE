@@ -1168,3 +1168,117 @@ class TestNotifyShellDriveChange:
         # Should return without error
         plat.notify_shell_drive_change("D:", added=True)
         plat.notify_shell_drive_change("D:", added=False)
+
+
+# ---------------------------------------------------------------------------
+# TestParseMountTokensQuoting -- quote-stripping in _parse_mount_tokens
+# ---------------------------------------------------------------------------
+
+
+class TestParseMountTokensQuoting:
+    """Verify _parse_mount_tokens strips a matched surrounding quote pair.
+
+    On Windows the command line is tokenized with shlex.split(posix=False),
+    which retains the literal quotes that list2cmdline adds around spaced paths.
+    The parser must return image/mountpoint without those surrounding quotes,
+    while leaving unbalanced input untouched (no crash).
+    """
+
+    def test_quoted_spaced_image_and_mountpoint_stripped(self):
+        # Tokens as produced by shlex.split(cmdline, posix=False) on Windows:
+        # the spaced image path and mountpoint keep their surrounding quotes.
+        from amifuse.platform import _parse_mount_tokens
+
+        tokens = [
+            "pythonw", "-m", "amifuse", "mount",
+            "--mountpoint", "I:",
+            "--write", "--daemon",
+            '"U:\\thomas\\Test Fixtures\\hd0-ericA3000.hdf"',
+        ]
+        image, mountpoint = _parse_mount_tokens(tokens)
+        assert image == "U:\\thomas\\Test Fixtures\\hd0-ericA3000.hdf"
+        assert mountpoint == "I:"
+        # No surrounding quotes leaked through.
+        assert not image.startswith('"') and not image.endswith('"')
+
+    def test_quoted_spaced_mountpoint_stripped(self):
+        from amifuse.platform import _parse_mount_tokens
+
+        tokens = [
+            "amifuse", "mount",
+            "--mountpoint", '"/Volumes/My Disk"',
+            "/path/plain.hdf",
+        ]
+        image, mountpoint = _parse_mount_tokens(tokens)
+        assert mountpoint == "/Volumes/My Disk"
+        assert image == "/path/plain.hdf"
+
+    def test_unbalanced_leading_quote_left_untouched(self):
+        # Only a leading quote (no matching trailing one): must not be stripped
+        # and must not raise.
+        from amifuse.platform import _parse_mount_tokens
+
+        tokens = ["amifuse", "mount", '"U:\\thomas\\weird.hdf']
+        image, mountpoint = _parse_mount_tokens(tokens)
+        assert image == '"U:\\thomas\\weird.hdf'
+        assert mountpoint is None
+
+    def test_unbalanced_trailing_quote_left_untouched(self):
+        from amifuse.platform import _parse_mount_tokens
+
+        tokens = ["amifuse", "mount", 'U:\\thomas\\weird.hdf"']
+        image, mountpoint = _parse_mount_tokens(tokens)
+        assert image == 'U:\\thomas\\weird.hdf"'
+
+    def test_unquoted_image_unchanged(self):
+        # Unix posix=True path already strips quotes: tokens have none, so the
+        # strip is a harmless no-op.
+        from amifuse.platform import _parse_mount_tokens
+
+        tokens = [
+            "python", "-m", "amifuse", "mount",
+            "--mountpoint", "/mnt/amiga",
+            "/home/user/disk.hdf",
+        ]
+        image, mountpoint = _parse_mount_tokens(tokens)
+        assert image == "/home/user/disk.hdf"
+        assert mountpoint == "/mnt/amiga"
+
+    def test_quoted_spaced_unc_image_stripped(self):
+        # UNC path with a space: a single surrounding quote pair is stripped
+        # while the internal backslashes (including the leading \\) survive.
+        from amifuse.platform import _parse_mount_tokens
+
+        tokens = [
+            "amifuse", "mount",
+            '"\\\\192.168.3.3\\share\\my disk.hdf"',
+        ]
+        image, mountpoint = _parse_mount_tokens(tokens)
+        assert image == "\\\\192.168.3.3\\share\\my disk.hdf"
+        assert mountpoint is None
+        # No surrounding quotes leaked; the leading UNC \\ is intact.
+        assert not image.startswith('"') and not image.endswith('"')
+        assert image.startswith("\\\\")
+
+    def test_lone_quote_token_unchanged(self):
+        # A token of exactly one double-quote (len 1) exercises the
+        # len(value) >= 2 guard: it must be returned unchanged, not stripped.
+        from amifuse.platform import _parse_mount_tokens
+
+        tokens = ["amifuse", "mount", '"']
+        image, mountpoint = _parse_mount_tokens(tokens)
+        assert image == '"'
+        assert mountpoint is None
+
+    def test_quoted_spaced_image_and_mountpoint_both_stripped(self):
+        # Both image and mountpoint quoted-and-spaced in a single call.
+        from amifuse.platform import _parse_mount_tokens
+
+        tokens = [
+            "amifuse", "mount",
+            "--mountpoint", '"/Volumes/My Disk"',
+            '"/path/My Disk.hdf"',
+        ]
+        image, mountpoint = _parse_mount_tokens(tokens)
+        assert image == "/path/My Disk.hdf"
+        assert mountpoint == "/Volumes/My Disk"
