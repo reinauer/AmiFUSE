@@ -13,6 +13,9 @@ import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
+
+import amifuse.platform as platform
 
 DETACHED_PROCESS = 0x00000008
 CREATE_NEW_PROCESS_GROUP = 0x00000200
@@ -21,6 +24,10 @@ CREATE_NEW_CONSOLE = 0x00000010
 CREATE_BREAKAWAY_FROM_JOB = 0x01000000
 
 _DETACHED_FLAGS = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
+
+# Seconds to wait for a mount to appear before surfacing an error dialog.
+# Shared by _do_open and _do_mount so both poll loops stay in sync.
+MOUNT_POLL_TIMEOUT = 15.0
 
 _LOG_DIR = Path(os.environ.get("APPDATA", "")) / "AmiFUSE"
 
@@ -77,7 +84,34 @@ def main(argv=None) -> None:
     os._exit(0)
 
 
+def _select_drive_letter() -> Optional[str]:
+    """Return the first unallocated drive letter as an ``"X:"`` string, or None.
+
+    Selection uses ``platform._windows_allocated_drive_letters()`` (the Win32
+    GetLogicalDrives bitmask) rather than ``os.path.exists`` so an
+    assigned-but-empty removable slot (e.g. an empty card-reader D:) is
+    correctly treated as taken -- the launcher and the core mount path share
+    one correct implementation. The helper returns bare uppercase letters, so
+    compare against uppercase candidates.
+    """
+    allocated = platform._windows_allocated_drive_letters()
+    for letter in "DEFGHIJKLMNOPQRSTUVWXYZ":
+        if letter not in allocated:
+            return f"{letter}:"
+    return None
+
+
 def _do_mount(args) -> None:
+    import time
+
+    # Select the drive letter here (via the shared helper) so we know which
+    # letter to poll for after spawning the detached mount.
+    drive_letter = _select_drive_letter()
+    if drive_letter is None:
+        _log("No available drive letter found")
+        _show_error("AmiFUSE", "No available drive letter found. Cannot mount.")
+        return
+
     python_dir = Path(sys.executable).parent
     python_exe = str(python_dir / "pythonw.exe")
     if not os.path.isfile(python_exe):
@@ -86,6 +120,8 @@ def _do_mount(args) -> None:
     cmd = [python_exe, "-m", "amifuse", "mount"]
     if args.write:
         cmd.append("--write")
+    cmd.append("--mountpoint")
+    cmd.append(drive_letter)
     cmd.append("--daemon")
     cmd.append(args.image)
 
@@ -100,9 +136,46 @@ def _do_mount(args) -> None:
         )
     except Exception as exc:
         _log(f"Failed to launch mount subprocess: {exc}")
+        _show_error("AmiFUSE", f"Failed to launch mount process:\n{exc}")
         return
 
+    # Poll for the mount to appear, surfacing failures via a dialog instead of
+    # exiting silently. os.path.exists is the CORRECT probe here for "did my
+    # mount appear" -- a live WinFSP mount has media, so the path becomes
+    # reachable -- but it is WRONG for "is a letter allocated" (that is the bug
+    # _select_drive_letter avoids by using the GetLogicalDrives bitmask). Do
+    # not consolidate the two probes.
+    #
+    # This intentionally blocks up to MOUNT_POLL_TIMEOUT before main() reaches
+    # os._exit(0). Safe because the mountro verb is launched hidden and
+    # non-waiting via `WScript.Shell.Run cmd, 0, False`, so Explorer's UI
+    # thread is not blocked by this wait. Do not "optimize" the poll away -- it
+    # is what surfaces mount failures instead of re-silencing them.
+    mount_path = f"{drive_letter}\\"
+    poll_interval = 0.25
+    elapsed = 0.0
+    while elapsed < MOUNT_POLL_TIMEOUT:
+        time.sleep(poll_interval)
+        elapsed += poll_interval
+        if os.path.exists(mount_path):
+            _log(f"Mount ready at {drive_letter} after {elapsed:.1f}s")
+            _ensure_tray_running()
+            return
+
+    _log(f"Mount timed out after {MOUNT_POLL_TIMEOUT}s for {drive_letter}")
+    # Start the tray on the timeout path too: a slow cold mount (vamos + m68k
+    # init on a large multi-partition HDF) may still be initializing, so this
+    # may be a slow success rather than a failure. The tray self-manages and
+    # auto-exits shortly if no mounts are present, so starting it here is
+    # harmless even on a genuine failure.
     _ensure_tray_running()
+    _show_error(
+        "AmiFUSE",
+        f"Drive {drive_letter} did not appear within "
+        f"{MOUNT_POLL_TIMEOUT:.0f} seconds.\n\n"
+        "It may still be starting up -- check Explorer for the drive, or see "
+        "the log if it doesn't appear.",
+    )
 
 
 def _do_inspect(args) -> None:
@@ -122,13 +195,10 @@ def _do_open(args) -> None:
     """Mount an image and open Explorer to the mounted drive."""
     import time
 
-    # Find an available drive letter
-    drive_letter = None
-    for letter in "DEFGHIJKLMNOPQRSTUVWXYZ":
-        candidate = f"{letter}:"
-        if not os.path.exists(candidate + "\\"):
-            drive_letter = candidate
-            break
+    # Select an available drive letter via the shared helper (GetLogicalDrives
+    # bitmask), so the launcher and the core mount path agree on which letters
+    # are free -- see _select_drive_letter for why os.path.exists is wrong here.
+    drive_letter = _select_drive_letter()
 
     if drive_letter is None:
         _log("No available drive letter found")
@@ -157,9 +227,12 @@ def _do_open(args) -> None:
         _show_error("AmiFUSE", f"Failed to launch mount process:\n{exc}")
         return
 
-    # Poll for mount to become ready
+    # Poll for mount to become ready. os.path.exists is the CORRECT probe here
+    # for "did my mount appear" (a live WinFSP mount has media) but WRONG for
+    # "is a letter allocated" -- selection above uses the GetLogicalDrives
+    # bitmask via _select_drive_letter instead. Do not merge the two probes.
     mount_path = f"{drive_letter}\\"
-    timeout = 15.0
+    timeout = MOUNT_POLL_TIMEOUT
     poll_interval = 0.25
     elapsed = 0.0
 
@@ -172,12 +245,20 @@ def _do_open(args) -> None:
             _ensure_tray_running()
             return
 
-    # Timeout — mount may have failed
+    # Timeout — the drive may still be initializing (slow cold mount)
     _log(f"Mount timed out after {timeout}s for {drive_letter}")
+    # Start the tray on the timeout path too: a slow cold mount (vamos + m68k
+    # init on a large multi-partition HDF) may still be initializing, so this
+    # may be a slow success rather than a failure. The tray self-manages and
+    # auto-exits shortly if no mounts are present, so starting it here is
+    # harmless even on a genuine failure.
+    _ensure_tray_running()
     _show_error(
         "AmiFUSE",
-        f"Mount timed out waiting for {drive_letter}.\n\n"
-        "The image may be invalid or the filesystem handler failed to start.",
+        f"Drive {drive_letter} did not appear within "
+        f"{timeout:.0f} seconds.\n\n"
+        "It may still be starting up -- check Explorer for the drive, or see "
+        "the log if it doesn't appear.",
     )
 
 

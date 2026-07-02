@@ -21,7 +21,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import List, Optional, TYPE_CHECKING
+from typing import List, Optional, Set, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .icon_darwin import DarwinIconHandler
@@ -112,6 +112,50 @@ def get_primary_driver_dir() -> Path:
     return Path.home() / ".local" / "share" / "amifuse" / "drivers"
 
 
+def _windows_allocated_drive_letters() -> Set[str]:
+    """Return the set of drive letters currently allocated on Windows.
+
+    Uses the Win32 ``GetLogicalDrives`` bitmask, which reports letter
+    *allocation* regardless of whether media is present. This is the correct
+    probe for "is this drive letter taken" -- unlike ``os.path.exists``, which
+    false-negatives on an assigned-but-empty removable slot (e.g. an empty
+    card-reader ``D:``) and led AmiFUSE to auto-select a letter that WinFsp
+    then refused with "mount point in use".
+
+    Returns:
+        A set of bare, uppercase, single-character letters (e.g. ``{"C", "D"}``
+        -- not ``"C:"`` strings). On non-Windows platforms returns an empty set
+        without ever touching ``windll``.
+
+    Bitmask decode: bit 0 = A:, bit 1 = B:, ... bit 25 = Z:.
+    """
+    if not sys.platform.startswith("win"):
+        return set()
+
+    # Conservative fallback for API failure. ``GetLogicalDrives`` returns 0
+    # only when the call fails (a real system always has at least C: allocated).
+    # Decoding 0 naively would yield an empty set, making *every* letter look
+    # free and re-selecting the empty D: this fix removes. Instead we treat
+    # every letter as allocated, so auto-selection declines to pick a letter
+    # rather than picking a bad one, and validation rejects rather than
+    # waving through. Callers must handle the "no free letter" outcome.
+    all_letters = set("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+
+    try:
+        # windll is Windows-only; keep the reference inside the function body so
+        # merely importing this module never touches it on macOS/Linux. Matches
+        # the ctypes idiom used elsewhere in this file (e.g. _pid_exists).
+        import ctypes
+        mask = ctypes.windll.kernel32.GetLogicalDrives()
+    except Exception:
+        return all_letters
+
+    if not mask:
+        return all_letters
+
+    return {chr(ord("A") + i) for i in range(26) if mask & (1 << i)}
+
+
 def get_default_mountpoint(volname: str) -> Optional[Path]:
     """Get the default mountpoint for the current platform.
 
@@ -124,11 +168,13 @@ def get_default_mountpoint(volname: str) -> Optional[Path]:
     if sys.platform.startswith("darwin"):
         return Path(f"/Volumes/{volname}")
     elif sys.platform.startswith("win"):
-        # Find first available drive letter (skip A/B floppy and C system)
+        # Find first unallocated drive letter (skip A/B floppy and C system).
+        # Use the GetLogicalDrives bitmask, not os.path.exists: the latter
+        # false-negatives on assigned-but-empty removable slots (e.g. D:).
+        allocated = _windows_allocated_drive_letters()
         for letter in "DEFGHIJKLMNOPQRSTUVWXYZ":
-            drive = f"{letter}:"
-            if not os.path.exists(drive):
-                return Path(drive)
+            if letter not in allocated:
+                return Path(f"{letter}:")
         return None  # No available drive letter
     else:
         # Linux requires explicit mountpoint
@@ -272,11 +318,14 @@ def validate_mountpoint(mountpoint: Path) -> Optional[str]:
     """
     mp_str = str(mountpoint)
     if sys.platform.startswith("win") and len(mp_str) == 2 and mp_str[1] == ":":
-        # Drive letter mountpoint -- check if drive exists (i.e., is assigned)
-        if os.path.exists(mp_str + "\\"):
+        # Drive letter mountpoint -- reject if the letter is already allocated.
+        # Use the GetLogicalDrives bitmask (via the shared helper), not
+        # os.path.exists, which false-negatives on assigned-but-empty removable
+        # slots. Normalize case so an explicit lowercase "d:" is still caught.
+        if mp_str[0].upper() in _windows_allocated_drive_letters():
             return (
-                f"Drive {mp_str} is already in use; choose a different drive letter "
-                f"or free it first."
+                f"Drive {mp_str} is already allocated; choose a different drive "
+                f"letter or free it first."
             )
     else:
         try:

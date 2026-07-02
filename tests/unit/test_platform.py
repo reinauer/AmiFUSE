@@ -20,6 +20,43 @@ import pytest
 
 
 # ---------------------------------------------------------------------------
+# Helpers for mocking the Windows GetLogicalDrives bitmask deterministically.
+#
+# The drive-letter probe now uses ctypes.windll.kernel32.GetLogicalDrives()
+# instead of os.path.exists(). These helpers install a fake windll so the
+# Windows drive-letter tests never depend on the real machine's drive state.
+# ---------------------------------------------------------------------------
+
+
+def _mask_for(letters):
+    """Build a GetLogicalDrives-style bitmask for the given letters.
+
+    Bit 0 = A:, bit 1 = B:, ... bit 25 = Z:.
+    """
+    mask = 0
+    for ch in letters:
+        mask |= 1 << (ord(ch.upper()) - ord("A"))
+    return mask
+
+
+def _install_fake_get_logical_drives(monkeypatch, mask, calls=None):
+    """Patch ctypes.windll.kernel32.GetLogicalDrives to return a fixed mask.
+
+    Works cross-platform: on non-Windows, ctypes has no ``windll`` attribute,
+    so we add it with raising=False. When ``calls`` is provided, each call
+    appends to it, letting a test assert the API was (or was not) invoked.
+    """
+    def get_logical_drives():
+        if calls is not None:
+            calls.append(True)
+        return mask
+
+    kernel32 = types.SimpleNamespace(GetLogicalDrives=get_logical_drives)
+    fake_windll = types.SimpleNamespace(kernel32=kernel32)
+    monkeypatch.setattr("ctypes.windll", fake_windll, raising=False)
+
+
+# ---------------------------------------------------------------------------
 # A. get_default_mountpoint() -- 3 tests
 # ---------------------------------------------------------------------------
 
@@ -44,18 +81,12 @@ class TestGetDefaultMountpoint:
         assert result is None
 
     def test_default_mountpoint_windows(self, monkeypatch):
-        """On Windows, returns first available drive letter as Path.
+        """On Windows, returns first unallocated drive letter as Path.
 
-        Mocks os.path.exists at the module level to simulate D: being in use
-        and E: being available.
+        Mocks GetLogicalDrives so C: and D: are allocated and E: is free.
         """
         monkeypatch.setattr("sys.platform", "win32")
-
-        def fake_exists(path):
-            # D: is taken, E: is free
-            return path == "D:"
-
-        monkeypatch.setattr("amifuse.platform.os.path.exists", fake_exists)
+        _install_fake_get_logical_drives(monkeypatch, _mask_for("CD"))
         from amifuse.platform import get_default_mountpoint
 
         result = get_default_mountpoint("TestVol")
@@ -550,29 +581,23 @@ class TestValidateMountpoint:
     """
 
     def test_validate_drive_letter_available(self, monkeypatch):
-        r"""On Windows, D: with D:\ not existing returns None (available)."""
+        """On Windows, D: unallocated returns None (available)."""
         monkeypatch.setattr("sys.platform", "win32")
-        monkeypatch.setattr(
-            "amifuse.platform.os.path.exists",
-            lambda path: False,
-        )
+        _install_fake_get_logical_drives(monkeypatch, _mask_for("C"))
         from amifuse.platform import validate_mountpoint
 
         result = validate_mountpoint(Path("D:"))
         assert result is None
 
     def test_validate_drive_letter_in_use(self, monkeypatch):
-        r"""On Windows, D: with D:\ existing returns error string."""
+        """On Windows, an allocated D: returns an 'allocated' error string."""
         monkeypatch.setattr("sys.platform", "win32")
-        monkeypatch.setattr(
-            "amifuse.platform.os.path.exists",
-            lambda path: path == "D:\\",
-        )
+        _install_fake_get_logical_drives(monkeypatch, _mask_for("CD"))
         from amifuse.platform import validate_mountpoint
 
         result = validate_mountpoint(Path("D:"))
         assert result is not None
-        assert "already in use" in result
+        assert "already allocated" in result
 
     def test_validate_unix_mountpoint_available(self, monkeypatch):
         """On Linux, path that doesn't exist returns None (available)."""
@@ -685,12 +710,10 @@ class TestWindowsMountpointEdgeCases:
     """
 
     def test_default_mountpoint_windows_all_taken(self, monkeypatch):
-        """On Windows, all D-Z drive letters taken returns None."""
+        """On Windows, all A-Z drive letters allocated returns None."""
         monkeypatch.setattr("sys.platform", "win32")
-        # All drive letters exist (are in use)
-        monkeypatch.setattr(
-            "amifuse.platform.os.path.exists",
-            lambda path: True,
+        _install_fake_get_logical_drives(
+            monkeypatch, _mask_for("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
         )
         from amifuse.platform import get_default_mountpoint
 
@@ -698,29 +721,129 @@ class TestWindowsMountpointEdgeCases:
         assert result is None
 
     def test_default_mountpoint_windows_first_available(self, monkeypatch):
-        """On Windows, D-F taken and G free returns Path('G:')."""
+        """On Windows, C-F allocated and G free returns Path('G:')."""
         monkeypatch.setattr("sys.platform", "win32")
-        taken = {"D:", "E:", "F:"}
-        monkeypatch.setattr(
-            "amifuse.platform.os.path.exists",
-            lambda path: path in taken,
-        )
+        _install_fake_get_logical_drives(monkeypatch, _mask_for("CDEF"))
         from amifuse.platform import get_default_mountpoint
 
         result = get_default_mountpoint("TestVol")
         assert result == Path("G:")
 
     def test_default_mountpoint_windows_d_available(self, monkeypatch):
-        """On Windows, all drives free returns Path('D:') (first checked)."""
+        """On Windows, only C allocated returns Path('D:') (first checked)."""
         monkeypatch.setattr("sys.platform", "win32")
-        monkeypatch.setattr(
-            "amifuse.platform.os.path.exists",
-            lambda path: False,
-        )
+        _install_fake_get_logical_drives(monkeypatch, _mask_for("C"))
         from amifuse.platform import get_default_mountpoint
 
         result = get_default_mountpoint("TestVol")
         assert result == Path("D:")
+
+
+# ---------------------------------------------------------------------------
+# I2. _windows_allocated_drive_letters() and the GetLogicalDrives rewire
+# ---------------------------------------------------------------------------
+
+
+class TestWindowsAllocatedDriveLetters:
+    """Tests for the GetLogicalDrives-based drive-letter probe (Task 1).
+
+    Covers the helper's decode contract, the empirical oracle from the
+    investigation, the conservative zero/failure fallback, and the
+    cross-platform guard that keeps windll untouched off Windows.
+    """
+
+    def test_decode_returns_bare_uppercase_letters(self, monkeypatch):
+        """Helper returns bare uppercase single letters (e.g. {'C', 'D'})."""
+        monkeypatch.setattr("sys.platform", "win32")
+        _install_fake_get_logical_drives(monkeypatch, _mask_for("CD"))
+        from amifuse.platform import _windows_allocated_drive_letters
+
+        assert _windows_allocated_drive_letters() == {"C", "D"}
+
+    def test_empirical_oracle_selects_I(self, monkeypatch):
+        """Assigned C,D,E,F,G,H,S-Z -> get_default_mountpoint returns I:.
+
+        This is the empirical oracle captured on the investigation machine:
+        D-H are empty removable card-reader slots (allocated but mediumless)
+        and S-Z are network drives. The old os.path.exists probe false-selected
+        the empty D:; the bitmask probe skips all allocated letters and lands on
+        the first genuinely-free letter, I:.
+        """
+        monkeypatch.setattr("sys.platform", "win32")
+        _install_fake_get_logical_drives(
+            monkeypatch, _mask_for("CDEFGHSTUVWXYZ")
+        )
+        from amifuse.platform import get_default_mountpoint
+
+        assert get_default_mountpoint("TestVol") == Path("I:")
+
+    def test_zero_return_does_not_resurrect_D_bug(self, monkeypatch):
+        """GetLogicalDrives() -> 0 (API failure) must not re-select D:.
+
+        A naive decode of 0 yields an empty set, making every letter look free
+        and regressing to the empty D:. The conservative fallback treats every
+        letter as allocated, so auto-selection declines rather than picking D:.
+        """
+        monkeypatch.setattr("sys.platform", "win32")
+        _install_fake_get_logical_drives(monkeypatch, 0)
+        from amifuse.platform import get_default_mountpoint
+
+        result = get_default_mountpoint("TestVol")
+        assert result != Path("D:")
+        assert result is None
+
+    def test_zero_return_all_letters_allocated(self, monkeypatch):
+        """On a 0 return the helper reports every letter as allocated."""
+        monkeypatch.setattr("sys.platform", "win32")
+        _install_fake_get_logical_drives(monkeypatch, 0)
+        from amifuse.platform import _windows_allocated_drive_letters
+
+        assert _windows_allocated_drive_letters() == set(
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        )
+
+    def test_exception_falls_back_to_all_allocated(self, monkeypatch):
+        """If the windll call raises, fall back to treating all as allocated."""
+        monkeypatch.setattr("sys.platform", "win32")
+
+        class _ExplodingWinDLL:
+            def __getattr__(self, name):
+                raise OSError("simulated GetLogicalDrives failure")
+
+        monkeypatch.setattr("ctypes.windll", _ExplodingWinDLL(), raising=False)
+        from amifuse.platform import _windows_allocated_drive_letters
+
+        assert _windows_allocated_drive_letters() == set(
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        )
+
+    def test_guard_no_windll_on_non_windows(self, monkeypatch):
+        """On non-Windows the helper returns set() without touching windll.
+
+        The GetLogicalDrives sentinel raises if any attribute is accessed. A
+        broken guard would enter the try-body, hit the sentinel (caught by the
+        except -> all-allocated set), and the empty-set assertion would fail.
+        """
+        monkeypatch.setattr("sys.platform", "linux")
+
+        class _ExplodingWinDLL:
+            def __getattr__(self, name):
+                raise AssertionError(f"windll.{name} accessed on non-Windows")
+
+        monkeypatch.setattr("ctypes.windll", _ExplodingWinDLL(), raising=False)
+        from amifuse.platform import _windows_allocated_drive_letters
+
+        assert _windows_allocated_drive_letters() == set()
+
+    def test_validate_lowercase_letter_normalized(self, monkeypatch):
+        """An explicit lowercase 'd:' is still caught when D: is allocated."""
+        monkeypatch.setattr("sys.platform", "win32")
+        _install_fake_get_logical_drives(monkeypatch, _mask_for("CD"))
+        from amifuse.platform import validate_mountpoint
+
+        result = validate_mountpoint(Path("d:"))
+        assert result is not None
+        assert "already allocated" in result
 
 
 # ---------------------------------------------------------------------------
