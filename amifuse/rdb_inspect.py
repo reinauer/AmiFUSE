@@ -83,6 +83,41 @@ class MBRContext:
     scheme: str = "emu68"       # "emu68" or "parceiro"
 
 
+@dataclass
+class PartInfo:
+    """One RDB partition, as surfaced by ``list_partitions``.
+
+    ``index`` is the amitools ``Partition.num`` -- the per-RDB positional index.
+    It restarts at 0 within each RDB, so it is NOT unique across a multi-RDB
+    image; use ``name`` (the drive name) as the stable fan-out key
+    (``--partition <name>``), never the index.
+    """
+    index: int          # Partition.num (per-RDB positional index; collides across RDBs)
+    name: str           # drive name -- the --partition key for the fan-out
+    dostype: int        # dos_env.dos_type
+    dostype_str: str    # DosType tag string (e.g. "DOS1")
+
+
+@dataclass
+class PartitionList:
+    """Result of ``list_partitions``: the partitions plus an optional fallback signal.
+
+    ``partitions`` is the stable-ordered list of :class:`PartInfo` the caller
+    should fan out over (one drive per entry). Normally it holds every partition
+    across the image's RDB(s).
+
+    ``fallback_reason`` is ``None`` in the normal case. It is set to a
+    human-readable string ONLY when a partition name collided across multiple
+    RDBs (which would make name-keyed ``--partition`` routing ambiguous), forcing
+    a fall back to first-partition-only: in that case ``partitions`` holds exactly
+    ONE ``PartInfo`` (index 0 of the first RDB) and ``fallback_reason`` explains
+    why. The caller is responsible for logging it and naming it in the summary
+    dialog; ``list_partitions`` performs no I/O of its own.
+    """
+    partitions: List[PartInfo]
+    fallback_reason: Optional[str] = None
+
+
 def detect_mbr(image: Path) -> Optional[MBRInfo]:
     """Detect and parse MBR partition table.
 
@@ -654,6 +689,120 @@ def find_partition_mbr_index(
         except IOError:
             continue
     return None
+
+
+def _part_info(p) -> PartInfo:
+    """Build a :class:`PartInfo` from an amitools ``Partition``.
+
+    Reads only already-parsed, in-memory fields (``num``, the drive-name BSTR,
+    and ``dos_env.dos_type``), so it is safe to call after the block device is
+    closed. ``str(p.get_drive_name())`` matches the existing name idiom in
+    ``fuse_fs.get_partition_info``.
+    """
+    dos_type = p.part_blk.dos_env.dos_type
+    return PartInfo(
+        index=p.num,
+        name=str(p.get_drive_name()),
+        dostype=dos_type,
+        dostype_str=DosType.num_to_tag_str(dos_type),
+    )
+
+
+def list_partitions(
+    image: Path, block_size: Optional[int] = None
+) -> PartitionList:
+    """Enumerate every partition in an RDB image, keyed by drive name.
+
+    Opens the image via :func:`open_rdisk`, walks ``rdisk.parts``, and returns
+    one :class:`PartInfo` per partition, then closes BOTH the rdisk and the
+    underlying block device (``rdisk.close(); blkdev.close()`` -- the established
+    pattern; ``RDisk.close()`` only nulls its state, so the block device must be
+    closed separately or the image handle leaks).
+
+    For multi-RDB images (Emu68/Parceiro disks with more than one ``0x76`` MBR
+    partition, each carrying its own RDB) it enumerates across ALL ``0x76`` RDBs,
+    mirroring the multi-RDB loop in ``rdb_inspect.main`` / ``fuse_fs.cmd_inspect``.
+    Names -- not indices -- are the fan-out key, because ``Partition.num``
+    restarts at 0 in each RDB and so collides across RDBs; every emitted name
+    re-resolves through the existing, tested ``find_partition_mbr_index`` name
+    path when the caller spawns ``--partition <name>``.
+
+    RDB-ONLY: the caller performs the non-RDB short-circuit (``detect_adf`` /
+    ``detect_iso``) BEFORE calling this. ``list_partitions`` does not probe for
+    ADF/ISO and propagates :class:`IOError` from :func:`open_rdisk` on a non-RDB
+    image.
+
+    Duplicate-name guard (narrow): amitools does not enforce drive-name
+    uniqueness across RDBs, and ``--partition`` resolves name-first, so two RDBs
+    each holding e.g. ``DH0`` would be ambiguous to route. When (and only when) a
+    name collides ACROSS RDBs, this falls back to first-partition-only (index 0
+    of the first RDB) and sets ``PartitionList.fallback_reason``. The guard never
+    fires for a plain RDB or for a multi-RDB image whose names are all distinct.
+
+    Args:
+        image: Path to the RDB disk image.
+        block_size: Force a specific block size (default: auto-detect).
+
+    Returns:
+        A :class:`PartitionList`. ``.partitions`` is in stable RDB order
+        (normally >= 1 entry); ``.fallback_reason`` is ``None`` normally and, on
+        the duplicate-name fallback, a string with ``.partitions`` holding a
+        single entry. The caller logs and surfaces ``.fallback_reason``.
+    """
+    mbr_info = detect_mbr(image)
+    amiga_parts = []
+    if mbr_info is not None and mbr_info.has_amiga_partitions:
+        amiga_parts = [
+            p for p in mbr_info.partitions if p.partition_type == MBR_TYPE_AMIGA_RDB
+        ]
+
+    # Plain RDB (or a single 0x76 RDB): open once, enumerate, close both handles.
+    if len(amiga_parts) <= 1:
+        blkdev, rdisk, _mbr_ctx = open_rdisk(image, block_size=block_size)
+        try:
+            parts = [_part_info(p) for p in rdisk.parts]
+        finally:
+            rdisk.close()
+            blkdev.close()
+        return PartitionList(partitions=parts)
+
+    # Multi-RDB: enumerate across every 0x76 RDB, keyed by name. Each iteration
+    # opens its own (blkdev, rdisk) and MUST close both inside the loop or N
+    # block-device handles leak.
+    all_parts: List[PartInfo] = []
+    seen_names: dict = {}   # lower-cased names from previously-processed RDBs
+    first_part: Optional[PartInfo] = None
+    for rdb_idx in range(len(amiga_parts)):
+        try:
+            blkdev, rdisk, _mbr_ctx = open_rdisk(
+                image, block_size=block_size, mbr_partition_index=rdb_idx
+            )
+        except IOError:
+            continue
+        try:
+            rdb_parts = [_part_info(p) for p in rdisk.parts]
+        finally:
+            rdisk.close()
+            blkdev.close()
+
+        if first_part is None and rdb_parts:
+            first_part = rdb_parts[0]
+
+        # A name shared with a PRIOR RDB makes name-keyed fan-out unsafe ->
+        # fall back to first-partition-only for the whole image.
+        for info in rdb_parts:
+            if info.name.lower() in seen_names:
+                reason = (
+                    "multiple RDBs with colliding partition names "
+                    "(%r); mounted first only" % info.name
+                )
+                return PartitionList(partitions=[first_part], fallback_reason=reason)
+
+        for info in rdb_parts:
+            seen_names[info.name.lower()] = info
+            all_parts.append(info)
+
+    return PartitionList(partitions=all_parts)
 
 
 def format_fs_summary(rdisk: RDisk):
