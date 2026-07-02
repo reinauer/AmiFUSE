@@ -563,6 +563,22 @@ def find_amifuse_mounts():
     return mounts
 
 
+def _strip_matched_quotes(value):
+    """Strip a single matched pair of surrounding double quotes.
+
+    On Windows, mount discovery tokenizes the command line with
+    ``shlex.split(cmdline, posix=False)``, which retains the surrounding quote
+    characters that ``subprocess.list2cmdline`` adds around paths containing
+    spaces. This leaks literal quotes into the reported image/mountpoint. Strip
+    only a *matched* leading+trailing ``"`` pair; leave unbalanced input (a quote
+    on one side only) untouched. On the Unix path (posix=True) tokens carry no
+    surrounding quotes, so this is a no-op there.
+    """
+    if value and len(value) >= 2 and value[0] == '"' and value[-1] == '"':
+        return value[1:-1]
+    return value
+
+
 def _parse_mount_tokens(tokens):
     """Extract image path and --mountpoint value from amifuse command tokens.
 
@@ -604,7 +620,7 @@ def _parse_mount_tokens(tokens):
             image = tok
         i += 1
 
-    return image, mountpoint
+    return _strip_matched_quotes(image), _strip_matched_quotes(mountpoint)
 
 
 def _find_amifuse_mounts_unix():
