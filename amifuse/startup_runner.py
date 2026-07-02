@@ -704,6 +704,100 @@ class HandlerLauncher:
 
         return True
 
+    def _finalize_burst_blocked(
+        self,
+        state: HandlerLaunchState,
+        block_state: dict,
+        blocked_sp: int,
+        blocked_ret,  # Optional[int]
+        wait_mask,  # Optional[int]
+        waitport_sp,  # Optional[int]
+        ram_end: int,
+        debug: bool = False,
+    ) -> None:
+        """Handle post-burst state when handler is blocked in Wait()/WaitPort().
+
+        Extracted from the near-identical logic in both run_state.error and
+        run_state.done branches. Sets state.pc/sp and D0 based on whether
+        pending messages/signals can wake the handler immediately.
+        """
+        cpu = self.vh.machine.cpu
+        mem = self.vh.alloc.get_mem()
+
+        def _pc_valid(pc: int) -> bool:
+            return 0x800 <= pc < ram_end
+
+        ret_addr = blocked_ret if blocked_ret is not None else mem.r32(blocked_sp)
+        # Save as main loop PC if not yet initialized
+        if (not state.initialized or state.main_loop_pc == 0) and _pc_valid(ret_addr):
+            state.main_loop_pc = ret_addr
+            state.main_loop_sp = blocked_sp + 4
+            state.initialized = True
+            if wait_mask is not None and not state.wait_mask:
+                state.wait_mask = wait_mask
+        # Determine if there's something pending that would wake the handler
+        if wait_mask is not None:
+            # Wait() blocked - check for ANY pending signals (messages OR IO completion)
+            pending = self._compute_pending_signals(wait_mask)
+            has_pending = pending != 0
+            if debug:
+                all_pending = self._compute_pending_signals(0xFFFFFFFF)
+                print(f"[run_burst] Wait block: ret=0x{ret_addr:x} mask=0x{wait_mask:x} pending_masked=0x{pending:x} pending_all=0x{all_pending:x} has_pending={has_pending}")
+        else:
+            # WaitPort blocked - check for message on the port
+            has_pending = self.exec_impl.port_mgr.has_msg(state.port_addr)
+        if has_pending:
+            # Resume from blocking call return address (saved on stack)
+            if _pc_valid(ret_addr):
+                state.pc = ret_addr
+                state.sp = blocked_sp + 4
+            elif state.main_loop_pc and _pc_valid(state.main_loop_pc):
+                state.pc = state.main_loop_pc
+                state.sp = state.main_loop_sp
+            # CRITICAL: Set D0 before resuming from Wait() or WaitPort()
+            if wait_mask is not None:
+                # Wait() resume - set D0 to pending signals
+                if wait_mask == 0:
+                    pending = self._compute_pending_signals(0xFFFFFFFF)
+                else:
+                    pending = self._compute_pending_signals(wait_mask)
+                cpu.w_reg(REG_D0, pending)
+                self._set_saved_reg(state, REG_D0, pending)
+                if debug:
+                    print(f"[run_burst] Wait resume: D0=0x{pending:x}")
+                # Clear returned signals from tc_SigRecvd (like Wait() would)
+                self._clear_signals_from_task(pending)
+            elif waitport_sp is not None:
+                # WaitPort()/WaitPkt() resume - set D0 appropriately
+                waitport_port = block_state.get("waitport_blocked_port")
+                if waitport_port is not None:
+                    # CRITICAL: use get_msg (not peek_msg) to dequeue.
+                    msg_addr = self.exec_impl.port_mgr.get_msg(waitport_port)
+                    if msg_addr:
+                        _unlink_msg_from_m68k_list(self.mem, msg_addr, debug=debug)
+                    if block_state.get("waitpkt_blocked", False) and msg_addr:
+                        # WaitPkt() resume - extract packet from message
+                        msg = MessageStruct(self.mem, msg_addr)
+                        pkt_addr = msg.node.name.aptr
+                        d0_val = pkt_addr if pkt_addr else 0
+                    else:
+                        # WaitPort() resume - return message address
+                        d0_val = msg_addr if msg_addr else 0
+                    cpu.w_reg(REG_D0, d0_val)
+                    self._set_saved_reg(state, REG_D0, d0_val)
+            # Clear both blocking states
+            _clear_all_block_state()
+            state.block_state = None
+            state.exit_count = 0  # Reset for both callers (field is vestigial)
+        else:
+            # No message pending - save restart point for later
+            if _pc_valid(ret_addr):
+                state.pc = ret_addr
+                state.sp = blocked_sp + 4
+            elif state.main_loop_pc and _pc_valid(state.main_loop_pc):
+                state.pc = state.main_loop_pc
+                state.sp = state.main_loop_sp
+
     def run_burst(self, state: HandlerLaunchState, max_cycles=200000, debug: bool = False):
         """Run the handler from its current PC/SP for a limited number of cycles."""
         import sys
@@ -836,77 +930,10 @@ class HandlerLauncher:
             # WaitPort/Wait or other blocking call failed - handler is waiting for a message.
             if blocked_sp is not None:
                 state.block_state = block_state
-                ret_addr = blocked_ret if blocked_ret is not None else mem.r32(blocked_sp)
-                # Save as main loop PC if not yet set - this is where handler waits for messages
-                if (not state.initialized or state.main_loop_pc == 0) and _pc_valid(ret_addr):
-                    state.main_loop_pc = ret_addr
-                    state.main_loop_sp = blocked_sp + 4
-                    state.initialized = True
-                    # Capture Wait mask for _flush_pending_signals before
-                    # _clear_all_block_state wipes it.
-                    if wait_mask is not None and not state.wait_mask:
-                        state.wait_mask = wait_mask
-                # Check if there's something pending that would wake the handler
-                if wait_mask is not None:
-                    # Wait() blocked - check for ANY pending signals (messages OR IO completion)
-                    pending = self._compute_pending_signals(wait_mask)
-                    has_pending = pending != 0
-                    if debug:
-                        all_pending = self._compute_pending_signals(0xFFFFFFFF)
-                        print(f"[run_burst] Wait block: ret=0x{ret_addr:x} mask=0x{wait_mask:x} pending_masked=0x{pending:x} pending_all=0x{all_pending:x} has_pending={has_pending}")
-                else:
-                    # WaitPort blocked - check for message on the port
-                    has_pending = self.exec_impl.port_mgr.has_msg(state.port_addr)
-                if has_pending:
-                    # Resume from blocking call return address (saved on stack)
-                    if _pc_valid(ret_addr):
-                        state.pc = ret_addr
-                        state.sp = blocked_sp + 4
-                    elif state.main_loop_pc and _pc_valid(state.main_loop_pc):
-                        state.pc = state.main_loop_pc
-                        state.sp = state.main_loop_sp
-                    # CRITICAL: Set D0 before resuming from Wait() or WaitPort()
-                    if wait_mask is not None:
-                        # Wait() resume - set D0 to pending signals
-                        if wait_mask == 0:
-                            pending = self._compute_pending_signals(0xFFFFFFFF)
-                        else:
-                            pending = self._compute_pending_signals(wait_mask)
-                        cpu.w_reg(REG_D0, pending)
-                        self._set_saved_reg(state, REG_D0, pending)
-                        if debug:
-                            print(f"[run_burst] Wait resume: D0=0x{pending:x}")
-                        # Clear returned signals from tc_SigRecvd (like Wait() would)
-                        self._clear_signals_from_task(pending)
-                    elif waitport_sp is not None:
-                        # WaitPort()/WaitPkt() resume - set D0 appropriately
-                        waitport_port = block_state.get("waitport_blocked_port")
-                        if waitport_port is not None:
-                            # CRITICAL: use get_msg (not peek_msg) to dequeue.
-                            msg_addr = self.exec_impl.port_mgr.get_msg(waitport_port)
-                            if msg_addr:
-                                _unlink_msg_from_m68k_list(self.mem, msg_addr, debug=debug)
-                            if block_state.get("waitpkt_blocked", False) and msg_addr:
-                                # WaitPkt() resume - extract packet from message
-                                msg = MessageStruct(self.mem, msg_addr)
-                                pkt_addr = msg.node.name.aptr
-                                d0_val = pkt_addr if pkt_addr else 0
-                            else:
-                                # WaitPort() resume - return message address
-                                d0_val = msg_addr if msg_addr else 0
-                            cpu.w_reg(REG_D0, d0_val)
-                            self._set_saved_reg(state, REG_D0, d0_val)
-                    # Clear both blocking states
-                    _clear_all_block_state()
-                    state.block_state = None
-                else:
-                    # No message pending - save restart point for later
-                    if _pc_valid(ret_addr):
-                        state.pc = ret_addr
-                        state.sp = blocked_sp + 4
-                    elif state.main_loop_pc and _pc_valid(state.main_loop_pc):
-                        state.pc = state.main_loop_pc
-                        state.sp = state.main_loop_sp
+                self._finalize_burst_blocked(
+                    state, block_state, blocked_sp, blocked_ret,
+                    wait_mask, waitport_sp, ram_end, debug=debug,
+                )
             elif state.initialized and state.main_loop_pc != 0:
                 # Fall back to saved main loop PC
                 state.pc = state.main_loop_pc
@@ -917,75 +944,10 @@ class HandlerLauncher:
             # Check if WaitPort/Wait blocked - if so, we can get the return address from the saved SP
             if blocked_sp is not None:
                 state.block_state = block_state
-                ret_addr = blocked_ret if blocked_ret is not None else mem.r32(blocked_sp)
-                # Save as main loop PC if not yet initialized
-                if (not state.initialized or state.main_loop_pc == 0) and _pc_valid(ret_addr):
-                    state.main_loop_pc = ret_addr
-                    state.main_loop_sp = blocked_sp + 4  # Pop return address
-                    state.initialized = True
-                    if wait_mask is not None and not state.wait_mask:
-                        state.wait_mask = wait_mask
-                # Only restart immediately if there's something pending (message or signal).
-                # Otherwise, leave state pointing to Wait/WaitPort return - caller
-                # will queue a message before calling run_burst again.
-                if wait_mask is not None:
-                    # Wait() blocked - check for ANY pending signals (messages OR IO completion)
-                    pending = self._compute_pending_signals(wait_mask)
-                    has_pending = pending != 0
-                else:
-                    # WaitPort blocked - check for message on the port
-                    has_pending = self.exec_impl.port_mgr.has_msg(state.port_addr)
-                if has_pending:
-                    # Restart from return address (where Wait/WaitPort was called)
-                    if _pc_valid(ret_addr):
-                        state.pc = ret_addr
-                        state.sp = blocked_sp + 4  # Pop the return address
-                    elif state.main_loop_pc and _pc_valid(state.main_loop_pc):
-                        state.pc = state.main_loop_pc
-                        state.sp = state.main_loop_sp
-                    # CRITICAL: Set D0 before resuming from Wait() or WaitPort()
-                    if wait_mask is not None:
-                        # Wait() resume - set D0 to pending signals
-                        if wait_mask == 0:
-                            pending = self._compute_pending_signals(0xFFFFFFFF)
-                        else:
-                            pending = self._compute_pending_signals(wait_mask)
-                        cpu.w_reg(REG_D0, pending)
-                        self._set_saved_reg(state, REG_D0, pending)
-                        # Clear returned signals from tc_SigRecvd (like Wait() would)
-                        self._clear_signals_from_task(pending)
-                    elif waitport_sp is not None:
-                        # WaitPort()/WaitPkt() resume - set D0 appropriately
-                        waitport_port = block_state.get("waitport_blocked_port")
-                        if waitport_port is not None:
-                            # CRITICAL: use get_msg (not peek_msg) to dequeue.
-                            msg_addr = self.exec_impl.port_mgr.get_msg(waitport_port)
-                            if msg_addr:
-                                _unlink_msg_from_m68k_list(self.mem, msg_addr, debug=debug)
-                            if block_state.get("waitpkt_blocked", False) and msg_addr:
-                                # WaitPkt() resume - extract packet from message
-                                msg = MessageStruct(self.mem, msg_addr)
-                                pkt_addr = msg.node.name.aptr
-                                d0_val = pkt_addr if pkt_addr else 0
-                            else:
-                                # WaitPort() resume - return message address
-                                d0_val = msg_addr if msg_addr else 0
-                            cpu.w_reg(REG_D0, d0_val)
-                            self._set_saved_reg(state, REG_D0, d0_val)
-                    # Clear the blocked states
-                    _clear_all_block_state()
-                    state.block_state = None
-                    state.exit_count = 0  # Reset exit counter
-                else:
-                    # No message pending - save restart point but don't spin.
-                    # Next run_burst will restart from here when a message is queued.
-                    if _pc_valid(ret_addr):
-                        state.pc = ret_addr
-                        state.sp = blocked_sp + 4
-                    elif state.main_loop_pc and _pc_valid(state.main_loop_pc):
-                        state.pc = state.main_loop_pc
-                        state.sp = state.main_loop_sp
-                    # Keep blocked state so we know handler is waiting
+                self._finalize_burst_blocked(
+                    state, block_state, blocked_sp, blocked_ret,
+                    wait_mask, waitport_sp, ram_end, debug=debug,
+                )
             else:
                 # Normal exit trap (RTS to run_exit_addr) without WaitPort block.
                 # For FFS, this means startup processing is complete. Check if there's

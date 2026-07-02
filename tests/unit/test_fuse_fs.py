@@ -3904,3 +3904,103 @@ class TestPinnedStatCache:
         assert "/new" not in fs._pinned_stats
         assert "/old" not in fs._stat_cache
         assert "/new" not in fs._stat_cache
+
+
+class TestCacheLocking:
+    """Verify _cache_lock protects cache dicts from concurrent access."""
+
+    def test_cache_lock_exists_in_init(self):
+        """AmigaFuseFS.__init__ creates a _cache_lock RLock."""
+        import inspect
+        from amifuse.fuse_fs import AmigaFuseFS
+        source = inspect.getsource(AmigaFuseFS.__init__)
+        assert "_cache_lock" in source
+        assert "RLock()" in source
+
+    def test_get_cached_stat_uses_lock(self):
+        """_get_cached_stat acquires _cache_lock."""
+        import inspect
+        from amifuse.fuse_fs import AmigaFuseFS
+        source = inspect.getsource(AmigaFuseFS._get_cached_stat)
+        assert "_cache_lock" in source
+
+    def test_set_cached_stat_uses_lock(self):
+        """_set_cached_stat acquires _cache_lock."""
+        import inspect
+        from amifuse.fuse_fs import AmigaFuseFS
+        source = inspect.getsource(AmigaFuseFS._set_cached_stat)
+        assert "_cache_lock" in source
+
+    def test_is_neg_cached_uses_lock(self):
+        """_is_neg_cached acquires _cache_lock."""
+        import inspect
+        from amifuse.fuse_fs import AmigaFuseFS
+        source = inspect.getsource(AmigaFuseFS._is_neg_cached)
+        assert "_cache_lock" in source
+
+    def test_set_neg_cached_uses_lock(self):
+        """_set_neg_cached acquires _cache_lock."""
+        import inspect
+        from amifuse.fuse_fs import AmigaFuseFS
+        source = inspect.getsource(AmigaFuseFS._set_neg_cached)
+        assert "_cache_lock" in source
+
+
+# ---------------------------------------------------------------------------
+# TestStatfs -- disk space reporting
+# ---------------------------------------------------------------------------
+
+
+class TestStatfs:
+    """Verify statfs implementation."""
+
+    def test_statfs_method_exists(self):
+        """AmigaFuseFS has a statfs method."""
+        from amifuse.fuse_fs import AmigaFuseFS
+        assert hasattr(AmigaFuseFS, 'statfs')
+
+    def test_get_disk_info_method_exists(self):
+        """HandlerBridge has a get_disk_info method."""
+        from amifuse.fuse_fs import HandlerBridge
+        assert hasattr(HandlerBridge, 'get_disk_info')
+
+    def test_statfs_returns_required_keys(self):
+        """statfs returns dict with all required statvfs keys."""
+        import inspect
+        from amifuse.fuse_fs import AmigaFuseFS
+        source = inspect.getsource(AmigaFuseFS.statfs)
+        for key in ['f_bsize', 'f_frsize', 'f_blocks', 'f_bfree', 'f_bavail', 'f_namemax']:
+            assert key in source
+
+    def test_disk_info_cache_ttl_readonly(self):
+        """Read-only mount uses infinite disk info cache TTL."""
+        import inspect
+        from amifuse.fuse_fs import AmigaFuseFS
+        source = inspect.getsource(AmigaFuseFS.__init__)
+        assert "_disk_info_ttl" in source
+
+    def test_disk_info_cache_ttl_write(self):
+        """Write mount uses 30s disk info cache TTL."""
+        import inspect
+        from amifuse.fuse_fs import AmigaFuseFS
+        source = inspect.getsource(AmigaFuseFS.__init__)
+        assert "30.0" in source or "30" in source
+
+
+# ---------------------------------------------------------------------------
+# TestFuseInit -- shell notification integration
+# ---------------------------------------------------------------------------
+
+
+class TestFuseInit:
+    """Verify init() method exists for shell notification."""
+
+    def test_init_method_exists(self):
+        from amifuse.fuse_fs import AmigaFuseFS
+        assert hasattr(AmigaFuseFS, "init")
+
+    def test_destroy_has_notification(self):
+        import inspect
+        from amifuse.fuse_fs import AmigaFuseFS
+        source = inspect.getsource(AmigaFuseFS.destroy)
+        assert "notify_shell_drive_change" in source

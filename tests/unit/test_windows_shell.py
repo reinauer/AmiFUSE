@@ -189,7 +189,7 @@ class TestRegister:
         assert reg.key_exists(reg.HKEY_CURRENT_USER, r"Software\Classes\AmiFUSE.FloppyImage")
 
     def test_register_creates_flat_verb_keys(self, fake_registry, tmp_path, monkeypatch):
-        """mount and mountrw verbs created under ProgID."""
+        """mountro verb created under ProgID."""
         reg, _ = fake_registry
         monkeypatch.setattr("amifuse.windows_shell.ICON_DIR", tmp_path / "icons")
 
@@ -197,10 +197,8 @@ class TestRegister:
         register()
 
         base = r"Software\Classes\AmiFUSE.DiskImage"
-        assert reg.key_exists(reg.HKEY_CURRENT_USER, rf"{base}\shell\mount")
-        assert reg.key_exists(reg.HKEY_CURRENT_USER, rf"{base}\shell\mount\command")
-        assert reg.key_exists(reg.HKEY_CURRENT_USER, rf"{base}\shell\mountrw")
-        assert reg.key_exists(reg.HKEY_CURRENT_USER, rf"{base}\shell\mountrw\command")
+        assert reg.key_exists(reg.HKEY_CURRENT_USER, rf"{base}\shell\mountro")
+        assert reg.key_exists(reg.HKEY_CURRENT_USER, rf"{base}\shell\mountro\command")
 
     def test_register_creates_open_with_progids(self, fake_registry, tmp_path, monkeypatch):
         """OpenWithProgids entry created for each extension."""
@@ -398,3 +396,52 @@ class TestRegisterCreatesLaunchVbs:
         assert launch_vbs.exists()
         content = launch_vbs.read_text(encoding="utf-8")
         assert "WScript" in content or "CreateObject" in content
+
+
+class TestOpenVerb:
+    """Verify open verb registration for double-click mount."""
+
+    def test_register_sets_default_verb(self, fake_registry, tmp_path, monkeypatch):
+        """register() sets shell\\(Default) to 'open'."""
+        reg, _ = fake_registry
+        monkeypatch.setattr("amifuse.windows_shell.ICON_DIR", tmp_path / "icons")
+
+        from amifuse.windows_shell import register
+        register()
+
+        # shell key's default value should be "open"
+        val = reg.get_value(
+            reg.HKEY_CURRENT_USER,
+            r"Software\Classes\AmiFUSE.DiskImage\shell",
+            "",
+        )
+        assert val == "open"
+
+    def test_register_creates_open_verb(self, fake_registry, tmp_path, monkeypatch):
+        """register() creates open verb under ProgID."""
+        reg, _ = fake_registry
+        monkeypatch.setattr("amifuse.windows_shell.ICON_DIR", tmp_path / "icons")
+
+        from amifuse.windows_shell import register
+        register()
+
+        base = r"Software\Classes\AmiFUSE.DiskImage"
+        assert reg.key_exists(reg.HKEY_CURRENT_USER, rf"{base}\shell\open")
+        assert reg.key_exists(reg.HKEY_CURRENT_USER, rf"{base}\shell\open\command")
+
+    def test_open_verb_command_uses_open_subcommand(self, fake_registry, tmp_path, monkeypatch):
+        """open verb command line invokes launcher with 'open' subcommand."""
+        reg, _ = fake_registry
+        monkeypatch.setattr("amifuse.windows_shell.ICON_DIR", tmp_path / "icons")
+
+        from amifuse.windows_shell import register
+        register()
+
+        base = r"Software\Classes\AmiFUSE.DiskImage"
+        cmd_val = reg.get_value(
+            reg.HKEY_CURRENT_USER,
+            rf"{base}\shell\open\command",
+            "",
+        )
+        assert cmd_val is not None
+        assert " open " in cmd_val

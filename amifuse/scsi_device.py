@@ -233,6 +233,7 @@ class ScsiDevice(LibImpl):
             cdb_bytes = mem.r_block(cdb_ptr, cdb_len) if cdb_ptr and cdb_len else b""
             actual = 0
             status = 0
+            sense_actual = 0
             # default: no sense data
             if sense_ptr:
                 mem.w_block(sense_ptr, b"\x00" * min(sense_len, 18))
@@ -290,21 +291,33 @@ class ScsiDevice(LibImpl):
             elif opcode == 0x2A:  # WRITE(10)
                 lba = mem.r32(cdb_ptr + 2)
                 xfer_blocks = mem.r16(cdb_ptr + 7)
+                expected_len = xfer_blocks * self.backend.block_size
                 if not self._check_block_bounds(lba, xfer_blocks):
                     status = 2  # check condition
+                elif expected_len > 0 and data_len < expected_len:
+                    # Buffer too short for requested transfer
+                    status = 2  # check condition
+                    if sense_ptr and sense_len >= 18:
+                        sense_data = bytearray(18)
+                        sense_data[0] = 0x70  # current errors, fixed format
+                        sense_data[2] = 0x05  # ILLEGAL_REQUEST
+                        sense_data[7] = 0x0A  # additional sense length
+                        sense_data[12] = 0x24  # ASC: INVALID FIELD IN CDB
+                        sense_data[13] = 0x00  # ASCQ
+                        mem.w_block(sense_ptr, bytes(sense_data))
+                        sense_actual = 18
                 else:
-                    data = mem.r_block(
-                        data_ptr, min(data_len, xfer_blocks * self.backend.block_size)
-                    )
-                    self.backend.write_blocks(lba, data, xfer_blocks)
-                    actual = len(data)
+                    if xfer_blocks > 0:
+                        data = mem.r_block(data_ptr, expected_len)
+                        self.backend.write_blocks(lba, data, xfer_blocks)
+                        actual = len(data)
             else:
                 # Unsupported command: report check condition
                 status = 2  # check condition
             scsi.scsi_CmdActual.val = cdb_len
             scsi.scsi_Status.val = status
             scsi.scsi_Actual.val = actual
-            scsi.scsi_SenseActual.val = 0
+            scsi.scsi_SenseActual.val = sense_actual
             ior.actual.val = actual
         elif cmd == CMD_READ:
             block_num = offset // self.backend.block_size

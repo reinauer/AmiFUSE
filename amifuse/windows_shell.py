@@ -20,6 +20,9 @@ PROGID_DESCRIPTIONS = {
 
 ICON_DIR = Path(os.environ.get("APPDATA", "")) / "AmiFUSE" / "icons"
 _AMIFUSE_DIR = Path(os.environ.get("APPDATA", "")) / "AmiFUSE"
+# Security note: launch.vbs is user-writable (%APPDATA%). Shell verb
+# registration trusts this path — integrity depends on the user account
+# not being compromised. Acceptable for a user-space tool.
 _LAUNCH_VBS = _AMIFUSE_DIR / "launch.vbs"
 
 # VBScript launcher: runs a command with hidden window and no wait,
@@ -221,23 +224,34 @@ def _register_progid(winreg, progid: str, launcher: str) -> None:
     finally:
         winreg.CloseKey(key)
 
-    # Flat verb: mount — wscript runs VBS launcher invisibly (no cmd.exe flash)
+    # Set default verb to "open" so double-click triggers mount
     vbs = str(_LAUNCH_VBS)
+    shell_key = winreg.CreateKey(winreg.HKEY_CURRENT_USER, rf"{base}\shell")
+    try:
+        winreg.SetValueEx(shell_key, "", 0, winreg.REG_SZ, "open")
+    finally:
+        winreg.CloseKey(shell_key)
+
+    # Flat verb: open — mount and open Explorer (default action for double-click)
     _set_verb(
         winreg,
         base,
-        "mount",
-        "Mount with AmiFUSE",
-        f'wscript.exe //nologo //b "{vbs}" "{launcher}" mount "%1"',
+        "open",
+        "Mount && Open with AmiFUSE",
+        f'wscript.exe //nologo //b "{vbs}" "{launcher}" open "%1"',
     )
 
-    # Flat verb: mountrw
+    # Clean up stale verb keys from previous registrations
+    for stale_verb in ("mount", "mountrw"):
+        _delete_key_recursive(winreg.HKEY_CURRENT_USER, rf"{base}\shell\{stale_verb}")
+
+    # Flat verb: mountro — read-only mount without opening Explorer
     _set_verb(
         winreg,
         base,
-        "mountrw",
-        "Mount Read-Write with AmiFUSE",
-        f'wscript.exe //nologo //b "{vbs}" "{launcher}" mount --write "%1"',
+        "mountro",
+        "Mount Read-Only with AmiFUSE",
+        f'wscript.exe //nologo //b "{vbs}" "{launcher}" mount "%1"',
     )
 
     # DefaultIcon
