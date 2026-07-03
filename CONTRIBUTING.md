@@ -85,3 +85,10 @@ machine68k fixes
 - One logical change per PR
 - All CI checks should pass (or failures should be pre-existing)
 - Keep the scope focused -- small, reviewable diffs are easier to merge
+
+## Platform-Specific Entry Points
+
+Platform-specific entry points (e.g. Windows-only `gui-scripts`) must guard
+at the top of their entry function with
+`if not sys.platform.startswith("win"): raise SystemExit(...)` so they fail
+cleanly when invoked on another platform.

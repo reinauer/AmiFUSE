@@ -57,6 +57,9 @@ def _spawn_detached(cmd: list[str], **kwargs) -> None:
 
 
 def main(argv=None) -> None:
+    if not sys.platform.startswith("win"):
+        raise SystemExit("The AmiFUSE launcher is only supported on Windows.")
+
     parser = argparse.ArgumentParser(description="AmiFUSE launcher")
     sub = parser.add_subparsers(dest="command", required=True)
 
