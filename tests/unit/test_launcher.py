@@ -1,6 +1,8 @@
 """Unit tests for amifuse.launcher module.
 
-Mocks subprocess.Popen and ctypes.windll so tests run on all platforms.
+Mocks subprocess.Popen and ctypes.windll. This module is Windows-only
+(``pytestmark`` skips it off Windows); the cross-platform guard test lives
+in ``test_launcher_guard.py``.
 """
 
 from __future__ import annotations

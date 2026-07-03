@@ -212,7 +212,10 @@ def _check_single_instance() -> bool:
     return ctypes.get_last_error() != _ERROR_ALREADY_EXISTS
 
 
-def main():
+def main(argv=None) -> None:
+    if not sys.platform.startswith("win"):
+        raise SystemExit("The AmiFUSE tray is only supported on Windows.")
+
     log_dir = Path(os.environ.get("APPDATA", "")) / "AmiFUSE"
     log_dir.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(
