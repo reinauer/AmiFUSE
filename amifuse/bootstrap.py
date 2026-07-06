@@ -9,8 +9,7 @@ from typing import Optional
 from amitools.fs.blkdev.RawBlockDevice import RawBlockDevice  # type: ignore
 
 from .amiga_structs import DosEnvecStruct, FileSysStartupMsgStruct, DeviceNodeStruct
-from amitools.vamos.libstructs.exec_ import MsgPortStruct, ListStruct, NodeType  # type: ignore
-from .rdb_inspect import detect_adf, ADFInfo, ISOInfo
+from .rdb_inspect import ADFInfo, ISOInfo
 
 
 def _scalar_field(struct, name: str):
@@ -211,32 +210,3 @@ class BootstrapAllocator:
             "rd": rd,
             "part": part,
         }
-
-    def alloc_msgport(self):
-        """Allocate and minimally init a MsgPort.
-
-        Initializes mp_MsgList as a proper empty Exec list with correct
-        sentinel pointers (lh_Head -> &lh_Tail, lh_Tail = 0,
-        lh_TailPred -> &lh_Head). This matches the logic/semantics of
-        HandlerLauncher._init_msgport() (proper sentinel pointers) but
-        uses inline offset computation rather than the cached offsets
-        that _init_msgport() uses.
-        """
-        mp_mem = self.alloc.alloc_memory(MsgPortStruct.get_size(), label="MsgPort")
-        mp = MsgPortStruct(self.mem, mp_mem.addr)
-        mp.node.type.val = NodeType.NT_MSGPORT
-        # Init message list as a proper empty Exec list
-        list_offset = MsgPortStruct.sdef.find_field_def_by_name("mp_MsgList").offset
-        list_addr = mp_mem.addr + list_offset
-        lst = ListStruct(self.mem, list_addr)
-        lh_head_addr = list_addr + ListStruct.sdef.find_field_def_by_name("lh_Head").offset
-        lh_tail_addr = list_addr + ListStruct.sdef.find_field_def_by_name("lh_Tail").offset
-        # Empty list: Head points to Tail address, TailPred points to Head address
-        lst.head.aptr = lh_tail_addr
-        lst.tail.aptr = 0
-        lst.tail_pred.aptr = lh_head_addr
-        lst.type.val = NodeType.NT_MESSAGE
-        mp.flags.val = 0
-        mp.sig_bit.val = 0
-        mp.sig_task.aptr = 0
-        return mp_mem.addr

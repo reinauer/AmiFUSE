@@ -62,63 +62,6 @@ class ScsiDevice(LibImpl):
         self.backend = backend
         self.debug = debug
 
-    def _signal_io_complete(self, ctx, req_ptr):
-        """Signal the task that IO has completed.
-
-        Even with IOF_QUICK set, some handlers (like FFS) check for the IO
-        completion signal. We need to set the signal bit from the IORequest's
-        reply port in the current task's tc_SigRecvd.
-        """
-        from amitools.vamos.libstructs.exec_ import (
-            ExecLibraryStruct,
-            TaskStruct,
-            MsgPortStruct,
-            MessageStruct,
-        )
-
-        mem = ctx.mem
-
-        # Get reply port from IORequest's embedded message (io_Message.mn_ReplyPort)
-        # IORequest starts with io_Message (a Message struct)
-        # Message.mn_ReplyPort is at offset 14
-        reply_port = mem.r32(req_ptr + 14)  # mn_ReplyPort offset
-        if reply_port == 0:
-            if self.debug:
-                print(
-                    f"[SCSI] _signal_io_complete: no reply_port (req_ptr=0x{req_ptr:x})"
-                )
-            return
-
-        # Get signal bit from reply port (mp_SigBit at offset 15)
-        sigbit = mem.r8(reply_port + 15)
-        if sigbit >= 32:
-            if self.debug:
-                print(
-                    f"[SCSI] _signal_io_complete: invalid sigbit={sigbit} (reply_port=0x{reply_port:x})"
-                )
-            return
-
-        # Get ThisTask from ExecBase (address 4)
-        exec_base = mem.r32(4)
-        if exec_base == 0:
-            return
-
-        # ThisTask offset in ExecLibrary
-        this_task_off = ExecLibraryStruct.sdef.find_field_def_by_name("ThisTask").offset
-        this_task = mem.r32(exec_base + this_task_off)
-        if this_task == 0:
-            return
-
-        # tc_SigRecvd offset in Task
-        sigrecvd_off = TaskStruct.sdef.find_field_def_by_name("tc_SigRecvd").offset
-        current_sigs = mem.r32(this_task + sigrecvd_off)
-        new_sigs = current_sigs | (1 << sigbit)
-        mem.w32(this_task + sigrecvd_off, new_sigs)
-        if self.debug:
-            print(
-                f"[SCSI] _signal_io_complete: set sigbit={sigbit} (0x{1<<sigbit:x}) tc_SigRecvd: 0x{current_sigs:x} -> 0x{new_sigs:x}"
-            )
-
     def _check_block_bounds(self, block_num: int, num_blocks: int) -> bool:
         """Return True if the block range is within the image bounds.
 
