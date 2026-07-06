@@ -49,6 +49,14 @@ from .startup_runner import (
 from amitools.vamos.libstructs.dos import FileInfoBlockStruct, FileHandleStruct, DosPacketStruct, InfoDataStruct  # type: ignore
 from amitools.vamos.lib.dos.DosProtection import DosProtection  # type: ignore
 
+__version__ = "v0.5.0"
+try:
+    from importlib.metadata import version as _pkg_version
+    __version__ = f"v{_pkg_version('amifuse')}"
+except Exception:
+    pass
+__banner__ = f"amifuse {__version__} - Copyright (C) 2025-2026 by Stefan Reinauer"
+
 
 # AmigaDOS error codes that mean the object genuinely does not exist. Only
 # these justify a negative-cache entry: transient failures such as
@@ -3215,15 +3223,6 @@ def format_volume(
             bridge.close()
         if temp_driver is not None and temp_driver.exists():
             temp_driver.unlink()
-
-
-__version__ = "v0.5.0"
-try:
-    from importlib.metadata import version as _pkg_version
-    __version__ = f"v{_pkg_version('amifuse')}"
-except Exception:
-    pass
-__banner__ = f"amifuse {__version__} - Copyright (C) 2025-2026 by Stefan Reinauer"
 
 
 def _json_error(command: str, code: str, message: str, details: dict = None) -> dict:
