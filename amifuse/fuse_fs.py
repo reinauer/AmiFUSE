@@ -50,6 +50,15 @@ from amitools.vamos.libstructs.dos import FileInfoBlockStruct, FileHandleStruct,
 from amitools.vamos.lib.dos.DosProtection import DosProtection  # type: ignore
 
 
+# AmigaDOS error codes that mean the object genuinely does not exist. Only
+# these justify a negative-cache entry: transient failures such as
+# ERROR_OBJECT_IN_USE (202) must not make an existing file report ENOENT
+# for the cache TTL.
+ERROR_DIR_NOT_FOUND = 204
+ERROR_OBJECT_NOT_FOUND = 205
+_NOT_FOUND_ERRORS = frozenset({ERROR_DIR_NOT_FOUND, ERROR_OBJECT_NOT_FOUND})
+
+
 def _require_fuse():
     if FUSE is None:
         raise SystemExit(
@@ -1062,7 +1071,7 @@ class HandlerBridge:
                     self.free_lock(parent)
                 if lock == 0:
                     break
-            if lock == 0 and path and path != "/":
+            if lock == 0 and path and path != "/" and res2 in _NOT_FOUND_ERRORS:
                 self._set_neg_cached(path)
             return lock, res2, [lock] if lock else []
 
@@ -1076,13 +1085,13 @@ class HandlerBridge:
                 return None
             name = parts[-1]
             dir_path = "/" + "/".join(parts[:-1])
-            dir_lock, _, locks = self.locate_path(dir_path)
+            dir_lock, dir_res2, locks = self.locate_path(dir_path)
             if dir_path == "/" and dir_lock == 0:
                 dir_lock, _ = self.locate(0, "")
                 if dir_lock:
                     locks.append(dir_lock)
             if dir_lock == 0 and dir_path != "/":
-                if path and path != "/":
+                if path and path != "/" and dir_res2 in _NOT_FOUND_ERRORS:
                     self._set_neg_cached(path)
                 return None
             _, name_bptr = self._alloc_bstr(name)
@@ -1106,10 +1115,10 @@ class HandlerBridge:
             replies = self._run_until_replies()
             self._log_replies("find", replies)
             if not replies or replies[-1][2] == 0:
+                res2 = replies[-1][3] if replies else -1
                 if self._debug:
-                    res2 = replies[-1][3] if replies else -1
                     print(f"[amifuse][open_file] FAILED: replies={bool(replies)} res1={replies[-1][2] if replies else 'none'} res2={res2}", flush=True)
-                if path and path != "/":
+                if path and path != "/" and res2 in _NOT_FOUND_ERRORS:
                     self._set_neg_cached(path)
                 self._free_fh(fh_addr)
                 for l in reversed(locks):
@@ -1287,9 +1296,9 @@ class HandlerBridge:
                 return b""
             name = parts[-1]
             dir_path = "/" + "/".join(parts[:-1])
-            dir_lock, _, locks = self.locate_path(dir_path)
+            dir_lock, dir_res2, locks = self.locate_path(dir_path)
             if dir_lock == 0 and dir_path != "/":
-                if path and path != "/":
+                if path and path != "/" and dir_res2 in _NOT_FOUND_ERRORS:
                     self._set_neg_cached(path)
                 return b""
             _, name_bptr = self._alloc_bstr(name)
@@ -1298,7 +1307,8 @@ class HandlerBridge:
             replies = self._run_until_replies()
             self._log_replies("findinput", replies)
             if not replies or replies[-1][2] == 0:
-                if path and path != "/":
+                res2 = replies[-1][3] if replies else -1
+                if path and path != "/" and res2 in _NOT_FOUND_ERRORS:
                     self._set_neg_cached(path)
                 self._free_fh(fh_addr)
                 for l in reversed(locks):
