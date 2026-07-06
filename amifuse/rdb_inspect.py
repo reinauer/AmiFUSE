@@ -516,9 +516,12 @@ def _lenient_rdisk_open(rdisk) -> List[str]:
 
 
 def open_rdisk(
-    image: Path, block_size: Optional[int] = None, mbr_partition_index: Optional[int] = None
+    image: Path,
+    block_size: Optional[int] = None,
+    mbr_partition_index: Optional[int] = None,
+    read_only: bool = True,
 ) -> Tuple[Union[RawBlockDevice, 'OffsetBlockDevice'], RDisk, Optional[MBRContext]]:
-    """Open an RDB image read-only and return the block device + parsed RDisk.
+    """Open an RDB image and return the block device + parsed RDisk.
 
     Scans blocks 0-15 for the RDB signature (RDSK), as the RDB can be located
     at any of these blocks depending on the disk geometry.
@@ -539,13 +542,14 @@ def open_rdisk(
         block_size: Force a specific block size (default: auto-detect)
         mbr_partition_index: For MBR disks with multiple 0x76 partitions,
             select which one to use (0-based). Default: first 0x76 partition.
+        read_only: Open the underlying image read-only (default True).
 
     Returns:
         Tuple of (block_device, rdisk, mbr_context).
         mbr_context is None for plain RDB disks, or MBRContext for MBR disks.
     """
     initial_block_size = block_size or 512
-    blkdev = RawBlockDevice(str(image), read_only=True, block_bytes=initial_block_size)
+    blkdev = RawBlockDevice(str(image), read_only=read_only, block_bytes=initial_block_size)
     blkdev.open()
 
     # First try direct RDB scan
@@ -554,7 +558,7 @@ def open_rdisk(
     if new_block_size is not None:
         # Need to reopen with correct block size and rescan
         blkdev.close()
-        blkdev = RawBlockDevice(str(image), read_only=True, block_bytes=new_block_size)
+        blkdev = RawBlockDevice(str(image), read_only=read_only, block_bytes=new_block_size)
         blkdev.open()
         rdb_block, _ = _scan_for_rdb(blkdev, block_size)
 
@@ -610,7 +614,7 @@ def open_rdisk(
             if new_block_size is not None:
                 # Need to reopen base device with new block size and rescan
                 blkdev.close()
-                blkdev = RawBlockDevice(str(image), read_only=True, block_bytes=new_block_size)
+                blkdev = RawBlockDevice(str(image), read_only=read_only, block_bytes=new_block_size)
                 blkdev.open()
                 offset_dev = OffsetBlockDevice(blkdev, mbr_part.start_lba, mbr_part.num_sectors)
                 rdb_block, _ = _scan_for_rdb(offset_dev, block_size)

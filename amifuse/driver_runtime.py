@@ -26,6 +26,9 @@ class BlockDeviceBackend:
     def __init__(self, image: Path, block_size: Optional[int] = None, read_only=True,
                  adf_info=None, iso_info=None, mbr_partition_index=None):
         self.image = image
+        # Keep the caller's request separate from the effective size:
+        # None means auto-detect, which open_rdisk needs to see as None.
+        self._requested_block_size = block_size
         self.block_size = block_size or 512
         self.read_only = read_only
         self.blkdev: Optional[RawBlockDevice] = None
@@ -45,10 +48,7 @@ class BlockDeviceBackend:
         self.total_blocks = pd.cyls * pd.heads * pd.secs
 
     def open(self):
-        from .rdb_inspect import (
-            OffsetBlockDevice, MBRContext, detect_mbr, MBR_TYPE_AMIGA_RDB,
-            _scan_for_rdb, _lenient_rdisk_open,
-        )
+        from .rdb_inspect import open_rdisk
 
         # For ADF images, skip RDB/MBR parsing and use synthetic geometry
         if self.adf_info is not None:
@@ -79,95 +79,16 @@ class BlockDeviceBackend:
             self.total_blocks = self.iso_info.total_blocks
             return
 
-        # Try opening as direct RDB first (scan blocks 0-15)
-        self.blkdev = RawBlockDevice(
-            str(self.image), read_only=self.read_only, block_bytes=self.block_size
+        # RDB image (plain, Parceiro-style MBR+RDB, or inside an Emu68-style
+        # 0x76 MBR partition): delegate scanning, lenient parsing, and MBR
+        # handling to open_rdisk so the logic lives in one place.
+        self.blkdev, self.rdb, self.mbr_context = open_rdisk(
+            self.image,
+            block_size=self._requested_block_size,
+            mbr_partition_index=self.mbr_partition_index,
+            read_only=self.read_only,
         )
-        self.blkdev.open()
-
-        rdb_block, new_block_size = _scan_for_rdb(self.blkdev, self.block_size)
-
-        if new_block_size is not None:
-            self.blkdev.close()
-            self.blkdev = RawBlockDevice(
-                str(self.image), read_only=self.read_only, block_bytes=new_block_size
-            )
-            self.blkdev.open()
-            rdb_block, _ = _scan_for_rdb(self.blkdev, self.block_size)
-
-        if rdb_block is not None:
-            self.rdb = RDisk(self.blkdev)
-            self.rdb.rdb = rdb_block
-            if self.rdb.open():
-                # Direct RDB success
-                self._setup_geometry()
-                return
-            # Strict open failed — try lenient parse (Parceiro checksums)
-            rdisk2 = RDisk(self.blkdev)
-            rdisk2.rdb = rdb_block
-            try:
-                rdisk2.rdb_warnings = _lenient_rdisk_open(rdisk2)
-                self.rdb = rdisk2
-                self._setup_geometry()
-                return
-            except IOError:
-                pass  # Fall through to MBR check
-
-        # No direct RDB - check for MBR with 0x76 partitions
-        mbr_info = detect_mbr(self.image)
-        if mbr_info is not None and mbr_info.has_amiga_partitions:
-            amiga_parts = [p for p in mbr_info.partitions if p.partition_type == MBR_TYPE_AMIGA_RDB]
-
-            if self.mbr_partition_index is not None:
-                if self.mbr_partition_index >= len(amiga_parts):
-                    self.close()
-                    raise IOError(
-                        f"MBR partition index {self.mbr_partition_index} out of range "
-                        f"(found {len(amiga_parts)} Amiga partitions)"
-                    )
-                amiga_parts = [amiga_parts[self.mbr_partition_index]]
-
-            # Try each 0x76 partition
-            for mbr_part in amiga_parts:
-                offset_dev = OffsetBlockDevice(self.blkdev, mbr_part.start_lba, mbr_part.num_sectors)
-
-                test_rdb = RDisk(offset_dev)
-                peeked = test_rdb.peek_block_size()
-                if peeked:
-                    if peeked != self.blkdev.block_bytes:
-                        # Need to reopen with correct block size
-                        self.blkdev.close()
-                        self.blkdev = RawBlockDevice(
-                            str(self.image), read_only=self.read_only, block_bytes=peeked
-                        )
-                        self.blkdev.open()
-                        offset_dev = OffsetBlockDevice(self.blkdev, mbr_part.start_lba, mbr_part.num_sectors)
-
-                    self.rdb = RDisk(offset_dev)
-                    if self.rdb.open():
-                        # Success - set up geometry and context
-                        pd = self.rdb.rdb.phy_drv
-                        self.block_size = offset_dev.block_bytes
-                        self.cyls = pd.cyls
-                        self.heads = pd.heads
-                        self.secs = pd.secs
-                        self.total_blocks = pd.cyls * pd.heads * pd.secs
-                        # OffsetBlockDevice.close() will close the underlying raw device
-                        self.blkdev = offset_dev
-                        self.mbr_context = MBRContext(
-                            mbr_info=mbr_info,
-                            mbr_partition=mbr_part,
-                            offset_blocks=mbr_part.start_lba,
-                        )
-                        return
-
-            self.close()
-            raise IOError(
-                f"MBR with Amiga partition(s) found, but none contain a valid RDB: {self.image}"
-            )
-
-        self.close()
-        raise IOError(f"Failed to parse RDB on {self.image}")
+        self._setup_geometry()
 
     def close(self):
         if self.rdb:
@@ -212,7 +133,8 @@ class BlockDeviceBackend:
             f"{self.image} cyls={pd.cyls} heads={pd.heads} secs={pd.secs} "
             f"block={self.blkdev.block_bytes if self.blkdev else self.block_size}"
         )
-        if self.mbr_context is not None:
+        # Parceiro-style coexistence has mbr_context with mbr_partition=None
+        if self.mbr_context is not None and self.mbr_context.mbr_partition is not None:
             mbr_part = self.mbr_context.mbr_partition
             base_desc += (
                 f" [MBR partition {mbr_part.index}: "
