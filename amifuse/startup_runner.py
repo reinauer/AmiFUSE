@@ -63,6 +63,42 @@ class HandlerTask(ExecTask):
 
     def free(self):
         pass  # Stack is managed by HandlerLauncher
+
+
+class HandlerDosProcess:
+    """Minimal stand-in for a dos.library Process.
+
+    Some handlers call dos.library functions during their own startup -
+    GetCurrentDir(), CurrentDir() and friends, which also record
+    errors in pr_Result2. Those go through DosLibCtx.process, which vamos only
+    populates for programs it launches itself, not for the handler processes
+    amifuse runs. Without a process the first such call raises
+    ``'NoneType' object has no attribute 'get_current_dir'``.
+
+    ``this_task`` is a struct accessor over the (zeroed) ProcessStruct amifuse
+    already allocated for the handler, so pr_CurrentDir reads as BNULL (root)
+    and fields like pr_Result2 are writable - matching the real vamos Process.
+    Only installed when no real process is present, so handlers that create
+    their own (SFS via CreateNewProc) are left untouched - see
+    HandlerLauncher.launch_with_startup.
+    """
+
+    def __init__(self, mem, proc_addr: int):
+        # accessor over amifuse's real handler ProcessStruct
+        self.this_task = ProcessStruct(mem, proc_addr)
+
+    def get_current_dir(self) -> int:
+        return self.this_task.pr_CurrentDir.aptr
+
+    def set_current_dir(self, lock: int) -> int:
+        old = self.this_task.pr_CurrentDir.aptr
+        self.this_task.pr_CurrentDir.aptr = lock & 0xFFFFFFFF
+        return old
+
+    def get_home_dir(self) -> int:
+        return self.this_task.pr_HomeDir.aptr
+
+
 from amitools.vamos.libstructs.exec_ import NodeStruct  # type: ignore
 from amitools.vamos.lib.DosLibrary import DosLibrary  # type: ignore
 from .handler_stub import build_entry_stub  # type: ignore
@@ -654,6 +690,14 @@ class HandlerLauncher:
         handler_task = HandlerTask(stack)
         if hasattr(self.vh, 'slm') and hasattr(self.vh.slm, 'exec_ctx'):
             self.vh.slm.exec_ctx.set_cur_task_process(handler_task, None)
+        # Give dos.library a process so handlers that call GetCurrentDir()/Lock()
+        # during startup don't crash on a NULL process. Only when none exists
+        # yet: handlers that install their own process (SFS via
+        # CreateNewProc) must keep it. Set the attribute directly - set_cur_process
+        # asserts a real DosProcess, and this lightweight stub intentionally isn't.
+        dos_ctx = getattr(self.vh.slm, 'dos_ctx', None)
+        if dos_ctx is not None and getattr(dos_ctx, 'process', None) is None:
+            dos_ctx.process = HandlerDosProcess(self.mem, proc_addr)
 
         return HandlerLaunchState(
             process_addr=proc_addr,
