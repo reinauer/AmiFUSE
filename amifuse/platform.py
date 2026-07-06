@@ -1074,8 +1074,8 @@ def kill_mount_owner_processes(mountpoint: Path) -> List[int]:
 def _find_amifuse_mounts_windows():
     """Discover amifuse mounts on Windows using wmic.
 
-    Note: wmic is deprecated on Windows 11. Future fallback: use
-    Get-CimInstance Win32_Process via PowerShell if wmic is unavailable.
+    Falls back to PowerShell Get-CimInstance when wmic is missing or fails
+    (wmic is deprecated and removed on newer Windows 11 builds).
     """
     try:
         result = subprocess.run(
@@ -1093,8 +1093,10 @@ def _find_amifuse_mounts_windows():
         logger.debug("wmic not available, cannot discover mounts")
         return _find_amifuse_mounts_cim()
     if result.returncode != 0:
+        # wmic may exist as a broken/deprecated stub -- try CIM instead of
+        # silently reporting no mounts.
         logger.debug("wmic exited with code %d", result.returncode)
-        return []
+        return _find_amifuse_mounts_cim()
 
     current_pid = os.getpid()
     mounts = []
