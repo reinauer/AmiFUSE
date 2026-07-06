@@ -1542,13 +1542,13 @@ class AmigaFuseFS(Operations):
     # macOS special files we should reject immediately without calling handler.
     # Note: "Icon\r" and ".VolumeIcon.icns" are NOT in this list - we handle them for custom icons.
     _MACOS_SPECIAL = frozenset([
-        "._.", ".hidden", ".Trashes", ".Spotlight-V100", ".fseventsd",
+        "._.", ".hidden", ".Spotlight-V100", ".fseventsd",
         ".metadata_never_index", ".com.apple.timemachine.donotpresent",
         ".DS_Store", ".ql_disablethumbnails",
         ".localized", ".TemporaryItems", ".DocumentRevisions-V100",
         ".vol", ".file", ".hotfiles.btree", ".quota.user", ".quota.group",
         ".apdisk", ".com.apple.NetBootX", "mach_kernel", ".PKInstallSandboxManager",
-        ".PKInstallSandboxManager-SystemSoftware", ".Trashes.501", "Backups.backupdb",
+        ".PKInstallSandboxManager-SystemSoftware", "Backups.backupdb",
     ])
 
     # Windows Explorer probe files we should reject immediately.
@@ -1650,6 +1650,10 @@ class AmigaFuseFS(Operations):
         name = path.rsplit("/", 1)[-1]
         if sys.platform.startswith("darwin"):
             if name.startswith("._"):  # AppleDouble resource fork files
+                return True
+            # .Trashes plus per-uid variants like .Trashes.501 -- match by
+            # prefix instead of hardcoding a uid in the set.
+            if name == ".Trashes" or name.startswith(".Trashes."):
                 return True
             # Icon files are handled specially when icons enabled
             if self._icon_handler:
