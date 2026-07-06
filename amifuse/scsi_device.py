@@ -190,7 +190,13 @@ class ScsiDevice(LibImpl):
                 alloc_len = mem.r8(cdb_ptr + 4) if cdb_len > 4 else data_len
                 alloc_len = min(alloc_len, data_len)
                 resp = bytearray(max(alloc_len, 36))
-                resp[0] = 0x00  # direct-access block
+                # CD/DVD filesystems check the peripheral device type and
+                # refuse anything that isn't a CD-ROM. Report 0x05 (CD-ROM) +
+                # removable for ISO images, else direct-access.
+                is_cd = getattr(self.backend, "iso_info", None) is not None
+                resp[0] = 0x05 if is_cd else 0x00  # peripheral device type
+                if is_cd:
+                    resp[1] = 0x80  # RMB: removable medium
                 resp[2] = 0x05  # SPC-3
                 resp[3] = 0x02  # response data format
                 resp[4] = len(resp) - 5
