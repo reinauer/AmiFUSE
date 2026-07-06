@@ -34,6 +34,31 @@ NSCMD_DEVICEQUERY = 0x4000  # New Style Device query
 # handler code/data (which is allocated from the low end).
 _NSD_CMD_TABLE_ADDR = 0x7FFF00
 
+# Command names for debug logging (BeginIO is the disk-I/O hot path, so
+# this must not be rebuilt per request).
+_CMD_NAMES = {
+    2: "CMD_READ",
+    3: "CMD_WRITE",
+    4: "CMD_UPDATE",
+    5: "CMD_CLEAR",
+    9: "TD_MOTOR",
+    10: "TD_SEEK",
+    11: "TD_FORMAT",
+    13: "TD_CHANGENUM",
+    14: "TD_CHANGESTATE",
+    15: "TD_PROTSTATUS",
+    18: "TD_GETDRIVETYPE",
+    20: "TD_ADDCHANGEINT",
+    21: "TD_REMCHANGEINT",
+    22: "TD_GETGEOMETRY",
+    24: "TD_READ64",
+    25: "TD_WRITE64",
+    26: "TD_SEEK64",
+    27: "TD_FORMAT64",
+    28: "HD_SCSICMD",
+    NSCMD_DEVICEQUERY: "NSCMD_DEVICEQUERY",
+}
+
 
 @AmigaStructDef
 class SCSICmdStruct(AmigaStruct):
@@ -103,32 +128,8 @@ class ScsiDevice(LibImpl):
         buf_ptr = ior.data.val
         # For TD64 commands, io_Actual contains the high 32 bits of the offset
         io_actual = ior.actual.val
-        # SCSI command dispatch
-        cmd_names = {
-            2: "CMD_READ",
-            3: "CMD_WRITE",
-            4: "CMD_UPDATE",
-            5: "CMD_CLEAR",
-            9: "TD_MOTOR",
-            10: "TD_SEEK",
-            11: "TD_FORMAT",
-            13: "TD_CHANGENUM",
-            14: "TD_CHANGESTATE",
-            15: "TD_PROTSTATUS",
-            18: "TD_GETDRIVETYPE",
-            20: "TD_ADDCHANGEINT",
-            21: "TD_REMCHANGEINT",
-            22: "TD_GETGEOMETRY",
-            24: "TD_READ64",
-            25: "TD_WRITE64",
-            26: "TD_SEEK64",
-            27: "TD_FORMAT64",
-            28: "HD_SCSICMD",
-        }
         if self.debug:
-            cmd_name = cmd_names.get(cmd, f"CMD_{cmd}")
-            if cmd == NSCMD_DEVICEQUERY:
-                cmd_name = "NSCMD_DEVICEQUERY"
+            cmd_name = _CMD_NAMES.get(cmd, f"CMD_{cmd}")
             extra = ""
             # For TD64, compute 64-bit offset
             if cmd in (TD_READ64, TD_WRITE64):
