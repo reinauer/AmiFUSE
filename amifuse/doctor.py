@@ -108,7 +108,6 @@ def run_checks() -> List[CheckResult]:
         ))
 
     # 6. Driver availability
-    from . import platform as plat
     driver_found = False
     driver_path = None
     for search_dir in plat.get_driver_search_dirs():
@@ -131,11 +130,22 @@ def run_checks() -> List[CheckResult]:
             fix_description=f"Copy FastFileSystem to {primary_dir} for ADF floppy mounting",
         ))
 
-    # 7. Shell registration (Windows only)
+    # 7-8b. Windows shell integration: registration status plus, when
+    # registered, tray dependencies and wscript availability. One import
+    # and one registry probe shared by all three checks; skipped entirely
+    # when windows_shell cannot be imported.
     if sys.platform.startswith("win"):
         try:
             from .windows_shell import is_registered, register
-            if is_registered():
+            shell_registered = is_registered()
+        except ImportError:
+            # windows_shell (or winreg inside it) not available -- skip all
+            # three shell checks, like the per-check guards used to.
+            shell_registered = None
+        if shell_registered is not None:
+
+            # 7. Shell registration
+            if shell_registered:
                 results.append(CheckResult(
                     "shell_registration", "ok", "File associations are registered",
                 ))
@@ -146,14 +156,9 @@ def run_checks() -> List[CheckResult]:
                     fixable=True, fix_fn=register,
                     fix_description="Run: amifuse register",
                 ))
-        except ImportError:
-            pass  # windows_shell not available, skip check
 
-    # 8. Tray dependencies (Windows only, when shell registered)
-    if sys.platform.startswith("win"):
-        try:
-            from .windows_shell import is_registered
-            if is_registered():
+            if shell_registered:
+                # 8. Tray dependencies
                 import importlib.util
                 missing = []
                 if importlib.util.find_spec("pystray") is None:
@@ -175,14 +180,8 @@ def run_checks() -> List[CheckResult]:
                         "tray_deps", "ok",
                         "Tray dependencies installed (pystray, Pillow)",
                     ))
-        except ImportError:
-            pass
 
-    # 8b. WScript availability (Windows only, when shell registered)
-    if sys.platform.startswith("win"):
-        try:
-            from .windows_shell import is_registered
-            if is_registered():
+                # 8b. WScript availability (needed for context menu actions)
                 if not shutil.which("wscript.exe"):
                     results.append(CheckResult(
                         "wscript", "warning",
@@ -193,8 +192,6 @@ def run_checks() -> List[CheckResult]:
                         "wscript", "ok",
                         "wscript.exe available for context menu actions",
                     ))
-        except ImportError:
-            pass
 
     # 9. PATH check
     if shutil.which("amifuse"):
