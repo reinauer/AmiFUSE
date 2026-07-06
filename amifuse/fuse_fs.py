@@ -2340,16 +2340,18 @@ class AmigaFuseFS(Operations):
         if not name:
             raise FuseOSError(errno.EINVAL)
         parent_lock, _, locks = self.bridge.locate_path(dir_path)
-        if parent_lock == 0 and dir_path != "/":
-            raise FuseOSError(errno.ENOENT)
-        new_lock, _ = self.bridge.create_dir(parent_lock, name)
-        if new_lock == 0:
-            raise FuseOSError(errno.EIO)
-        self.bridge.free_lock(new_lock)
+        try:
+            if parent_lock == 0 and dir_path != "/":
+                raise FuseOSError(errno.ENOENT)
+            new_lock, _ = self.bridge.create_dir(parent_lock, name)
+            if new_lock == 0:
+                raise FuseOSError(errno.EIO)
+            self.bridge.free_lock(new_lock)
+        finally:
+            for l in reversed(locks):
+                self.bridge.free_lock(l)
         with self._cache_lock:
             self._dir_cache.pop(dir_path, None)
-        for l in reversed(locks):
-            self.bridge.free_lock(l)
         return 0
 
     def rename(self, old, new):
@@ -2364,15 +2366,19 @@ class AmigaFuseFS(Operations):
             raise FuseOSError(errno.EINVAL)
         src_lock, _, src_locks = self.bridge.locate_path(src_dir)
         dst_lock, _, dst_locks = self.bridge.locate_path(dst_dir)
-        if (src_lock == 0 and src_dir != "/") or (dst_lock == 0 and dst_dir != "/"):
+        try:
+            if (src_lock == 0 and src_dir != "/") or (dst_lock == 0 and dst_dir != "/"):
+                raise FuseOSError(errno.ENOENT)
+            res1, _ = self.bridge.rename_object(src_lock, src_name, dst_lock, dst_name)
+            if res1 == 0:
+                raise FuseOSError(errno.EIO)
+        finally:
+            # Free the dir locks on every exit; a leaked lock lingers in
+            # handler memory and can block later deletes with OBJECT_IN_USE.
             for l in reversed(src_locks):
                 self.bridge.free_lock(l)
             for l in reversed(dst_locks):
                 self.bridge.free_lock(l)
-            raise FuseOSError(errno.ENOENT)
-        res1, _ = self.bridge.rename_object(src_lock, src_name, dst_lock, dst_name)
-        if res1 == 0:
-            raise FuseOSError(errno.EIO)
         with self._cache_lock:
             self._stat_cache.pop(old, None)
             self._stat_cache.pop(new, None)
@@ -2380,10 +2386,6 @@ class AmigaFuseFS(Operations):
             self._dir_cache.pop(dst_dir, None)
         self._pinned_stats.discard(old)
         self._pinned_stats.discard(new)
-        for l in reversed(src_locks):
-            self.bridge.free_lock(l)
-        for l in reversed(dst_locks):
-            self.bridge.free_lock(l)
         return 0
 
     def flush(self, path, fh):
