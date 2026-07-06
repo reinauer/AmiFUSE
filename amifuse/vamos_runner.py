@@ -36,7 +36,6 @@ from amitools.vamos.schedule import Scheduler
 from amitools.vamos.libmgr import SetupLibManager
 # local fake scsi.device
 from amifuse.scsi_device import ScsiDevice
-from amifuse.pending_ports import reset as reset_pending_ports
 
 _LOG_SETUP_DONE = False
 
@@ -67,7 +66,6 @@ def _reset_runtime_state():
     DosLibrary._child_processes.clear()
     SignalFunc._fallback_signals = 0
     SignalFunc._fallback_sig_alloc = 0x0000FFFF
-    reset_pending_ports()
 
 
 class VamosHandlerRuntime:
