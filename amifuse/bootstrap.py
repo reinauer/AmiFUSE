@@ -146,74 +146,76 @@ class BootstrapAllocator:
             de, blk, rd, part = self._read_iso_env()
         else:
             de, blk, rd, part = self._read_partition_env()
-        # DosEnvec
-        env_mem = self.alloc.alloc_memory(DosEnvecStruct.get_size(), label="DosEnvec")
-        env = DosEnvecStruct(self.mem, env_mem.addr)
-        _scalar_field(env, "de_TableSize").val = de.size if getattr(de, "size", 0) else 16
-        _scalar_field(env, "de_SizeBlock").val = de.block_size
-        _scalar_field(env, "de_SecOrg").val = de.sec_org
-        _scalar_field(env, "de_Surfaces").val = de.surfaces
-        _scalar_field(env, "de_SectorPerBlock").val = de.sec_per_blk
-        _scalar_field(env, "de_BlocksPerTrack").val = de.blk_per_trk
-        _scalar_field(env, "de_Reserved").val = de.reserved
-        _scalar_field(env, "de_PreAlloc").val = de.pre_alloc
-        _scalar_field(env, "de_Interleave").val = de.interleave
-        _scalar_field(env, "de_LowCyl").val = de.low_cyl
-        _scalar_field(env, "de_HighCyl").val = de.high_cyl
-        _scalar_field(env, "de_NumBuffers").val = de.num_buffer
-        _scalar_field(env, "de_BufMemType").val = de.buf_mem_type
-        _scalar_field(env, "de_MaxTransfer").val = de.max_transfer
-        # Relax mask: allow any address to avoid handler memorymask complaints
-        _scalar_field(env, "de_Mask").val = 0xFFFFFFFF
-        _scalar_field(env, "de_BootPri").val = de.boot_pri
-        _scalar_field(env, "de_DosType").val = de.dos_type
-        _scalar_field(env, "de_Baud").val = de.baud
-        _scalar_field(env, "de_Control").val = de.control
-        _scalar_field(env, "de_BootBlocks").val = de.boot_blocks
+        try:
+            # DosEnvec
+            env_mem = self.alloc.alloc_memory(DosEnvecStruct.get_size(), label="DosEnvec")
+            env = DosEnvecStruct(self.mem, env_mem.addr)
+            _scalar_field(env, "de_TableSize").val = de.size if getattr(de, "size", 0) else 16
+            _scalar_field(env, "de_SizeBlock").val = de.block_size
+            _scalar_field(env, "de_SecOrg").val = de.sec_org
+            _scalar_field(env, "de_Surfaces").val = de.surfaces
+            _scalar_field(env, "de_SectorPerBlock").val = de.sec_per_blk
+            _scalar_field(env, "de_BlocksPerTrack").val = de.blk_per_trk
+            _scalar_field(env, "de_Reserved").val = de.reserved
+            _scalar_field(env, "de_PreAlloc").val = de.pre_alloc
+            _scalar_field(env, "de_Interleave").val = de.interleave
+            _scalar_field(env, "de_LowCyl").val = de.low_cyl
+            _scalar_field(env, "de_HighCyl").val = de.high_cyl
+            _scalar_field(env, "de_NumBuffers").val = de.num_buffer
+            _scalar_field(env, "de_BufMemType").val = de.buf_mem_type
+            _scalar_field(env, "de_MaxTransfer").val = de.max_transfer
+            # Relax mask: allow any address to avoid handler memorymask complaints
+            _scalar_field(env, "de_Mask").val = 0xFFFFFFFF
+            _scalar_field(env, "de_BootPri").val = de.boot_pri
+            _scalar_field(env, "de_DosType").val = de.dos_type
+            _scalar_field(env, "de_Baud").val = de.baud
+            _scalar_field(env, "de_Control").val = de.control
+            _scalar_field(env, "de_BootBlocks").val = de.boot_blocks
 
-        # FSSM
-        fssm_mem = self.alloc.alloc_memory(FileSysStartupMsgStruct.get_size(), label="FSSM")
-        fssm = FileSysStartupMsgStruct(self.mem, fssm_mem.addr)
-        dev_bstr = b"\x0b" + b"scsi.device"
-        dev_mem = self.alloc.alloc_memory(len(dev_bstr), label="dev_bstr")
-        self.mem.w_block(dev_mem.addr, dev_bstr)
-        _scalar_field(fssm, "fssm_Unit").val = 0
-        _scalar_field(fssm, "fssm_Device").val = dev_mem.addr >> 2
-        _scalar_field(fssm, "fssm_Environ").val = env_mem.addr >> 2
-        _scalar_field(fssm, "fssm_Flags").val = 0
+            # FSSM
+            fssm_mem = self.alloc.alloc_memory(FileSysStartupMsgStruct.get_size(), label="FSSM")
+            fssm = FileSysStartupMsgStruct(self.mem, fssm_mem.addr)
+            dev_bstr = b"\x0b" + b"scsi.device"
+            dev_mem = self.alloc.alloc_memory(len(dev_bstr), label="dev_bstr")
+            self.mem.w_block(dev_mem.addr, dev_bstr)
+            _scalar_field(fssm, "fssm_Unit").val = 0
+            _scalar_field(fssm, "fssm_Device").val = dev_mem.addr >> 2
+            _scalar_field(fssm, "fssm_Environ").val = env_mem.addr >> 2
+            _scalar_field(fssm, "fssm_Flags").val = 0
 
-        # DeviceNode
-        dn_mem = self.alloc.alloc_memory(DeviceNodeStruct.get_size(), label="DeviceNode")
-        dn = DeviceNodeStruct(self.mem, dn_mem.addr)
-        name_bstr = bytes([len(handler_name)]) + handler_name.encode("ascii")
-        name_mem = self.alloc.alloc_memory(len(name_bstr), label="dn_name")
-        self.mem.w_block(name_mem.addr, name_bstr)
-        _scalar_field(dn, "dn_Next").val = 0
-        _scalar_field(dn, "dn_Type").val = 0
-        _scalar_field(dn, "dn_Task").val = 0
-        _scalar_field(dn, "dn_Lock").val = 0
-        _scalar_field(dn, "dn_Handler").val = handler_seglist_bptr
-        _scalar_field(dn, "dn_StackSize").val = 0
-        _scalar_field(dn, "dn_Priority").val = 0
-        _scalar_field(dn, "dn_Startup").val = fssm_mem.addr >> 2
-        _scalar_field(dn, "dn_SegList").val = handler_seglist_bptr
-        _scalar_field(dn, "dn_GlobalVec").val = -1
-        _scalar_field(dn, "dn_Name").val = name_mem.addr >> 2
+            # DeviceNode
+            dn_mem = self.alloc.alloc_memory(DeviceNodeStruct.get_size(), label="DeviceNode")
+            dn = DeviceNodeStruct(self.mem, dn_mem.addr)
+            name_bstr = bytes([len(handler_name)]) + handler_name.encode("ascii")
+            name_mem = self.alloc.alloc_memory(len(name_bstr), label="dn_name")
+            self.mem.w_block(name_mem.addr, name_bstr)
+            _scalar_field(dn, "dn_Next").val = 0
+            _scalar_field(dn, "dn_Type").val = 0
+            _scalar_field(dn, "dn_Task").val = 0
+            _scalar_field(dn, "dn_Lock").val = 0
+            _scalar_field(dn, "dn_Handler").val = handler_seglist_bptr
+            _scalar_field(dn, "dn_StackSize").val = 0
+            _scalar_field(dn, "dn_Priority").val = 0
+            _scalar_field(dn, "dn_Startup").val = fssm_mem.addr >> 2
+            _scalar_field(dn, "dn_SegList").val = handler_seglist_bptr
+            _scalar_field(dn, "dn_GlobalVec").val = -1
+            _scalar_field(dn, "dn_Name").val = name_mem.addr >> 2
 
-        # alloc_all opens its own view of the image only to read the
-        # partition's DosEnvec. Everything callers need later (part.part_blk)
-        # is already parsed into memory, so release the file handles here
-        # instead of holding a second open image for the mount's lifetime.
-        if rd is not None:
-            rd.close()
-        if blk is not None:
-            blk.close()
-
-        return {
-            "env_addr": env_mem.addr,
-            "fssm_addr": fssm_mem.addr,
-            "device_bstr": dev_mem.addr,
-            "dn_addr": dn_mem.addr,
-            "dn_name_addr": name_mem.addr,
-            "part": part,
-        }
+            return {
+                "env_addr": env_mem.addr,
+                "fssm_addr": fssm_mem.addr,
+                "device_bstr": dev_mem.addr,
+                "dn_addr": dn_mem.addr,
+                "dn_name_addr": name_mem.addr,
+                "part": part,
+            }
+        finally:
+            # alloc_all opens its own view of the image only to read the
+            # partition's DosEnvec. Everything callers need later
+            # (part.part_blk) is already parsed into memory, so release the
+            # file handles -- also when a struct allocation above raises --
+            # instead of holding a second open image for the mount's lifetime.
+            if rd is not None:
+                rd.close()
+            if blk is not None:
+                blk.close()
