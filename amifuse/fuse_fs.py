@@ -1861,33 +1861,53 @@ class AmigaFuseFS(Operations):
             # Cache negative result
             self._set_neg_cached(path)
             raise FuseOSError(errno.ENOENT)
-        is_dir = info["dir_type"] >= 0
+        result = self._stat_from_fib(info, path, int(time.time()))
+        self._set_cached_stat(path, result)
+        return result
+
+    def _stat_from_fib(self, ent: Dict, name: str, now: int) -> Dict:
+        """Build a FUSE stat dict from a parsed FileInfoBlock entry.
+
+        ``name`` is only used for the trailing ``.info`` check, so both a
+        full path (getattr) and a bare entry name (readdir) work.
+        """
+        is_dir = ent["dir_type"] >= 0
         # Convert Amiga protection bits to Unix mode
-        prot = DosProtection(info.get("protection", 0))
+        prot = DosProtection(ent.get("protection", 0))
         base_mode = prot.to_host_mode()
         # For read-only mounts, strip write bits
         if not self.bridge._write_enabled:
             base_mode &= ~(0o222)
-        mode = base_mode | (0o040000 if is_dir else 0o100000)
-        now = int(time.time())
         result = {
-            "st_mode": mode,
+            "st_mode": base_mode | (0o040000 if is_dir else 0o100000),
             "st_nlink": 2 if is_dir else 1,
-            "st_size": info["size"],
+            "st_size": ent["size"],
             "st_ctime": now,
             "st_mtime": now,
             "st_atime": now,
             "st_uid": self._uid,
             "st_gid": self._gid,
-            "st_blksize": 512, # TODO: compute from ACTION_DISK_INFO?
-            "st_blocks": info["num_blocks"]
+            "st_blksize": 512,  # TODO: compute from ACTION_DISK_INFO?
+            "st_blocks": ent["num_blocks"],
         }
-        # Set UF_HIDDEN on all .info files when icons mode is enabled
-        # This hides the Amiga icon files since we display icons via xattrs
-        if self._icons_enabled and (path.endswith(".info") or path.lower().endswith(".info")):
-            result["st_flags"] = result.get("st_flags", 0) | 0x8000  # UF_HIDDEN
-        self._set_cached_stat(path, result)
+        # Set UF_HIDDEN on .info files when icons mode is enabled: the Amiga
+        # icon files are hidden since we display icons via xattrs instead.
+        if self._icons_enabled and name.lower().endswith(".info"):
+            result["st_flags"] = 0x8000  # UF_HIDDEN
         return result
+
+    def _filter_pending_deletes(self, path: str, entries: List[str]) -> List[str]:
+        """Drop directory entries whose full path has a pending (deferred) delete."""
+        with self._fh_lock:
+            if not self._pending_deletes:
+                return entries
+            return [
+                e for e in entries
+                if e in (".", "..") or (
+                    (path.rstrip("/") + "/" + e if path != "/" else "/" + e)
+                    not in self._pending_deletes
+                )
+            ]
 
     def opendir(self, path):
         with self._fh_lock:
@@ -1952,17 +1972,7 @@ class AmigaFuseFS(Operations):
                 ts, cached_entries = self._dir_cache[path]
                 if time.time() - ts < self._dir_cache_ttl:
                     self._track_op("readdir", path, cached=True)
-                    # Filter pending deletes from cached results
-                    with self._fh_lock:
-                        if self._pending_deletes:
-                            cached_entries = [
-                                e for e in cached_entries
-                                if e in (".", "..") or (
-                                    (path.rstrip("/") + "/" + e if path != "/" else "/" + e)
-                                    not in self._pending_deletes
-                                )
-                            ]
-                    return cached_entries
+                    return self._filter_pending_deletes(path, cached_entries)
                 del self._dir_cache[path]
 
         self._track_op("readdir", path, cached=False)
@@ -1974,29 +1984,7 @@ class AmigaFuseFS(Operations):
             entries.append(name)
             # Pre-populate stat cache from directory listing
             child_path = path.rstrip("/") + "/" + name if path != "/" else "/" + name
-            is_dir = ent["dir_type"] >= 0
-            # Convert Amiga protection bits to Unix mode
-            prot = DosProtection(ent.get("protection", 0))
-            base_mode = prot.to_host_mode()
-            # For read-only mounts, strip write bits
-            if not self.bridge._write_enabled:
-                base_mode &= ~(0o222)
-            mode = base_mode | (0o040000 if is_dir else 0o100000)
-            stat_result = {
-                "st_mode": mode,
-                "st_nlink": 2 if is_dir else 1,
-                "st_size": ent["size"],
-                "st_ctime": int(now),
-                "st_mtime": int(now),
-                "st_atime": int(now),
-                "st_uid": self._uid,
-                "st_gid": self._gid,
-                "st_blksize": 512, # TODO: compute from ACTION_DISK_INFO?
-                "st_blocks": ent["num_blocks"]
-            }
-            # Set UF_HIDDEN on .info files when icons mode is enabled
-            if self._icons_enabled and (name.endswith(".info") or name.lower().endswith(".info")):
-                stat_result["st_flags"] = 0x8000  # UF_HIDDEN
+            stat_result = self._stat_from_fib(ent, name, int(now))
             with self._cache_lock:
                 _prune_cache(self._stat_cache)
                 self._stat_cache[child_path] = (now, stat_result)
@@ -2016,15 +2004,7 @@ class AmigaFuseFS(Operations):
                 entries.append(volume_icon_file)
 
         # Filter out entries with pending (deferred) deletes
-        with self._fh_lock:
-            if self._pending_deletes:
-                entries = [
-                    e for e in entries
-                    if e in (".", "..") or (
-                        (path.rstrip("/") + "/" + e if path != "/" else "/" + e)
-                        not in self._pending_deletes
-                    )
-                ]
+        entries = self._filter_pending_deletes(path, entries)
 
         # Cache the directory listing
         with self._cache_lock:
