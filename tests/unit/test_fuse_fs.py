@@ -274,7 +274,6 @@ class TestMountFuseOptions:
         monkeypatch.setattr(plat_mod, "check_fuse_available", lambda: None)
         monkeypatch.setattr(plat_mod, "validate_mountpoint", lambda mp: None)
         monkeypatch.setattr(plat_mod, "should_auto_create_mountpoint", lambda mp: True)
-        monkeypatch.setattr(plat_mod, "mount_runs_in_foreground_by_default", lambda: True)
 
         mock_bridge = MagicMock()
         mock_bridge.state.crashed = True
@@ -364,7 +363,7 @@ class TestUnmountCommand:
 
     def test_unmount_rejects_non_mountpoint(self, monkeypatch, fuse_mock):
         monkeypatch.setattr("os.path.ismount", lambda path: False)
-        monkeypatch.setattr("amifuse.platform._is_stale_mountpoint", lambda path: False)
+        monkeypatch.setattr("amifuse.platform.is_stale_mountpoint", lambda path: False)
         import amifuse.fuse_fs as fuse_fs_mod
 
         with pytest.raises(SystemExit) as exc_info:
@@ -412,7 +411,7 @@ class TestUnmountCommand:
     def test_unmount_runs_for_stale_mountpoint(self, monkeypatch, fuse_mock):
         monkeypatch.setattr("os.path.ismount", lambda path: False)
         monkeypatch.setattr(
-            "amifuse.platform._is_stale_mountpoint",
+            "amifuse.platform.is_stale_mountpoint",
             lambda mountpoint: True,
         )
         monkeypatch.setattr(
@@ -636,7 +635,6 @@ class TestDriverValidation:
         monkeypatch.setattr(plat_mod, "check_fuse_available", lambda: None)
         monkeypatch.setattr(plat_mod, "validate_mountpoint", lambda mp: None)
         monkeypatch.setattr(plat_mod, "should_auto_create_mountpoint", lambda mp: False)
-        monkeypatch.setattr(plat_mod, "mount_runs_in_foreground_by_default", lambda: True)
         monkeypatch.setattr(plat_mod, "get_unmount_command", lambda mp: ["umount", "-f", str(mp)])
 
         fake_rdb = MagicMock()
