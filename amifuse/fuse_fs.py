@@ -265,23 +265,7 @@ class HandlerBridge:
             if not self.state.main_loop_pc:
                 from amitools.vamos.machine.regs import REG_D0
                 cpu = self.vh.machine.cpu
-                from amitools.vamos.lib.ExecLibrary import ExecLibrary as _EL
-                _wps = _get_block_state(_EL, '_waitport_blocked_sp')
-                _ws = _get_block_state(_EL, '_wait_blocked_sp')
-                _wpr = _get_block_state(_EL, '_waitport_blocked_ret')
-                _wr = _get_block_state(_EL, '_wait_blocked_ret')
-                _wm = _get_block_state(_EL, '_wait_blocked_mask')
-                _bsp = _wps if _wps is not None else _ws
-                _bret = _wpr if _wpr is not None else _wr
-                if _bsp is not None:
-                    _ret = _bret if _bret is not None else self.mem.r32(_bsp)
-                    if _ret >= 0x800:
-                        self.state.main_loop_pc = _ret
-                        self.state.main_loop_sp = _bsp + 4
-                        if _wm is not None and _wm != 0:
-                            self.state.wait_mask = _wm
-                        self.state.initialized = True
-                        self.state.block_state = _snapshot_block_state()
+                self._capture_main_loop_from_block_state()
                 _clear_all_block_state()
                 cpu.w_reg(REG_D0, 0)
                 self._set_saved_main_reg(REG_D0, 0)
@@ -318,34 +302,7 @@ class HandlerBridge:
         from amitools.vamos.machine.regs import REG_D0
         cpu = self.vh.machine.cpu
         if not self.state.main_loop_pc:
-            from amitools.vamos.lib.ExecLibrary import ExecLibrary as _EL
-
-            _wps = _get_block_state(_EL, "_waitport_blocked_sp")
-            _ws = _get_block_state(_EL, "_wait_blocked_sp")
-            _wpr = _get_block_state(_EL, "_waitport_blocked_ret")
-            _wr = _get_block_state(_EL, "_wait_blocked_ret")
-            _wm = _get_block_state(_EL, "_wait_blocked_mask")
-            _bsp = _wps if _wps is not None else _ws
-            _bret = _wpr if _wpr is not None else _wr
-            if _bsp is not None:
-                _ret = _bret if _bret is not None else self.mem.r32(_bsp)
-                if _ret >= 0x800:
-                    self.state.main_loop_pc = _ret
-                    self.state.main_loop_sp = _bsp + 4
-                    if _wm is not None and _wm != 0:
-                        self.state.wait_mask = _wm
-                    self.state.initialized = True
-                    self.state.block_state = _snapshot_block_state()
-                    if self._debug:
-                        mask_str = (
-                            f" wait_mask=0x{self.state.wait_mask:x}"
-                            if self.state.wait_mask
-                            else ""
-                        )
-                        print(
-                            f"[amifuse] Captured main_loop from blocking state: "
-                            f"pc=0x{_ret:x}, sp=0x{_bsp + 4:x}{mask_str}"
-                        )
+            self._capture_main_loop_from_block_state()
         if not self.state.main_loop_pc:
             self.state.main_loop_pc = 0
             self.state.main_loop_sp = 0
@@ -711,6 +668,46 @@ class HandlerBridge:
             self._drain_non_essential_ports(pmgr)
 
         return replies
+
+    def _capture_main_loop_from_block_state(self) -> bool:
+        """Adopt the handler's Wait/WaitPort return frame as the main loop.
+
+        When a run burst left the handler blocked, the Exec-side blocking
+        variables hold the return PC/SP of the Wait()/WaitPort() call. If
+        they look valid, save them as the main-loop restart point and
+        snapshot the block state. Returns True if a main loop was captured.
+        """
+        from amitools.vamos.lib.ExecLibrary import ExecLibrary
+
+        waitport_sp = _get_block_state(ExecLibrary, "_waitport_blocked_sp")
+        wait_sp = _get_block_state(ExecLibrary, "_wait_blocked_sp")
+        waitport_ret = _get_block_state(ExecLibrary, "_waitport_blocked_ret")
+        wait_ret = _get_block_state(ExecLibrary, "_wait_blocked_ret")
+        wait_mask = _get_block_state(ExecLibrary, "_wait_blocked_mask")
+        blocked_sp = waitport_sp if waitport_sp is not None else wait_sp
+        blocked_ret = waitport_ret if waitport_ret is not None else wait_ret
+        if blocked_sp is None:
+            return False
+        ret_addr = blocked_ret if blocked_ret is not None else self.mem.r32(blocked_sp)
+        if ret_addr < 0x800:
+            return False
+        self.state.main_loop_pc = ret_addr
+        self.state.main_loop_sp = blocked_sp + 4
+        if wait_mask:
+            self.state.wait_mask = wait_mask
+        self.state.initialized = True
+        self.state.block_state = _snapshot_block_state()
+        if self._debug:
+            mask_str = (
+                f" wait_mask=0x{self.state.wait_mask:x}"
+                if self.state.wait_mask
+                else ""
+            )
+            print(
+                f"[amifuse] Captured main_loop from blocking state: "
+                f"pc=0x{ret_addr:x}, sp=0x{blocked_sp + 4:x}{mask_str}"
+            )
+        return True
 
     def _capture_main_loop_state(self, max_iters: int = 50, cycles: int = 10_000):
         """Run until the handler blocks in Wait/WaitPort and capture restart PC/SP."""
