@@ -2348,8 +2348,7 @@ class TestCmdInspectJson:
         fake_rdb_inspect = MagicMock()
         fake_rdb_inspect.detect_adf.return_value = mock_adf_info
         fake_rdb_inspect.detect_iso.return_value = None
-        fake_rdb_inspect.detect_mbr.return_value = None
-        fake_rdb_inspect.MBR_TYPE_AMIGA_RDB = 0x76
+        fake_rdb_inspect.amiga_rdb_partitions.return_value = []
         monkeypatch.setitem(sys.modules, "amifuse.rdb_inspect", fake_rdb_inspect)
 
         return fuse_fs_mod, fake_rdb_inspect
@@ -2476,7 +2475,6 @@ class TestCmdInspectJson:
 
         fake_rdb.detect_adf.return_value = None
         fake_rdb.detect_iso.return_value = None
-        fake_rdb.detect_mbr.return_value = None
 
         mock_blkdev = MagicMock()
         mock_rdisk = MagicMock()
@@ -2485,6 +2483,8 @@ class TestCmdInspectJson:
         }
         mock_rdisk.rdb_warnings = []
         fake_rdb.open_rdisk.return_value = (mock_blkdev, mock_rdisk, None)
+        # build_rdisk_desc lives in the mocked module; pass through to get_desc
+        fake_rdb.build_rdisk_desc.side_effect = lambda rdisk, mbr_ctx: rdisk.get_desc()
 
         fuse_fs_mod.cmd_inspect(inspect_args)
         output = capsys.readouterr().out
@@ -2537,7 +2537,6 @@ class TestCmdInspectJson:
 
         fake_rdb.detect_adf.return_value = None
         fake_rdb.detect_iso.return_value = None
-        fake_rdb.detect_mbr.return_value = None
         fake_rdb.open_rdisk.side_effect = IOError("No valid RDB found")
 
         with pytest.raises(SystemExit) as exc_info:
@@ -2587,7 +2586,9 @@ class TestCmdInspectJson:
 
         fake_rdb.detect_adf.return_value = None
         fake_rdb.detect_iso.return_value = None
-        fake_rdb.detect_mbr.return_value = mbr_info
+        fake_rdb.amiga_rdb_partitions.return_value = [part0, part1]
+        # build_rdisk_desc lives in the mocked module; pass through to get_desc
+        fake_rdb.build_rdisk_desc.side_effect = lambda rdisk, mbr_ctx: rdisk.get_desc()
 
         # open_rdisk called twice (once per 0x76 partition)
         def make_rdisk_result(partition_index):

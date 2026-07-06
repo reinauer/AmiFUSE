@@ -753,12 +753,7 @@ def list_partitions(
         the duplicate-name fallback, a string with ``.partitions`` holding a
         single entry. The caller logs and surfaces ``.fallback_reason``.
     """
-    mbr_info = detect_mbr(image)
-    amiga_parts = []
-    if mbr_info is not None and mbr_info.has_amiga_partitions:
-        amiga_parts = [
-            p for p in mbr_info.partitions if p.partition_type == MBR_TYPE_AMIGA_RDB
-        ]
+    amiga_parts = amiga_rdb_partitions(image)
 
     # Plain RDB (or a single 0x76 RDB): open once, enumerate, close both handles.
     if len(amiga_parts) <= 1:
@@ -819,6 +814,130 @@ def format_fs_summary(rdisk: RDisk):
             f"size={len(fs.get_data())} flags={fs.get_flags_info()}"
         )
     return lines
+
+
+def amiga_rdb_partitions(image: Path) -> List[MBRPartition]:
+    """Return the 0x76 (Amiga RDB) MBR partitions of an image, [] if none.
+
+    More than one entry means the image carries multiple independent RDBs
+    (Emu68-style multi-RDB disk).
+    """
+    mbr_info = detect_mbr(image)
+    if mbr_info is None or not mbr_info.has_amiga_partitions:
+        return []
+    return [p for p in mbr_info.partitions if p.partition_type == MBR_TYPE_AMIGA_RDB]
+
+
+def build_rdisk_desc(rdisk: RDisk, mbr_ctx: Optional[MBRContext]) -> dict:
+    """Build the JSON-able description of a parsed RDisk.
+
+    Folds the MBR context and lenient-parse warnings into the amitools
+    desc dict. Shared by `rdb-inspect --json` and `amifuse inspect --json`.
+    """
+    desc = rdisk.get_desc()
+    if mbr_ctx is not None:
+        mbr_desc = {
+            "scheme": mbr_ctx.scheme,
+            "offset_blocks": mbr_ctx.offset_blocks,
+            "all_partitions": [
+                {
+                    "index": p.index,
+                    "type": p.partition_type,
+                    "bootable": p.bootable,
+                    "start_lba": p.start_lba,
+                    "num_sectors": p.num_sectors,
+                }
+                for p in mbr_ctx.mbr_info.partitions
+            ],
+        }
+        if mbr_ctx.mbr_partition is not None:
+            mbr_desc["partition_index"] = mbr_ctx.mbr_partition.index
+            mbr_desc["partition_size"] = mbr_ctx.mbr_partition.num_sectors
+        desc["mbr"] = mbr_desc
+    warnings = getattr(rdisk, "rdb_warnings", [])
+    if warnings:
+        desc["warnings"] = warnings
+    return desc
+
+
+def format_rdisk_report(rdisk: RDisk, full: bool = False) -> List[str]:
+    """Format RDB info, filesystem drivers, and warnings as printable lines."""
+    lines = list(rdisk.get_info(full=full))
+    fs_lines = format_fs_summary(rdisk)
+    if fs_lines:
+        lines.append("")
+        lines.append("Filesystem drivers:")
+        for line in fs_lines:
+            lines.append(f"  {line}")
+    warnings = getattr(rdisk, "rdb_warnings", [])
+    if warnings:
+        lines.append("")
+        lines.append("Warnings:")
+        for w in warnings:
+            lines.append(f"  {w}")
+    return lines
+
+
+def print_inspect_report(image: Path, block_size: Optional[int], full: bool) -> None:
+    """Print the human-readable inspection report for an RDB image.
+
+    Handles plain-RDB, Parceiro-style MBR+RDB, and Emu68-style multi-RDB
+    layouts. Shared by `amifuse inspect` and the rdb-inspect tool. Raises
+    SystemExit when the initial open fails; per-RDB failures in a multi-RDB
+    image are reported inline and skipped.
+    """
+    amiga_parts = amiga_rdb_partitions(image)
+    if len(amiga_parts) > 1:
+        # Show the MBR table once using the first partition's context
+        try:
+            blkdev, rdisk, mbr_ctx = open_rdisk(
+                image, block_size=block_size, mbr_partition_index=0
+            )
+        except IOError as e:
+            raise SystemExit(f"Error: {e}")
+        for line in format_mbr_info(mbr_ctx):
+            print(line)
+        rdisk.close()
+        blkdev.close()
+
+        # Show each RDB
+        for rdb_idx in range(len(amiga_parts)):
+            try:
+                blkdev, rdisk, mbr_ctx = open_rdisk(
+                    image, block_size=block_size, mbr_partition_index=rdb_idx
+                )
+            except IOError as e:
+                print(f"\nMBR partition [{amiga_parts[rdb_idx].index}]: Error: {e}")
+                continue
+            try:
+                print(f"\n=== Amiga RDB in MBR partition [{mbr_ctx.mbr_partition.index}]"
+                      f" (offset: {mbr_ctx.offset_blocks} sectors) ===\n")
+                for line in format_rdisk_report(rdisk, full=full):
+                    print(line)
+            finally:
+                rdisk.close()
+                blkdev.close()
+        return
+
+    # Single RDB (plain or Parceiro-style)
+    blkdev = None
+    rdisk = None
+    try:
+        try:
+            blkdev, rdisk, mbr_ctx = open_rdisk(image, block_size=block_size)
+        except IOError as e:
+            raise SystemExit(f"Error: {e}")
+        if mbr_ctx is not None:
+            for line in format_mbr_info(mbr_ctx):
+                print(line)
+            print()
+        for line in format_rdisk_report(rdisk, full=full):
+            print(line)
+    finally:
+        if rdisk is not None:
+            rdisk.close()
+        if blkdev is not None:
+            blkdev.close()
 
 
 _MBR_TYPE_NAMES = {
@@ -900,17 +1019,11 @@ def main(argv=None):
     )
     args = parser.parse_args(argv)
 
-    # Detect if MBR with multiple 0x76 partitions
-    mbr_info = detect_mbr(args.image)
-    multi_rdb = False
-    amiga_parts = []
-    if mbr_info and mbr_info.has_amiga_partitions:
-        amiga_parts = [p for p in mbr_info.partitions if p.partition_type == MBR_TYPE_AMIGA_RDB]
-        if len(amiga_parts) > 1:
-            multi_rdb = True
-
     if args.json:
-        # JSON mode: collect all RDBs into a single JSON structure
+        # JSON mode: collect all RDBs into a single JSON structure,
+        # skipping RDBs that fail to open.
+        amiga_parts = amiga_rdb_partitions(args.image)
+        multi_rdb = len(amiga_parts) > 1
         all_rdbs = []
         for rdb_idx in range(len(amiga_parts) if multi_rdb else 1):
             mbr_partition_index = rdb_idx if multi_rdb else None
@@ -921,30 +1034,7 @@ def main(argv=None):
             except IOError:
                 continue
             try:
-                desc = rdisk.get_desc()
-                if mbr_ctx is not None:
-                    mbr_desc = {
-                        "scheme": mbr_ctx.scheme,
-                        "offset_blocks": mbr_ctx.offset_blocks,
-                        "all_partitions": [
-                            {
-                                "index": p.index,
-                                "type": p.partition_type,
-                                "bootable": p.bootable,
-                                "start_lba": p.start_lba,
-                                "num_sectors": p.num_sectors,
-                            }
-                            for p in mbr_ctx.mbr_info.partitions
-                        ],
-                    }
-                    if mbr_ctx.mbr_partition is not None:
-                        mbr_desc["partition_index"] = mbr_ctx.mbr_partition.index
-                        mbr_desc["partition_size"] = mbr_ctx.mbr_partition.num_sectors
-                    desc["mbr"] = mbr_desc
-                warnings = getattr(rdisk, 'rdb_warnings', [])
-                if warnings:
-                    desc["warnings"] = warnings
-                all_rdbs.append(desc)
+                all_rdbs.append(build_rdisk_desc(rdisk, mbr_ctx))
             finally:
                 rdisk.close()
                 blkdev.close()
@@ -952,76 +1042,8 @@ def main(argv=None):
             print(json.dumps(all_rdbs[0], indent=2))
         else:
             print(json.dumps(all_rdbs, indent=2))
-    elif multi_rdb:
-        # Text mode with multiple RDBs: show MBR table once, then each RDB
-        try:
-            blkdev, rdisk, mbr_ctx = open_rdisk(
-                args.image, block_size=args.block_size, mbr_partition_index=0
-            )
-        except IOError as e:
-            raise SystemExit(f"Error: {e}")
-        for line in format_mbr_info(mbr_ctx):
-            print(line)
-        rdisk.close()
-        blkdev.close()
-
-        for rdb_idx in range(len(amiga_parts)):
-            try:
-                blkdev, rdisk, mbr_ctx = open_rdisk(
-                    args.image, block_size=args.block_size, mbr_partition_index=rdb_idx
-                )
-            except IOError as e:
-                print(f"\nMBR partition [{amiga_parts[rdb_idx].index}]: Error: {e}")
-                continue
-            try:
-                print(f"\n=== Amiga RDB in MBR partition [{mbr_ctx.mbr_partition.index}]"
-                      f" (offset: {mbr_ctx.offset_blocks} sectors) ===\n")
-                for line in rdisk.get_info(full=args.full):
-                    print(line)
-                fs_lines = format_fs_summary(rdisk)
-                if fs_lines:
-                    print("\nFilesystem drivers:")
-                    for line in fs_lines:
-                        print(" ", line)
-                warnings = getattr(rdisk, 'rdb_warnings', [])
-                if warnings:
-                    print("\nWarnings:")
-                    for w in warnings:
-                        print(f"  {w}")
-            finally:
-                rdisk.close()
-                blkdev.close()
     else:
-        # Single RDB: original behavior
-        blkdev = None
-        rdisk = None
-        mbr_ctx = None
-        try:
-            blkdev, rdisk, mbr_ctx = open_rdisk(args.image, block_size=args.block_size)
-
-            if mbr_ctx is not None:
-                for line in format_mbr_info(mbr_ctx):
-                    print(line)
-                print()
-
-            for line in rdisk.get_info(full=args.full):
-                print(line)
-            fs_lines = format_fs_summary(rdisk)
-            if fs_lines:
-                print("\nFilesystem drivers:")
-                for line in fs_lines:
-                    print(" ", line)
-
-            warnings = getattr(rdisk, 'rdb_warnings', [])
-            if warnings:
-                print("\nWarnings:")
-                for w in warnings:
-                    print(f"  {w}")
-        finally:
-            if rdisk is not None:
-                rdisk.close()
-            if blkdev is not None:
-                blkdev.close()
+        print_inspect_report(args.image, args.block_size, args.full)
 
     if args.extract_fs is not None:
         # Extract from first RDB (use --mbr-partition for specific one in future)
