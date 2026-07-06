@@ -3226,23 +3226,6 @@ except Exception:
 __banner__ = f"amifuse {__version__} - Copyright (C) 2025-2026 by Stefan Reinauer"
 
 
-def _inspect_rdisk(rdisk, full=False):
-    """Print RDB info, filesystem drivers, and warnings for a single RDisk."""
-    from .rdb_inspect import format_fs_summary
-    for line in rdisk.get_info(full=full):
-        print(line)
-    fs_lines = format_fs_summary(rdisk)
-    if fs_lines:
-        print("\nFilesystem drivers:")
-        for line in fs_lines:
-            print(" ", line)
-    warnings = getattr(rdisk, 'rdb_warnings', [])
-    if warnings:
-        print("\nWarnings:")
-        for w in warnings:
-            print(f"  {w}")
-
-
 def _json_error(command: str, code: str, message: str, details: dict = None) -> dict:
     """Build a JSON error envelope."""
     result = {
@@ -4075,8 +4058,8 @@ def cmd_inspect(args):
     import json as _json
     import amitools.fs.DosType as DosType
     from .rdb_inspect import (
-        open_rdisk, format_mbr_info, detect_adf, detect_iso, detect_mbr,
-        MBR_TYPE_AMIGA_RDB,
+        open_rdisk, detect_adf, detect_iso,
+        amiga_rdb_partitions, build_rdisk_desc, print_inspect_report,
     )
 
     use_json = getattr(args, "json", False)
@@ -4143,17 +4126,12 @@ def cmd_inspect(args):
         print(f"  Total blocks: {iso_info.total_blocks}")
         return
 
-    # Detect if MBR with multiple 0x76 partitions
-    mbr_info = detect_mbr(args.image)
-    multi_rdb = False
-    amiga_parts = []
-    if mbr_info and mbr_info.has_amiga_partitions:
-        amiga_parts = [p for p in mbr_info.partitions if p.partition_type == MBR_TYPE_AMIGA_RDB]
-        if len(amiga_parts) > 1:
-            multi_rdb = True
-
     if use_json:
-        # JSON mode: collect all RDBs into a single envelope
+        # JSON mode: collect all RDBs into a single envelope. Unlike the
+        # rdb-inspect tool (which skips unreadable RDBs), any open failure
+        # is fatal here so scripts get a definitive error envelope.
+        amiga_parts = amiga_rdb_partitions(args.image)
+        multi_rdb = len(amiga_parts) > 1
         all_rdbs = []
         for rdb_idx in range(len(amiga_parts) if multi_rdb else 1):
             mbr_partition_index = rdb_idx if multi_rdb else None
@@ -4168,96 +4146,23 @@ def cmd_inspect(args):
                 print(_json.dumps(envelope, indent=2))
                 sys.exit(1)
             try:
-                desc = rdisk.get_desc()
-                if mbr_ctx is not None:
-                    mbr_desc = {
-                        "scheme": mbr_ctx.scheme,
-                        "offset_blocks": mbr_ctx.offset_blocks,
-                        "all_partitions": [
-                            {
-                                "index": p.index,
-                                "type": p.partition_type,
-                                "bootable": p.bootable,
-                                "start_lba": p.start_lba,
-                                "num_sectors": p.num_sectors,
-                            }
-                            for p in mbr_ctx.mbr_info.partitions
-                        ],
-                    }
-                    if mbr_ctx.mbr_partition is not None:
-                        mbr_desc["partition_index"] = mbr_ctx.mbr_partition.index
-                        mbr_desc["partition_size"] = mbr_ctx.mbr_partition.num_sectors
-                    desc["mbr"] = mbr_desc
-                warnings = getattr(rdisk, 'rdb_warnings', [])
-                if warnings:
-                    desc["warnings"] = warnings
-                all_rdbs.append(desc)
+                all_rdbs.append(build_rdisk_desc(rdisk, mbr_ctx))
             finally:
                 rdisk.close()
                 blkdev.close()
 
-        if len(all_rdbs) == 1:
-            rdb_data = all_rdbs[0]
-        else:
-            rdb_data = all_rdbs
         envelope = _json_result("inspect",
             image=str(args.image),
             image_type="rdb",
         )
-        if isinstance(rdb_data, list):
-            envelope["rdbs"] = rdb_data
+        if len(all_rdbs) == 1:
+            envelope.update(all_rdbs[0])
         else:
-            envelope.update(rdb_data)
+            envelope["rdbs"] = all_rdbs
         print(_json.dumps(envelope, indent=2))
         return
 
-    if multi_rdb:
-        # Show MBR table once using first partition's context
-        try:
-            blkdev, rdisk, mbr_ctx = open_rdisk(args.image, block_size=args.block_size, mbr_partition_index=0)
-        except IOError as e:
-            raise SystemExit(f"Error: {e}")
-        for line in format_mbr_info(mbr_ctx):
-            print(line)
-        rdisk.close()
-        blkdev.close()
-
-        # Show each RDB
-        for rdb_idx in range(len(amiga_parts)):
-            try:
-                blkdev, rdisk, mbr_ctx = open_rdisk(
-                    args.image, block_size=args.block_size, mbr_partition_index=rdb_idx
-                )
-            except IOError as e:
-                print(f"\nMBR partition [{amiga_parts[rdb_idx].index}]: Error: {e}")
-                continue
-            try:
-                print(f"\n=== Amiga RDB in MBR partition [{mbr_ctx.mbr_partition.index}]"
-                      f" (offset: {mbr_ctx.offset_blocks} sectors) ===\n")
-                _inspect_rdisk(rdisk, full=args.full)
-            finally:
-                rdisk.close()
-                blkdev.close()
-    else:
-        # Single RDB (or non-MBR): existing behavior
-        blkdev = None
-        rdisk = None
-        mbr_ctx = None
-        try:
-            try:
-                blkdev, rdisk, mbr_ctx = open_rdisk(args.image, block_size=args.block_size)
-            except IOError as e:
-                raise SystemExit(f"Error: {e}")
-            if mbr_ctx is not None:
-                for line in format_mbr_info(mbr_ctx):
-                    print(line)
-                print()
-            _inspect_rdisk(rdisk, full=args.full)
-        finally:
-            if rdisk is not None:
-                rdisk.close()
-            if blkdev is not None:
-                blkdev.close()
+    print_inspect_report(args.image, args.block_size, args.full)
 
 
 def cmd_mount(args):
