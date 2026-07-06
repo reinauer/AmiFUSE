@@ -9,3 +9,6 @@ mnt/
 /SmartFileSystem
 /pfs3aio
 *.egg-info/
+build/
+dist/
+.venv/

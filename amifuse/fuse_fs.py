@@ -2871,10 +2871,15 @@ def get_partition_name(image: Path, block_size: Optional[int], partition: Option
     return get_partition_info(image, block_size, partition)["name"]
 
 
-def extract_embedded_driver(image: Path, block_size: Optional[int], partition: Optional[str]) -> Optional[Path]:
+def extract_embedded_driver(
+    image: Path, block_size: Optional[int], partition: Optional[str]
+) -> Optional[Tuple[Path, str, int]]:
     """Extract filesystem driver from RDB if available for the partition's dostype.
 
-    Returns path to temp file containing the driver, or None if not found.
+    Returns (temp file path, dostype tag string, dostype) for the extracted
+    driver, or None if the RDB has no filesystem entry matching the
+    partition's dostype. The caller is responsible for deleting the temp
+    file when done.
     """
     import tempfile
     import amitools.fs.DosType as DosType

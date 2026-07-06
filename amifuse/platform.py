@@ -210,13 +210,9 @@ def get_unmount_command(mountpoint: Path) -> List[str]:
     Returns:
         Command as a list of strings suitable for subprocess.
         Returns an empty list [] on platforms where no unmount command is
-        available (e.g. Windows foreground mounts). Callers must handle
-        the empty-list case -- typically by skipping subprocess invocation
-        and providing a user hint instead.
-
-        Note: A future `amifuse unmount` command will need a different
-        strategy on Windows (process termination or signal) since no CLI
-        unmount tool exists for foreground WinFSP mounts.
+        available (Windows/WinFSP). Callers must handle the empty-list
+        case -- `amifuse unmount` falls through to terminating the mount
+        owner process instead.
     """
     if sys.platform.startswith("darwin"):
         return ["umount", "-f", str(mountpoint)]
