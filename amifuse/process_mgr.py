@@ -8,7 +8,7 @@ for filesystems like SFS that spawn child processes via CreateNewProc().
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
-from amitools.vamos.libstructs import ProcessStruct, MsgPortFlags
+from amitools.vamos.libstructs import MsgPortFlags
 from amitools.vamos.machine.regs import REG_D0, REG_A6
 
 from .startup_runner import (

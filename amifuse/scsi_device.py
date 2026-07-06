@@ -5,10 +5,9 @@ startup (OpenDevice + BeginIO/DoIO).
 """
 
 from amitools.vamos.libcore import LibImpl  # type: ignore
-from amitools.vamos.machine.regs import REG_D0, REG_D1  # type: ignore
 from amitools.vamos.astructs import AmigaStructDef, AmigaStruct  # type: ignore
 from amitools.vamos.astructs.scalar import UBYTE, UWORD, ULONG  # type: ignore
-from amitools.vamos.libstructs.exec_ import IORequestStruct, UnitStruct  # type: ignore
+from amitools.vamos.libstructs.exec_ import IORequestStruct  # type: ignore
 
 # IO flags
 IOF_QUICK = 0x01  # Complete IO synchronously if possible
