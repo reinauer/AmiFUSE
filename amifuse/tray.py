@@ -53,7 +53,16 @@ class TrayApp:
 
         prev_set = set()
         while not self._stop_event.is_set():
-            mounts = find_amifuse_mounts()
+            try:
+                mounts = find_amifuse_mounts()
+            except Exception:
+                # Discovery can fail transiently (e.g. wmic/PowerShell
+                # hiccups). Keep the poll thread alive and retry; without
+                # this the menu would silently stop updating forever.
+                logger.exception("Mount discovery failed; retrying")
+                self._wake_event.wait(self.POLL_INTERVAL)
+                self._wake_event.clear()
+                continue
             # Compare (pid, mountpoint) tuples to detect mountpoint changes
             current_set = {(m["pid"], m.get("mountpoint", "")) for m in mounts}
 
