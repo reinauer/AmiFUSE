@@ -4,6 +4,7 @@ Diagnostic checks for amifuse environment readiness.
 Provides structured check results with optional --fix mode and JSON output.
 """
 
+import contextlib
 import dataclasses
 import json
 import shutil
@@ -255,6 +256,45 @@ def run_checks() -> List[CheckResult]:
     return results
 
 
+def _overall_status(checks: List[CheckResult]) -> str:
+    statuses = [c.status for c in checks]
+    if "error" in statuses:
+        return "not_ready"
+    if "warning" in statuses:
+        return "degraded"
+    return "ready"
+
+
+def _apply_fixes(checks: List[CheckResult], verbose: bool) -> None:
+    """Run fix functions for all fixable non-ok checks.
+
+    With verbose=False (JSON mode) the per-fix progress lines are suppressed
+    and anything the fix functions print is redirected to stderr, so stdout
+    stays valid JSON.
+    """
+    if sys.platform.startswith("win"):
+        symbols = {"ok": "+", "warning": "!", "error": "X", "fix": "*"}
+    else:
+        symbols = {"ok": "✔", "warning": "⚠", "error": "✘", "fix": "\U0001f527"}
+
+    for check in checks:
+        if check.status == "ok":
+            continue
+        if check.fixable and check.fix_fn:
+            if verbose:
+                print(f"  [{symbols['fix']}] {check.name}: {check.fix_description}")
+            try:
+                if verbose:
+                    check.fix_fn()
+                else:
+                    with contextlib.redirect_stdout(sys.stderr):
+                        check.fix_fn()
+            except Exception as e:
+                print(f"      Failed: {e}", file=sys.stdout if verbose else sys.stderr)
+        elif check.fix_description and verbose:
+            print(f"  [{symbols[check.status]}] {check.name}: {check.fix_description}")
+
+
 def cmd_doctor(args) -> None:
     """Main entry point for the doctor subcommand."""
     try:
@@ -263,19 +303,23 @@ def cmd_doctor(args) -> None:
     except Exception:
         __version__ = "v0.5.0"
 
+    use_json = getattr(args, "json", False)
+    fix_mode = getattr(args, "fix", False)
+
     checks = run_checks()
 
-    # Determine overall status
-    statuses = [c.status for c in checks]
-    if "error" in statuses:
-        overall = "not_ready"
-    elif "warning" in statuses:
-        overall = "degraded"
-    else:
-        overall = "ready"
+    if fix_mode:
+        if not use_json:
+            print(f"amifuse {__version__} -- fixing issues\n")
+        _apply_fixes(checks, verbose=not use_json)
+        if not use_json:
+            print("\nRe-checking...\n")
+        # Re-run so the report reflects the post-fix state
+        checks = run_checks()
 
-    # JSON output
-    if getattr(args, "json", False):
+    overall = _overall_status(checks)
+
+    if use_json:
         output = {
             "overall_status": overall,
             "platform": sys.platform,
@@ -292,46 +336,11 @@ def cmd_doctor(args) -> None:
             ],
         }
         print(json.dumps(output, indent=2))
-        if not getattr(args, "fix", False):
-            sys.exit({"ready": 0, "not_ready": 1, "degraded": 2}[overall])
-        return
-
-    # Fix mode
-    if getattr(args, "fix", False):
-        if sys.platform.startswith("win"):
-            symbols = {"ok": "+", "warning": "!", "error": "X", "fix": "*"}
-        else:
-            symbols = {"ok": "✔", "warning": "⚠", "error": "✘", "fix": "\U0001f527"}
-
-        print(f"amifuse {__version__} -- fixing issues\n")
-        for check in checks:
-            if check.status == "ok":
-                continue
-            if check.fixable and check.fix_fn:
-                print(f"  [{symbols['fix']}] {check.name}: {check.fix_description}")
-                try:
-                    check.fix_fn()
-                except Exception as e:
-                    print(f"      Failed: {e}")
-            elif check.fix_description:
-                print(f"  [{symbols[check.status]}] {check.name}: {check.fix_description}")
-
-        # Re-run checks and show updated status
-        print("\nRe-checking...\n")
-        checks = run_checks()
-        statuses = [c.status for c in checks]
-        if "error" in statuses:
-            overall = "not_ready"
-        elif "warning" in statuses:
-            overall = "degraded"
-        else:
-            overall = "ready"
-
+    else:
         _print_human(checks, overall, __version__)
-        return  # fix mode always exits 0
 
-    # Default human-readable output
-    _print_human(checks, overall, __version__)
+    if fix_mode:
+        return  # fix mode always exits 0
     sys.exit({"ready": 0, "not_ready": 1, "degraded": 2}[overall])
 
 
