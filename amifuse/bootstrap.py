@@ -200,13 +200,20 @@ class BootstrapAllocator:
         _scalar_field(dn, "dn_GlobalVec").val = -1
         _scalar_field(dn, "dn_Name").val = name_mem.addr >> 2
 
+        # alloc_all opens its own view of the image only to read the
+        # partition's DosEnvec. Everything callers need later (part.part_blk)
+        # is already parsed into memory, so release the file handles here
+        # instead of holding a second open image for the mount's lifetime.
+        if rd is not None:
+            rd.close()
+        if blk is not None:
+            blk.close()
+
         return {
             "env_addr": env_mem.addr,
             "fssm_addr": fssm_mem.addr,
             "device_bstr": dev_mem.addr,
             "dn_addr": dn_mem.addr,
             "dn_name_addr": name_mem.addr,
-            "blk": blk,
-            "rd": rd,
             "part": part,
         }
