@@ -12,7 +12,7 @@ For Linux/Windows support, create icon_linux.py or icon_windows.py with
 the same interface.
 """
 
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 # Import resource fork builders from the dedicated module
 from .resource_fork import build_resource_fork, build_finder_info as _build_finder_info

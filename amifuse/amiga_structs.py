@@ -53,12 +53,7 @@ class DeviceNodeStruct(AmigaStruct):
     ]
 
 
-# DosEnvec stays the same; reimport from old file
-from amitools.vamos.astructs import AmigaStructDef as _AmigaStructDef
-from amitools.vamos.astructs.scalar import UBYTE, UWORD
-
-
-@_AmigaStructDef
+@AmigaStructDef
 class DosEnvecStruct(AmigaStruct):
     _format = [
         (ULONG, "de_TableSize"),   # number of entries (longs)

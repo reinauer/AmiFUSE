@@ -9,11 +9,10 @@ import pstats
 import argparse
 import errno
 import os
-import shlex
-import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 
 from pathlib import Path
@@ -96,8 +95,6 @@ def _parse_fib(mem, fib_addr: int) -> Dict:
         "num_blocks": num_blocks,
     }
 
-
-import threading
 
 class HandlerBridge:
     """Maintains the handler state and issues DOS packets synchronously."""
@@ -1719,7 +1716,6 @@ class AmigaFuseFS(Operations):
         """Check if handler is alive and raise EIO if crashed."""
         if _handler_has_crashed(self.bridge):
             if self._debug and not getattr(self, '_crash_reported', False):
-                import sys
                 print(f"[FUSE] Handler crashed - all operations returning EIO", file=sys.stderr, flush=True)
                 self._crash_reported = True
             self._schedule_crash_shutdown()
@@ -1746,7 +1742,6 @@ class AmigaFuseFS(Operations):
     def _log_op(self, op: str, path: str, extra: str = ""):
         """Log operation if debug is enabled."""
         if self._debug:
-            import sys
             msg = f"[FUSE][{op}] {path}"
             if extra:
                 msg += f" {extra}"

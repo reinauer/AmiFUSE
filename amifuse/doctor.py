@@ -6,7 +6,6 @@ Provides structured check results with optional --fix mode and JSON output.
 
 import dataclasses
 import json
-import os
 import shutil
 import subprocess
 import sys
