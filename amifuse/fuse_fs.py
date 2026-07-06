@@ -58,6 +58,23 @@ ERROR_DIR_NOT_FOUND = 204
 ERROR_OBJECT_NOT_FOUND = 205
 _NOT_FOUND_ERRORS = frozenset({ERROR_DIR_NOT_FOUND, ERROR_OBJECT_NOT_FOUND})
 
+# Upper bound for the path-keyed metadata caches. They are TTL-based but
+# otherwise unbounded, so a full traversal of a huge image would pin every
+# path in memory for the TTL. Entries are inserted in timestamp order, so
+# dropping from the front of the dict approximates dropping the oldest.
+_CACHE_MAX_ENTRIES = 50_000
+
+
+def _prune_cache(cache: Dict) -> None:
+    """Drop the oldest half of a cache dict once it reaches the size cap.
+
+    The caller must hold the lock protecting the cache.
+    """
+    if len(cache) < _CACHE_MAX_ENTRIES:
+        return
+    for key in list(cache.keys())[: len(cache) // 2]:
+        del cache[key]
+
 
 def _require_fuse():
     if FUSE is None:
@@ -1023,6 +1040,7 @@ class HandlerBridge:
     def _set_neg_cached(self, path: str):
         if self._neg_cache_ttl <= 0:
             return
+        _prune_cache(self._neg_cache)
         self._neg_cache[path] = time.time()
 
     def locate(self, lock_bptr: int, name: str):
@@ -1677,6 +1695,7 @@ class AmigaFuseFS(Operations):
     def _set_cached_stat(self, path: str, result: Dict):
         """Cache a stat result."""
         with self._cache_lock:
+            _prune_cache(self._stat_cache)
             self._stat_cache[path] = (time.time(), result)
 
     def _is_neg_cached(self, path: str) -> bool:
@@ -1695,6 +1714,7 @@ class AmigaFuseFS(Operations):
         if self._neg_cache_ttl <= 0:
             return
         with self._cache_lock:
+            _prune_cache(self._neg_cache)
             self._neg_cache[path] = time.time()
 
     def _track_op(self, op: str, path: str, cached: bool = False):
@@ -1974,6 +1994,7 @@ class AmigaFuseFS(Operations):
             if self._icons_enabled and (name.endswith(".info") or name.lower().endswith(".info")):
                 stat_result["st_flags"] = 0x8000  # UF_HIDDEN
             with self._cache_lock:
+                _prune_cache(self._stat_cache)
                 self._stat_cache[child_path] = (now, stat_result)
 
         # Add virtual icon files if this directory has a custom icon
@@ -2003,6 +2024,7 @@ class AmigaFuseFS(Operations):
 
         # Cache the directory listing
         with self._cache_lock:
+            _prune_cache(self._dir_cache)
             self._dir_cache[path] = (now, entries)
         return entries
 
