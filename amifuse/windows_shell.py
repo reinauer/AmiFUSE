@@ -997,18 +997,21 @@ def _install_icons() -> None:
             path.write_bytes(data)
         except PermissionError:
             # File may be locked by Explorer; write to temp and atomic-rename
+            tmp = None
             try:
                 fd, tmp = tempfile.mkstemp(dir=ICON_DIR, suffix=".ico")
-                os.write(fd, data)
-                os.close(fd)
+                with os.fdopen(fd, "wb") as f:
+                    f.write(data)
                 os.replace(tmp, path)
             except OSError as exc:
                 logger.warning("Could not update icon %s (locked): %s", path, exc)
-                # Clean up temp file if rename failed
-                try:
-                    os.unlink(tmp)
-                except OSError:
-                    pass
+                # Clean up temp file if the write or rename failed. tmp is
+                # None when mkstemp itself failed.
+                if tmp is not None:
+                    try:
+                        os.unlink(tmp)
+                    except OSError:
+                        pass
                 continue
         logger.info("Installed icon %s", path)
     # VBS launcher for invisible context-menu invocation
