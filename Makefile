@@ -98,4 +98,4 @@ run:
 	@echo "           --driver pfs3aio \\"
 	@echo "           --mountpoint ./mnt"
 
-.PHONY: all run example-smoke image-format-smoke
+.PHONY: all run download unpack bench-pfs example-smoke image-format-smoke
