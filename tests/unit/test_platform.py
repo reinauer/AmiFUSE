@@ -847,29 +847,6 @@ class TestWindowsAllocatedDriveLetters:
 
 
 # ---------------------------------------------------------------------------
-# J. mount_runs_in_foreground_by_default() -- 3 tests
-# ---------------------------------------------------------------------------
-
-
-class TestMountRunsInForegroundByDefault:
-    """Tests for mount_runs_in_foreground_by_default()."""
-
-    @pytest.mark.parametrize(
-        "platform,expected",
-        [
-            ("darwin", False),
-            ("linux", False),
-            ("win32", False),
-        ],
-    )
-    def test_default_mode_by_platform(self, monkeypatch, platform, expected):
-        monkeypatch.setattr("sys.platform", platform)
-        from amifuse.platform import mount_runs_in_foreground_by_default
-
-        assert mount_runs_in_foreground_by_default() is expected
-
-
-# ---------------------------------------------------------------------------
 # K. Windows unmount command tests -- 3 tests
 # ---------------------------------------------------------------------------
 

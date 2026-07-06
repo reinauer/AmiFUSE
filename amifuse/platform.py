@@ -273,12 +273,6 @@ def _get_windows_unmount_command(mountpoint: Path) -> List[str]:
     return []
 
 
-def mount_runs_in_foreground_by_default() -> bool:
-    """Return the safest default mount mode for the current platform."""
-    # All platforms now support daemon mode with `amifuse unmount`.
-    return False
-
-
 def check_fuse_available() -> None:
     """Verify that the platform's FUSE driver is installed.
 
@@ -332,12 +326,12 @@ def validate_mountpoint(mountpoint: Path) -> Optional[str]:
             path_exists = os.path.exists(mp_str)
         except OSError as exc:
             if _is_stale_mount_os_error(exc):
-                return _format_stale_mountpoint_error(mountpoint)
+                return format_stale_mountpoint_error(mountpoint)
             return f"Mountpoint {mountpoint} is not accessible: {exc.strerror or exc}."
         if not path_exists:
-            if not _is_stale_mountpoint(mountpoint):
+            if not is_stale_mountpoint(mountpoint):
                 return None
-            return _format_stale_mountpoint_error(mountpoint)
+            return format_stale_mountpoint_error(mountpoint)
         try:
             if os.path.ismount(mp_str):
                 if get_unmount_command(mountpoint):
@@ -352,7 +346,7 @@ def validate_mountpoint(mountpoint: Path) -> Optional[str]:
                     )
         except OSError as exc:
             if _is_stale_mount_os_error(exc):
-                return _format_stale_mountpoint_error(mountpoint)
+                return format_stale_mountpoint_error(mountpoint)
             return f"Mountpoint {mountpoint} is not accessible: {exc.strerror or exc}."
     return None
 
@@ -361,7 +355,7 @@ def _is_stale_mount_os_error(exc: OSError) -> bool:
     return exc.errno in (errno.EIO, errno.ENOTCONN)
 
 
-def _is_stale_mountpoint(mountpoint: Path) -> bool:
+def is_stale_mountpoint(mountpoint: Path) -> bool:
     try:
         os.lstat(str(mountpoint))
     except FileNotFoundError:
@@ -372,7 +366,7 @@ def _is_stale_mountpoint(mountpoint: Path) -> bool:
     return False
 
 
-def _format_stale_mountpoint_error(mountpoint: Path) -> str:
+def format_stale_mountpoint_error(mountpoint: Path) -> str:
     if get_unmount_command(mountpoint):
         return (
             f"Mountpoint {mountpoint} looks like a stale or broken mount; "

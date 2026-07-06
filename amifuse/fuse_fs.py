@@ -3020,16 +3020,18 @@ def mount_fuse(
             try:
                 mountpoint.mkdir(parents=True, exist_ok=True)
             except FileExistsError:
-                raise SystemExit(plat._format_stale_mountpoint_error(mountpoint))
+                raise SystemExit(plat.format_stale_mountpoint_error(mountpoint))
             except OSError as exc:
                 if exc.errno in (errno.EIO, errno.ENOTCONN):
-                    raise SystemExit(plat._format_stale_mountpoint_error(mountpoint))
+                    raise SystemExit(plat.format_stale_mountpoint_error(mountpoint))
                 raise SystemExit(
                     f"Could not create mountpoint {mountpoint}: {exc.strerror or exc}"
                 )
 
     if foreground is None:
-        foreground = plat.mount_runs_in_foreground_by_default()
+        # Daemon mode is the default on every platform; --interactive /
+        # --foreground opts in to staying attached to the terminal.
+        foreground = False
 
     # Print startup banner
     print(__banner__)
@@ -4328,7 +4330,7 @@ def cmd_unmount(args):
         is_mounted = os.path.ismount(mountpoint)
     except OSError:
         is_mounted = False
-    if not is_mounted and not plat._is_stale_mountpoint(mountpoint):
+    if not is_mounted and not plat.is_stale_mountpoint(mountpoint):
         raise SystemExit(f"Mountpoint {mountpoint} is not currently mounted.")
 
     cmd = plat.get_unmount_command(mountpoint)
