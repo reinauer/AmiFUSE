@@ -1035,28 +1035,36 @@ class HandlerBridge:
                 self._run_until_replies()
 
     def locate_path(self, path: str) -> Tuple[int, int, List[int]]:
-        """Return (lock BPTR, res2, locks_to_free) for the given absolute path."""
+        """Return (lock BPTR, res2, locks_to_free) for the given absolute path.
+
+        A parent lock is only needed to resolve the next path component, so
+        intermediate locks are freed while descending; locks_to_free holds at
+        most the final lock. Ancestor locks must not accumulate in handler
+        memory: they are never freed by callers, which only release the
+        returned list.
+        """
         with self._lock:
             if path and path != "/" and self._is_neg_cached(path):
                 return 0, -1, []
             parts = [p for p in path.split("/") if p]
             lock = 0
             res2 = 0
-            locks: List[int] = []
             if not parts:
-                return lock, res2, locks
+                return lock, res2, []
             for comp in parts:
                 _, name_bptr = self._alloc_bstr(comp)
                 self.launcher.send_locate(self.state, lock, name_bptr)
                 replies = self._run_until_replies()
+                parent = lock
                 lock = replies[-1][2] if replies else 0
                 res2 = replies[-1][3] if replies else -1
+                if parent:
+                    self.free_lock(parent)
                 if lock == 0:
                     break
-                locks.append(lock)
             if lock == 0 and path and path != "/":
                 self._set_neg_cached(path)
-            return lock, res2, locks
+            return lock, res2, [lock] if lock else []
 
     def open_file(self, path: str, flags: int = os.O_RDONLY) -> Optional[Tuple[int, int]]:
         """Open a file via FINDINPUT/FINDUPDATE/FINDOUTPUT and return the FileHandle address."""
@@ -1402,15 +1410,18 @@ class HandlerBridge:
                 dir_path = "/"
             parts = [p for p in dir_path.split("/") if p]
             lock = 0
-            locks: List[int] = []
             for comp in parts:
                 _, name_bptr = self._alloc_bstr(comp)
                 self.launcher.send_locate(self.state, lock, name_bptr)
                 replies = self._run_until_replies()
+                parent = lock
                 lock = replies[-1][2] if replies else 0
+                if parent:
+                    # Free intermediate locks while descending (see locate_path).
+                    self.free_lock(parent)
                 if lock == 0:
                     break
-                locks.append(lock)
+            locks: List[int] = [lock] if lock else []
             if dir_path == "/" and lock == 0:
                 lock, _ = self.locate(0, "")
                 if lock:
@@ -2333,6 +2344,10 @@ class AmigaFuseFS(Operations):
         src_lock, _, src_locks = self.bridge.locate_path(src_dir)
         dst_lock, _, dst_locks = self.bridge.locate_path(dst_dir)
         if (src_lock == 0 and src_dir != "/") or (dst_lock == 0 and dst_dir != "/"):
+            for l in reversed(src_locks):
+                self.bridge.free_lock(l)
+            for l in reversed(dst_locks):
+                self.bridge.free_lock(l)
             raise FuseOSError(errno.ENOENT)
         res1, _ = self.bridge.rename_object(src_lock, src_name, dst_lock, dst_name)
         if res1 == 0:
