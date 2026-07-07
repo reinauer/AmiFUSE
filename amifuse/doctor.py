@@ -294,11 +294,7 @@ def _apply_fixes(checks: List[CheckResult], verbose: bool) -> None:
 
 def cmd_doctor(args) -> None:
     """Main entry point for the doctor subcommand."""
-    try:
-        from importlib.metadata import version as _pkg_version
-        __version__ = f"v{_pkg_version('amifuse')}"
-    except Exception:
-        __version__ = "v0.5.0"
+    from . import __version__
 
     use_json = getattr(args, "json", False)
     fix_mode = getattr(args, "fix", False)

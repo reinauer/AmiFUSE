@@ -388,8 +388,8 @@ class TestRunChecks:
 class TestCmdDoctor:
     """Tests for cmd_doctor() output formatting and exit codes."""
 
-    def _run_doctor(self, capsys, monkeypatch, checks, args, version="v0.5.0"):
-        """Run cmd_doctor with mocked run_checks and __version__."""
+    def _run_doctor(self, capsys, monkeypatch, checks, args):
+        """Run cmd_doctor with mocked run_checks."""
         monkeypatch.setattr("amifuse.doctor.run_checks", lambda: checks)
         try:
             cmd_doctor(args)

@@ -49,12 +49,8 @@ from .startup_runner import (
 from amitools.vamos.libstructs.dos import FileInfoBlockStruct, FileHandleStruct, DosPacketStruct, InfoDataStruct  # type: ignore
 from amitools.vamos.lib.dos.DosProtection import DosProtection  # type: ignore
 
-__version__ = "v0.5.0"
-try:
-    from importlib.metadata import version as _pkg_version
-    __version__ = f"v{_pkg_version('amifuse')}"
-except Exception:
-    pass
+from . import __version__
+
 __banner__ = f"amifuse {__version__} - Copyright (C) 2025-2026 by Stefan Reinauer"
 
 
