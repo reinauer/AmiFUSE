@@ -11,7 +11,7 @@ try:
 except Exception:
     # Fallback when package metadata is unavailable (running from a source
     # tree without an installed distribution).
-    __version__ = "v0.5.0"
+    __version__ = "v0.6.0"
 
 
 def _ensure_local_amitools_on_path() -> None:
