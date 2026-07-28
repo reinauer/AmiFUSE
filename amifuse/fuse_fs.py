@@ -20,19 +20,44 @@ from typing import Dict, List, Optional, Set, Tuple
 
 from .platform import kill_mount_owner_processes
 
-try:
-    from fuse import FUSE, FuseOSError, LoggingMixIn, Operations  # type: ignore
-except ImportError:
-    FUSE = None
+FUSE = None
 
-    class FuseOSError(RuntimeError):
-        pass
 
-    class LoggingMixIn:
-        pass
+class FuseOSError(OSError):
+    """FUSE-compatible error that does not require importing fusepy."""
 
-    class Operations:
-        pass
+    def __init__(self, error):
+        super().__init__(error, os.strerror(error))
+
+
+class _FuseOperations:
+    """The fusepy Operations defaults used by AmigaFuseFS."""
+
+    bmap = None
+    lock = None
+
+    def __call__(self, op, *args):
+        if not hasattr(self, op):
+            raise FuseOSError(errno.EFAULT)
+        return getattr(self, op)(*args)
+
+    def fsyncdir(self, path, datasync, fh):
+        return 0
+
+    def ioctl(self, path, cmd, arg, fip, flags, data):
+        raise FuseOSError(errno.ENOTTY)
+
+    def link(self, target, source):
+        raise FuseOSError(errno.EROFS)
+
+    def mknod(self, path, mode, dev):
+        raise FuseOSError(errno.EROFS)
+
+    def readlink(self, path):
+        raise FuseOSError(errno.ENOENT)
+
+    def symlink(self, target, source):
+        raise FuseOSError(errno.EROFS)
 
 from .driver_runtime import BlockDeviceBackend
 from .vamos_runner import VamosHandlerRuntime
@@ -81,11 +106,21 @@ def _prune_cache(cache: Dict) -> None:
 
 
 def _require_fuse():
-    if FUSE is None:
+    global FUSE
+
+    if FUSE is not None:
+        return FUSE
+
+    try:
+        from fuse import FUSE as fuse_class  # type: ignore
+    except (ImportError, OSError):
         raise SystemExit(
-            "Python FUSE bindings not found. Install fusepy (pip install fusepy) "
-            "or build the local python-fuse bindings and add them to PYTHONPATH."
-        )
+            "Python FUSE bindings or a native FUSE library are unavailable. "
+            "Install fusepy (pip install fusepy) and a supported FUSE backend."
+        ) from None
+
+    FUSE = fuse_class
+    return FUSE
 
 
 def _handler_has_crashed(obj) -> bool:
@@ -1539,7 +1574,7 @@ class HandlerBridge:
                     print("[amifuse] Volume flush may have failed", flush=True)
 
 
-class AmigaFuseFS(Operations):
+class AmigaFuseFS(_FuseOperations):
     # macOS special files we should reject immediately without calling handler.
     # Note: "Icon\r" and ".VolumeIcon.icns" are NOT in this list - we handle them for custom icons.
     _MACOS_SPECIAL = frozenset([
@@ -2912,7 +2947,7 @@ def mount_fuse(
     icons: bool = False,
     foreground: Optional[bool] = None,
 ):
-    _require_fuse()
+    fuse_class = _require_fuse()
     import amitools.fs.DosType as DosType
     from .rdb_inspect import detect_adf, detect_iso
     from . import platform as plat
@@ -3103,7 +3138,7 @@ def mount_fuse(
         print(f"[amifuse] FUSE options: {fuse_kwargs}", flush=True)
 
     try:
-        FUSE(
+        fuse_class(
             AmigaFuseFS(bridge, debug=debug, icons=icons, mountpoint=mountpoint),
             str(mountpoint),
             **fuse_kwargs,

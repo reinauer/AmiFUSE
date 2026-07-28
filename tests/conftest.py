@@ -20,10 +20,10 @@ def fixtures_path():
 
 @pytest.fixture
 def fuse_mock(monkeypatch):
-    """Inject a fake fuse module to allow importing amifuse.fuse_fs without FUSE.
+    """Inject a fake fuse module for tests that exercise the mount path.
 
-    Adapted from tools/pfs_benchmark.py. Required because fuse_fs.py imports
-    fusepy at module level. Tests that don't touch fuse_fs don't need this.
+    AmiFUSE loads fusepy only when mounting. Most tests use this fixture to
+    avoid touching the host FUSE installation when they exercise mount_fuse().
 
     Usage:
         def test_something(fuse_mock):
@@ -37,8 +37,6 @@ def fuse_mock(monkeypatch):
 
     fake_fuse.FUSE = object
     fake_fuse.FuseOSError = _DummyFuseError
-    fake_fuse.LoggingMixIn = type("LoggingMixIn", (), {})
-    fake_fuse.Operations = type("Operations", (), {})
     monkeypatch.setitem(sys.modules, "fuse", fake_fuse)
 
     # If amifuse.fuse_fs was already imported without this mock (e.g. by an
@@ -46,11 +44,10 @@ def fuse_mock(monkeypatch):
     # import time. Rebind its module-level symbols so those tests can't leave
     # fuse_fs in an unusable state. setattr auto-reverts at teardown.
     mod = sys.modules.get("amifuse.fuse_fs")
+    module_was_loaded = mod is not None
     if mod is not None:
         monkeypatch.setattr(mod, "FUSE", fake_fuse.FUSE)
         monkeypatch.setattr(mod, "FuseOSError", fake_fuse.FuseOSError)
-        monkeypatch.setattr(mod, "LoggingMixIn", fake_fuse.LoggingMixIn)
-        monkeypatch.setattr(mod, "Operations", fake_fuse.Operations)
 
     def _stub_module(name, **attrs):
         mod = types.ModuleType(name)
@@ -98,6 +95,13 @@ def fuse_mock(monkeypatch):
     _stub_module("amitools.vamos.lib")
     _stub_module("amitools.vamos.lib.dos")
     _stub_module("amitools.vamos.lib.dos.DosProtection", DosProtection=_FakeDosProtection)
+
+    yield fake_fuse
+
+    if not module_was_loaded:
+        mod = sys.modules.get("amifuse.fuse_fs")
+        if mod is not None:
+            mod.FUSE = None
 
 
 @pytest.fixture

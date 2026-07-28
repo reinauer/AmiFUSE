@@ -6,9 +6,12 @@ installed.
 """
 
 import argparse
+import builtins
+import errno
 import json
 import signal
 import sys
+import types
 from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -19,6 +22,58 @@ import pytest
 # ---------------------------------------------------------------------------
 # A. TestMountFuseOptions -- subtype guard tests
 # ---------------------------------------------------------------------------
+
+
+class TestFuseLazyLoad:
+    def test_uses_injected_fuse_without_importing(self, monkeypatch):
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        sentinel = object()
+        monkeypatch.setattr(fuse_fs_mod, "FUSE", sentinel)
+
+        assert fuse_fs_mod._require_fuse() is sentinel
+
+    def test_imports_and_caches_fuse_on_demand(self, monkeypatch):
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        sentinel = object()
+        fake_fuse = types.ModuleType("fuse")
+        fake_fuse.FUSE = sentinel
+        monkeypatch.setitem(sys.modules, "fuse", fake_fuse)
+        monkeypatch.setattr(fuse_fs_mod, "FUSE", None)
+
+        assert fuse_fs_mod._require_fuse() is sentinel
+        assert fuse_fs_mod.FUSE is sentinel
+
+    @pytest.mark.parametrize("failure", [ImportError, OSError])
+    def test_reports_unavailable_fuse(self, monkeypatch, failure):
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        real_import = builtins.__import__
+
+        def failing_import(name, *args, **kwargs):
+            if name == "fuse":
+                raise failure("fuse import failed")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(fuse_fs_mod, "FUSE", None)
+        monkeypatch.delitem(sys.modules, "fuse", raising=False)
+        monkeypatch.setattr(builtins, "__import__", failing_import)
+
+        with pytest.raises(SystemExit, match="native FUSE library"):
+            fuse_fs_mod._require_fuse()
+
+    def test_operations_defaults_match_fusepy(self):
+        from amifuse.fuse_fs import _FuseOperations, FuseOSError
+
+        operations = _FuseOperations()
+
+        assert operations.bmap is None
+        assert operations.lock is None
+        assert operations.fsyncdir("/", False, 0) == 0
+        with pytest.raises(FuseOSError) as exc_info:
+            operations.readlink("/missing")
+        assert exc_info.value.errno == errno.ENOENT
 
 
 class TestMountFuseOptions:

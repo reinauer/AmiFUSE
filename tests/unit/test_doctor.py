@@ -94,8 +94,8 @@ def _patch_all_checks(**overrides):
         amitools_import: True (importable) or False (ImportError)
         subprocess_rc: return code for machine68k subprocess check
         subprocess_timeout: if True, raise TimeoutExpired
-        fuse_import: True (importable) or False (ImportError)
-        fuse_version: __version__ value on the fuse module (or None)
+        fuse_installed: True or False
+        fuse_version: installed fusepy package version
         backend: dict for detect_fuse_backend return value
         platform: sys.platform value
         which_amifuse: return value for shutil.which("amifuse")
@@ -115,18 +115,22 @@ def _patch_all_checks(**overrides):
     else:
         mock_amitools = None  # sentinel
 
-    # fuse import
-    fuse_ok = overrides.get("fuse_import", True)
+    # fusepy package metadata
+    fuse_ok = overrides.get("fuse_installed", True)
     fuse_ver = overrides.get("fuse_version", "1.0.0")
     if fuse_ok:
-        mock_fuse = types.ModuleType("fuse")
-        if fuse_ver is not None:
-            mock_fuse.__version__ = fuse_ver
-        # else no __version__ attribute
+        patches.append(patch(
+            "amifuse.doctor.importlib_metadata.version",
+            return_value=fuse_ver,
+        ))
     else:
-        mock_fuse = None
+        from importlib.metadata import PackageNotFoundError
+        patches.append(patch(
+            "amifuse.doctor.importlib_metadata.version",
+            side_effect=PackageNotFoundError,
+        ))
 
-    # Build a custom __import__ to intercept amitools and fuse
+    # Build a custom __import__ to intercept amitools and reject fusepy loads.
     real_import = __builtins__.__import__ if hasattr(__builtins__, "__import__") else __import__
 
     def custom_import(name, *args, **kwargs):
@@ -135,9 +139,7 @@ def _patch_all_checks(**overrides):
                 raise ImportError("No module named 'amitools'")
             return mock_amitools
         if name == "fuse":
-            if mock_fuse is None:
-                raise ImportError("No module named 'fuse'")
-            return mock_fuse
+            raise AssertionError("doctor must not import fusepy")
         return real_import(name, *args, **kwargs)
 
     patches.append(patch("builtins.__import__", side_effect=custom_import))
@@ -285,15 +287,15 @@ class TestRunChecks:
                 m.__version__ = "0.8.0"
                 return m
             if name == "fuse":
-                m = types.ModuleType("fuse")
-                m.__version__ = "1.0.0"
-                return m
+                raise AssertionError("doctor must not import fusepy")
             return real_import(name, *args, **kwargs)
 
         with patch("amifuse.doctor.subprocess.run", return_value=MagicMock(returncode=0)) as mock_run, \
              patch("amifuse.doctor.sys.version_info", _make_version_info(3, 12, 0)), \
              patch("amifuse.doctor.sys.platform", "linux"), \
              patch("builtins.__import__", side_effect=custom_import), \
+             patch("amifuse.doctor.importlib_metadata.version",
+                   return_value="1.0.0"), \
              patch("amifuse.doctor.shutil.which", return_value="/usr/bin/amifuse"), \
              patch("amifuse.platform.detect_fuse_backend",
                    return_value={"installed": True, "name": "FUSE", "version": None}):
@@ -304,24 +306,17 @@ class TestRunChecks:
             code_arg = cmd_args[2]  # the -c argument
             assert "Machine(0, 1024)" in code_arg
 
-    def test_fusepy_importable_with_version(self):
-        patches = _patch_all_checks(fuse_import=True, fuse_version="1.0.0")
+    def test_fusepy_installed_with_version(self):
+        patches = _patch_all_checks(
+            fuse_installed=True, fuse_version="1.0.0"
+        )
         results = _run_with_patches(patches)
         c = _find_check(results, "fusepy")
         assert c.status == "ok"
         assert "1.0.0" in c.message
 
-    def test_fusepy_importable_no_version(self):
-        """When fusepy has no __version__, message should say 'installed' not 'unknown'."""
-        patches = _patch_all_checks(fuse_import=True, fuse_version=None)
-        results = _run_with_patches(patches)
-        c = _find_check(results, "fusepy")
-        assert c.status == "ok"
-        assert "installed" in c.message
-        assert "unknown" not in c.message.lower()
-
     def test_fusepy_not_installed(self):
-        patches = _patch_all_checks(fuse_import=False)
+        patches = _patch_all_checks(fuse_installed=False)
         results = _run_with_patches(patches)
         c = _find_check(results, "fusepy")
         assert c.status == "error"

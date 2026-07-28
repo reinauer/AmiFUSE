@@ -6,6 +6,7 @@ Provides structured check results with optional --fix mode and JSON output.
 
 import contextlib
 import dataclasses
+from importlib import metadata as importlib_metadata
 import json
 import shutil
 import subprocess
@@ -75,13 +76,11 @@ def run_checks() -> List[CheckResult]:
     except OSError:
         results.append(CheckResult("machine68k", "error", "Could not run machine68k check"))
 
-    # 4. fusepy (no __version__ attribute -- don't say "unknown version")
+    # 4. fusepy. Query package metadata without loading libfuse.
     try:
-        import fuse  # type: ignore
-        ver = getattr(fuse, "__version__", None)
-        msg = f"fusepy {ver}" if ver else "fusepy is installed"
-        results.append(CheckResult("fusepy", "ok", msg))
-    except ImportError:
+        ver = importlib_metadata.version("fusepy")
+        results.append(CheckResult("fusepy", "ok", f"fusepy {ver}"))
+    except importlib_metadata.PackageNotFoundError:
         results.append(CheckResult(
             "fusepy", "error", "fusepy is not installed",
             fixable=True, fix_description="pip install fusepy",
