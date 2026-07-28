@@ -8,7 +8,7 @@ AmiFUSE runs actual Amiga filesystem drivers (like PFS3) through m68k CPU emulat
 
 ## Requirements
 
-- **macOS**: [macFUSE](https://osxfuse.github.io/)
+- **macOS**: [macFUSE](https://osxfuse.github.io/) 5.3.3 or newer
 - **Linux**: FUSE for Linux
 - **Windows**: [WinFSP](https://winfsp.dev/)
 - **Python 3.9+**
@@ -61,7 +61,9 @@ pip install -e '.[windows]'         # Windows only: adds pystray + Pillow for tr
 
 ### macOS-specific
 
-Install macFUSE from https://osxfuse.github.io/ or via Homebrew/MacPorts:
+Install macFUSE 5.3.3 or newer from https://osxfuse.github.io/ or via
+Homebrew/MacPorts. Earlier releases can crash because they initialize
+DiskArbitration and CoreFoundation state before daemonizing:
 
 ```bash
 # Homebrew
