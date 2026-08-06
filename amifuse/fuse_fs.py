@@ -1268,7 +1268,8 @@ class HandlerBridge:
     def get_disk_info(self) -> Optional[Dict]:
         """Query filesystem geometry via ACTION_DISK_INFO.
 
-        Returns dict with keys: num_blocks, num_blocks_used, bytes_per_block.
+        Returns a dict containing num_blocks, num_blocks_used,
+        bytes_per_block, disk_type, and volume_node.
         Returns None if the handler doesn't respond.
         """
         with self._lock:
@@ -1285,19 +1286,55 @@ class HandlerBridge:
                 return None
 
             # Read InfoDataStruct fields (all LONGs at known offsets):
-            # id_NumBlocks: offset 12
-            # id_NumBlocksUsed: offset 16
-            # id_BytesPerBlock: offset 20
+            # id_NumBlocks: 12, id_NumBlocksUsed: 16,
+            # id_BytesPerBlock: 20, id_DiskType: 24, id_VolumeNode: 28
             num_blocks = self.mem.r32(info_mem.addr + 12)
             num_blocks_used = self.mem.r32(info_mem.addr + 16)
             bytes_per_block = self.mem.r32(info_mem.addr + 20)
+            disk_type = self.mem.r32(info_mem.addr + 24)
+            volume_node = self.mem.r32(info_mem.addr + 28)
 
             self.vh.alloc.free_memory(info_mem)
             return {
                 "num_blocks": num_blocks,
                 "num_blocks_used": num_blocks_used,
                 "bytes_per_block": bytes_per_block,
+                "disk_type": disk_type,
+                "volume_node": volume_node,
             }
+
+    # AmigaDOS id_DiskType sentinels meaning "no usable volume mounted"
+    _UNMOUNTED_DISK_REASONS = {
+        0xFFFFFFFF: "no disk present",  # ID_NO_DISK_PRESENT (-1)
+        0x42414400: "unreadable disk",  # ID_UNREADABLE_DISK 'BAD\0'
+        0x4E444F53: "not a DOS disk",  # ID_NOT_REALLY_DOS 'NDOS'
+        0x42555359: "disk busy or inhibited",  # ID_BUSY 'BUSY'
+        0x4B49434B: "Kickstart disk has no DOS volume",  # ID_KICKSTART_DISK
+    }
+    # CrossDOS uses ID_MSDOS_DISK for successfully mounted volumes.
+
+    def is_mounted(
+            self) -> Tuple[Optional[bool], Optional[Dict], Optional[str]]:
+        """Return the mount state, ACTION_DISK_INFO result, and reason.
+
+        The state is None when the handler does not provide enough information
+        to decide. Any nonzero type except a known unusable sentinel counts as
+        mounted, allowing custom filesystem identifiers. id_VolumeNode can
+        confirm a mount when the type is zero.
+        """
+        info = self.get_disk_info()
+        if not info:
+            return None, None, "handler did not report disk info"
+
+        disk_type = info.get("disk_type", 0)
+        reason = self._UNMOUNTED_DISK_REASONS.get(disk_type)
+        if reason is not None:
+            return False, info, reason
+        if disk_type != 0:
+            return True, info, None
+        if info.get("volume_node", 0) != 0:
+            return True, info, None
+        return None, info, "handler reported no disk type or volume node"
 
     def volume_name(self) -> str:
         """Best-effort name: RDB drive name, else first dir entry, else fallback."""
@@ -3572,6 +3609,31 @@ def cmd_verify(args):
 
     bridge, temp_driver = _create_bridge_from_args(args, "verify")
     try:
+        # Reject a disk that the handler conclusively identified as unusable
+        # before either verification path can manufacture a successful result.
+        mounted, dinfo, mount_reason = bridge.is_mounted()
+        if mounted is False:
+            disk_type = dinfo["disk_type"]
+            details = {"disk_type": disk_type}
+            if "volume_node" in dinfo:
+                details["volume_node"] = dinfo["volume_node"]
+
+            if use_json:
+                print(json.dumps(_json_error(
+                    "verify", "NOT_MOUNTED",
+                    f"No usable volume mounted: {mount_reason}",
+                    details=details,
+                )))
+                sys.exit(1)
+            print("Volume: (none)")
+            print(f"  Filesystem responsive: NO -- {mount_reason}")
+            print(f"  id_DiskType: 0x{disk_type:08x}")
+            sys.exit(1)
+
+        responsive_text = "yes"
+        if mounted is None:
+            responsive_text = f"unknown -- {mount_reason}"
+
         if file_path:
             # Verify a specific file
             normalized = "/" + file_path.lstrip("/")
@@ -3589,6 +3651,7 @@ def cmd_verify(args):
                 "exists": True,
                 "size": stat.get("size", 0),
                 "type": "dir" if stat.get("dir_type", 0) > 0 else "file",
+                "filesystem_responsive": mounted,
             }
             if expect_size is not None:
                 result_data["expected_size"] = expect_size
@@ -3601,6 +3664,7 @@ def cmd_verify(args):
                 print(f"  Exists: yes")
                 print(f"  Type: {result_data['type']}")
                 print(f"  Size: {stat.get('size', 0)}")
+                print(f"  Filesystem responsive: {responsive_text}")
                 if expect_size is not None:
                     match = "yes" if result_data["size_matches"] else "NO"
                     print(f"  Expected size: {expect_size} ({match})")
@@ -3624,7 +3688,7 @@ def cmd_verify(args):
                 "total_dirs": total_dirs,
                 "total_files": total_files,
                 "total_size_bytes": total_size,
-                "filesystem_responsive": True,
+                "filesystem_responsive": mounted,
             }
 
             if use_json:
@@ -3634,7 +3698,7 @@ def cmd_verify(args):
                 print(f"  Directories: {total_dirs}")
                 print(f"  Files: {total_files}")
                 print(f"  Total size: {total_size:,} bytes")
-                print(f"  Filesystem responsive: yes")
+                print(f"  Filesystem responsive: {responsive_text}")
     except SystemExit:
         raise
     except Exception as e:

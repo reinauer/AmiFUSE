@@ -1783,6 +1783,99 @@ class TestCmdLs:
 
 
 # ---------------------------------------------------------------------------
+# TestHandlerBridgeMountState -- mounted-volume checks
+# ---------------------------------------------------------------------------
+
+
+class TestHandlerBridgeMountState:
+    """Tests for HandlerBridge.is_mounted()."""
+
+    @staticmethod
+    def _mount_state(fuse_fs_mod, info):
+        bridge = object.__new__(fuse_fs_mod.HandlerBridge)
+        bridge.get_disk_info = MagicMock(return_value=info)
+        return bridge.is_mounted()
+
+    def test_missing_disk_info_is_inconclusive(self, fuse_mock):
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        mounted, info, reason = self._mount_state(fuse_fs_mod, None)
+
+        assert mounted is None
+        assert info is None
+        assert reason == "handler did not report disk info"
+
+    @pytest.mark.parametrize(("disk_type", "expected_reason"), [
+        (0xFFFFFFFF, "no disk present"),
+        (0x42414400, "unreadable disk"),
+        (0x4E444F53, "not a DOS disk"),
+        (0x42555359, "disk busy or inhibited"),
+        (0x4B49434B, "Kickstart disk has no DOS volume"),
+    ])
+    def test_unusable_disk_type_is_not_mounted(
+            self, fuse_mock, disk_type, expected_reason):
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        disk_info = {"disk_type": disk_type, "volume_node": 1}
+        mounted, info, reason = self._mount_state(fuse_fs_mod, disk_info)
+
+        assert mounted is False
+        assert info is disk_info
+        assert reason == expected_reason
+
+    def test_disk_type_is_authoritative_without_volume_node(self, fuse_mock):
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        disk_info = {"disk_type": 0x50465303, "volume_node": 0}
+        mounted, info, reason = self._mount_state(fuse_fs_mod, disk_info)
+
+        assert mounted is True
+        assert info is disk_info
+        assert reason is None
+
+    def test_msdos_disk_type_can_be_mounted(self, fuse_mock):
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        disk_info = {"disk_type": 0x4D534400, "volume_node": 0}
+        mounted, info, reason = self._mount_state(fuse_fs_mod, disk_info)
+
+        assert mounted is True
+        assert info is disk_info
+        assert reason is None
+
+    def test_unknown_disk_type_and_volume_node_is_inconclusive(
+            self, fuse_mock):
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        disk_info = {"disk_type": 0, "volume_node": 0}
+        mounted, info, reason = self._mount_state(fuse_fs_mod, disk_info)
+
+        assert mounted is None
+        assert info is disk_info
+        assert reason == "handler reported no disk type or volume node"
+
+    def test_volume_node_confirms_unknown_disk_type(self, fuse_mock):
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        disk_info = {"disk_type": 0, "volume_node": 1}
+        mounted, info, reason = self._mount_state(fuse_fs_mod, disk_info)
+
+        assert mounted is True
+        assert info is disk_info
+        assert reason is None
+
+    def test_valid_volume_is_mounted(self, fuse_mock):
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        disk_info = {"disk_type": 0x50465303, "volume_node": 1}
+        mounted, info, reason = self._mount_state(fuse_fs_mod, disk_info)
+
+        assert mounted is True
+        assert info is disk_info
+        assert reason is None
+
+
+# ---------------------------------------------------------------------------
 # TestCmdVerify -- verify command tests
 # ---------------------------------------------------------------------------
 
@@ -1796,6 +1889,9 @@ class TestCmdVerify:
         import amifuse.fuse_fs as fuse_fs_mod
 
         mock_bridge = MagicMock()
+        mock_bridge.is_mounted.return_value = (
+            True, {"disk_type": 0x50465303, "volume_node": 1}, None,
+        )
         monkeypatch.setattr(
             fuse_fs_mod, "_create_bridge_from_args",
             lambda args, cmd, read_only=True: (mock_bridge, None),
@@ -1827,6 +1923,7 @@ class TestCmdVerify:
         assert data["exists"] is True
         assert data["size"] == 1234
         assert data["type"] == "file"
+        assert data["filesystem_responsive"] is True
 
     def test_verify_file_size_match(self, mock_bridge_for_verify, capsys):
         mock_bridge, fuse_fs_mod = mock_bridge_for_verify
@@ -1936,6 +2033,176 @@ class TestCmdVerify:
         assert data["total_files"] == 3
         assert data["total_size_bytes"] == 350
         assert data["filesystem_responsive"] is True
+
+    def test_verify_unmounted_volume_json(self, mock_bridge_for_verify, capsys):
+        mock_bridge, fuse_fs_mod = mock_bridge_for_verify
+        mock_bridge.is_mounted.return_value = (
+            False, {"disk_type": 0x4E444F53, "volume_node": 0},
+            "not a DOS disk",
+        )
+
+        args = argparse.Namespace(
+            image=Path("/fake/test.hdf"),
+            json=True,
+            file=None,
+            expect_size=None,
+            partition=None,
+            driver=None,
+            block_size=None,
+            debug=False,
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            fuse_fs_mod.cmd_verify(args)
+        output = capsys.readouterr().out
+        data = json.loads(output)
+
+        assert exc_info.value.code == 1
+        assert data["error"]["code"] == "NOT_MOUNTED"
+        assert "not a DOS disk" in data["error"]["message"]
+        assert data["error"]["details"] == {
+            "disk_type": 0x4E444F53,
+            "volume_node": 0,
+        }
+        mock_bridge.stat_path.assert_not_called()
+        mock_bridge.list_dir_path.assert_not_called()
+        mock_bridge.volume_name.assert_not_called()
+
+    def test_verify_unmounted_volume_human(self, mock_bridge_for_verify, capsys):
+        mock_bridge, fuse_fs_mod = mock_bridge_for_verify
+        mock_bridge.is_mounted.return_value = (
+            False, {"disk_type": 0x42414400, "volume_node": 0},
+            "unreadable disk",
+        )
+
+        args = argparse.Namespace(
+            image=Path("/fake/test.hdf"),
+            json=False,
+            file=None,
+            expect_size=None,
+            partition=None,
+            driver=None,
+            block_size=None,
+            debug=False,
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            fuse_fs_mod.cmd_verify(args)
+        output = capsys.readouterr().out
+
+        assert exc_info.value.code == 1
+        assert "Volume: (none)" in output
+        assert "Filesystem responsive: NO" in output
+        assert "unreadable disk" in output
+        assert "id_DiskType: 0x42414400" in output
+        mock_bridge.stat_path.assert_not_called()
+        mock_bridge.list_dir_path.assert_not_called()
+        mock_bridge.volume_name.assert_not_called()
+
+    def test_verify_unmounted_file_json(self, mock_bridge_for_verify, capsys):
+        mock_bridge, fuse_fs_mod = mock_bridge_for_verify
+        mock_bridge.is_mounted.return_value = (
+            False, {"disk_type": 0x4E444F53, "volume_node": 0},
+            "not a DOS disk",
+        )
+
+        args = argparse.Namespace(
+            image=Path("/fake/test.hdf"),
+            json=True,
+            file="/",
+            expect_size=None,
+            partition=None,
+            driver=None,
+            block_size=None,
+            debug=False,
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            fuse_fs_mod.cmd_verify(args)
+        output = capsys.readouterr().out
+        data = json.loads(output)
+
+        assert exc_info.value.code == 1
+        assert data["error"]["code"] == "NOT_MOUNTED"
+        mock_bridge.stat_path.assert_not_called()
+
+    def test_verify_unknown_mount_status_is_reported_for_file_json(
+            self, mock_bridge_for_verify, capsys):
+        mock_bridge, fuse_fs_mod = mock_bridge_for_verify
+        mock_bridge.is_mounted.return_value = (
+            None, None, "handler did not report disk info",
+        )
+        mock_bridge.stat_path.return_value = {
+            "dir_type": 2, "size": 0, "name": "",
+            "protection": 0,
+        }
+
+        args = argparse.Namespace(
+            image=Path("/fake/test.hdf"),
+            json=True,
+            file="/",
+            expect_size=None,
+            partition=None,
+            driver=None,
+            block_size=None,
+            debug=False,
+        )
+        fuse_fs_mod.cmd_verify(args)
+        output = capsys.readouterr().out
+        data = json.loads(output)
+
+        assert data["status"] == "ok"
+        assert data["filesystem_responsive"] is None
+        mock_bridge.stat_path.assert_called_once_with("/")
+
+    def test_verify_unknown_mount_status_is_reported_for_volume_json(
+            self, mock_bridge_for_verify, capsys):
+        mock_bridge, fuse_fs_mod = mock_bridge_for_verify
+        mock_bridge.is_mounted.return_value = (
+            None, None, "handler did not report disk info",
+        )
+        mock_bridge.list_dir_path.return_value = []
+        mock_bridge.volume_name.return_value = "Unknown"
+
+        args = argparse.Namespace(
+            image=Path("/fake/test.hdf"),
+            json=True,
+            file=None,
+            expect_size=None,
+            partition=None,
+            driver=None,
+            block_size=None,
+            debug=False,
+        )
+        fuse_fs_mod.cmd_verify(args)
+        output = capsys.readouterr().out
+        data = json.loads(output)
+
+        assert data["status"] == "ok"
+        assert data["filesystem_responsive"] is None
+
+    def test_verify_unknown_mount_status_is_reported_for_file_human(
+            self, mock_bridge_for_verify, capsys):
+        mock_bridge, fuse_fs_mod = mock_bridge_for_verify
+        mock_bridge.is_mounted.return_value = (
+            None, None, "handler did not report disk info",
+        )
+        mock_bridge.stat_path.return_value = {
+            "dir_type": 2, "size": 0, "name": "", "protection": 0,
+        }
+
+        args = argparse.Namespace(
+            image=Path("/fake/test.hdf"),
+            json=False,
+            file="/",
+            expect_size=None,
+            partition=None,
+            driver=None,
+            block_size=None,
+            debug=False,
+        )
+        fuse_fs_mod.cmd_verify(args)
+        output = capsys.readouterr().out
+
+        assert "Filesystem responsive: unknown" in output
+        assert "handler did not report disk info" in output
 
     def test_verify_expect_size_without_file_json(self, fuse_mock, capsys):
         import amifuse.fuse_fs as fuse_fs_mod
