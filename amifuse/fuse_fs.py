@@ -1270,7 +1270,19 @@ class HandlerBridge:
 
         Returns a dict containing num_blocks, num_blocks_used,
         bytes_per_block, disk_type, and volume_node.
-        Returns None if the handler doesn't respond.
+        Returns None if the handler doesn't respond or refuses the packet;
+        callers that need to tell those apart want _query_disk_info().
+        """
+        return self._query_disk_info()[0]
+
+    def _query_disk_info(self) -> Tuple[Optional[Dict], Optional[int]]:
+        """Send ACTION_DISK_INFO and return (info, res2).
+
+        A handler can decline this packet two ways, and they mean different
+        things. Silence (no reply at all) says nothing about the volume; an
+        explicit DOSFALSE reply carries a res2 error code that often does.
+        info is None in both cases, and res2 tells them apart: None for
+        silence, the DOS error code for a refusal.
         """
         with self._lock:
             # Allocate InfoDataStruct (9 LONGs = 36 bytes)
@@ -1281,9 +1293,15 @@ class HandlerBridge:
             self.launcher.send_disk_info(self.state, info_mem.addr)
             replies = self._run_until_replies()
 
-            if not replies or replies[-1][2] == 0:
+            if not replies:
                 self.vh.alloc.free_memory(info_mem)
-                return None
+                return None, None
+            if replies[-1][2] == 0:
+                # DOSFALSE: the handler answered, refusing the request. The
+                # InfoData buffer is not filled in, but res2 says why.
+                res2 = replies[-1][3]
+                self.vh.alloc.free_memory(info_mem)
+                return None, res2
 
             # Read InfoDataStruct fields (all LONGs at known offsets):
             # id_NumBlocks: 12, id_NumBlocksUsed: 16,
@@ -1301,7 +1319,7 @@ class HandlerBridge:
                 "bytes_per_block": bytes_per_block,
                 "disk_type": disk_type,
                 "volume_node": volume_node,
-            }
+            }, None
 
     # AmigaDOS id_DiskType sentinels meaning "no usable volume mounted"
     _UNMOUNTED_DISK_REASONS = {
@@ -1313,6 +1331,19 @@ class HandlerBridge:
     }
     # CrossDOS uses ID_MSDOS_DISK for successfully mounted volumes.
 
+    # res2 codes from a refused ACTION_DISK_INFO that positively identify an
+    # unusable volume. A handler can reject a disk this way instead of filling
+    # in an NDOS id_DiskType the way pfs3aio does. Only diagnostic codes belong
+    # here: any other refusal stays inconclusive rather than risk calling a
+    # healthy image broken.
+    _UNMOUNTED_DISK_ERRORS = {
+        225: "not a DOS disk",  # ERROR_NOT_A_DOS_DISK
+        226: "no disk present",  # ERROR_NO_DISK
+        218: "device not mounted",  # ERROR_DEVICE_NOT_MOUNTED
+    }
+    # ERROR_ACTION_NOT_KNOWN (209) means the handler does not implement this
+    # packet at all, which says nothing about the volume.
+
     def is_mounted(
             self) -> Tuple[Optional[bool], Optional[Dict], Optional[str]]:
         """Return the mount state, ACTION_DISK_INFO result, and reason.
@@ -1320,11 +1351,19 @@ class HandlerBridge:
         The state is None when the handler does not provide enough information
         to decide. Any nonzero type except a known unusable sentinel counts as
         mounted, allowing custom filesystem identifiers. id_VolumeNode can
-        confirm a mount when the type is zero.
+        confirm a mount when the type is zero. A handler that refuses the
+        packet outright is judged by its res2 error code instead, and the
+        returned InfoData is None in that case.
         """
-        info = self.get_disk_info()
+        info, res2 = self._query_disk_info()
         if not info:
-            return None, None, "handler did not report disk info"
+            if res2 is None:
+                return None, None, "handler did not report disk info"
+            reason = self._UNMOUNTED_DISK_ERRORS.get(res2)
+            if reason is not None:
+                return False, None, reason
+            return None, None, (
+                f"handler refused disk info with error {res2}")
 
         disk_type = info.get("disk_type", 0)
         reason = self._UNMOUNTED_DISK_REASONS.get(disk_type)
@@ -3613,10 +3652,14 @@ def cmd_verify(args):
         # before either verification path can manufacture a successful result.
         mounted, dinfo, mount_reason = bridge.is_mounted()
         if mounted is False:
-            disk_type = dinfo["disk_type"]
-            details = {"disk_type": disk_type}
-            if "volume_node" in dinfo:
-                details["volume_node"] = dinfo["volume_node"]
+            # dinfo is None when the handler refused ACTION_DISK_INFO outright.
+            # Report only what it actually told us: there is no id_DiskType to
+            # name in that case.
+            details = {}
+            if dinfo is not None:
+                details["disk_type"] = dinfo["disk_type"]
+                if "volume_node" in dinfo:
+                    details["volume_node"] = dinfo["volume_node"]
 
             if use_json:
                 print(json.dumps(_json_error(
@@ -3627,7 +3670,8 @@ def cmd_verify(args):
                 sys.exit(1)
             print("Volume: (none)")
             print(f"  Filesystem responsive: NO -- {mount_reason}")
-            print(f"  id_DiskType: 0x{disk_type:08x}")
+            if dinfo is not None:
+                print(f"  id_DiskType: 0x{dinfo['disk_type']:08x}")
             sys.exit(1)
 
         responsive_text = "yes"

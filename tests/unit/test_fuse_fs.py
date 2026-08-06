@@ -1791,9 +1791,9 @@ class TestHandlerBridgeMountState:
     """Tests for HandlerBridge.is_mounted()."""
 
     @staticmethod
-    def _mount_state(fuse_fs_mod, info):
+    def _mount_state(fuse_fs_mod, info, res2=None):
         bridge = object.__new__(fuse_fs_mod.HandlerBridge)
-        bridge.get_disk_info = MagicMock(return_value=info)
+        bridge._query_disk_info = MagicMock(return_value=(info, res2))
         return bridge.is_mounted()
 
     def test_missing_disk_info_is_inconclusive(self, fuse_mock):
@@ -1873,6 +1873,66 @@ class TestHandlerBridgeMountState:
         assert mounted is True
         assert info is disk_info
         assert reason is None
+
+    @pytest.mark.parametrize(("res2", "expected_reason"), [
+        (225, "not a DOS disk"),  # ERROR_NOT_A_DOS_DISK
+        (226, "no disk present"),  # ERROR_NO_DISK
+        (218, "device not mounted"),  # ERROR_DEVICE_NOT_MOUNTED
+    ])
+    def test_refusal_with_diagnostic_error_is_not_mounted(
+            self, fuse_mock, res2, expected_reason):
+        """A DOSFALSE reply naming an unusable volume is a negative answer."""
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        mounted, info, reason = self._mount_state(fuse_fs_mod, None, res2)
+
+        assert mounted is False
+        assert info is None
+        assert reason == expected_reason
+
+    def test_unimplemented_packet_is_inconclusive(self, fuse_mock):
+        """ERROR_ACTION_NOT_KNOWN says nothing about the volume."""
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        mounted, info, reason = self._mount_state(fuse_fs_mod, None, 209)
+
+        assert mounted is None
+        assert info is None
+        assert "209" in reason
+
+    def test_refusal_with_unknown_error_is_inconclusive(self, fuse_mock):
+        """An undiagnostic refusal must not condemn a possibly healthy image."""
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        mounted, info, reason = self._mount_state(fuse_fs_mod, None, 202)
+
+        assert mounted is None
+        assert info is None
+        assert "202" in reason
+
+    def test_silence_is_distinct_from_refusal(self, fuse_mock):
+        """No reply at all keeps the old inconclusive wording."""
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        mounted, info, reason = self._mount_state(fuse_fs_mod, None, None)
+
+        assert mounted is None
+        assert info is None
+        assert reason == "handler did not report disk info"
+
+    def test_get_disk_info_returns_only_the_dict(self, fuse_mock):
+        """The public accessor keeps its Optional[Dict] contract."""
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        bridge = object.__new__(fuse_fs_mod.HandlerBridge)
+        disk_info = {"disk_type": 0x444F5301, "volume_node": 1}
+        bridge._query_disk_info = MagicMock(return_value=(disk_info, None))
+
+        assert bridge.get_disk_info() is disk_info
+
+        bridge._query_disk_info = MagicMock(return_value=(None, 225))
+
+        assert bridge.get_disk_info() is None
 
 
 # ---------------------------------------------------------------------------
@@ -2096,6 +2156,58 @@ class TestCmdVerify:
         mock_bridge.stat_path.assert_not_called()
         mock_bridge.list_dir_path.assert_not_called()
         mock_bridge.volume_name.assert_not_called()
+
+    def test_verify_refused_disk_info_json(self, mock_bridge_for_verify, capsys):
+        """A refusal has no InfoData, so no id_DiskType may be reported."""
+        mock_bridge, fuse_fs_mod = mock_bridge_for_verify
+        mock_bridge.is_mounted.return_value = (False, None, "not a DOS disk")
+
+        args = argparse.Namespace(
+            image=Path("/fake/test.hdf"),
+            json=True,
+            file=None,
+            expect_size=None,
+            partition=None,
+            driver=None,
+            block_size=None,
+            debug=False,
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            fuse_fs_mod.cmd_verify(args)
+        output = capsys.readouterr().out
+        data = json.loads(output)
+
+        assert exc_info.value.code == 1
+        assert data["error"]["code"] == "NOT_MOUNTED"
+        assert "not a DOS disk" in data["error"]["message"]
+        # No InfoData was returned, so there is nothing to report in details
+        assert "details" not in data["error"]
+        mock_bridge.stat_path.assert_not_called()
+        mock_bridge.list_dir_path.assert_not_called()
+
+    def test_verify_refused_disk_info_human(self, mock_bridge_for_verify, capsys):
+        mock_bridge, fuse_fs_mod = mock_bridge_for_verify
+        mock_bridge.is_mounted.return_value = (False, None, "no disk present")
+
+        args = argparse.Namespace(
+            image=Path("/fake/test.hdf"),
+            json=False,
+            file=None,
+            expect_size=None,
+            partition=None,
+            driver=None,
+            block_size=None,
+            debug=False,
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            fuse_fs_mod.cmd_verify(args)
+        output = capsys.readouterr().out
+
+        assert exc_info.value.code == 1
+        assert "Volume: (none)" in output
+        assert "Filesystem responsive: NO" in output
+        assert "no disk present" in output
+        assert "id_DiskType" not in output
 
     def test_verify_unmounted_file_json(self, mock_bridge_for_verify, capsys):
         mock_bridge, fuse_fs_mod = mock_bridge_for_verify
