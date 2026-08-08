@@ -30,6 +30,26 @@ except ImportError:  # pragma: no cover - amitools submodule not checked out
     _RealInfoData = None
 
 
+def _make_mock_bridge():
+    """Build the bridge mock the cmd_* fixtures hand to their subcommand.
+
+    A bare MagicMock is a trap for any bridge method whose result the caller
+    unpacks. `mounted, dinfo, reason = bridge.is_mounted()` gets a MagicMock,
+    which iterates as empty and raises ValueError; the subcommand's blanket
+    `except Exception` turns that into a HANDLER_ERROR envelope and exits 1,
+    so the test dies with SystemExit nowhere near the real cause. Stubbing it
+    here means wiring is_mounted() into another subcommand cannot silently
+    break that subcommand's whole test class.
+
+    The default is a healthy, mounted PFS volume; tests that care override it.
+    """
+    bridge = MagicMock()
+    bridge.is_mounted.return_value = (
+        True, {"disk_type": 0x50465303, "volume_node": 1}, None,
+    )
+    return bridge
+
+
 # ---------------------------------------------------------------------------
 # A. TestMountFuseOptions -- subtype guard tests
 # ---------------------------------------------------------------------------
@@ -1622,10 +1642,7 @@ class TestCmdLs:
         """Set up mocked bridge for ls tests."""
         import amifuse.fuse_fs as fuse_fs_mod
 
-        mock_bridge = MagicMock()
-        mock_bridge.is_mounted.return_value = (
-            True, {"disk_type": 0x50465303, "volume_node": 1}, None,
-        )
+        mock_bridge = _make_mock_bridge()
         monkeypatch.setattr(
             fuse_fs_mod, "_create_bridge_from_args",
             lambda args, cmd, read_only=True: (mock_bridge, None),
@@ -2237,10 +2254,7 @@ class TestCmdVerify:
         """Set up mocked bridge for verify tests."""
         import amifuse.fuse_fs as fuse_fs_mod
 
-        mock_bridge = MagicMock()
-        mock_bridge.is_mounted.return_value = (
-            True, {"disk_type": 0x50465303, "volume_node": 1}, None,
-        )
+        mock_bridge = _make_mock_bridge()
         monkeypatch.setattr(
             fuse_fs_mod, "_create_bridge_from_args",
             lambda args, cmd, read_only=True: (mock_bridge, None),
@@ -2811,7 +2825,7 @@ class TestCmdHash:
         """Set up mocked bridge for hash tests."""
         import amifuse.fuse_fs as fuse_fs_mod
 
-        mock_bridge = MagicMock()
+        mock_bridge = _make_mock_bridge()
         monkeypatch.setattr(
             fuse_fs_mod, "_create_bridge_from_args",
             lambda args, cmd, read_only=True: (mock_bridge, None),
@@ -3474,7 +3488,7 @@ class TestCmdRead:
         """Set up mocked bridge for read tests."""
         import amifuse.fuse_fs as fuse_fs_mod
 
-        mock_bridge = MagicMock()
+        mock_bridge = _make_mock_bridge()
         monkeypatch.setattr(
             fuse_fs_mod, "_create_bridge_from_args",
             lambda args, cmd, read_only=True: (mock_bridge, None),
@@ -3890,7 +3904,7 @@ class TestCmdWrite:
         """Set up mocked bridge for write tests."""
         import amifuse.fuse_fs as fuse_fs_mod
 
-        mock_bridge = MagicMock()
+        mock_bridge = _make_mock_bridge()
         monkeypatch.setattr(
             fuse_fs_mod, "_create_bridge_from_args",
             lambda args, cmd, read_only=True: (mock_bridge, None),
@@ -3986,7 +4000,7 @@ class TestCmdWrite:
         import amifuse.fuse_fs as fuse_fs_mod
 
         captured = {}
-        mock_bridge = MagicMock()
+        mock_bridge = _make_mock_bridge()
         mock_bridge.open_file.return_value = (0x1000, 0x2000)
         mock_bridge.write_handle.return_value = 5
         mock_bridge.close_file.return_value = None
@@ -4225,7 +4239,7 @@ class TestCmdWrite:
                                              tmp_path):
         import amifuse.fuse_fs as fuse_fs_mod
 
-        mock_bridge = MagicMock()
+        mock_bridge = _make_mock_bridge()
         mock_bridge.open_file.return_value = (0x1000, 0x2000)
         mock_bridge.write_handle.return_value = 5
         mock_bridge.close_file.return_value = None
@@ -4315,7 +4329,7 @@ class TestCmdWrite:
         import amifuse.fuse_fs as fuse_fs_mod
 
         written_data = bytearray()
-        mock_bridge = MagicMock()
+        mock_bridge = _make_mock_bridge()
         mock_bridge.open_file.return_value = (0x1000, 0x2000)
         mock_bridge.close_file.return_value = None
         mock_bridge.flush_volume.return_value = None
