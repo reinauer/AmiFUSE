@@ -18,6 +18,17 @@ from unittest.mock import MagicMock
 
 import pytest
 
+# The fuse_mock fixture stubs amitools.vamos with dummies, so the real
+# MockMemory and InfoDataStruct have to be captured at import time, before
+# any fixture patches sys.modules. TestQueryDiskInfo needs the genuine
+# struct to pin the InfoData field offsets.
+try:
+    from amitools.vamos.machine.mock.mem import MockMemory as _RealMockMemory
+    from amitools.vamos.libstructs.dos import InfoDataStruct as _RealInfoData
+except ImportError:  # pragma: no cover - amitools submodule not checked out
+    _RealMockMemory = None
+    _RealInfoData = None
+
 
 # ---------------------------------------------------------------------------
 # A. TestMountFuseOptions -- subtype guard tests
@@ -1783,6 +1794,164 @@ class TestCmdLs:
 
 
 # ---------------------------------------------------------------------------
+# TestQueryDiskInfo -- ACTION_DISK_INFO memory reads
+# ---------------------------------------------------------------------------
+
+
+class TestQueryDiskInfo:
+    """Drive _query_disk_info() through real InfoData memory.
+
+    The is_mounted() tests below stub _query_disk_info, so they exercise the
+    decision table but never the part that can silently be wrong: which
+    InfoData offset each field is read from, and which slot of the reply
+    tuple carries res1 and res2. Offset and BPTR/APTR confusion in direct
+    memory reads is exactly what the repo's gotchas call out as hardest to
+    debug after the fact, so these tests plant known values through the real
+    InfoDataStruct field names and assert they come back out.
+    """
+
+    INFO_ADDR = 0x1000
+
+    # Fields the handler is expected to fill in, plus decoys in the
+    # neighbouring slots. The decoys are the point: reading id_DiskState (8)
+    # or id_InUse (32) instead of id_DiskType (24) or id_VolumeNode (28)
+    # must not go unnoticed.
+    PLANTED = {
+        "id_NumSoftErrors": 7,
+        "id_UnitNumber": 3,
+        "id_DiskState": 81,  # ID_VALIDATING -- decoy for disk_type
+        "id_NumBlocks": 12288,
+        "id_NumBlocksUsed": 4096,
+        "id_BytesPerBlock": 512,
+        "id_DiskType": 0x444F5303,  # 'DOS\3'
+        "id_VolumeNode": 0xABCD00,
+        "id_InUse": 1,  # decoy for volume_node
+    }
+
+    def _query(self, fuse_fs_mod, monkeypatch, replies, fields=None):
+        """Run _query_disk_info() against a bridge backed by MockMemory."""
+        import threading
+
+        if _RealMockMemory is None:
+            pytest.skip("amitools submodule not available")
+        MockMemory = _RealMockMemory
+        InfoDataStruct = _RealInfoData
+        # fuse_mock bound a dummy InfoDataStruct into the module; the real
+        # one is the whole point of these tests.
+        monkeypatch.setattr(fuse_fs_mod, "InfoDataStruct", InfoDataStruct)
+
+        mem = MockMemory(size_kib=64)
+        bridge = object.__new__(fuse_fs_mod.HandlerBridge)
+        bridge._lock = threading.RLock()
+        bridge.mem = mem
+        bridge.state = MagicMock()
+        bridge.launcher = MagicMock()
+        bridge.vh = MagicMock()
+        info_mem = SimpleNamespace(addr=self.INFO_ADDR)
+        bridge.vh.alloc.alloc_memory.return_value = info_mem
+
+        def fake_run_until_replies():
+            # The real handler fills InfoData in place before replying, so
+            # plant the fields here -- the buffer is zeroed before the send.
+            if fields:
+                info = InfoDataStruct(mem, self.INFO_ADDR)
+                for name, value in fields.items():
+                    # Write through the field's own address rather than .val:
+                    # id_VolumeNode is a BPTR whose typed setter rejects a
+                    # raw int. The address still comes from the real struct,
+                    # so a production offset mistake still fails the test.
+                    mem.w32(getattr(info, name).addr, value)
+            return replies
+
+        bridge._run_until_replies = fake_run_until_replies
+        result = bridge._query_disk_info()
+        return result, bridge, info_mem
+
+    def test_success_reads_every_field_from_its_own_offset(self, fuse_mock, monkeypatch):
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        # (msg, pkt_addr, res1, res2) -- res1 nonzero means DOSTRUE
+        replies = [(0, 0x9999, 1, 0)]
+        (info, res2), bridge, info_mem = self._query(
+            fuse_fs_mod, monkeypatch, replies, self.PLANTED)
+
+        assert res2 is None
+        assert info == {
+            "num_blocks": 12288,
+            "num_blocks_used": 4096,
+            "bytes_per_block": 512,
+            "disk_type": 0x444F5303,
+            "volume_node": 0xABCD00,
+        }
+        # The decoy values must not have leaked into any returned field
+        assert 81 not in info.values()
+        assert 7 not in info.values()
+        bridge.vh.alloc.free_memory.assert_called_once_with(info_mem)
+
+    def test_dosfalse_reply_yields_res2_not_the_packet_address(self, fuse_mock, monkeypatch):
+        """res2 is slot 3 of the reply; slot 1 is the packet address."""
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        replies = [(0, 0x9999, 0, 225)]
+        (info, res2), bridge, info_mem = self._query(
+            fuse_fs_mod, monkeypatch, replies, self.PLANTED)
+
+        # res1 == 0 means the buffer is not trustworthy even though this
+        # test planted values in it
+        assert info is None
+        assert res2 == 225
+        assert res2 != 0x9999
+        bridge.vh.alloc.free_memory.assert_called_once_with(info_mem)
+
+    def test_no_reply_is_silence_not_refusal(self, fuse_mock, monkeypatch):
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        (info, res2), bridge, info_mem = self._query(fuse_fs_mod, monkeypatch, [])
+
+        assert info is None
+        assert res2 is None
+        bridge.vh.alloc.free_memory.assert_called_once_with(info_mem)
+
+    def test_zeroed_buffer_when_handler_fills_nothing(self, fuse_mock, monkeypatch):
+        """A handler that replies DOSTRUE but fills nothing reads back zeros."""
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        (info, res2), _, _ = self._query(fuse_fs_mod, monkeypatch, [(0, 0x9999, 1, 0)])
+
+        assert res2 is None
+        assert info == {
+            "num_blocks": 0,
+            "num_blocks_used": 0,
+            "bytes_per_block": 0,
+            "disk_type": 0,
+            "volume_node": 0,
+        }
+
+    def test_end_to_end_refusal_is_not_mounted(self, fuse_mock, monkeypatch):
+        """The offsets and the decision table agree on a real refusal."""
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        mem_bridge = self._query(fuse_fs_mod, monkeypatch, [(0, 0x9999, 0, 225)])[1]
+        mounted, info, reason = mem_bridge.is_mounted()
+
+        assert mounted is False
+        assert info is None
+        assert reason == "not a DOS disk"
+
+    def test_end_to_end_ndos_disk_type_is_not_mounted(self, fuse_mock, monkeypatch):
+        """An NDOS id_DiskType read from offset 24 drives the same verdict."""
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        fields = dict(self.PLANTED, id_DiskType=0x4E444F53)
+        mem_bridge = self._query(fuse_fs_mod, monkeypatch, [(0, 0x9999, 1, 0)], fields)[1]
+        mounted, info, reason = mem_bridge.is_mounted()
+
+        assert mounted is False
+        assert info["disk_type"] == 0x4E444F53
+        assert reason == "not a DOS disk"
+
+
+# ---------------------------------------------------------------------------
 # TestHandlerBridgeMountState -- mounted-volume checks
 # ---------------------------------------------------------------------------
 
@@ -2234,6 +2403,87 @@ class TestCmdVerify:
         assert exc_info.value.code == 1
         assert data["error"]["code"] == "NOT_MOUNTED"
         mock_bridge.stat_path.assert_not_called()
+
+    def test_verify_unmounted_file_human_names_the_file(
+            self, mock_bridge_for_verify, capsys):
+        """The diagnosis must stay attached to the file the user asked about."""
+        mock_bridge, fuse_fs_mod = mock_bridge_for_verify
+        mock_bridge.is_mounted.return_value = (
+            False, {"disk_type": 0x4E444F53, "volume_node": 0},
+            "not a DOS disk",
+        )
+
+        args = argparse.Namespace(
+            image=Path("/fake/test.hdf"),
+            json=False,
+            file="S/Startup-Sequence",
+            expect_size=None,
+            partition=None,
+            driver=None,
+            block_size=None,
+            debug=False,
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            fuse_fs_mod.cmd_verify(args)
+        output = capsys.readouterr().out
+
+        assert exc_info.value.code == 1
+        assert "File: S/Startup-Sequence" in output
+        assert "Volume: (none)" not in output
+        assert "Filesystem responsive: NO -- not a DOS disk" in output
+
+    def test_verify_file_not_found_carries_unknown_mount_state(
+            self, mock_bridge_for_verify, capsys):
+        """FILE_NOT_FOUND must not look identical on a healthy volume."""
+        mock_bridge, fuse_fs_mod = mock_bridge_for_verify
+        mock_bridge.is_mounted.return_value = (
+            None, None, "handler did not report disk info",
+        )
+        mock_bridge.stat_path.return_value = None
+
+        args = argparse.Namespace(
+            image=Path("/fake/test.hdf"),
+            json=True,
+            file="S/Startup-Sequence",
+            expect_size=None,
+            partition=None,
+            driver=None,
+            block_size=None,
+            debug=False,
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            fuse_fs_mod.cmd_verify(args)
+        data = json.loads(capsys.readouterr().out)
+
+        assert exc_info.value.code == 1
+        assert data["error"]["code"] == "FILE_NOT_FOUND"
+        assert data["error"]["details"]["filesystem_responsive"] is None
+        assert data["error"]["details"]["mount_state_reason"] == (
+            "handler did not report disk info")
+
+    def test_verify_file_not_found_on_healthy_volume_is_distinguishable(
+            self, mock_bridge_for_verify, capsys):
+        """The confirmed-mounted case reports true, not null."""
+        mock_bridge, fuse_fs_mod = mock_bridge_for_verify
+        mock_bridge.stat_path.return_value = None
+
+        args = argparse.Namespace(
+            image=Path("/fake/test.hdf"),
+            json=True,
+            file="S/Startup-Sequence",
+            expect_size=None,
+            partition=None,
+            driver=None,
+            block_size=None,
+            debug=False,
+        )
+        with pytest.raises(SystemExit):
+            fuse_fs_mod.cmd_verify(args)
+        data = json.loads(capsys.readouterr().out)
+
+        assert data["error"]["code"] == "FILE_NOT_FOUND"
+        assert data["error"]["details"]["filesystem_responsive"] is True
+        assert "mount_state_reason" not in data["error"]["details"]
 
     def test_verify_unknown_mount_status_is_reported_for_file_json(
             self, mock_bridge_for_verify, capsys):

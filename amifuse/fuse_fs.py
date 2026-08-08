@@ -87,6 +87,24 @@ ERROR_DIR_NOT_FOUND = 204
 ERROR_OBJECT_NOT_FOUND = 205
 _NOT_FOUND_ERRORS = frozenset({ERROR_DIR_NOT_FOUND, ERROR_OBJECT_NOT_FOUND})
 
+# AmigaDOS error codes a handler can return when it refuses ACTION_DISK_INFO.
+# ERROR_ACTION_NOT_KNOWN is deliberately absent from the unmounted set in
+# HandlerBridge._UNMOUNTED_DISK_ERRORS: it means the handler does not
+# implement the packet, which says nothing about the volume.
+ERROR_ACTION_NOT_KNOWN = 209
+ERROR_DEVICE_NOT_MOUNTED = 218
+ERROR_NOT_A_DOS_DISK = 225
+ERROR_NO_DISK = 226
+
+# id_DiskType values from dos/dos.h. ID_MSDOS_DISK is not an unusable disk:
+# CrossDOS reports it for a volume it has successfully mounted.
+ID_NO_DISK_PRESENT = 0xFFFFFFFF  # -1
+ID_UNREADABLE_DISK = 0x42414400  # 'BAD\0'
+ID_NOT_REALLY_DOS = 0x4E444F53  # 'NDOS'
+ID_KICKSTART_DISK = 0x4B49434B  # 'KICK'
+ID_MSDOS_DISK = 0x4D534400  # 'MSD\0'
+ID_BUSY = 0x42555359  # 'BUSY'
+
 # Upper bound for the path-keyed metadata caches. They are TTL-based but
 # otherwise unbounded, so a full traversal of a huge image would pin every
 # path in memory for the TTL. Entries are inserted in timestamp order, so
@@ -1323,13 +1341,12 @@ class HandlerBridge:
 
     # AmigaDOS id_DiskType sentinels meaning "no usable volume mounted"
     _UNMOUNTED_DISK_REASONS = {
-        0xFFFFFFFF: "no disk present",  # ID_NO_DISK_PRESENT (-1)
-        0x42414400: "unreadable disk",  # ID_UNREADABLE_DISK 'BAD\0'
-        0x4E444F53: "not a DOS disk",  # ID_NOT_REALLY_DOS 'NDOS'
-        0x42555359: "disk busy or inhibited",  # ID_BUSY 'BUSY'
-        0x4B49434B: "Kickstart disk has no DOS volume",  # ID_KICKSTART_DISK
+        ID_NO_DISK_PRESENT: "no disk present",
+        ID_UNREADABLE_DISK: "unreadable disk",
+        ID_NOT_REALLY_DOS: "not a DOS disk",
+        ID_BUSY: "disk busy or inhibited",
+        ID_KICKSTART_DISK: "Kickstart disk has no DOS volume",
     }
-    # CrossDOS uses ID_MSDOS_DISK for successfully mounted volumes.
 
     # res2 codes from a refused ACTION_DISK_INFO that positively identify an
     # unusable volume. A handler can reject a disk this way instead of filling
@@ -1337,12 +1354,10 @@ class HandlerBridge:
     # here: any other refusal stays inconclusive rather than risk calling a
     # healthy image broken.
     _UNMOUNTED_DISK_ERRORS = {
-        225: "not a DOS disk",  # ERROR_NOT_A_DOS_DISK
-        226: "no disk present",  # ERROR_NO_DISK
-        218: "device not mounted",  # ERROR_DEVICE_NOT_MOUNTED
+        ERROR_NOT_A_DOS_DISK: "not a DOS disk",
+        ERROR_NO_DISK: "no disk present",
+        ERROR_DEVICE_NOT_MOUNTED: "device not mounted",
     }
-    # ERROR_ACTION_NOT_KNOWN (209) means the handler does not implement this
-    # packet at all, which says nothing about the volume.
 
     def is_mounted(
             self) -> Tuple[Optional[bool], Optional[Dict], Optional[str]]:
@@ -3668,7 +3683,12 @@ def cmd_verify(args):
                     details=details,
                 )))
                 sys.exit(1)
-            print("Volume: (none)")
+            # Keep the diagnosis attached to what the user actually asked
+            # about, so --file does not get a bare volume-shaped report.
+            if file_path:
+                print(f"File: {file_path}")
+            else:
+                print("Volume: (none)")
             print(f"  Filesystem responsive: NO -- {mount_reason}")
             if dinfo is not None:
                 print(f"  id_DiskType: 0x{dinfo['disk_type']:08x}")
@@ -3683,10 +3703,20 @@ def cmd_verify(args):
             normalized = "/" + file_path.lstrip("/")
             stat = bridge.stat_path(normalized)
             if stat is None:
+                # A missing file on a volume whose mount could not be
+                # confirmed is a different situation from a missing file on
+                # a healthy volume. Carry the mount state so the error path
+                # stays as informative as the success path below.
+                details = {"filesystem_responsive": mounted}
+                if mounted is None:
+                    details["mount_state_reason"] = mount_reason
                 if use_json:
                     print(json.dumps(_json_error("verify", "FILE_NOT_FOUND",
-                        f"File not found: {file_path}")))
+                        f"File not found: {file_path}", details=details)))
                     sys.exit(1)
+                print(f"File: {file_path}")
+                print(f"  Exists: no")
+                print(f"  Filesystem responsive: {responsive_text}")
                 raise SystemExit(f"Error: file not found: {file_path}")
 
             result_data = {
