@@ -3376,6 +3376,21 @@ def _json_result(command: str, **kwargs) -> dict:
     return result
 
 
+def _mount_error_details(dinfo: Optional[Dict]) -> Dict:
+    """Machine-readable details for a NOT_MOUNTED error envelope.
+
+    dinfo is None when the handler refused ACTION_DISK_INFO outright, in
+    which case there is no id_DiskType it actually reported and the details
+    stay empty rather than naming a value the handler never sent.
+    """
+    details = {}
+    if dinfo is not None:
+        details["disk_type"] = dinfo["disk_type"]
+        if "volume_node" in dinfo:
+            details["volume_node"] = dinfo["volume_node"]
+    return details
+
+
 def _cleanup_bridge(bridge, temp_driver=None):
     """Shut down a HandlerBridge and release all resources.
 
@@ -3592,6 +3607,23 @@ def cmd_ls(args):
 
     bridge, temp_driver = _create_bridge_from_args(args, "ls")
     try:
+        # A handler that rejected the disk still answers directory reads with
+        # an empty result. The stat fallback below would catch that, but it is
+        # skipped at the root (path != "/"), and -R bypasses it entirely --
+        # so without this guard the default `amifuse ls image.hdf` reports an
+        # unmountable image as an empty volume and exits 0.
+        mounted, dinfo, mount_reason = bridge.is_mounted()
+        if mounted is False:
+            if use_json:
+                print(json.dumps(_json_error(
+                    "ls", "NOT_MOUNTED",
+                    f"No usable volume mounted: {mount_reason}",
+                    details=_mount_error_details(dinfo),
+                )))
+                sys.exit(1)
+            raise SystemExit(
+                f"Error: no usable volume mounted: {mount_reason}")
+
         if recursive:
             entries = _ls_recursive(bridge, path)
         else:
@@ -3625,6 +3657,7 @@ def cmd_ls(args):
                 target=str(args.image),
                 path=path,
                 entries=entries,
+                filesystem_responsive=mounted,
             )
             print(json.dumps(result, indent=2))
         else:
@@ -3633,6 +3666,12 @@ def cmd_ls(args):
                     print(f"  {ent['name']:30s}  <dir>     {ent['protection']}")
                 else:
                     print(f"  {ent['name']:30s}  {ent['size']:>10d}  {ent['protection']}")
+            # An empty listing that we could not confirm is a real listing
+            # looks identical to an empty volume. Say so, on stderr, so the
+            # listing itself stays clean for anything parsing stdout.
+            if not entries and mounted is None:
+                print(f"Warning: mount state unknown -- {mount_reason}",
+                      file=sys.stderr)
     except SystemExit:
         raise
     except Exception as e:
@@ -3667,15 +3706,7 @@ def cmd_verify(args):
         # before either verification path can manufacture a successful result.
         mounted, dinfo, mount_reason = bridge.is_mounted()
         if mounted is False:
-            # dinfo is None when the handler refused ACTION_DISK_INFO outright.
-            # Report only what it actually told us: there is no id_DiskType to
-            # name in that case.
-            details = {}
-            if dinfo is not None:
-                details["disk_type"] = dinfo["disk_type"]
-                if "volume_node" in dinfo:
-                    details["volume_node"] = dinfo["volume_node"]
-
+            details = _mount_error_details(dinfo)
             if use_json:
                 print(json.dumps(_json_error(
                     "verify", "NOT_MOUNTED",
