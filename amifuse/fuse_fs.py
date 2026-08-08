@@ -16,7 +16,7 @@ import threading
 import time
 
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, NamedTuple, Optional, Set, Tuple
 
 from .platform import kill_mount_owner_processes
 
@@ -104,6 +104,23 @@ ID_NOT_REALLY_DOS = 0x4E444F53  # 'NDOS'
 ID_KICKSTART_DISK = 0x4B49434B  # 'KICK'
 ID_MSDOS_DISK = 0x4D534400  # 'MSD\0'
 ID_BUSY = 0x42555359  # 'BUSY'
+
+
+class MountState(NamedTuple):
+    """What HandlerBridge.is_mounted() concluded, and what it saw.
+
+    Attribute access rather than unpacking: this result has grown a field
+    twice now, and each time every call site and test mock had to change.
+
+    mounted is None when the handler gave too little to decide. info is the
+    ACTION_DISK_INFO payload, absent when the handler refused the packet
+    rather than answering it -- in which case dos_error carries the res2
+    code that produced the verdict.
+    """
+    mounted: Optional[bool]
+    info: Optional[Dict]
+    reason: Optional[str]
+    dos_error: Optional[int] = None
 
 # Upper bound for the path-keyed metadata caches. They are TTL-based but
 # otherwise unbounded, so a full traversal of a huge image would pin every
@@ -1359,9 +1376,8 @@ class HandlerBridge:
         ERROR_DEVICE_NOT_MOUNTED: "device not mounted",
     }
 
-    def is_mounted(
-            self) -> Tuple[Optional[bool], Optional[Dict], Optional[str]]:
-        """Return the mount state, ACTION_DISK_INFO result, and reason.
+    def is_mounted(self) -> MountState:
+        """Decide whether a usable volume is mounted.
 
         The state is None when the handler does not provide enough information
         to decide. Any nonzero type except a known unusable sentinel counts as
@@ -1373,22 +1389,25 @@ class HandlerBridge:
         info, res2 = self._query_disk_info()
         if not info:
             if res2 is None:
-                return None, None, "handler did not report disk info"
+                return MountState(
+                    None, None, "handler did not report disk info")
             reason = self._UNMOUNTED_DISK_ERRORS.get(res2)
             if reason is not None:
-                return False, None, reason
-            return None, None, (
-                f"handler refused disk info with error {res2}")
+                return MountState(False, None, reason, res2)
+            return MountState(
+                None, None,
+                f"handler refused disk info with error {res2}", res2)
 
         disk_type = info.get("disk_type", 0)
         reason = self._UNMOUNTED_DISK_REASONS.get(disk_type)
         if reason is not None:
-            return False, info, reason
+            return MountState(False, info, reason)
         if disk_type != 0:
-            return True, info, None
+            return MountState(True, info, None)
         if info.get("volume_node", 0) != 0:
-            return True, info, None
-        return None, info, "handler reported no disk type or volume node"
+            return MountState(True, info, None)
+        return MountState(
+            None, info, "handler reported no disk type or volume node")
 
     def volume_name(self) -> str:
         """Best-effort name: RDB drive name, else first dir entry, else fallback."""
@@ -3376,18 +3395,41 @@ def _json_result(command: str, **kwargs) -> dict:
     return result
 
 
-def _mount_error_details(dinfo: Optional[Dict]) -> Dict:
+def _mount_error_details(state: "MountState") -> Dict:
     """Machine-readable details for a NOT_MOUNTED error envelope.
 
-    dinfo is None when the handler refused ACTION_DISK_INFO outright, in
-    which case there is no id_DiskType it actually reported and the details
-    stay empty rather than naming a value the handler never sent.
+    The two ways a volume can be rejected leave different evidence, and each
+    reports what it actually has. An InfoData reply carries the disk type the
+    handler named; a refusal carries only the res2 code that produced the
+    verdict. Reporting the res2 keeps the refusal branch machine-readable
+    instead of leaving prose in `message` as a consumer's only handle -- both
+    branches can yield the same reason string, so the distinction would
+    otherwise be invisible.
+
+    Every key is read defensively: this feeds an error path, and a KeyError
+    here would be swallowed by the caller's blanket `except Exception` and
+    reported as HANDLER_ERROR, hiding the diagnosis it was trying to give.
     """
     details = {}
-    if dinfo is not None:
-        details["disk_type"] = dinfo["disk_type"]
-        if "volume_node" in dinfo:
-            details["volume_node"] = dinfo["volume_node"]
+    if state.info is not None:
+        for key in ("disk_type", "volume_node"):
+            if key in state.info:
+                details[key] = state.info[key]
+    if state.dos_error is not None:
+        details["dos_error"] = state.dos_error
+    return details
+
+
+def _mount_state_details(state: "MountState") -> Dict:
+    """Mount context for an error envelope raised on a mounted-enough volume.
+
+    A path that is missing on a volume whose mount could not be confirmed is
+    a different situation from one missing on a healthy volume, and the two
+    otherwise emit byte-identical envelopes.
+    """
+    details = {"filesystem_responsive": state.mounted}
+    if state.mounted is None:
+        details["mount_state_reason"] = state.reason
     return details
 
 
@@ -3612,13 +3654,14 @@ def cmd_ls(args):
         # skipped at the root (path != "/"), and -R bypasses it entirely --
         # so without this guard the default `amifuse ls image.hdf` reports an
         # unmountable image as an empty volume and exits 0.
-        mounted, dinfo, mount_reason = bridge.is_mounted()
+        state = bridge.is_mounted()
+        mounted, mount_reason = state.mounted, state.reason
         if mounted is False:
             if use_json:
                 print(json.dumps(_json_error(
                     "ls", "NOT_MOUNTED",
                     f"No usable volume mounted: {mount_reason}",
-                    details=_mount_error_details(dinfo),
+                    details=_mount_error_details(state),
                 )))
                 sys.exit(1)
             raise SystemExit(
@@ -3632,10 +3675,18 @@ def cmd_ls(args):
                 # Path might not exist -- try stat to distinguish
                 stat = bridge.stat_path(path)
                 if stat is None:
+                    # On an unmountable volume no path resolves, so this
+                    # branch is reachable for exactly the condition the check
+                    # above exists for. Carry the mount state, or a missing
+                    # directory on a healthy volume looks identical.
+                    details = _mount_state_details(state)
                     if use_json:
                         print(json.dumps(_json_error("ls", "FILE_NOT_FOUND",
-                            f"Path not found: {path}")))
+                            f"Path not found: {path}", details=details)))
                         sys.exit(1)
+                    if mounted is None:
+                        print(f"Warning: mount state unknown -- {mount_reason}",
+                              file=sys.stderr)
                     raise SystemExit(f"Error: path not found: {path}")
             entries = []
             for ent in raw:
@@ -3704,14 +3755,14 @@ def cmd_verify(args):
     try:
         # Reject a disk that the handler conclusively identified as unusable
         # before either verification path can manufacture a successful result.
-        mounted, dinfo, mount_reason = bridge.is_mounted()
+        state = bridge.is_mounted()
+        mounted, mount_reason = state.mounted, state.reason
         if mounted is False:
-            details = _mount_error_details(dinfo)
             if use_json:
                 print(json.dumps(_json_error(
                     "verify", "NOT_MOUNTED",
                     f"No usable volume mounted: {mount_reason}",
-                    details=details,
+                    details=_mount_error_details(state),
                 )))
                 sys.exit(1)
             # Keep the diagnosis attached to what the user actually asked
@@ -3721,8 +3772,14 @@ def cmd_verify(args):
             else:
                 print("Volume: (none)")
             print(f"  Filesystem responsive: NO -- {mount_reason}")
-            if dinfo is not None:
-                print(f"  id_DiskType: 0x{dinfo['disk_type']:08x}")
+            if state.info is not None and "disk_type" in state.info:
+                print(f"  id_DiskType: 0x{state.info['disk_type']:08x}")
+            # The report belongs on stdout, but every other error path in
+            # this file puts its reason on stderr. Echo it so that
+            # `verify image.hdf 2>&1 >/dev/null` is not silent for exactly
+            # the condition this check exists to surface.
+            print(f"Error: no usable volume mounted: {mount_reason}",
+                  file=sys.stderr)
             sys.exit(1)
 
         responsive_text = "yes"
@@ -3738,9 +3795,7 @@ def cmd_verify(args):
                 # confirmed is a different situation from a missing file on
                 # a healthy volume. Carry the mount state so the error path
                 # stays as informative as the success path below.
-                details = {"filesystem_responsive": mounted}
-                if mounted is None:
-                    details["mount_state_reason"] = mount_reason
+                details = _mount_state_details(state)
                 if use_json:
                     print(json.dumps(_json_error("verify", "FILE_NOT_FOUND",
                         f"File not found: {file_path}", details=details)))
