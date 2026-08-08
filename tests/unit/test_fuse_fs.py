@@ -1623,11 +1623,131 @@ class TestCmdLs:
         import amifuse.fuse_fs as fuse_fs_mod
 
         mock_bridge = MagicMock()
+        mock_bridge.is_mounted.return_value = (
+            True, {"disk_type": 0x50465303, "volume_node": 1}, None,
+        )
         monkeypatch.setattr(
             fuse_fs_mod, "_create_bridge_from_args",
             lambda args, cmd, read_only=True: (mock_bridge, None),
         )
         return mock_bridge, fuse_fs_mod
+
+    @staticmethod
+    def _ls_args(**overrides):
+        base = dict(
+            image=Path("/fake/test.hdf"),
+            json=True,
+            path="/",
+            recursive=False,
+            partition=None,
+            driver=None,
+            block_size=None,
+            debug=False,
+        )
+        base.update(overrides)
+        return argparse.Namespace(**base)
+
+    def test_ls_unmounted_root_json(self, mock_bridge_for_ls, capsys):
+        """The default `amifuse ls image.hdf` must not report an empty volume."""
+        mock_bridge, fuse_fs_mod = mock_bridge_for_ls
+        mock_bridge.is_mounted.return_value = (
+            False, {"disk_type": 0x4E444F53, "volume_node": 0},
+            "not a DOS disk",
+        )
+        mock_bridge.list_dir_path.return_value = []
+
+        with pytest.raises(SystemExit) as exc_info:
+            fuse_fs_mod.cmd_ls(self._ls_args())
+        data = json.loads(capsys.readouterr().out)
+
+        assert exc_info.value.code == 1
+        assert data["status"] == "error"
+        assert data["error"]["code"] == "NOT_MOUNTED"
+        assert "not a DOS disk" in data["error"]["message"]
+        assert data["error"]["details"]["disk_type"] == 0x4E444F53
+        mock_bridge.list_dir_path.assert_not_called()
+
+    def test_ls_unmounted_recursive_json(self, mock_bridge_for_ls, capsys):
+        """-R bypassed the stat fallback entirely, so it needs the guard too."""
+        mock_bridge, fuse_fs_mod = mock_bridge_for_ls
+        mock_bridge.is_mounted.return_value = (
+            False, {"disk_type": 0x4E444F53, "volume_node": 0},
+            "not a DOS disk",
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            fuse_fs_mod.cmd_ls(self._ls_args(recursive=True))
+        data = json.loads(capsys.readouterr().out)
+
+        assert exc_info.value.code == 1
+        assert data["error"]["code"] == "NOT_MOUNTED"
+
+    def test_ls_unmounted_human_exits_nonzero(self, mock_bridge_for_ls, capsys):
+        mock_bridge, fuse_fs_mod = mock_bridge_for_ls
+        mock_bridge.is_mounted.return_value = (
+            False, None, "no disk present",
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            fuse_fs_mod.cmd_ls(self._ls_args(json=False))
+
+        # SystemExit carries the message; a bare listing printed nothing before
+        assert "no usable volume mounted" in str(exc_info.value.code)
+        assert "no disk present" in str(exc_info.value.code)
+
+    def test_ls_refused_disk_info_omits_disk_type(self, mock_bridge_for_ls, capsys):
+        mock_bridge, fuse_fs_mod = mock_bridge_for_ls
+        mock_bridge.is_mounted.return_value = (False, None, "not a DOS disk")
+
+        with pytest.raises(SystemExit):
+            fuse_fs_mod.cmd_ls(self._ls_args())
+        data = json.loads(capsys.readouterr().out)
+
+        assert data["error"]["code"] == "NOT_MOUNTED"
+        assert "details" not in data["error"]
+
+    def test_ls_unknown_mount_state_json(self, mock_bridge_for_ls, capsys):
+        """An inconclusive mount is reported, but still lists and exits 0."""
+        mock_bridge, fuse_fs_mod = mock_bridge_for_ls
+        mock_bridge.is_mounted.return_value = (
+            None, None, "handler did not report disk info",
+        )
+        mock_bridge.list_dir_path.return_value = []
+
+        fuse_fs_mod.cmd_ls(self._ls_args())
+        data = json.loads(capsys.readouterr().out)
+
+        assert data["status"] == "ok"
+        assert data["entries"] == []
+        assert data["filesystem_responsive"] is None
+
+    def test_ls_unknown_mount_state_warns_on_empty_human(
+            self, mock_bridge_for_ls, capsys):
+        mock_bridge, fuse_fs_mod = mock_bridge_for_ls
+        mock_bridge.is_mounted.return_value = (
+            None, None, "handler did not report disk info",
+        )
+        mock_bridge.list_dir_path.return_value = []
+
+        fuse_fs_mod.cmd_ls(self._ls_args(json=False))
+        captured = capsys.readouterr()
+
+        assert captured.out == ""
+        assert "mount state unknown" in captured.err
+        assert "handler did not report disk info" in captured.err
+
+    def test_ls_healthy_volume_reports_responsive(self, mock_bridge_for_ls, capsys):
+        mock_bridge, fuse_fs_mod = mock_bridge_for_ls
+        mock_bridge.list_dir_path.return_value = [
+            {"name": "file1.txt", "dir_type": 0, "size": 100, "protection": 0},
+        ]
+
+        fuse_fs_mod.cmd_ls(self._ls_args())
+        data = json.loads(capsys.readouterr().out)
+
+        assert data["status"] == "ok"
+        assert data["filesystem_responsive"] is True
+        assert len(data["entries"]) == 1
 
     def test_ls_json_output_structure(self, mock_bridge_for_ls, capsys):
         mock_bridge, fuse_fs_mod = mock_bridge_for_ls
