@@ -43,8 +43,10 @@ def _make_mock_bridge():
 
     The default is a healthy, mounted PFS volume; tests that care override it.
     """
+    import amifuse.fuse_fs as fuse_fs_mod
+
     bridge = MagicMock()
-    bridge.is_mounted.return_value = (
+    bridge.is_mounted.return_value = fuse_fs_mod.MountState(
         True, {"disk_type": 0x50465303, "volume_node": 1}, None,
     )
     return bridge
@@ -1667,7 +1669,7 @@ class TestCmdLs:
     def test_ls_unmounted_root_json(self, mock_bridge_for_ls, capsys):
         """The default `amifuse ls image.hdf` must not report an empty volume."""
         mock_bridge, fuse_fs_mod = mock_bridge_for_ls
-        mock_bridge.is_mounted.return_value = (
+        mock_bridge.is_mounted.return_value = fuse_fs_mod.MountState(
             False, {"disk_type": 0x4E444F53, "volume_node": 0},
             "not a DOS disk",
         )
@@ -1687,7 +1689,7 @@ class TestCmdLs:
     def test_ls_unmounted_recursive_json(self, mock_bridge_for_ls, capsys):
         """-R bypassed the stat fallback entirely, so it needs the guard too."""
         mock_bridge, fuse_fs_mod = mock_bridge_for_ls
-        mock_bridge.is_mounted.return_value = (
+        mock_bridge.is_mounted.return_value = fuse_fs_mod.MountState(
             False, {"disk_type": 0x4E444F53, "volume_node": 0},
             "not a DOS disk",
         )
@@ -1701,7 +1703,7 @@ class TestCmdLs:
 
     def test_ls_unmounted_human_exits_nonzero(self, mock_bridge_for_ls, capsys):
         mock_bridge, fuse_fs_mod = mock_bridge_for_ls
-        mock_bridge.is_mounted.return_value = (
+        mock_bridge.is_mounted.return_value = fuse_fs_mod.MountState(
             False, None, "no disk present",
         )
 
@@ -1712,21 +1714,59 @@ class TestCmdLs:
         assert "no usable volume mounted" in str(exc_info.value.code)
         assert "no disk present" in str(exc_info.value.code)
 
-    def test_ls_refused_disk_info_omits_disk_type(self, mock_bridge_for_ls, capsys):
+    def test_ls_refused_disk_info_reports_dos_error(self, mock_bridge_for_ls, capsys):
+        """A refusal has no id_DiskType, so res2 is the machine-readable handle."""
         mock_bridge, fuse_fs_mod = mock_bridge_for_ls
-        mock_bridge.is_mounted.return_value = (False, None, "not a DOS disk")
+        mock_bridge.is_mounted.return_value = fuse_fs_mod.MountState(
+            False, None, "not a DOS disk", 225)
 
         with pytest.raises(SystemExit):
             fuse_fs_mod.cmd_ls(self._ls_args())
         data = json.loads(capsys.readouterr().out)
 
         assert data["error"]["code"] == "NOT_MOUNTED"
-        assert "details" not in data["error"]
+        assert data["error"]["details"] == {"dos_error": 225}
+        # The two provenances yield the same reason string, so details is
+        # what tells a consumer which one it got
+        assert "disk_type" not in data["error"]["details"]
+
+    def test_ls_path_not_found_carries_unknown_mount_state(
+            self, mock_bridge_for_ls, capsys):
+        """A missing path on an unconfirmed volume must not look healthy."""
+        mock_bridge, fuse_fs_mod = mock_bridge_for_ls
+        mock_bridge.is_mounted.return_value = fuse_fs_mod.MountState(
+            None, None, "handler did not report disk info")
+        mock_bridge.list_dir_path.return_value = []
+        mock_bridge.stat_path.return_value = None
+
+        with pytest.raises(SystemExit) as exc_info:
+            fuse_fs_mod.cmd_ls(self._ls_args(path="S"))
+        data = json.loads(capsys.readouterr().out)
+
+        assert exc_info.value.code == 1
+        assert data["error"]["code"] == "FILE_NOT_FOUND"
+        assert data["error"]["details"]["filesystem_responsive"] is None
+        assert data["error"]["details"]["mount_state_reason"] == (
+            "handler did not report disk info")
+
+    def test_ls_path_not_found_on_healthy_volume_is_distinguishable(
+            self, mock_bridge_for_ls, capsys):
+        mock_bridge, fuse_fs_mod = mock_bridge_for_ls
+        mock_bridge.list_dir_path.return_value = []
+        mock_bridge.stat_path.return_value = None
+
+        with pytest.raises(SystemExit):
+            fuse_fs_mod.cmd_ls(self._ls_args(path="S"))
+        data = json.loads(capsys.readouterr().out)
+
+        assert data["error"]["code"] == "FILE_NOT_FOUND"
+        assert data["error"]["details"]["filesystem_responsive"] is True
+        assert "mount_state_reason" not in data["error"]["details"]
 
     def test_ls_unknown_mount_state_json(self, mock_bridge_for_ls, capsys):
         """An inconclusive mount is reported, but still lists and exits 0."""
         mock_bridge, fuse_fs_mod = mock_bridge_for_ls
-        mock_bridge.is_mounted.return_value = (
+        mock_bridge.is_mounted.return_value = fuse_fs_mod.MountState(
             None, None, "handler did not report disk info",
         )
         mock_bridge.list_dir_path.return_value = []
@@ -1741,7 +1781,7 @@ class TestCmdLs:
     def test_ls_unknown_mount_state_warns_on_empty_human(
             self, mock_bridge_for_ls, capsys):
         mock_bridge, fuse_fs_mod = mock_bridge_for_ls
-        mock_bridge.is_mounted.return_value = (
+        mock_bridge.is_mounted.return_value = fuse_fs_mod.MountState(
             None, None, "handler did not report disk info",
         )
         mock_bridge.list_dir_path.return_value = []
@@ -2069,11 +2109,11 @@ class TestQueryDiskInfo:
         import amifuse.fuse_fs as fuse_fs_mod
 
         mem_bridge = self._query(fuse_fs_mod, monkeypatch, [(0, 0x9999, 0, 225)])[1]
-        mounted, info, reason = mem_bridge.is_mounted()
+        state = mem_bridge.is_mounted()
 
-        assert mounted is False
-        assert info is None
-        assert reason == "not a DOS disk"
+        assert state.mounted is False
+        assert state.info is None
+        assert state.reason == "not a DOS disk"
 
     def test_end_to_end_ndos_disk_type_is_not_mounted(self, fuse_mock, monkeypatch):
         """An NDOS id_DiskType read from offset 24 drives the same verdict."""
@@ -2081,11 +2121,11 @@ class TestQueryDiskInfo:
 
         fields = dict(self.PLANTED, id_DiskType=0x4E444F53)
         mem_bridge = self._query(fuse_fs_mod, monkeypatch, [(0, 0x9999, 1, 0)], fields)[1]
-        mounted, info, reason = mem_bridge.is_mounted()
+        state = mem_bridge.is_mounted()
 
-        assert mounted is False
-        assert info["disk_type"] == 0x4E444F53
-        assert reason == "not a DOS disk"
+        assert state.mounted is False
+        assert state.info["disk_type"] == 0x4E444F53
+        assert state.reason == "not a DOS disk"
 
 
 # ---------------------------------------------------------------------------
@@ -2105,11 +2145,11 @@ class TestHandlerBridgeMountState:
     def test_missing_disk_info_is_inconclusive(self, fuse_mock):
         import amifuse.fuse_fs as fuse_fs_mod
 
-        mounted, info, reason = self._mount_state(fuse_fs_mod, None)
+        state = self._mount_state(fuse_fs_mod, None)
 
-        assert mounted is None
-        assert info is None
-        assert reason == "handler did not report disk info"
+        assert state.mounted is None
+        assert state.info is None
+        assert state.reason == "handler did not report disk info"
 
     @pytest.mark.parametrize(("disk_type", "expected_reason"), [
         (0xFFFFFFFF, "no disk present"),
@@ -2123,62 +2163,62 @@ class TestHandlerBridgeMountState:
         import amifuse.fuse_fs as fuse_fs_mod
 
         disk_info = {"disk_type": disk_type, "volume_node": 1}
-        mounted, info, reason = self._mount_state(fuse_fs_mod, disk_info)
+        state = self._mount_state(fuse_fs_mod, disk_info)
 
-        assert mounted is False
-        assert info is disk_info
-        assert reason == expected_reason
+        assert state.mounted is False
+        assert state.info is disk_info
+        assert state.reason == expected_reason
 
     def test_disk_type_is_authoritative_without_volume_node(self, fuse_mock):
         import amifuse.fuse_fs as fuse_fs_mod
 
         disk_info = {"disk_type": 0x50465303, "volume_node": 0}
-        mounted, info, reason = self._mount_state(fuse_fs_mod, disk_info)
+        state = self._mount_state(fuse_fs_mod, disk_info)
 
-        assert mounted is True
-        assert info is disk_info
-        assert reason is None
+        assert state.mounted is True
+        assert state.info is disk_info
+        assert state.reason is None
 
     def test_msdos_disk_type_can_be_mounted(self, fuse_mock):
         import amifuse.fuse_fs as fuse_fs_mod
 
         disk_info = {"disk_type": 0x4D534400, "volume_node": 0}
-        mounted, info, reason = self._mount_state(fuse_fs_mod, disk_info)
+        state = self._mount_state(fuse_fs_mod, disk_info)
 
-        assert mounted is True
-        assert info is disk_info
-        assert reason is None
+        assert state.mounted is True
+        assert state.info is disk_info
+        assert state.reason is None
 
     def test_unknown_disk_type_and_volume_node_is_inconclusive(
             self, fuse_mock):
         import amifuse.fuse_fs as fuse_fs_mod
 
         disk_info = {"disk_type": 0, "volume_node": 0}
-        mounted, info, reason = self._mount_state(fuse_fs_mod, disk_info)
+        state = self._mount_state(fuse_fs_mod, disk_info)
 
-        assert mounted is None
-        assert info is disk_info
-        assert reason == "handler reported no disk type or volume node"
+        assert state.mounted is None
+        assert state.info is disk_info
+        assert state.reason == "handler reported no disk type or volume node"
 
     def test_volume_node_confirms_unknown_disk_type(self, fuse_mock):
         import amifuse.fuse_fs as fuse_fs_mod
 
         disk_info = {"disk_type": 0, "volume_node": 1}
-        mounted, info, reason = self._mount_state(fuse_fs_mod, disk_info)
+        state = self._mount_state(fuse_fs_mod, disk_info)
 
-        assert mounted is True
-        assert info is disk_info
-        assert reason is None
+        assert state.mounted is True
+        assert state.info is disk_info
+        assert state.reason is None
 
     def test_valid_volume_is_mounted(self, fuse_mock):
         import amifuse.fuse_fs as fuse_fs_mod
 
         disk_info = {"disk_type": 0x50465303, "volume_node": 1}
-        mounted, info, reason = self._mount_state(fuse_fs_mod, disk_info)
+        state = self._mount_state(fuse_fs_mod, disk_info)
 
-        assert mounted is True
-        assert info is disk_info
-        assert reason is None
+        assert state.mounted is True
+        assert state.info is disk_info
+        assert state.reason is None
 
     @pytest.mark.parametrize(("res2", "expected_reason"), [
         (225, "not a DOS disk"),  # ERROR_NOT_A_DOS_DISK
@@ -2190,41 +2230,41 @@ class TestHandlerBridgeMountState:
         """A DOSFALSE reply naming an unusable volume is a negative answer."""
         import amifuse.fuse_fs as fuse_fs_mod
 
-        mounted, info, reason = self._mount_state(fuse_fs_mod, None, res2)
+        state = self._mount_state(fuse_fs_mod, None, res2)
 
-        assert mounted is False
-        assert info is None
-        assert reason == expected_reason
+        assert state.mounted is False
+        assert state.info is None
+        assert state.reason == expected_reason
 
     def test_unimplemented_packet_is_inconclusive(self, fuse_mock):
         """ERROR_ACTION_NOT_KNOWN says nothing about the volume."""
         import amifuse.fuse_fs as fuse_fs_mod
 
-        mounted, info, reason = self._mount_state(fuse_fs_mod, None, 209)
+        state = self._mount_state(fuse_fs_mod, None, 209)
 
-        assert mounted is None
-        assert info is None
-        assert "209" in reason
+        assert state.mounted is None
+        assert state.info is None
+        assert "209" in state.reason
 
     def test_refusal_with_unknown_error_is_inconclusive(self, fuse_mock):
         """An undiagnostic refusal must not condemn a possibly healthy image."""
         import amifuse.fuse_fs as fuse_fs_mod
 
-        mounted, info, reason = self._mount_state(fuse_fs_mod, None, 202)
+        state = self._mount_state(fuse_fs_mod, None, 202)
 
-        assert mounted is None
-        assert info is None
-        assert "202" in reason
+        assert state.mounted is None
+        assert state.info is None
+        assert "202" in state.reason
 
     def test_silence_is_distinct_from_refusal(self, fuse_mock):
         """No reply at all keeps the old inconclusive wording."""
         import amifuse.fuse_fs as fuse_fs_mod
 
-        mounted, info, reason = self._mount_state(fuse_fs_mod, None, None)
+        state = self._mount_state(fuse_fs_mod, None, None)
 
-        assert mounted is None
-        assert info is None
-        assert reason == "handler did not report disk info"
+        assert state.mounted is None
+        assert state.info is None
+        assert state.reason == "handler did not report disk info"
 
     def test_get_disk_info_returns_only_the_dict(self, fuse_mock):
         """The public accessor keeps its Optional[Dict] contract."""
@@ -2399,7 +2439,7 @@ class TestCmdVerify:
 
     def test_verify_unmounted_volume_json(self, mock_bridge_for_verify, capsys):
         mock_bridge, fuse_fs_mod = mock_bridge_for_verify
-        mock_bridge.is_mounted.return_value = (
+        mock_bridge.is_mounted.return_value = fuse_fs_mod.MountState(
             False, {"disk_type": 0x4E444F53, "volume_node": 0},
             "not a DOS disk",
         )
@@ -2432,7 +2472,7 @@ class TestCmdVerify:
 
     def test_verify_unmounted_volume_human(self, mock_bridge_for_verify, capsys):
         mock_bridge, fuse_fs_mod = mock_bridge_for_verify
-        mock_bridge.is_mounted.return_value = (
+        mock_bridge.is_mounted.return_value = fuse_fs_mod.MountState(
             False, {"disk_type": 0x42414400, "volume_node": 0},
             "unreadable disk",
         )
@@ -2461,9 +2501,10 @@ class TestCmdVerify:
         mock_bridge.volume_name.assert_not_called()
 
     def test_verify_refused_disk_info_json(self, mock_bridge_for_verify, capsys):
-        """A refusal has no InfoData, so no id_DiskType may be reported."""
+        """A refusal has no InfoData, so res2 stands in for id_DiskType."""
         mock_bridge, fuse_fs_mod = mock_bridge_for_verify
-        mock_bridge.is_mounted.return_value = (False, None, "not a DOS disk")
+        mock_bridge.is_mounted.return_value = fuse_fs_mod.MountState(
+            False, None, "not a DOS disk", 225)
 
         args = argparse.Namespace(
             image=Path("/fake/test.hdf"),
@@ -2483,14 +2524,15 @@ class TestCmdVerify:
         assert exc_info.value.code == 1
         assert data["error"]["code"] == "NOT_MOUNTED"
         assert "not a DOS disk" in data["error"]["message"]
-        # No InfoData was returned, so there is nothing to report in details
-        assert "details" not in data["error"]
+        # No InfoData, so no id_DiskType -- but res2 keeps the branch
+        # machine-readable rather than leaving only prose in the message
+        assert data["error"]["details"] == {"dos_error": 225}
         mock_bridge.stat_path.assert_not_called()
         mock_bridge.list_dir_path.assert_not_called()
 
     def test_verify_refused_disk_info_human(self, mock_bridge_for_verify, capsys):
         mock_bridge, fuse_fs_mod = mock_bridge_for_verify
-        mock_bridge.is_mounted.return_value = (False, None, "no disk present")
+        mock_bridge.is_mounted.return_value = fuse_fs_mod.MountState(False, None, "no disk present")
 
         args = argparse.Namespace(
             image=Path("/fake/test.hdf"),
@@ -2514,7 +2556,7 @@ class TestCmdVerify:
 
     def test_verify_unmounted_file_json(self, mock_bridge_for_verify, capsys):
         mock_bridge, fuse_fs_mod = mock_bridge_for_verify
-        mock_bridge.is_mounted.return_value = (
+        mock_bridge.is_mounted.return_value = fuse_fs_mod.MountState(
             False, {"disk_type": 0x4E444F53, "volume_node": 0},
             "not a DOS disk",
         )
@@ -2542,7 +2584,7 @@ class TestCmdVerify:
             self, mock_bridge_for_verify, capsys):
         """The diagnosis must stay attached to the file the user asked about."""
         mock_bridge, fuse_fs_mod = mock_bridge_for_verify
-        mock_bridge.is_mounted.return_value = (
+        mock_bridge.is_mounted.return_value = fuse_fs_mod.MountState(
             False, {"disk_type": 0x4E444F53, "volume_node": 0},
             "not a DOS disk",
         )
@@ -2570,7 +2612,7 @@ class TestCmdVerify:
             self, mock_bridge_for_verify, capsys):
         """FILE_NOT_FOUND must not look identical on a healthy volume."""
         mock_bridge, fuse_fs_mod = mock_bridge_for_verify
-        mock_bridge.is_mounted.return_value = (
+        mock_bridge.is_mounted.return_value = fuse_fs_mod.MountState(
             None, None, "handler did not report disk info",
         )
         mock_bridge.stat_path.return_value = None
@@ -2622,7 +2664,7 @@ class TestCmdVerify:
     def test_verify_unknown_mount_status_is_reported_for_file_json(
             self, mock_bridge_for_verify, capsys):
         mock_bridge, fuse_fs_mod = mock_bridge_for_verify
-        mock_bridge.is_mounted.return_value = (
+        mock_bridge.is_mounted.return_value = fuse_fs_mod.MountState(
             None, None, "handler did not report disk info",
         )
         mock_bridge.stat_path.return_value = {
@@ -2651,7 +2693,7 @@ class TestCmdVerify:
     def test_verify_unknown_mount_status_is_reported_for_volume_json(
             self, mock_bridge_for_verify, capsys):
         mock_bridge, fuse_fs_mod = mock_bridge_for_verify
-        mock_bridge.is_mounted.return_value = (
+        mock_bridge.is_mounted.return_value = fuse_fs_mod.MountState(
             None, None, "handler did not report disk info",
         )
         mock_bridge.list_dir_path.return_value = []
@@ -2677,7 +2719,7 @@ class TestCmdVerify:
     def test_verify_unknown_mount_status_is_reported_for_file_human(
             self, mock_bridge_for_verify, capsys):
         mock_bridge, fuse_fs_mod = mock_bridge_for_verify
-        mock_bridge.is_mounted.return_value = (
+        mock_bridge.is_mounted.return_value = fuse_fs_mod.MountState(
             None, None, "handler did not report disk info",
         )
         mock_bridge.stat_path.return_value = {
