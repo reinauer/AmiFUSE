@@ -179,8 +179,8 @@ class BootstrapAllocator:
             dev_mem = self.alloc.alloc_memory(len(dev_bstr), label="dev_bstr")
             self.mem.w_block(dev_mem.addr, dev_bstr)
             _scalar_field(fssm, "fssm_Unit").val = 0
-            _scalar_field(fssm, "fssm_Device").val = dev_mem.addr >> 2
-            _scalar_field(fssm, "fssm_Environ").val = env_mem.addr >> 2
+            _scalar_field(fssm, "fssm_Device").bptr = dev_mem.addr >> 2
+            _scalar_field(fssm, "fssm_Environ").bptr = env_mem.addr >> 2
             _scalar_field(fssm, "fssm_Flags").val = 0
 
             # DeviceNode
@@ -189,17 +189,17 @@ class BootstrapAllocator:
             name_bstr = bytes([len(handler_name)]) + handler_name.encode("ascii")
             name_mem = self.alloc.alloc_memory(len(name_bstr), label="dn_name")
             self.mem.w_block(name_mem.addr, name_bstr)
-            _scalar_field(dn, "dn_Next").val = 0
-            _scalar_field(dn, "dn_Type").val = 0
-            _scalar_field(dn, "dn_Task").val = 0
-            _scalar_field(dn, "dn_Lock").val = 0
-            _scalar_field(dn, "dn_Handler").val = handler_seglist_bptr
-            _scalar_field(dn, "dn_StackSize").val = 0
-            _scalar_field(dn, "dn_Priority").val = 0
-            _scalar_field(dn, "dn_Startup").val = fssm_mem.addr >> 2
-            _scalar_field(dn, "dn_SegList").val = handler_seglist_bptr
-            _scalar_field(dn, "dn_GlobalVec").val = -1
-            _scalar_field(dn, "dn_Name").val = name_mem.addr >> 2
+            dn.dol_Next.bptr = 0
+            dn.dol_Type.val = 0
+            dn.dol_Task.aptr = 0
+            dn.dol_Lock.bptr = 0
+            dn.dol_Handler.bptr = handler_seglist_bptr
+            dn.dol_StackSize.val = 0
+            dn.dol_Priority.val = 0
+            dn.dol_Startup.val = fssm_mem.addr >> 2
+            dn.dol_SegList.bptr = handler_seglist_bptr
+            dn.dol_GlobVec.bptr = 0xFFFFFFFF
+            dn.dol_Name.bptr = name_mem.addr >> 2
 
             return {
                 "env_addr": env_mem.addr,
