@@ -18,6 +18,7 @@ if str(AMITOOLS_PATH) not in sys.path:
 
 from amitools.fs.blkdev.RawBlockDevice import RawBlockDevice  # type: ignore  # noqa: E402
 from amitools.fs.rdb.RDisk import RDisk  # type: ignore  # noqa: E402
+from amitools.vamos.disk import HostFileLock  # type: ignore  # noqa: E402
 
 
 class BlockDeviceBackend:
@@ -37,6 +38,11 @@ class BlockDeviceBackend:
         self.iso_info = iso_info  # ISOInfo if this is an ISO image
         self.mbr_partition_index = mbr_partition_index  # For MBR disks with multiple 0x76 partitions
         self.mbr_context = None  # MBRContext if opened via MBR partition
+        self.host_lock = HostFileLock(image, read_only=read_only)
+
+    @property
+    def exclusive(self):
+        return self.host_lock.is_locked
 
     def _setup_geometry(self):
         """Set geometry fields from the open RDB."""
@@ -48,6 +54,16 @@ class BlockDeviceBackend:
         self.total_blocks = pd.cyls * pd.heads * pd.secs
 
     def open(self):
+        if self.blkdev is not None:
+            return
+        self.host_lock.acquire()
+        try:
+            self._open_image()
+        except Exception:
+            self.close()
+            raise
+
+    def _open_image(self):
         from .rdb_inspect import open_rdisk
 
         # For ADF images, skip RDB/MBR parsing and use synthetic geometry
@@ -91,12 +107,29 @@ class BlockDeviceBackend:
         self._setup_geometry()
 
     def close(self):
-        if self.rdb:
-            self.rdb.close()
-            self.rdb = None
-        if self.blkdev:
-            self.blkdev.close()
-            self.blkdev = None
+        rdisk = self.rdb
+        blkdev = self.blkdev
+        self.rdb = None
+        self.blkdev = None
+        first_error = None
+        try:
+            if rdisk:
+                rdisk.close()
+        except Exception as exc:
+            first_error = exc
+        try:
+            if blkdev:
+                blkdev.close()
+        except Exception as exc:
+            if first_error is None:
+                first_error = exc
+        try:
+            self.host_lock.release()
+        except Exception as exc:
+            if first_error is None:
+                first_error = exc
+        if first_error is not None:
+            raise first_error
 
     def read_blocks(self, blk_num: int, num_blks: int = 1) -> bytes:
         if not self.blkdev:
