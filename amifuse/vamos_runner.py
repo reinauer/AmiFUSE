@@ -34,8 +34,7 @@ class SimpleRunState:
 from amitools.vamos.path import VamosPathManager
 from amitools.vamos.schedule import Scheduler
 from amitools.vamos.libmgr import SetupLibManager
-# local fake scsi.device
-from amifuse.scsi_device import ScsiDevice
+from amitools.vamos.disk import DiskSession
 
 _LOG_SETUP_DONE = False
 
@@ -80,9 +79,19 @@ class VamosHandlerRuntime:
         self.slm: Optional[SetupLibManager] = None
         self.seglist_baddr: Optional[int] = None
         self._temp_dir: Optional[tempfile.TemporaryDirectory] = None
+        self.disk_session = DiskSession(
+            acknowledge_read_only_writes=True,
+            acknowledge_unsupported_commands=True,
+        )
+        self.scsi_backend = None
+        self.scsi_debug = False
 
     def setup(self, cpu: Optional[str] = None):
         _reset_runtime_state()
+        self.disk_session = DiskSession(
+            acknowledge_read_only_writes=True,
+            acknowledge_unsupported_commands=True,
+        )
         # Use default vamos configs (bin argument required, so pass a dummy).
         mp = VamosMainParser()
         mp.parse(paths=None, args=["dummy"], cfg_dict=None)
@@ -163,11 +172,9 @@ class VamosHandlerRuntime:
             raise RuntimeError("Failed to parse lib manager config")
         self.slm.setup()
         self.slm.open_base_libs()
-        # register fake scsi.device backed by backend placeholder
-        # actual backend will be set by caller via set_scsi_backend()
-        self.scsi_backend = None
-        self.scsi_debug = False
-        self.slm.lib_mgr.add_impl_cls("scsi.device", lambda: ScsiDevice(self.scsi_backend, self.scsi_debug))
+        # Register the shared vamos disk device. The backend is supplied by
+        # HandlerBridge after it has applied AmiFUSE's image detection.
+        self.disk_session.install_devices(self.slm)
         from amifuse.null_device import NullDevice  # lazy import to avoid cycles
         from amitools.vamos.lib.TimerDevice import TimerDevice
         self.slm.lib_mgr.add_impl_cls("keyboard.device", NullDevice)
@@ -252,6 +259,8 @@ class VamosHandlerRuntime:
     def set_scsi_backend(self, backend, debug=False):
         self.scsi_backend = backend
         self.scsi_debug = debug
+        self.disk_session.debug = debug
+        self.disk_session.set_backend(0, backend, owned=False)
 
     def enable_trace(self, show_regs: bool = False):
         if not self.machine:
@@ -271,6 +280,12 @@ class VamosHandlerRuntime:
 
     def shutdown(self):
         _reset_runtime_state()
+        self.disk_session.close()
+        self.disk_session = DiskSession(
+            acknowledge_read_only_writes=True,
+            acknowledge_unsupported_commands=True,
+        )
+        self.scsi_backend = None
         # Handlers may leave internal library/device state in a partially
         # torn-down state by the time AmiFuse unmounts. Calling
         # close_base_libs() here can end up touching stale Library structs
