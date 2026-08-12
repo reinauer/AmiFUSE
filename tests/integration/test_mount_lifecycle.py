@@ -69,28 +69,24 @@ def test_mounted_root_listable(pfs3_mount):
     )
 
 
-def test_file_read_matches_hash(pfs3_mount, pfs3_image, pfs3_driver):
+def test_file_read_matches_hash(mount_image, pfs3_image, pfs3_driver):
     """Read a file through the mount and compare its hash to amifuse hash output."""
-    _proc, mountpoint = pfs3_mount
+    target = "foo.md"
+
+    # Obtain the reference before mounting. The mount owns an exclusive
+    # host-file lock, so another image-backed command must not run while it
+    # is active.
+    result = _run_amifuse(
+        "hash", str(pfs3_image),
+        "--file", target,
+        "--driver", str(pfs3_driver),
+        "--json",
+    )
+    assert result.returncode == 0, result.stderr
+    expected_hash = json.loads(result.stdout)["hash"]
+
+    _proc, mountpoint = mount_image(pfs3_image, driver=pfs3_driver)
     mp = str(mountpoint)
-
-    # Pick the first regular file in the root (skip .info icon files
-    # which may have restricted permissions on the FUSE mount)
-    entries = os.listdir(mp)
-    target = None
-    for entry in entries:
-        if entry.lower().endswith(".info"):
-            continue
-        full = os.path.join(mp, entry)
-        try:
-            if os.path.isfile(full):
-                target = entry
-                break
-        except OSError:
-            continue
-
-    if target is None:
-        pytest.skip("No regular files found in mounted volume root")
 
     # Read file content through FUSE mount
     fuse_path = os.path.join(mp, target)
@@ -104,22 +100,6 @@ def test_file_read_matches_hash(pfs3_mount, pfs3_image, pfs3_driver):
         )
     fuse_hash = hashlib.sha256(fuse_content).hexdigest()
 
-    # Get hash via amifuse hash command (reads image directly, no FUSE)
-    # amifuse hash requires --file flag and --driver for PFS3
-    result = _run_amifuse(
-        "hash", str(pfs3_image),
-        "--file", target,
-        "--driver", str(pfs3_driver),
-        "--json",
-    )
-    if result.returncode != 0:
-        pytest.skip(
-            f"amifuse hash not available or failed: {result.stderr}"
-        )
-
-    # Parse hash from JSON output
-    hash_data = json.loads(result.stdout)
-    expected_hash = hash_data["hash"]
     assert fuse_hash == expected_hash, (
         f"Hash mismatch.\n"
         f"FUSE read SHA256: {fuse_hash}\n"

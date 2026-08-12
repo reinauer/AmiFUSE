@@ -1,9 +1,7 @@
 """Unit tests for amifuse.scsi_device module."""
 
-import inspect
-import struct
 import pytest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 from amitools.vamos.machine.mock.mem import MockMemory
 from amitools.vamos.libstructs.exec_ import IORequestStruct
@@ -58,52 +56,18 @@ class TestBlockBoundsChecking:
     def test_check_bounds_overflow(self, scsi):
         assert scsi._check_block_bounds(500, 501) is False
 
-    def test_begin_io_has_bounds_checking(self):
-        """Verify BeginIO dispatches through _check_block_bounds."""
+    def test_compat_module_exports_shared_device(self):
+        """The historical AmiFUSE import resolves to the shared device."""
         from amifuse.scsi_device import ScsiDevice
-        source = inspect.getsource(ScsiDevice.BeginIO)
-        assert "_check_block_bounds" in source
+        from amitools.vamos.lib.ScsiDevice import ScsiDevice as SharedScsiDevice
 
+        assert ScsiDevice is SharedScsiDevice
 
-class TestReadCapacityOverflow:
-    """Tests for READ CAPACITY(10) overflow handling."""
+    def test_compat_module_exports_io_request_struct(self):
+        """Fault-injection users retain the historical struct import."""
+        from amifuse.scsi_device import IORequestStruct as CompatIORequestStruct
 
-    def test_read_capacity_normal_image(self):
-        """Verify READ CAPACITY(10) returns correct last_lba for small images."""
-        total_blocks = 1000
-        last_lba = total_blocks - 1
-        if last_lba > 0xFFFFFFFF:
-            last_lba = 0xFFFFFFFF
-        assert last_lba == 999
-        packed = last_lba.to_bytes(4, "big")
-        assert packed == b"\x00\x00\x03\xe7"
-
-    def test_read_capacity_2tb_overflow(self):
-        """Verify READ CAPACITY(10) caps last_lba at 0xFFFFFFFF for >2TB."""
-        total_blocks = 2**32 + 100
-        last_lba = total_blocks - 1
-        if last_lba > 0xFFFFFFFF:
-            last_lba = 0xFFFFFFFF
-        assert last_lba == 0xFFFFFFFF
-        packed = last_lba.to_bytes(4, "big")
-        assert packed == b"\xff\xff\xff\xff"
-
-    def test_read_capacity_exactly_2tb(self):
-        """Verify READ CAPACITY(10) handles exactly 2^32 blocks (boundary)."""
-        total_blocks = 2**32
-        last_lba = total_blocks - 1
-        if last_lba > 0xFFFFFFFF:
-            last_lba = 0xFFFFFFFF
-        assert last_lba == 0xFFFFFFFF
-        packed = last_lba.to_bytes(4, "big")
-        assert packed == b"\xff\xff\xff\xff"
-
-    def test_read_capacity_source_has_cap(self):
-        """Verify READ CAPACITY(10) has the 0xFFFFFFFF cap in source."""
-        from amifuse.scsi_device import ScsiDevice
-        source = inspect.getsource(ScsiDevice.BeginIO)
-        assert "0xFFFFFFFF" in source
-        assert "last_lba > 0xFFFFFFFF" in source
+        assert CompatIORequestStruct is IORequestStruct
 
 
 class TestScsiWriteShortBuffer:
@@ -126,6 +90,7 @@ class TestScsiWriteShortBuffer:
         ior = IORequestStruct(mem, self.IOR_ADDR)
         ior.command.val = 28  # HD_SCSICMD
         ior.data.val = self.SCSI_CMD_ADDR  # buf_ptr -> SCSICmdStruct
+        ior.length.val = SCSICmdStruct.get_byte_size()
 
         # Build SCSICmdStruct at SCSI_CMD_ADDR
         scsi_struct = SCSICmdStruct(mem, self.SCSI_CMD_ADDR)
