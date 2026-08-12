@@ -662,9 +662,9 @@ class HandlerLauncher:
             sigbit=0xFF,
             flags=MsgPortFlags.PA_IGNORE,
         )
-        # fill DeviceNode dn_Task now that we have a port
+        # Fill DeviceNode dol_Task now that we have a port.
         dn = DeviceNodeStruct(self.mem, self.boot["dn_addr"])
-        dn.sfields.get_field_by_name("dn_Task").val = port_addr
+        dn.dol_Task.aptr = port_addr
         # startup packet args per pfs3: Arg1=mount name, Arg2=FSSM BPTR, Arg3=DeviceNode BPTR
         startup_pkt, startup_msg = self._build_std_packet(
             port_addr,

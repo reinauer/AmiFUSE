@@ -1018,7 +1018,12 @@ class HandlerBridge:
             if not new_port:
                 from .amiga_structs import DeviceNodeStruct
                 dn_addr = self.launcher.boot["dn_addr"]
-                dn_task = self.mem.r32(dn_addr + DeviceNodeStruct.sdef.find_field_def_by_name("dn_Task").offset)
+                dn_task = self.mem.r32(
+                    dn_addr
+                    + DeviceNodeStruct.sdef.find_field_def_by_name(
+                        "dol_Task"
+                    ).offset
+                )
                 if dn_task and dn_task != self.state.port_addr:
                     new_port = dn_task
                     if self._debug:
