@@ -71,7 +71,18 @@ def test_mounted_root_listable(pfs3_mount):
 
 def test_file_read_matches_hash(mount_image, pfs3_image, pfs3_driver):
     """Read a file through the mount and compare its hash to amifuse hash output."""
-    target = "foo.md"
+    listing = _run_amifuse(
+        "ls", str(pfs3_image), "--driver", str(pfs3_driver), "--json",
+    )
+    assert listing.returncode == 0, (
+        f"Cannot list fixture {pfs3_image}: {listing.stderr or listing.stdout}"
+    )
+    target = next((entry["name"] for entry in json.loads(listing.stdout)["entries"]
+                   if entry["type"] == "file"
+                   and not entry["name"].lower().endswith(".info")
+                   and not entry.get("protection_bits", 0) & 8), None)
+    if target is None:
+        pytest.skip(f"Fixture {pfs3_image} has no readable regular file except icons")
 
     # Obtain the reference before mounting. The mount owns an exclusive
     # host-file lock, so another image-backed command must not run while it
@@ -82,7 +93,10 @@ def test_file_read_matches_hash(mount_image, pfs3_image, pfs3_driver):
         "--driver", str(pfs3_driver),
         "--json",
     )
-    assert result.returncode == 0, result.stderr
+    assert result.returncode == 0, (
+        f"Cannot hash fixture file {pfs3_image}:{target}: "
+        f"{result.stderr or result.stdout}"
+    )
     expected_hash = json.loads(result.stdout)["hash"]
 
     _proc, mountpoint = mount_image(pfs3_image, driver=pfs3_driver)
