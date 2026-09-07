@@ -31,7 +31,7 @@ classifiers = [
 
 dependencies = [
     "fusepy>=3.0",
-    "amitools-amifuse[vamos]>=0.8.0.post7",
+    "amitools-amifuse[vamos]>=0.8.0.post8",
 ]
 
 [project.scripts]
