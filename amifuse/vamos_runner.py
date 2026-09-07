@@ -279,32 +279,42 @@ class VamosHandlerRuntime:
         return seg_baddr
 
     def shutdown(self):
-        _reset_runtime_state()
-        self.disk_session.close()
-        self.disk_session = DiskSession(
-            acknowledge_read_only_writes=True,
-            acknowledge_unsupported_commands=True,
-        )
-        self.scsi_backend = None
+        first_error = None
+        try:
+            _reset_runtime_state()
+        except BaseException as exc:
+            first_error = exc
         # Handlers may leave internal library/device state in a partially
         # torn-down state by the time AmiFuse unmounts. Calling
         # close_base_libs() here can end up touching stale Library structs
         # during open-count updates, which crashes inside machine68k. For this
         # short-lived runtime we let the lib manager's shutdown path decide
         # what can still be expunged safely and then tear down the machine.
-        if self.slm:
-            self.slm.cleanup()
-            self.slm = None
-        if self.path_mgr:
-            self.path_mgr.shutdown()
-            self.path_mgr = None
-        if self.mem_map:
-            self.mem_map.cleanup()
-            self.mem_map = None
-        if self.machine:
-            self.machine.cleanup()
-            self.machine = None
-        if self._temp_dir:
-            self._temp_dir.cleanup()
-            self._temp_dir = None
-        _reset_runtime_state()
+        for attr, method in (
+            ("disk_session", "close"),
+            ("slm", "cleanup"),
+            ("path_mgr", "shutdown"),
+            ("mem_map", "cleanup"),
+            ("machine", "cleanup"),
+            ("_temp_dir", "cleanup"),
+        ):
+            resource = getattr(self, attr)
+            setattr(self, attr, None)
+            try:
+                if resource is not None:
+                    getattr(resource, method)()
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
+        self.disk_session = DiskSession(
+            acknowledge_read_only_writes=True,
+            acknowledge_unsupported_commands=True,
+        )
+        self.scsi_backend = None
+        try:
+            _reset_runtime_state()
+        except BaseException as exc:
+            if first_error is None:
+                first_error = exc
+        if first_error is not None:
+            raise first_error

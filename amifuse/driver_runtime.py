@@ -59,8 +59,13 @@ class BlockDeviceBackend:
         self.host_lock.acquire()
         try:
             self._open_image()
-        except Exception:
-            self.close()
+        except BaseException:
+            # Cleanup must also run for SystemExit during image validation,
+            # while preserving the failure that caused the open to abort.
+            try:
+                self.close()
+            except BaseException:
+                pass
             raise
 
     def _open_image(self):
@@ -115,17 +120,17 @@ class BlockDeviceBackend:
         try:
             if rdisk:
                 rdisk.close()
-        except Exception as exc:
+        except BaseException as exc:
             first_error = exc
         try:
             if blkdev:
                 blkdev.close()
-        except Exception as exc:
+        except BaseException as exc:
             if first_error is None:
                 first_error = exc
         try:
             self.host_lock.release()
-        except Exception as exc:
+        except BaseException as exc:
             if first_error is None:
                 first_error = exc
         if first_error is not None:
