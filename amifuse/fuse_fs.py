@@ -215,6 +215,23 @@ class HandlerBridge:
         self._debug = debug
         self._adf_info = adf_info
         self._iso_info = iso_info
+        self.backend = None
+        self.vh = None
+        self._closed = False
+        try:
+            self._initialize(image, driver, block_size, read_only, debug,
+                             trace, partition, adf_info, iso_info)
+        except BaseException:
+            # A failed constructor has no caller that can close it. Preserve
+            # the startup error even if tearing down partial state also fails.
+            try:
+                self.close()
+            except BaseException:
+                pass
+            raise
+
+    def _initialize(self, image, driver, block_size, read_only, debug,
+                    trace, partition, adf_info, iso_info):
         # For MBR images with multiple 0x76 partitions, find the right one
         mbr_idx = None
         if partition and adf_info is None and iso_info is None:
@@ -429,20 +446,29 @@ class HandlerBridge:
                 f"[amifuse] handler loaded seg_baddr=0x{seg_baddr:x} seg_addr=0x{seg_addr:x} "
                 f"port=0x{self.state.port_addr:x} reply=0x{self.state.reply_port_addr:x}"
             )
-        self._closed = False
 
     def close(self):
         if getattr(self, "_closed", False):
             return
         self._closed = True
-        shutdown = getattr(getattr(self, "vh", None), "shutdown", None)
-        if shutdown is not None:
-            shutdown()
-            self.vh = None
+        runtime = getattr(self, "vh", None)
         backend = getattr(self, "backend", None)
-        if backend is not None:
-            backend.close()
-            self.backend = None
+        self.vh = None
+        self.backend = None
+        first_error = None
+        try:
+            if runtime is not None:
+                runtime.shutdown()
+        except BaseException as exc:
+            first_error = exc
+        try:
+            if backend is not None:
+                backend.close()
+        except BaseException as exc:
+            if first_error is None:
+                first_error = exc
+        if first_error is not None:
+            raise first_error
 
     def _set_saved_main_reg(self, reg_num: int, value: int):
         """Mirror manual register changes into the saved main handler state."""
