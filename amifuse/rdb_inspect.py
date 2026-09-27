@@ -18,6 +18,7 @@ if str(AMITOOLS_PATH) not in sys.path:
 from amitools.fs.blkdev.RawBlockDevice import RawBlockDevice  # type: ignore  # noqa: E402
 from amitools.fs.rdb.RDisk import RDisk  # type: ignore  # noqa: E402
 import amitools.fs.DosType as DosType  # type: ignore  # noqa: E402
+from amitools.util.Win32Disk import image_size, open_image
 
 
 # ADF geometry constants
@@ -125,7 +126,7 @@ def detect_mbr(image: Path) -> Optional[MBRInfo]:
     Only returns partitions that are non-empty (have sectors).
     """
     try:
-        with open(image, 'rb') as f:
+        with open_image(image) as f:
             block0 = f.read(512)
     except OSError:
         return None
@@ -232,7 +233,7 @@ def detect_adf(image: Path) -> Optional[ADFInfo]:
     Returns ADFInfo if detected, None otherwise.
     """
     try:
-        size = os.path.getsize(image)
+        size = image_size(image)
     except OSError:
         return None
 
@@ -248,7 +249,7 @@ def detect_adf(image: Path) -> Optional[ADFInfo]:
 
     # Read first 4 bytes and check for DOS signature
     try:
-        with open(image, 'rb') as f:
+        with open_image(image) as f:
             header = f.read(4)
     except OSError:
         return None
@@ -295,7 +296,7 @@ def detect_iso(image: Path) -> Optional[ISOInfo]:
     Returns ISOInfo if detected, None otherwise.
     """
     try:
-        size = os.path.getsize(image)
+        size = image_size(image)
     except OSError:
         return None
 
@@ -305,7 +306,7 @@ def detect_iso(image: Path) -> Optional[ISOInfo]:
         return None
 
     try:
-        with open(image, 'rb') as f:
+        with open_image(image) as f:
             f.seek(pvd_offset)
             pvd = f.read(ISO_BLOCK_SIZE)
     except OSError:

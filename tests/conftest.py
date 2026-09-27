@@ -30,6 +30,10 @@ def fuse_mock(monkeypatch):
             from amifuse.fuse_fs import HandlerBridge
             ...
     """
+    # Keep the real, platform-neutral disk helpers available when the root
+    # amitools package below is stubbed (also when this file is run alone).
+    import amitools.util.Win32Disk
+
     fake_fuse = types.ModuleType("fuse")
 
     class _DummyFuseError(RuntimeError):
@@ -125,6 +129,10 @@ def amitools_mock(monkeypatch):
             from amifuse.rdb_inspect import detect_adf
             ...
     """
+    # Format probes now share the real file/device access helper. It loads
+    # no native Windows APIs until a PhysicalDrive is actually opened.
+    import amitools.util.Win32Disk
+
     stubs = {}
     # Build the module hierarchy: amitools, amitools.fs, etc.
     for mod_path in [
