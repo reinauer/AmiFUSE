@@ -135,7 +135,7 @@ def make_rdb(tmp_path, api):
     api.data[:] = path.read_bytes()
 
 
-@pytest.mark.parametrize("path", [DEVICE, r"\\?\physicaldrive02", PureWindowsPath(DEVICE)])
+@pytest.mark.parametrize("path", [DEVICE, DEVICE + "\\", r"\\?\physicaldrive02", PureWindowsPath(DEVICE)])
 def test_device_names(path):
     assert win.physical_drive_number(path) == 2
 
@@ -315,7 +315,7 @@ def test_cli_inspect_accepts_device_without_file_exists(tmp_path, api, monkeypat
     monkeypatch.setattr("sys.argv", ["amifuse", "inspect", DEVICE, "--json"])
     fuse_fs.main()
     result = json.loads(capsys.readouterr().out)
-    assert result["image"] == DEVICE
+    assert result["image"] == str(Path(DEVICE))
     assert "DH0" in json.dumps(result)
 
 
