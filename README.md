@@ -194,6 +194,58 @@ Mount lifecycle:
   does not perform a clean unmount — use the tray or CLI instead.
 - `--profile` implies interactive mode.
 
+### Physical disks on Windows
+
+With WinFsp installed, AmiFUSE can open a USB CF/SD card or other physical
+disk directly using its `\\.\PhysicalDriveN` device name. Open **PowerShell
+as Administrator**, then identify the disk by its name and size:
+
+```powershell
+Get-Disk | Format-Table Number, FriendlyName, BusType, Size
+```
+
+Find the CF card by its **FriendlyName**, **USB** bus type, and **Size**.
+The **Number** column determines the device path: disk **2** is
+`\\.\PhysicalDrive2`, disk **3** is `\\.\PhysicalDrive3`, and so on.
+If you are unsure which disk is the card, compare the command's output with
+the reader unplugged and then plugged in, before mounting it.
+
+For example, if the CF card is disk **2**, inspect its Amiga partitions and
+mount `DH0` at an unused drive letter:
+
+```powershell
+amifuse inspect '\\.\PhysicalDrive2'
+amifuse mount '\\.\PhysicalDrive2' --partition DH0 --mountpoint R:
+amifuse unmount R:
+```
+
+The single quotes are PowerShell quoting; they are not part of the device name.
+
+Mounts are read-only by default. To enable writes to the card itself:
+
+```powershell
+amifuse mount '\\.\PhysicalDrive2' --partition DH0 --mountpoint R: --write
+```
+
+Use the actual disk number and partition name from the commands above.
+Cancel any Windows prompt to initialize or format the Amiga disk.
+
+AmiFUSE holds an exclusive handle to the physical disk for the mount's
+lifetime. Only one AmiFUSE mount/session can own that disk at a time.
+Writable mounts also lock and dismount any Windows volumes on that disk;
+close applications using those volumes first. If a required lock fails,
+the mount fails before AmiFUSE writes to the disk. Unmount with `amifuse unmount`
+before unplugging the card; this flushes writes and releases the disk and
+volume handles. No extra pywin32 dependency is required.
+
+When running this change from source, install the accompanying amitools
+checkout as well as AmiFUSE into your Python environment:
+
+```powershell
+python -m pip install -e './amitools[vamos]'
+python -m pip install -e '.[windows]'
+```
+
 ### Diagnosing Issues
 
 `amifuse doctor` checks that all dependencies (Python, FUSE provider, handlers)

@@ -73,6 +73,7 @@ from .startup_runner import (
 )
 from amitools.vamos.libstructs.dos import FileInfoBlockStruct, FileHandleStruct, DosPacketStruct, InfoDataStruct  # type: ignore
 from amitools.vamos.lib.dos.DosProtection import DosProtection  # type: ignore
+from amitools.util.Win32Disk import is_windows_disk
 
 from . import __version__
 
@@ -3531,7 +3532,7 @@ def _create_bridge_from_args(args, command: str, read_only: bool = True):
     image = args.image
 
     # Validate image exists
-    if not image.exists():
+    if not is_windows_disk(image) and not image.exists():
         if use_json:
             print(_json.dumps(_json_error(command, "IMAGE_NOT_FOUND",
                 f"Image file not found: {image}")))
@@ -4352,7 +4353,7 @@ def cmd_inspect(args):
     use_json = getattr(args, "json", False)
 
     # Check that image exists (before any detection)
-    if not args.image.exists():
+    if not is_windows_disk(args.image) and not args.image.exists():
         if use_json:
             envelope = _json_error("inspect", "IMAGE_NOT_FOUND",
                                    f"Image not found: {args.image}")
@@ -4723,7 +4724,7 @@ commands:
     inspect_parser = subparsers.add_parser(
         "inspect", help="Inspect RDB partitions and filesystems."
     )
-    inspect_parser.add_argument("image", type=Path, help="Disk image file")
+    inspect_parser.add_argument("image", type=Path, help="Disk image file or physical disk device")
     inspect_parser.add_argument(
         "--block-size", type=int, help="Override block size (defaults to auto/512)."
     )
@@ -4739,7 +4740,7 @@ commands:
     mount_parser = subparsers.add_parser(
         "mount", help="Mount an Amiga filesystem image via FUSE."
     )
-    mount_parser.add_argument("image", type=Path, help="Disk image file")
+    mount_parser.add_argument("image", type=Path, help="Disk image file or physical disk device")
     mount_parser.add_argument("--driver", type=Path, help="Filesystem binary (default: extract from RDB if available)")
     mount_parser.add_argument("--mountpoint", type=Path, help="Mount location (default: /Volumes/<partition> on macOS, first free drive letter on Windows)")
     mount_parser.add_argument(
