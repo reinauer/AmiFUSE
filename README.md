@@ -130,6 +130,15 @@ You can override the defaults with `PFS_BENCH_BASELINE`, `PFS_BENCH_IMAGE`,
 
 ## Usage
 
+Handler-backed commands hold an exclusive lock on the whole image, even
+in read-only mode. While an image is mounted, read its files through the
+mount; finish that session before running another `amifuse ls`, `hash`, or
+vamos disk session against the image. Mounting two partitions of one image
+in separate sessions concurrently is also unsupported.
+
+See [shared disk sessions](Docs/disk-session.md) for ownership and device
+compatibility policies.
+
 amifuse uses subcommands for different operations:
 
 ```bash
