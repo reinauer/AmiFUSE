@@ -130,6 +130,9 @@ You can override the defaults with `PFS_BENCH_BASELINE`, `PFS_BENCH_IMAGE`,
 
 ## Usage
 
+See [shared disk sessions](Docs/disk-session.md) for image locking,
+ownership and device compatibility policies.
+
 amifuse uses subcommands for different operations:
 
 ```bash

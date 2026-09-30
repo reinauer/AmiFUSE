@@ -84,6 +84,12 @@ Current canonical fixture set used by the matrix:
 - `fixtures/downloaded/netbsdamiga92.hdf` with `drivers/BFFSFilesystem`
 - `fixtures/readonly/AmigaOS3.2CD.iso` with `drivers/CDFileSystem`
 
+The PFS3 mount/hash test lists the root directory of the PFS3 image and
+picks a regular, read-enabled, non-`.info` file. It requires no particular
+filename; if none exists, that comparison skips with a fixture-specific
+reason. Discovery and reference hashing both finish before the test
+mounts the image, so the test does not depend on concurrent access.
+
 The `BFFS` NetBSD fixture is fetched on demand from the compressed
 aminet payload if
 `fixtures/downloaded/netbsdamiga92.hdf` is missing.
