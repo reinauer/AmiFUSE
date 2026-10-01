@@ -55,13 +55,18 @@ class FakeWin32:
         self.events.append(("open", path, access, share))
         if self.fail_open == path:
             raise winerror(5)
-        for old_path, old_access, old_share in self.handles.values():
-            if old_path == path and (share == 0 or old_share == 0):
-                raise winerror(32)
+        # Deliberately allow competing PhysicalDrive opens regardless of share
+        # mode. Correctness must depend on the explicit process lock instead.
         handle = self.next_handle
         self.next_handle += 1
         self.handles[handle] = (path, access, share)
         return handle
+
+    def lock_disk(self, number):
+        name = "process-lock-%d" % number
+        if any(path == name for path, _, _ in self.handles.values()):
+            raise IOError("cannot exclusively lock disk: already in use")
+        return self.open(name, 0)
 
     def close(self, handle):
         self.events.append(("close", self.handles[handle][0]))
@@ -201,10 +206,10 @@ def test_windows_volume_locks_and_close_order(api):
     assert ("ioctl", "system", api.LOCK_VOLUME) not in api.events
     flush = max(i for i, e in enumerate(api.events) if e == ("flush", DEVICE))
     assert flush < api.events.index(("close", DEVICE))
-    assert api.events[-1] == ("close", "cf")
+    assert api.events[-2:] == [("close", "cf"), ("close", "process-lock-2")]
 
 
-@pytest.mark.parametrize("failure", ["lock", "geometry", "access", "unknown_volume"])
+@pytest.mark.parametrize("failure", ["lock", "geometry", "access", "target_volume"])
 def test_open_failures_release_every_handle(api, failure):
     if failure == "lock":
         api.fail_lock = "cf"
@@ -213,7 +218,14 @@ def test_open_failures_release_every_handle(api, failure):
     elif failure == "access":
         api.fail_open = DEVICE
     else:
-        api.volume_map["unknown"] = winerror(5)
+        original_open = api.open
+
+        def deny_target_write(path, access, share=3):
+            if path == "cf" and access:
+                raise winerror(5)
+            return original_open(path, access, share)
+
+        api.open = deny_target_write
     lock = HostFileLock(DEVICE, read_only=False)
     with pytest.raises(IOError, match="exclusively lock"):
         lock.acquire()
@@ -256,6 +268,19 @@ def test_cannot_upgrade_read_only_session(api):
             win.open_disk(DEVICE, read_only=False)
     finally:
         lock.close()
+
+
+def test_process_lock_survives_until_last_borrower_closes(api, monkeypatch):
+    lock = win.DiskLock(DEVICE)
+    stream = win.open_disk(DEVICE)
+    lock.close()
+    try:
+        with pytest.raises(IOError, match="already in use"):
+            win.DiskLock(DEVICE)
+        assert stream.read(4) == bytes(4)
+    finally:
+        stream.close()
+    win.DiskLock(DEVICE).close()
 
 
 def test_sector_preservation_and_bounds(api):
@@ -339,3 +364,39 @@ def test_rdb_inside_mbr_uses_locked_device(tmp_path, api):
         backend.close()
     assert api.data[:-512] == original[:-512]
     assert api.data[-512:] == b"z" * 512
+
+
+@pytest.mark.parametrize("code", [1, 2, 3, 5, 21, 50])
+@pytest.mark.parametrize("failure", ["open", "extents"])
+def test_unqueryable_volumes_do_not_block_target(api, code, failure):
+    api.volume_map["unknown"] = winerror(code)
+    original_open = api.open
+
+    def open_volume(path, access, share=3):
+        if path == "unknown" and failure == "open":
+            raise winerror(code)
+        return original_open(path, access, share)
+
+    api.open = open_volume
+    lock = win.DiskLock(DEVICE, read_only=False)
+    lock.close()
+    assert ("ioctl", "cf", api.LOCK_VOLUME) in api.events
+    assert not api.handles
+
+
+@pytest.mark.parametrize("read_only", [True, False])
+def test_competing_process_cannot_open_or_dismount(api, monkeypatch, read_only):
+    owner = win.DiskLock(DEVICE, read_only=read_only)
+    try:
+        before = list(api.events)
+        # Simulate another process with an independent session registry.
+        with monkeypatch.context() as other:
+            other.setattr(win, "_sessions", {})
+            with pytest.raises(IOError, match="already in use"):
+                win.DiskLock(r"\\?\physicaldrive02", read_only=False)
+            with pytest.raises(IOError, match="already in use"):
+                win.open_disk(DEVICE)
+        assert api.events == before
+    finally:
+        owner.close()
+    win.DiskLock(DEVICE).close()
