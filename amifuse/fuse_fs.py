@@ -3491,6 +3491,25 @@ def _mount_state_details(state: "MountState") -> Dict:
     return details
 
 
+def _check_file_command_mount(bridge, command: str, use_json: bool) -> MountState:
+    """Reject unusable volumes before resolving or creating a file."""
+    import json
+
+    state = bridge.is_mounted()
+    if state.mounted is False:
+        if use_json:
+            print(json.dumps(_json_error(
+                command, "NOT_MOUNTED",
+                f"No usable volume mounted: {state.reason}",
+                details=_mount_error_details(state),
+            )))
+            raise SystemExit(1)
+        raise SystemExit(f"Error: no usable volume mounted: {state.reason}")
+    if state.mounted is None and not use_json:
+        print(f"Warning: mount state unknown -- {state.reason}", file=sys.stderr)
+    return state
+
+
 def _cleanup_bridge(bridge, temp_driver=None):
     """Shut down a HandlerBridge and release all resources.
 
@@ -3951,19 +3970,20 @@ def cmd_hash(args):
 
     bridge, temp_driver = _create_bridge_from_args(args, "hash")
     try:
+        state = _check_file_command_mount(bridge, "hash", use_json)
         normalized = "/" + file_path.lstrip("/")
         stat = bridge.stat_path(normalized)
         if stat is None:
             if use_json:
                 print(json.dumps(_json_error("hash", "FILE_NOT_FOUND",
-                    f"File not found: {file_path}")))
+                    f"File not found: {file_path}", details=_mount_state_details(state))))
                 sys.exit(1)
             raise SystemExit(f"Error: file not found: {file_path}")
 
         if stat.get("dir_type", 0) > 0:
             if use_json:
                 print(json.dumps(_json_error("hash", "INVALID_ARGUMENT",
-                    f"Cannot hash a directory: {file_path}")))
+                    f"Cannot hash a directory: {file_path}", details=_mount_state_details(state))))
                 sys.exit(1)
             raise SystemExit(f"Error: cannot hash a directory: {file_path}")
 
@@ -3975,7 +3995,7 @@ def cmd_hash(args):
         if fh_result is None:
             if use_json:
                 print(json.dumps(_json_error("hash", "HANDLER_ERROR",
-                    f"Failed to open file: {file_path}")))
+                    f"Failed to open file: {file_path}", details=_mount_state_details(state))))
                 sys.exit(1)
             raise SystemExit(f"Error: failed to open file: {file_path}")
 
@@ -4008,6 +4028,7 @@ def cmd_hash(args):
                 bytes_read=bytes_read,
                 algorithm=algorithm,
                 hash=hash_hex,
+                filesystem_responsive=state.mounted,
             )
             print(json.dumps(result, indent=2))
         else:
@@ -4026,7 +4047,8 @@ def cmd_hash(args):
         _cleanup_bridge(bridge, temp_driver)
 
 
-def _ensure_parent_dirs(bridge, path: str, use_json: bool = False, debug: bool = False):
+def _ensure_parent_dirs(bridge, path: str, use_json: bool = False,
+                        debug: bool = False, error_details=None):
     """Create parent directories for path if they don't exist.
 
     Walks each path component and creates missing directories via
@@ -4037,6 +4059,7 @@ def _ensure_parent_dirs(bridge, path: str, use_json: bool = False, debug: bool =
         path: Absolute Amiga path (e.g. "/S/User-Startup").
         use_json: If True, emit JSON errors instead of raising SystemExit.
         debug: If True, print debug messages for directory creation.
+        error_details: Mount context to include in JSON errors.
 
     Raises:
         SystemExit on error if use_json is False.
@@ -4056,7 +4079,7 @@ def _ensure_parent_dirs(bridge, path: str, use_json: bool = False, debug: bool =
             if stat.get("dir_type", 0) <= 0:
                 msg = f"Path component is a file, not a directory: {dir_path}"
                 if use_json:
-                    print(_json.dumps(_json_error("write", "HANDLER_ERROR", msg)))
+                    print(_json.dumps(_json_error("write", "HANDLER_ERROR", msg, error_details)))
                     sys.exit(1)
                 raise SystemExit(f"Error: {msg}")
             continue
@@ -4071,7 +4094,7 @@ def _ensure_parent_dirs(bridge, path: str, use_json: bool = False, debug: bool =
         if parent_lock == 0 and parent != "/":
             msg = f"Cannot locate parent directory: {parent}"
             if use_json:
-                print(_json.dumps(_json_error("write", "HANDLER_ERROR", msg)))
+                print(_json.dumps(_json_error("write", "HANDLER_ERROR", msg, error_details)))
                 sys.exit(1)
             raise SystemExit(f"Error: {msg}")
 
@@ -4084,7 +4107,7 @@ def _ensure_parent_dirs(bridge, path: str, use_json: bool = False, debug: bool =
             if new_lock == 0:
                 msg = f"Failed to create directory: {dir_path} (error {res2})"
                 if use_json:
-                    print(_json.dumps(_json_error("write", "HANDLER_ERROR", msg)))
+                    print(_json.dumps(_json_error("write", "HANDLER_ERROR", msg, error_details)))
                     sys.exit(1)
                 raise SystemExit(f"Error: {msg}")
             # Debug logging matching codebase pattern
@@ -4120,19 +4143,20 @@ def cmd_read(args):
 
     bridge, temp_driver = _create_bridge_from_args(args, "read")
     try:
+        state = _check_file_command_mount(bridge, "read", use_json)
         normalized = "/" + file_path.lstrip("/")
         stat = bridge.stat_path(normalized)
         if stat is None:
             if use_json:
                 print(json.dumps(_json_error("read", "FILE_NOT_FOUND",
-                    f"File not found: {file_path}")))
+                    f"File not found: {file_path}", details=_mount_state_details(state))))
                 sys.exit(1)
             raise SystemExit(f"Error: file not found: {file_path}")
 
         if stat.get("dir_type", 0) > 0:
             if use_json:
                 print(json.dumps(_json_error("read", "IS_DIRECTORY",
-                    f"Cannot read a directory: {file_path}")))
+                    f"Cannot read a directory: {file_path}", details=_mount_state_details(state))))
                 sys.exit(1)
             raise SystemExit(f"Error: cannot read a directory: {file_path}")
 
@@ -4143,7 +4167,7 @@ def cmd_read(args):
         if fh_result is None:
             if use_json:
                 print(json.dumps(_json_error("read", "HANDLER_ERROR",
-                    f"Failed to open file: {file_path}")))
+                    f"Failed to open file: {file_path}", details=_mount_state_details(state))))
                 sys.exit(1)
             raise SystemExit(f"Error: failed to open file: {file_path}")
 
@@ -4190,6 +4214,7 @@ def cmd_read(args):
                 size=file_size,
                 bytes_read=bytes_read,
                 output="-" if stdout_mode else out_path,
+                filesystem_responsive=state.mounted,
             )
             print(json.dumps(result, indent=2))
         else:
@@ -4248,18 +4273,24 @@ def cmd_write(args):
 
     bridge, temp_driver = _create_bridge_from_args(args, "write", read_only=False)
     flushed = False  # Guard flag to avoid double flush
+    write_started = False
+    mount_details = None
     try:
+        state = _check_file_command_mount(bridge, "write", use_json)
+        mount_details = _mount_state_details(state)
         normalized = "/" + amiga_path.lstrip("/")
 
         # Create parent directories if needed
-        _ensure_parent_dirs(bridge, normalized, use_json=use_json, debug=debug)
+        write_started = True
+        _ensure_parent_dirs(bridge, normalized, use_json=use_json, debug=debug,
+                            error_details=mount_details)
 
         # Open for write (create/truncate)
         fh_result = bridge.open_file(normalized, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
         if fh_result is None:
             if use_json:
                 print(json.dumps(_json_error("write", "HANDLER_ERROR",
-                    f"Failed to open file for writing: {amiga_path}")))
+                    f"Failed to open file for writing: {amiga_path}", details=mount_details)))
                 sys.exit(1)
             raise SystemExit(f"Error: failed to open file for writing: {amiga_path}")
 
@@ -4292,7 +4323,7 @@ def cmd_write(args):
                             print(json.dumps(_json_error("write", "WRITE_ERROR",
                                 f"Write failed at offset {bytes_written}: "
                                 f"no reply from handler",
-                                {"bytes_written": bytes_written,
+                                {**mount_details, "bytes_written": bytes_written,
                                  "expected": host_size})))
                             sys.exit(1)
                         raise SystemExit(
@@ -4304,7 +4335,7 @@ def cmd_write(args):
                             print(json.dumps(_json_error("write", "WRITE_ERROR",
                                 f"Write failed at offset {bytes_written}: "
                                 f"handler returned failure (DOSFALSE)",
-                                {"bytes_written": bytes_written,
+                                {**mount_details, "bytes_written": bytes_written,
                                  "expected": host_size})))
                             sys.exit(1)
                         raise SystemExit(
@@ -4318,7 +4349,7 @@ def cmd_write(args):
                             print(json.dumps(_json_error("write", "WRITE_ERROR",
                                 f"Partial write: wrote {bytes_written} of "
                                 f"{host_size} bytes (disk full?)",
-                                {"bytes_written": bytes_written,
+                                {**mount_details, "bytes_written": bytes_written,
                                  "expected": host_size})))
                             sys.exit(1)
                         raise SystemExit(
@@ -4340,6 +4371,7 @@ def cmd_write(args):
                 source=str(host_path),
                 size=host_size,
                 bytes_written=bytes_written,
+                filesystem_responsive=state.mounted,
             )
             print(json.dumps(result, indent=2))
         else:
@@ -4352,14 +4384,14 @@ def cmd_write(args):
     except Exception as e:
         if use_json:
             print(json.dumps(_json_error("write", "HANDLER_ERROR",
-                f"Write operation failed: {e}")))
+                f"Write operation failed: {e}", details=mount_details)))
             sys.exit(1)
         raise SystemExit(f"Error during write: {e}")
     finally:
         # On error paths, we still want to flush what was written to
         # avoid losing partially-written data. But if flush_volume() already
         # succeeded on the success path, skip the redundant flush.
-        if not flushed:
+        if write_started and not flushed:
             try:
                 bridge.flush_volume()
             except Exception:
