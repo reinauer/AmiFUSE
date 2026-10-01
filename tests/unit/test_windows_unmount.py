@@ -124,6 +124,9 @@ def test_windows_cli_uses_control_without_taskkill(monkeypatch):
     request.side_effect = None
     fuse_fs.cmd_unmount(SimpleNamespace(mountpoint=Path("R:")))
     kill.assert_not_called()
+    monkeypatch.setattr(platform, "_find_mount_owner_pids", lambda p: [])
+    with pytest.raises(SystemExit, match="No amifuse process found"):
+        fuse_fs.cmd_unmount(SimpleNamespace(mountpoint=Path("R:")))
 
 
 def test_exit_callback_captures_mount_thread_context(monkeypatch):
