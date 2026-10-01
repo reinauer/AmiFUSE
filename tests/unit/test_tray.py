@@ -334,7 +334,7 @@ class TestQuitLifecycle:
         tray_app._mounts = [{"pid": 1, "mountpoint": "D:", "image": "x.hdf"}]
 
         kill_calls = []
-        monkeypatch.setattr("amifuse.platform.kill_pids", lambda pids, **kw: kill_calls.extend(pids))
+        monkeypatch.setattr("amifuse.platform.stop_mount_processes", lambda pids, **kw: kill_calls.extend(pids))
 
         tray_app._quit(icon, None)
 
@@ -354,7 +354,7 @@ class TestQuitLifecycle:
         # Simulate mounts existing when run() returns
         app._mounts = [{"pid": 42, "mountpoint": "D:", "image": "x.hdf"}]
 
-        monkeypatch.setattr("amifuse.platform.kill_pids", lambda pids, **kw: kill_calls.extend(pids))
+        monkeypatch.setattr("amifuse.platform.stop_mount_processes", lambda pids, **kw: kill_calls.extend(pids))
 
         # Mock the poll thread to not actually run
         monkeypatch.setattr("threading.Thread.start", lambda self: None)
@@ -370,33 +370,33 @@ class TestQuitLifecycle:
 
 
 class TestUnmount:
-    def test_unmount_single_calls_kill_pids(self, tray_app, monkeypatch):
-        """kill_pids called with correct pid and timeout=2.0."""
+    def test_unmount_single_requests_clean_stop(self, tray_app, monkeypatch):
+        """Cooperative stop called with the correct pid."""
         calls = []
         monkeypatch.setattr(
-            "amifuse.platform.kill_pids",
-            lambda pids, timeout=10.0: calls.append((pids, timeout)),
+            "amifuse.platform.stop_mount_processes",
+            lambda pids: calls.append(pids),
         )
 
         mount = {"pid": 99, "mountpoint": "D:", "image": "x.hdf"}
         tray_app._unmount_single(mount)
 
-        assert calls == [([99], 2.0)]
+        assert calls == [[99]]
 
     def test_unmount_single_wakes_poll(self, tray_app, monkeypatch):
         """wake_event is set after unmount."""
-        monkeypatch.setattr("amifuse.platform.kill_pids", lambda pids, **kw: None)
+        monkeypatch.setattr("amifuse.platform.stop_mount_processes", lambda pids, **kw: None)
 
         mount = {"pid": 99, "mountpoint": "D:", "image": "x.hdf"}
         tray_app._unmount_single(mount)
 
         assert tray_app._wake_event.is_set()
 
-    def test_unmount_all_kills_all_pids(self, tray_app, monkeypatch):
-        """All PIDs killed."""
+    def test_unmount_all_requests_clean_stop(self, tray_app, monkeypatch):
+        """All mount owners receive cooperative stop requests."""
         calls = []
         monkeypatch.setattr(
-            "amifuse.platform.kill_pids",
+            "amifuse.platform.stop_mount_processes",
             lambda pids, **kw: calls.append(pids),
         )
         tray_app._mounts = [

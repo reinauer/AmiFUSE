@@ -137,9 +137,9 @@ class TrayApp:
         return cb
 
     def _unmount_single(self, mount):
-        from .platform import kill_pids, notify_shell_drive_change
+        from .platform import stop_mount_processes, notify_shell_drive_change
 
-        kill_pids([mount["pid"]], timeout=2.0)
+        stop_mount_processes([mount["pid"]])
         # Notify Explorer that drive was removed (crash recovery path:
         # if process crashes, destroy() never fires; tray detects the
         # dead process and sends notification here)
@@ -154,9 +154,9 @@ class TrayApp:
             pids = [m["pid"] for m in mounts_copy]
         if not pids:
             return
-        from .platform import kill_pids, notify_shell_drive_change
+        from .platform import stop_mount_processes, notify_shell_drive_change
 
-        kill_pids(pids, timeout=2.0)
+        stop_mount_processes(pids)
         # Notify Explorer for each removed drive
         for mount in mounts_copy:
             mountpoint = mount.get("mountpoint")

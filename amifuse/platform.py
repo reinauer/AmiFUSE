@@ -211,8 +211,8 @@ def get_unmount_command(mountpoint: Path) -> List[str]:
         Command as a list of strings suitable for subprocess.
         Returns an empty list [] on platforms where no unmount command is
         available (Windows/WinFSP). Callers must handle the empty-list
-        case -- `amifuse unmount` falls through to terminating the mount
-        owner process instead.
+        case -- `amifuse unmount` requests cooperative shutdown from the
+        Windows mount owner instead.
     """
     if sys.platform.startswith("darwin"):
         return ["umount", "-f", str(mountpoint)]
@@ -263,8 +263,7 @@ def _get_windows_unmount_command(mountpoint: Path) -> List[str]:
 
     WinFSP mounts are not network drives, so ``net use /delete`` does not
     work for them.  Return an empty list so that ``cmd_unmount`` falls
-    through to process-termination, which is the reliable approach on
-    Windows.
+    through to the cooperative Windows unmount protocol.
     """
     return []
 
@@ -1047,6 +1046,16 @@ def kill_pids(pids: List[int], timeout: float = 10.0) -> List[int]:
             killed.append(pid)
 
     return killed
+
+
+def stop_mount_processes(pids: List[int], timeout: float = 30.0) -> List[int]:
+    """Unmount cooperatively on Windows; never force-kill after a timeout."""
+    if sys.platform.startswith("win"):
+        from .windows_unmount import request_unmount
+        for pid in pids:
+            request_unmount(pid, timeout=timeout)
+        return pids
+    return kill_pids(pids, timeout=timeout)
 
 
 def kill_mount_owner_processes(mountpoint: Path) -> List[int]:
