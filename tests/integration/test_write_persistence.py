@@ -92,17 +92,15 @@ def test_write_persists_after_remount(
     assert os.path.exists(test_file)
 
     # Unmount the writable mount
-    subprocess.run(
+    result = subprocess.run(
         [sys.executable, "-m", "amifuse", "unmount", mp],
-        capture_output=True, text=True, timeout=10, check=False,
+        capture_output=True, text=True, timeout=40, check=False,
     )
+    assert result.returncode == 0, result.stdout + result.stderr
 
     # Wait for process exit
-    try:
-        proc.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait(timeout=5)
+    # A force kill would conceal a broken unmount protocol and lose buffers.
+    proc.wait(timeout=10)
 
     # Wait for unmount to complete
     deadline = time.monotonic() + 10.0

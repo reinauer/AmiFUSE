@@ -1684,7 +1684,7 @@ class HandlerBridge:
         """Flush the handler's buffers to disk. Call on unmount."""
         with self._lock:
             if self.state.crashed:
-                return
+                raise OSError("handler crashed before volume flush")
             if self._debug:
                 print("[amifuse] Flushing volume buffers to disk...", flush=True)
             self.launcher.send_flush(self.state)
@@ -1692,11 +1692,10 @@ class HandlerBridge:
             self._log_replies("flush_volume", replies)
             # Sync the underlying file to disk
             self.backend.sync()
+            if self.state.crashed or not replies or replies[-1][2] == 0:
+                raise OSError("filesystem handler did not acknowledge ACTION_FLUSH")
             if self._debug:
-                if replies and replies[-1][2] != 0:
-                    print("[amifuse] Volume flush complete", flush=True)
-                else:
-                    print("[amifuse] Volume flush may have failed", flush=True)
+                print("[amifuse] Volume flush complete", flush=True)
 
     def inhibit_cycle(self):
         """Inhibit then uninhibit the handler to clear all internal state."""
@@ -1752,6 +1751,7 @@ class AmigaFuseFS(_FuseOperations):
         self.bridge = bridge
         self._debug = debug
         self._mountpoint = mountpoint
+        self._unmount_control = None
         self._uid = getattr(os, 'getuid', lambda: 0)()
         self._gid = getattr(os, 'getgid', lambda: 0)()
         self._stat_cache: Dict[str, Tuple[float, Dict]] = {}  # path -> (timestamp, stat_result)
@@ -2920,38 +2920,56 @@ class AmigaFuseFS(_FuseOperations):
 
     def init(self, path):
         """Called when filesystem is mounted. Notify shell on Windows."""
+        if self._unmount_control is not None:
+            self._unmount_control.start()
         if sys.platform.startswith("win") and self._mountpoint:
             from .platform import notify_shell_drive_change
             notify_shell_drive_change(str(self._mountpoint), added=True)
 
     def destroy(self, path):
         """Called when filesystem is unmounted. Flush and release all resources."""
+        control = self._unmount_control
+        if control is not None:
+            control.stop()
+        success = True
         print("[amifuse] Unmounting - flushing volume...", flush=True)
         try:
             if self.bridge._write_enabled:
+                if _handler_has_crashed(self.bridge):
+                    raise RuntimeError("handler crashed before volume flush")
                 self.bridge.flush_volume()
         except Exception as e:
+            success = False
             print(f"[amifuse] WARNING: flush failed: {e}", flush=True)
         try:
             shutdown = getattr(getattr(self.bridge, "vh", None), "shutdown", None)
             if shutdown is not None:
                 shutdown()
         except Exception as e:
+            success = False
             print(f"[amifuse] WARNING: runtime shutdown failed: {e}", flush=True)
-        try:
-            backend = getattr(self.bridge, "backend", None)
-            if backend is not None:
+        backend = getattr(self.bridge, "backend", None)
+        if backend is not None:
+            try:
                 backend.sync()
+            except Exception as e:
+                success = False
+                print(f"[amifuse] WARNING: backend sync failed: {e}", flush=True)
+            try:
                 backend.close()
-        except Exception as e:
-            print(f"[amifuse] WARNING: backend close failed: {e}", flush=True)
+            except Exception as e:
+                success = False
+                print(f"[amifuse] WARNING: backend close failed: {e}", flush=True)
         # Mark bridge as closed so close() becomes a no-op if called after destroy()
         self.bridge._closed = True
         # Notify Explorer that drive was removed
         if sys.platform.startswith("win") and self._mountpoint:
             from .platform import notify_shell_drive_change
             notify_shell_drive_change(str(self._mountpoint), added=False)
-        print("[amifuse] Unmount complete.", flush=True)
+        if control is not None:
+            control.complete(success)
+        print("[amifuse] Unmount complete." if success else
+              "[amifuse] Unmount completed with errors.", flush=True)
 
     def statfs(self, path):
         """Return filesystem statistics (disk space info).
@@ -3279,13 +3297,21 @@ def mount_fuse(
     if debug:
         print(f"[amifuse] FUSE options: {fuse_kwargs}", flush=True)
 
+    control = None
     try:
+        operations = AmigaFuseFS(bridge, debug=debug, icons=icons, mountpoint=mountpoint)
+        if sys.platform.startswith("win"):
+            from .windows_unmount import UnmountControl
+            control = UnmountControl()
+            operations._unmount_control = control
         fuse_class(
-            AmigaFuseFS(bridge, debug=debug, icons=icons, mountpoint=mountpoint),
+            operations,
             str(mountpoint),
             **fuse_kwargs,
         )
     finally:
+        if control is not None:
+            control.close()
         bridge.close()
         # Clean up temp driver file if we extracted one
         if temp_driver is not None and temp_driver.exists():
@@ -4522,14 +4548,19 @@ def cmd_unmount(args):
                 f"{' '.join(cmd)}"
             )
     else:
-        # No platform unmount command (e.g. Windows/WinFSP) -- go straight
-        # to process termination.
-        killed_pids = kill_mount_owner_processes(mountpoint)
+        if sys.platform.startswith("win"):
+            try:
+                killed_pids = plat.stop_mount_processes(
+                    plat._find_mount_owner_pids(mountpoint))
+            except OSError as exc:
+                raise SystemExit(str(exc)) from exc
+        else:
+            killed_pids = kill_mount_owner_processes(mountpoint)
         if not killed_pids:
             raise SystemExit(
                 f"No amifuse process found for mountpoint {mountpoint}."
             )
-        print(f"Unmounted {mountpoint} (terminated "
+        print(f"Unmounted {mountpoint} (stopped "
               f"{'processes' if len(killed_pids) > 1 else 'process'}"
               f" {', '.join(str(p) for p in killed_pids)}).")
 

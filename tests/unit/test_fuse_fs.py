@@ -127,6 +127,7 @@ class TestMountFuseOptions:
         # Import after fuse_mock has injected the fake fuse module
         import amifuse.fuse_fs as fuse_fs_mod
 
+        monkeypatch.setattr("amifuse.windows_unmount.UnmountControl", MagicMock())
         captured = {"fuse_kwargs": None}
 
         # Patch FUSE to capture kwargs
