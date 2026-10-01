@@ -2,11 +2,10 @@
 
 ## Windows physical-disk release checks
 
-The physical-disk work depends on amitools PR #3. Before merging AmiFUSE
-PR #56, merge that dependency and pin the resulting commit on
-`Drop_AccessStruct`. Keep the companion feature branch until the pin is
-updated; `git submodule update --remote` follows `Drop_AccessStruct` and
-does not select the unmerged feature branch.
+The physical-disk dependency from amitools PR #3 is merged. The submodule
+pins `1e739090adfc914c039fe8df8863ef79ed351805` on `Drop_AccessStruct`,
+the branch tracked by `.gitmodules`. Source checkouts no longer depend on
+the companion feature branch remaining available.
 
 The installed-wheel CI job checks ordinary-image commands with the
 declared minimum `amitools-amifuse 0.8.0.post8`. Physical-disk support needs
