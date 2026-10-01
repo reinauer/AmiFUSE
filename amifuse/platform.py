@@ -181,6 +181,47 @@ def get_default_mountpoint(volname: str) -> Optional[Path]:
         return None
 
 
+def windows_drive_mountpoint(mountpoint) -> Optional[str]:
+    """Return X: for a drive-root alias, including WinFsp mount-manager form."""
+    import ntpath
+    import re
+
+    path = ntpath.normpath(str(mountpoint))
+    if path.startswith(("\\\\.\\", "\\\\?\\")):
+        path = path[4:]
+    if re.fullmatch(r"[A-Za-z]:\\?", path):
+        return path[:2].upper()
+    return None
+
+
+def is_windows_admin() -> bool:
+    """Whether the current token can create a global mount-manager drive."""
+    if not sys.platform.startswith("win"):
+        return False
+    import ctypes
+
+    return bool(ctypes.windll.shell32.IsUserAnAdmin())
+
+
+def get_fuse_mountpoint(mountpoint: Path) -> str:
+    """Use global drive letters for elevated Windows mounts."""
+    if sys.platform.startswith("win"):
+        drive = windows_drive_mountpoint(mountpoint)
+        if drive:
+            explicit = str(mountpoint).replace("/", "\\").startswith(
+                ("\\\\.\\", "\\\\?\\"))
+            elevated = is_windows_admin()
+            if explicit and not elevated:
+                raise ValueError(
+                    "Global drive mounts require Administrator privileges; "
+                    "run from an Administrator shell or use a plain drive letter."
+                )
+            # Do not pass a trailing slash: WinFsp interprets it as a
+            # mount-manager directory instead of a mount-manager drive.
+            return "\\\\.\\" + drive if elevated else drive
+    return str(mountpoint)
+
+
 def should_auto_create_mountpoint(mountpoint: Path) -> bool:
     """Check if the mountpoint should be auto-created by the FUSE library.
 
@@ -196,8 +237,7 @@ def should_auto_create_mountpoint(mountpoint: Path) -> bool:
     if sys.platform.startswith("win"):
         # WinFSP handles drive letter mountpoints; don't mkdir them.
         # Directory mountpoints (e.g. C:\mnt\amiga) still need mkdir.
-        mp_str = str(mountpoint)
-        return len(mp_str) == 2 and mp_str[1] == ":"
+        return windows_drive_mountpoint(mountpoint) is not None
     return False
 
 
@@ -306,14 +346,15 @@ def validate_mountpoint(mountpoint: Path) -> Optional[str]:
         if it is already in use or otherwise invalid.
     """
     mp_str = str(mountpoint)
-    if sys.platform.startswith("win") and len(mp_str) == 2 and mp_str[1] == ":":
+    drive = windows_drive_mountpoint(mountpoint) if sys.platform.startswith("win") else None
+    if drive:
         # Drive letter mountpoint -- reject if the letter is already allocated.
         # Use the GetLogicalDrives bitmask (via the shared helper), not
         # os.path.exists, which false-negatives on assigned-but-empty removable
         # slots. Normalize case so an explicit lowercase "d:" is still caught.
-        if mp_str[0].upper() in _windows_allocated_drive_letters():
+        if drive[0] in _windows_allocated_drive_letters():
             return (
-                f"Drive {mp_str} is already allocated; choose a different drive "
+                f"Drive {drive} is already allocated; choose a different drive "
                 f"letter or free it first."
             )
     else:
@@ -888,12 +929,13 @@ def _find_mount_owner_pids(mountpoint: Path) -> List[int]:
         import ntpath
 
         def key(path):
+            drive = windows_drive_mountpoint(path)
+            if drive:
+                return drive.lower() + "\\"
             path = ntpath.normpath(str(path))
             # AmiFUSE uses E: as a drive mountpoint, not as Windows' current
             # working directory on E. Match E:\ and case variants lexically:
             # resolving through WinFsp can produce a different device path.
-            if len(path) == 2 and path[1] == ":":
-                path += "\\"
             return ntpath.normcase(ntpath.abspath(path))
 
         target = key(mountpoint)
@@ -1223,7 +1265,8 @@ def _enrich_mountpoints_windows(null_mounts, all_mounts):
         return
 
     # Collect mountpoints already known (claimed by explicit --mountpoint)
-    claimed = {m["mountpoint"] for m in all_mounts if m.get("mountpoint")}
+    claimed = {windows_drive_mountpoint(m["mountpoint"]) or m["mountpoint"]
+               for m in all_mounts if m.get("mountpoint")}
 
     amifuse_drives = []
     fs_name_buf = ctypes.create_unicode_buffer(256)
@@ -1450,7 +1493,7 @@ def notify_shell_drive_change(drive_letter: str, added: bool) -> None:
     event = SHCNE_DRIVEADD if added else SHCNE_DRIVEREMOVED
     # SHChangeNotify expects a null-terminated path string
     # Normalize to "X:\" format
-    path = drive_letter.rstrip("\\") + "\\"
+    path = (windows_drive_mountpoint(drive_letter) or drive_letter.rstrip("\\")) + "\\"
 
     try:
         ctypes.windll.shell32.SHChangeNotify(event, SHCNF_PATH, ctypes.c_wchar_p(path), None)

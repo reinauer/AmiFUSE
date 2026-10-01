@@ -133,6 +133,8 @@ class TestMountFuseOptions:
         # Patch FUSE to capture kwargs
         def fake_fuse(fs_instance, mountpoint, **kwargs):
             captured["fuse_kwargs"] = kwargs
+            captured["mountpoint"] = mountpoint
+            captured["operations"] = fs_instance
 
         monkeypatch.setattr(fuse_fs_mod, "FUSE", fake_fuse)
 
@@ -198,6 +200,21 @@ class TestMountFuseOptions:
         monkeypatch.setitem(sys.modules, "amitools.fs.DosType", fake_dostype)
 
         return captured
+
+    @pytest.mark.parametrize("elevated, expected", [(True, "\\\\.\\R:"), (False, "R:")])
+    def test_windows_drive_passed_to_fuse(self, monkeypatch, mock_mount_fuse_deps, elevated, expected):
+        from amifuse import platform, fuse_fs
+        from types import SimpleNamespace
+
+        monkeypatch.setattr(fuse_fs, "sys", SimpleNamespace(platform="win32"))
+        monkeypatch.setattr(platform, "sys", SimpleNamespace(platform="win32"))
+        monkeypatch.setattr(platform, "is_windows_admin", lambda: elevated)
+        monkeypatch.setattr(Path, "mkdir", MagicMock(side_effect=AssertionError("drive mkdir")))
+        fuse_fs.mount_fuse(Path("test.hdf"), Path("driver"), Path("r:\\"),
+                           block_size=512, partition="DH0")
+        assert mock_mount_fuse_deps["mountpoint"] == expected
+        assert mock_mount_fuse_deps["fuse_kwargs"]["uid"] == -1
+        assert mock_mount_fuse_deps["fuse_kwargs"]["gid"] == -1
 
     def test_subtype_included_on_linux(self, monkeypatch, mock_mount_fuse_deps):
         """On Linux, the 'subtype' kwarg is included and set to 'amifuse'."""
