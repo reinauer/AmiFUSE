@@ -879,14 +879,30 @@ def _find_mount_owner_pids(mountpoint: Path) -> List[int]:
     Uses find_amifuse_mounts() for process discovery, then filters to those
     matching the given mountpoint.
     """
-    raw_mountpoint = str(mountpoint)
-    abs_mountpoint = str(mountpoint.resolve(strict=False))
-
     try:
         all_mounts = find_amifuse_mounts()
     except OSError:
         return []
 
+    if sys.platform.startswith("win"):
+        import ntpath
+
+        def key(path):
+            path = ntpath.normpath(str(path))
+            # AmiFUSE uses E: as a drive mountpoint, not as Windows' current
+            # working directory on E. Match E:\ and case variants lexically:
+            # resolving through WinFsp can produce a different device path.
+            if len(path) == 2 and path[1] == ":":
+                path += "\\"
+            return ntpath.normcase(ntpath.abspath(path))
+
+        target = key(mountpoint)
+        return [mount["pid"] for mount in all_mounts
+                if mount.get("mountpoint") is not None
+                and key(mount["mountpoint"]) == target]
+
+    raw_mountpoint = str(mountpoint)
+    abs_mountpoint = str(mountpoint.resolve(strict=False))
     pids = []
     for mount in all_mounts:
         mp = mount.get("mountpoint")

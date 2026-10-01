@@ -143,6 +143,20 @@ def test_exit_callback_captures_mount_thread_context(monkeypatch):
     assert exit_fuse.call_args.args[0].value == 0x123456789
 
 
+@pytest.mark.parametrize("requested", ["E:", "E:\\", "e:/", "e:\\."])
+@pytest.mark.parametrize("mounted", ["E:", "E:\\", "e:/"])
+def test_drive_mount_owner_matches_root_aliases(monkeypatch, requested, mounted):
+    from amifuse import platform
+
+    monkeypatch.setattr(platform, "sys", SimpleNamespace(platform="win32"))
+    monkeypatch.setattr(platform, "find_amifuse_mounts", lambda: [
+        {"mountpoint": mounted, "pid": 42},
+        {"mountpoint": "F:", "pid": 43},
+        {"mountpoint": "E:\\other", "pid": 44},
+    ])
+    assert platform._find_mount_owner_pids(Path(requested)) == [42]
+
+
 @pytest.mark.parametrize("replies", [[], [(0, 0, 0, 209)], [(0, 0, -1, 0)]])
 def test_flush_requires_handler_acknowledgement(replies):
     from amifuse.fuse_fs import HandlerBridge
