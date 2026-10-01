@@ -1,6 +1,6 @@
 """Windows mount-manager drives share one identity with their DOS aliases."""
 
-from pathlib import Path, PureWindowsPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -73,7 +73,7 @@ def test_windows_pathlib_device_root_has_no_trailing_slash_at_fuse(windows, monk
 def test_unix_paths_unchanged(monkeypatch, host):
     monkeypatch.setattr(platform, "sys", SimpleNamespace(platform=host))
     monkeypatch.setattr(platform, "is_windows_admin", Mock(side_effect=AssertionError))
-    assert platform.get_fuse_mountpoint(Path("/mnt/amiga")) == "/mnt/amiga"
+    assert platform.get_fuse_mountpoint(PurePosixPath("/mnt/amiga")) == "/mnt/amiga"
 
 
 @pytest.mark.parametrize("requested", DRIVE_ALIASES)
