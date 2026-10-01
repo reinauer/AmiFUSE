@@ -221,6 +221,12 @@ amifuse unmount R:
 
 The single quotes are PowerShell quoting; they are not part of the device name.
 
+The drive letter created by this elevated mount is visible to elevated
+programs in that logon session. Normal Explorer windows and unelevated
+applications cannot see it. Access the mounted files from the Administrator
+PowerShell session, and run `amifuse unmount R:` from an Administrator shell.
+The normal desktop tray cannot reliably discover or unmount elevated mounts.
+
 Mounts are read-only by default. To enable writes to the card itself:
 
 ```powershell
@@ -236,10 +242,11 @@ when a disk driver does not enforce exclusive handle sharing. It does not
 exclude unrelated raw-disk tools.
 Writable mounts also lock and dismount Windows volumes identified on that disk;
 close applications using those volumes first. If a required lock fails,
-the mount fails before AmiFUSE writes to the disk. Unmount with `amifuse unmount`
-or the tray before unplugging the card. Both request WinFsp shutdown and wait
-for handler flushing and disk cleanup. A timeout or flush failure is reported
-as an error; the unmount request never falls back to force-killing the process.
+the mount fails before AmiFUSE writes to the disk. Before unplugging the card,
+run `amifuse unmount R:` from an Administrator shell. This requests WinFsp
+shutdown and waits for handler flushing and disk cleanup. A timeout or flush
+failure is reported as an error; the unmount request never falls back to
+force-killing the process.
 Check the mount log and wait for a successful unmount before removing the card.
 No extra pywin32 dependency is required.
 
