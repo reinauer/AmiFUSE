@@ -460,8 +460,8 @@ class TestUnmountCommand:
 
         assert "is not currently mounted" in str(exc_info.value)
 
-    def test_unmount_uses_process_kill_when_no_command(self, monkeypatch, fuse_mock):
-        """When platform returns no unmount command, go straight to process kill."""
+    def test_unmount_uses_process_kill_without_unix_command(self, monkeypatch, fuse_mock):
+        """Unix retains its process fallback; Windows uses cooperative control."""
         monkeypatch.setattr("os.path.ismount", lambda path: True)
         monkeypatch.setattr(
             "amifuse.platform.get_unmount_command",
@@ -470,6 +470,7 @@ class TestUnmountCommand:
         import amifuse.fuse_fs as fuse_fs_mod
 
         killed_pids = [42]
+        monkeypatch.setattr(fuse_fs_mod, "sys", SimpleNamespace(platform="linux"))
         monkeypatch.setattr(
             fuse_fs_mod, "kill_mount_owner_processes",
             lambda mp: killed_pids,
@@ -487,6 +488,7 @@ class TestUnmountCommand:
         )
         import amifuse.fuse_fs as fuse_fs_mod
 
+        monkeypatch.setattr(fuse_fs_mod, "sys", SimpleNamespace(platform="linux"))
         monkeypatch.setattr(
             fuse_fs_mod, "kill_mount_owner_processes",
             lambda mp: [],
