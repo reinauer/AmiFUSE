@@ -26,6 +26,7 @@ class TrayApp:
         self._stop_event = threading.Event()
         self._wake_event = threading.Event()
         self._grace_start = None
+        self._unmount_thread = None
 
     def run(self):
         import pystray
@@ -45,6 +46,12 @@ class TrayApp:
         poll_thread.start()
 
         self._icon.run()
+        self._stop_event.set()
+        self._wake_event.set()
+        if poll_thread.is_alive():
+            poll_thread.join()
+        if self._unmount_thread is not None:
+            self._unmount_thread.join()
         # Unmount after icon.run() returns, not in _quit callback
         self._unmount_all()
 
@@ -120,11 +127,7 @@ class TrayApp:
 
     def _make_unmount_cb(self, mount):
         def cb(icon, item):
-            try:
-                logger.info("Unmount callback fired for %s", mount.get("mountpoint"))
-                self._unmount_single(mount)
-            except Exception:
-                logger.exception("Unmount callback failed for %s", mount.get("mountpoint"))
+            self._start_unmount([mount])
         return cb
 
     def _make_inspect_cb(self, mount):
@@ -137,35 +140,59 @@ class TrayApp:
         return cb
 
     def _unmount_single(self, mount):
-        from .platform import stop_mount_processes, notify_shell_drive_change
-
-        stop_mount_processes([mount["pid"]])
-        # Notify Explorer that drive was removed (crash recovery path:
-        # if process crashes, destroy() never fires; tray detects the
-        # dead process and sends notification here)
-        mountpoint = mount.get("mountpoint")
-        if mountpoint:
-            notify_shell_drive_change(mountpoint, added=False)
-        self._wake_event.set()
+        self._unmount_mounts([mount])
 
     def _unmount_all(self):
         with self._lock:
             mounts_copy = list(self._mounts)
-            pids = [m["pid"] for m in mounts_copy]
+        self._unmount_mounts(mounts_copy)
+
+    def _unmount_mounts(self, mounts):
+        from .platform import stop_mount_processes, notify_shell_drive_change
+        from .windows_unmount import UnmountError
+
+        pids = [m["pid"] for m in mounts]
         if not pids:
             return
-        from .platform import stop_mount_processes, notify_shell_drive_change
-
-        stop_mount_processes(pids)
-        # Notify Explorer for each removed drive
-        for mount in mounts_copy:
+        error = None
+        try:
+            completed = stop_mount_processes(pids)
+        except UnmountError as exc:
+            completed, error = exc.completed, exc
+        except Exception as exc:
+            completed, error = [], exc
+        for mount in mounts:
             mountpoint = mount.get("mountpoint")
-            if mountpoint:
+            if mount["pid"] in completed and mountpoint:
                 notify_shell_drive_change(mountpoint, added=False)
+        with self._lock:
+            self._mounts = [m for m in self._mounts if m["pid"] not in completed]
+        self._wake_event.set()
+        if error is not None:
+            self._report_unmount_error(error)
+
+    def _report_unmount_error(self, error):
+        logger.error("Unmount failed: %s", error)
+        # A dialog remains visible even when Exit has removed the tray icon.
+        try:
+            import ctypes
+            ctypes.windll.user32.MessageBoxW(
+                None, str(error), "AmiFUSE: unmount failed", 0x10)
+        except Exception:
+            logger.exception("Could not display the unmount error")
+
+    def _start_unmount(self, mounts):
+        # Menu callbacks must return immediately to the Win32 message pump.
+        if self._unmount_thread is not None and self._unmount_thread.is_alive():
+            return
+        self._unmount_thread = threading.Thread(
+            target=self._unmount_mounts, args=(mounts,))
+        self._unmount_thread.start()
 
     def _unmount_all_cb(self, icon, item):
-        self._unmount_all()
-        self._wake_event.set()
+        with self._lock:
+            mounts = list(self._mounts)
+        self._start_unmount(mounts)
 
     def _inspect(self, mount):
         logger.info("_inspect called with mount=%s", mount)

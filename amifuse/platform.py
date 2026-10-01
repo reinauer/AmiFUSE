@@ -1067,10 +1067,8 @@ def kill_pids(pids: List[int], timeout: float = 10.0) -> List[int]:
 def stop_mount_processes(pids: List[int], timeout: float = 30.0) -> List[int]:
     """Unmount cooperatively on Windows; never force-kill after a timeout."""
     if sys.platform.startswith("win"):
-        from .windows_unmount import request_unmount
-        for pid in pids:
-            request_unmount(pid, timeout=timeout)
-        return pids
+        from .windows_unmount import request_unmount_many
+        return request_unmount_many(pids, timeout=timeout)
     return kill_pids(pids, timeout=timeout)
 
 

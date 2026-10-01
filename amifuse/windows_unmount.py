@@ -7,6 +7,7 @@ calls destroy on the mount thread, where handler and device cleanup belong.
 import ctypes
 import os
 import threading
+import time
 
 
 class _Events:
@@ -117,26 +118,58 @@ class UnmountControl:
         self.handles.clear()
 
 
-def request_unmount(pid, timeout=30.0):
+class UnmountError(OSError):
+    """A batch failed partially; completed PIDs still finished cleanup."""
+
+    def __init__(self, completed, failures):
+        self.completed = completed
+        self.failures = failures
+        super().__init__("\n".join(str(error) for error in failures.values()))
+
+
+def request_unmount_many(pids, timeout=30.0):
+    """Signal every mount before waiting, with one timeout for the batch."""
     api = _Events()
-    handles = {}
+    pending = {}
+    completed, failures = [], {}
     try:
-        try:
-            for kind in ("stop", "done", "failed"):
-                handles[kind] = api.open(pid, kind)
-        except OSError as exc:
-            raise OSError(
-                "Cannot request clean unmount of process %d; it may be an "
-                "older AmiFUSE or require Administrator privileges. "
-                "The process has not been terminated." % pid
-            ) from exc
-        api.set(handles["stop"])
-        if not api.wait(handles["done"], timeout):
-            raise OSError("Timed out waiting for process %d to flush and unmount; "
-                          "the process has not been terminated." % pid)
-        if api.wait(handles["failed"], 0):
-            raise OSError("Process %d reported an unmount/flush failure; "
-                          "check the mount log before removing the disk." % pid)
+        for pid in dict.fromkeys(pids):
+            handles = pending[pid] = {}
+            try:
+                for kind in ("stop", "done", "failed"):
+                    handles[kind] = api.open(pid, kind)
+                api.set(handles["stop"])
+            except OSError as exc:
+                failures[pid] = OSError(
+                    "Cannot request clean unmount of process %d; it may be an "
+                    "older AmiFUSE or require Administrator privileges. "
+                    "The process has not been terminated. %s" % (pid, exc))
+
+        deadline = time.monotonic() + timeout
+        for pid, handles in pending.items():
+            if pid in failures:
+                continue
+            try:
+                remaining = max(0.0, deadline - time.monotonic())
+                if not api.wait(handles["done"], remaining):
+                    raise OSError(
+                        "Timed out waiting for process %d to flush and unmount; "
+                        "the process has not been terminated." % pid)
+                if api.wait(handles["failed"], 0):
+                    raise OSError(
+                        "Process %d reported an unmount/flush failure; "
+                        "check the mount log before removing the disk." % pid)
+                completed.append(pid)
+            except OSError as exc:
+                failures[pid] = exc
     finally:
-        for handle in handles.values():
-            api.close(handle)
+        for handles in pending.values():
+            for handle in handles.values():
+                api.close(handle)
+    if failures:
+        raise UnmountError(completed, failures)
+    return completed
+
+
+def request_unmount(pid, timeout=30.0):
+    request_unmount_many([pid], timeout=timeout)
