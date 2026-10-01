@@ -15,7 +15,7 @@ from amitools.util import Win32Disk as win
 def native(monkeypatch):
     names = ("CreateFileW", "CloseHandle", "DeviceIoControl", "SetFilePointerEx",
              "ReadFile", "WriteFile", "FlushFileBuffers", "FindFirstVolumeW",
-             "FindNextVolumeW", "FindVolumeClose")
+             "FindNextVolumeW", "FindVolumeClose", "CreateMutexW")
     dll = SimpleNamespace(**{name: Mock(return_value=1) for name in names})
     monkeypatch.setattr(ctypes, "WinDLL", Mock(return_value=dll), raising=False)
     monkeypatch.setattr(ctypes, "get_last_error", lambda: 5, raising=False)
