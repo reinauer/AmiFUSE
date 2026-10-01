@@ -6,6 +6,7 @@ required flags) are also exercised.
 """
 
 import json
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -14,6 +15,40 @@ from pathlib import Path
 import pytest
 
 pytestmark = pytest.mark.integration
+
+
+@pytest.mark.parametrize("command,path", [
+    ("hash", "S/Startup-Sequence"), ("hash", "/"),
+    ("read", "S/Startup-Sequence"), ("read", "/"),
+    ("write", "new/file"),
+])
+def test_file_commands_reject_unmounted_adf(ofs_adf_image, fixture_root, tmp_path, command, path):
+    """A real handler must report the damaged volume, not a missing file."""
+    driver = fixture_root / "drivers" / "FastFileSystem"
+    if not driver.exists():
+        pytest.skip("FastFileSystem handler not found")
+    image = tmp_path / "unmounted.adf"
+    shutil.copy2(ofs_adf_image, image)
+    # Standard OFS ADFs place the root block halfway through the disk.
+    with image.open("r+b") as stream:
+        stream.seek((image.stat().st_size // 512 // 2) * 512)
+        stream.write(bytes(512))
+    before = image.read_bytes()
+    source, output = tmp_path / "input", tmp_path / "output"
+    source.write_bytes(b"must not create a file on an unmounted volume")
+    output.write_bytes(b"must not truncate existing output")
+    args = [command, str(image), "--driver", str(driver), "--file", path, "--json"]
+    if command == "read":
+        args += ["--out", str(output)]
+    elif command == "write":
+        args += ["--in", str(source)]
+    proc = _run_amifuse(*args)
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    data = _parse_json_stdout(proc)
+    assert data["error"]["code"] == "NOT_MOUNTED", data
+    assert data["error"]["details"]["disk_type"] == 0x4E444F53
+    assert output.read_bytes() == b"must not truncate existing output"
+    assert image.read_bytes() == before
 
 # ---------------------------------------------------------------------------
 # Helpers

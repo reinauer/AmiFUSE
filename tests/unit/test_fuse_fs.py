@@ -3974,7 +3974,7 @@ class TestCmdWrite:
         # Also mock _ensure_parent_dirs to be a no-op by default
         monkeypatch.setattr(
             fuse_fs_mod, "_ensure_parent_dirs",
-            lambda bridge, path, use_json=False, debug=False: None,
+            lambda bridge, path, use_json=False, debug=False, error_details=None: None,
         )
         return mock_bridge, fuse_fs_mod
 
@@ -4075,7 +4075,7 @@ class TestCmdWrite:
         monkeypatch.setattr(fuse_fs_mod, "_create_bridge_from_args", fake_create)
         monkeypatch.setattr(
             fuse_fs_mod, "_ensure_parent_dirs",
-            lambda bridge, path, use_json=False, debug=False: None,
+            lambda bridge, path, use_json=False, debug=False, error_details=None: None,
         )
 
         source = tmp_path / "source.txt"
@@ -4314,7 +4314,7 @@ class TestCmdWrite:
 
         captured_calls = []
 
-        def capture_ensure(bridge, path, use_json=False, debug=False):
+        def capture_ensure(bridge, path, use_json=False, debug=False, error_details=None):
             captured_calls.append(path)
 
         monkeypatch.setattr(fuse_fs_mod, "_ensure_parent_dirs", capture_ensure)
@@ -4409,7 +4409,7 @@ class TestCmdWrite:
         )
         monkeypatch.setattr(
             fuse_fs_mod, "_ensure_parent_dirs",
-            lambda bridge, path, use_json=False, debug=False: None,
+            lambda bridge, path, use_json=False, debug=False, error_details=None: None,
         )
 
         source = tmp_path / "source.txt"
