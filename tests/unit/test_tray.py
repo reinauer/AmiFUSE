@@ -334,7 +334,7 @@ class TestQuitLifecycle:
         tray_app._mounts = [{"pid": 1, "mountpoint": "D:", "image": "x.hdf"}]
 
         kill_calls = []
-        monkeypatch.setattr("amifuse.platform.stop_mount_processes", lambda pids, **kw: kill_calls.extend(pids))
+        monkeypatch.setattr("amifuse.platform.stop_mount_processes", lambda pids, **kw: kill_calls.extend(pids) or pids)
 
         tray_app._quit(icon, None)
 
@@ -354,7 +354,7 @@ class TestQuitLifecycle:
         # Simulate mounts existing when run() returns
         app._mounts = [{"pid": 42, "mountpoint": "D:", "image": "x.hdf"}]
 
-        monkeypatch.setattr("amifuse.platform.stop_mount_processes", lambda pids, **kw: kill_calls.extend(pids))
+        monkeypatch.setattr("amifuse.platform.stop_mount_processes", lambda pids, **kw: kill_calls.extend(pids) or pids)
 
         # Mock the poll thread to not actually run
         monkeypatch.setattr("threading.Thread.start", lambda self: None)
@@ -363,6 +363,24 @@ class TestQuitLifecycle:
 
         assert 42 in kill_calls
 
+    def test_exit_reports_partial_failure_without_raising(self, tray_app, monkeypatch):
+        from amifuse.windows_unmount import UnmountError
+
+        tray_app._mounts = [{"pid": 1, "mountpoint": "D:"},
+                            {"pid": 2, "mountpoint": "E:"}]
+        failure = UnmountError([2], {1: OSError("missing control events")})
+        monkeypatch.setattr(tray_app, "_poll_loop", lambda: None)
+        monkeypatch.setattr("amifuse.platform.stop_mount_processes",
+                            MagicMock(side_effect=failure))
+        notify, report = MagicMock(), MagicMock()
+        monkeypatch.setattr("amifuse.platform.notify_shell_drive_change", notify)
+        monkeypatch.setattr(tray_app, "_report_unmount_error", report)
+
+        tray_app.run()
+
+        notify.assert_called_once_with("E:", added=False)
+        report.assert_called_once_with(failure)
+
 
 # ---------------------------------------------------------------------------
 # Unmount tests
@@ -370,12 +388,65 @@ class TestQuitLifecycle:
 
 
 class TestUnmount:
+    def test_partial_failure_notifies_success_and_reports_error(self, tray_app, monkeypatch):
+        from amifuse.windows_unmount import UnmountError
+
+        mounts = [{"pid": 1, "mountpoint": "D:"},
+                  {"pid": 2, "mountpoint": "E:"}]
+        tray_app._mounts = mounts
+        failure = UnmountError([2], {1: OSError("flush failed")})
+        stop = MagicMock(side_effect=failure)
+        notify = MagicMock()
+        report = MagicMock()
+        monkeypatch.setattr("amifuse.platform.stop_mount_processes", stop)
+        monkeypatch.setattr("amifuse.platform.notify_shell_drive_change", notify)
+        monkeypatch.setattr(tray_app, "_report_unmount_error", report)
+
+        tray_app._unmount_all()
+
+        stop.assert_called_once_with([1, 2])
+        notify.assert_called_once_with("E:", added=False)
+        report.assert_called_once_with(failure)
+        assert tray_app._mounts == mounts[:1]
+        assert tray_app._wake_event.is_set()
+
+    def test_unmount_menu_returns_while_cleanup_waits(self, tray_app, monkeypatch):
+        entered, release = threading.Event(), threading.Event()
+        tray_app._mounts = [{"pid": 1, "mountpoint": "D:"}]
+
+        def stop(pids):
+            entered.set()
+            assert release.wait(3)
+            return pids
+
+        monkeypatch.setattr("amifuse.platform.stop_mount_processes", stop)
+        monkeypatch.setattr("amifuse.platform.notify_shell_drive_change", MagicMock())
+        try:
+            tray_app._unmount_all_cb(None, None)
+            assert entered.wait(2)
+            assert tray_app._unmount_thread.is_alive()
+        finally:
+            release.set()
+            tray_app._unmount_thread.join(3)
+        assert not tray_app._unmount_thread.is_alive()
+
+    def test_error_dialog_and_log_remain_available_after_exit(self, tray_app, monkeypatch, caplog):
+        import ctypes
+
+        message_box = MagicMock()
+        monkeypatch.setattr(ctypes, "windll", types.SimpleNamespace(
+            user32=types.SimpleNamespace(MessageBoxW=message_box)), raising=False)
+        tray_app._report_unmount_error(OSError("process 42 flush failed"))
+        assert "process 42 flush failed" in caplog.text
+        message_box.assert_called_once_with(
+            None, "process 42 flush failed", "AmiFUSE: unmount failed", 0x10)
+
     def test_unmount_single_requests_clean_stop(self, tray_app, monkeypatch):
         """Cooperative stop called with the correct pid."""
         calls = []
         monkeypatch.setattr(
             "amifuse.platform.stop_mount_processes",
-            lambda pids: calls.append(pids),
+            lambda pids: calls.append(pids) or pids,
         )
 
         mount = {"pid": 99, "mountpoint": "D:", "image": "x.hdf"}
@@ -385,7 +456,7 @@ class TestUnmount:
 
     def test_unmount_single_wakes_poll(self, tray_app, monkeypatch):
         """wake_event is set after unmount."""
-        monkeypatch.setattr("amifuse.platform.stop_mount_processes", lambda pids, **kw: None)
+        monkeypatch.setattr("amifuse.platform.stop_mount_processes", lambda pids, **kw: pids)
 
         mount = {"pid": 99, "mountpoint": "D:", "image": "x.hdf"}
         tray_app._unmount_single(mount)
@@ -397,7 +468,7 @@ class TestUnmount:
         calls = []
         monkeypatch.setattr(
             "amifuse.platform.stop_mount_processes",
-            lambda pids, **kw: calls.append(pids),
+            lambda pids, **kw: calls.append(pids) or pids,
         )
         tray_app._mounts = [
             {"pid": 1, "mountpoint": "D:", "image": "a.hdf"},

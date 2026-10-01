@@ -106,6 +106,46 @@ def test_missing_control_is_an_error(monkeypatch):
         unmount.request_unmount(42)
 
 
+def test_batch_signals_all_mounts_and_collects_failures(monkeypatch):
+    opened, closed, signaled, waits = [], [], [], []
+    now = [100.0]
+
+    class BatchEvents:
+        def open(self, pid, kind):
+            if pid == 1 and kind == "done":
+                raise OSError("old mount has no events")
+            opened.append((pid, kind))
+            return pid, kind
+
+        def set(self, handle):
+            signaled.append(handle[0])
+
+        def wait(self, handle, timeout):
+            assert signaled == [2, 3, 4]
+            waits.append((handle, timeout))
+            pid, kind = handle
+            if pid == 2:
+                now[0] += timeout
+                return False  # exhaust the shared deadline
+            return kind == "done" or pid == 3  # 3 fails flush, 4 succeeds
+
+        def close(self, handle):
+            closed.append(handle)
+
+    monkeypatch.setattr(unmount, "_Events", BatchEvents)
+    monkeypatch.setattr(unmount.time, "monotonic", lambda: now[0])
+    with pytest.raises(unmount.UnmountError) as caught:
+        unmount.request_unmount_many([1, 2, 3, 4, 4], timeout=30)
+    assert caught.value.completed == [4]
+    assert set(caught.value.failures) == {1, 2, 3}
+    assert "older AmiFUSE" in str(caught.value.failures[1])
+    assert "Timed out" in str(caught.value.failures[2])
+    assert "flush failure" in str(caught.value.failures[3])
+    assert waits[0] == ((2, "done"), 30)
+    assert all(timeout == 0 for _, timeout in waits[1:])
+    assert closed == opened  # includes handles from the partially opened PID
+
+
 def test_windows_cli_uses_control_without_taskkill(monkeypatch):
     from amifuse import fuse_fs, platform
 
@@ -114,14 +154,14 @@ def test_windows_cli_uses_control_without_taskkill(monkeypatch):
     monkeypatch.setattr(os.path, "ismount", lambda p: True)
     monkeypatch.setattr(platform, "_find_mount_owner_pids", lambda p: [42])
     request = Mock(side_effect=OSError("flush failed"))
-    monkeypatch.setattr(unmount, "request_unmount", request)
+    monkeypatch.setattr(unmount, "request_unmount_many", request)
     kill = Mock(side_effect=AssertionError("must not kill"))
     monkeypatch.setattr(platform, "kill_pids", kill)
     monkeypatch.setattr(fuse_fs, "kill_mount_owner_processes", kill)
     with pytest.raises(SystemExit, match="flush failed"):
         fuse_fs.cmd_unmount(SimpleNamespace(mountpoint=Path("R:")))
-    request.assert_called_once_with(42, timeout=30.0)
-    request.side_effect = None
+    request.assert_called_once_with([42], timeout=30.0)
+    request.side_effect = lambda pids, **kwargs: pids
     fuse_fs.cmd_unmount(SimpleNamespace(mountpoint=Path("R:")))
     kill.assert_not_called()
     monkeypatch.setattr(platform, "_find_mount_owner_pids", lambda p: [])
