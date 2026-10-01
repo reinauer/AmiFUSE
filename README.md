@@ -230,13 +230,18 @@ amifuse mount '\\.\PhysicalDrive2' --partition DH0 --mountpoint R: --write
 Use the actual disk number and partition name from the commands above.
 Cancel any Windows prompt to initialize or format the Amiga disk.
 
-AmiFUSE holds an exclusive handle to the physical disk for the mount's
-lifetime. Only one AmiFUSE mount/session can own that disk at a time.
-Writable mounts also lock and dismount any Windows volumes on that disk;
+AmiFUSE holds a global Windows process lock for the physical disk until
+its last stream closes. This excludes other AmiFUSE/vamos sessions even
+when a disk driver does not enforce exclusive handle sharing. It does not
+exclude unrelated raw-disk tools.
+Writable mounts also lock and dismount Windows volumes identified on that disk;
 close applications using those volumes first. If a required lock fails,
 the mount fails before AmiFUSE writes to the disk. Unmount with `amifuse unmount`
-before unplugging the card; this flushes writes and releases the disk and
-volume handles. No extra pywin32 dependency is required.
+or the tray before unplugging the card. Both request WinFsp shutdown and wait
+for handler flushing and disk cleanup. A timeout or flush failure is reported
+as an error; the unmount request never falls back to force-killing the process.
+Check the mount log and wait for a successful unmount before removing the card.
+No extra pywin32 dependency is required.
 
 When running this change from source, install the accompanying amitools
 checkout as well as AmiFUSE into your Python environment:
@@ -245,6 +250,10 @@ checkout as well as AmiFUSE into your Python environment:
 python -m pip install -e './amitools[vamos]'
 python -m pip install -e '.[windows]'
 ```
+
+The published `amitools-amifuse 0.8.0.post8` dependency supports ordinary
+image files but does not include physical-disk support. Until a release
+containing that support is available, use the source installation above.
 
 ### Diagnosing Issues
 

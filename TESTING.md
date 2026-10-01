@@ -1,5 +1,26 @@
 # Testing
 
+## Windows physical-disk release checks
+
+The physical-disk work depends on amitools PR #3. Before merging AmiFUSE
+PR #56, merge that dependency and pin the resulting commit on
+`Drop_AccessStruct`. Keep the companion feature branch until the pin is
+updated; `git submodule update --remote` follows `Drop_AccessStruct` and
+does not select the unmerged feature branch.
+
+The installed-wheel CI job checks ordinary-image commands with the
+declared minimum `amitools-amifuse 0.8.0.post8`. Physical-disk support needs
+the source checkout until an amitools release includes it; update the
+dependency floor when making that support available in packaged installs.
+
+Windows CI exercises named locks and unmount events across real processes
+without opening a physical disk. The mount persistence test requires a
+successful CLI unmount and process exit before reopening the image; it
+does not force-kill the writer to make the test proceed. The sector and
+volume-control tests use simulated Win32 devices. A real Windows CF/SD
+reader still needs a write/unmount/reopen test before claiming hardware
+validation.
+
 This repo currently has two testing layers:
 
 - top-level AmiFuse integration and smoke tests
