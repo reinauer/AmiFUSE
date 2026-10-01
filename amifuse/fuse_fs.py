@@ -3197,9 +3197,20 @@ def mount_fuse(
     if validation_error:
         raise SystemExit(validation_error)
 
+    try:
+        fuse_mountpoint = plat.get_fuse_mountpoint(mountpoint)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    if sys.platform.startswith("win"):
+        drive = plat.windows_drive_mountpoint(mountpoint)
+        if drive:
+            # Keep OS probes, shell notifications and user-facing paths in
+            # the normal namespace; only WinFsp needs the device spelling.
+            mountpoint = Path(drive)
+
     # Create mountpoint directory if it doesn't exist
-    if not mountpoint.exists():
-        if not plat.should_auto_create_mountpoint(mountpoint):
+    if not plat.should_auto_create_mountpoint(mountpoint):
+        if not mountpoint.exists():
             try:
                 mountpoint.mkdir(parents=True, exist_ok=True)
             except FileExistsError:
@@ -3227,6 +3238,8 @@ def mount_fuse(
         print(f"Mounting partition '{part_name}' from {image}")
     print(f"Filesystem driver: {driver_desc}")
     print(f"Mount point: {mountpoint}")
+    if sys.platform.startswith("win") and fuse_mountpoint.startswith("\\\\.\\"):
+        print("[amifuse] global drive; unmount from an Administrator shell")
     if foreground:
         print("[amifuse] interactive mode; press Ctrl+C to unmount")
     else:
@@ -3306,7 +3319,7 @@ def mount_fuse(
             operations._unmount_control = control
         fuse_class(
             operations,
-            str(mountpoint),
+            fuse_mountpoint,
             **fuse_kwargs,
         )
     finally:
@@ -4526,6 +4539,10 @@ def cmd_unmount(args):
     from . import platform as plat
 
     mountpoint = args.mountpoint
+    if sys.platform.startswith("win"):
+        drive = plat.windows_drive_mountpoint(mountpoint)
+        if drive:
+            mountpoint = Path(drive + "\\")
     is_mounted = False
     try:
         is_mounted = os.path.ismount(mountpoint)
