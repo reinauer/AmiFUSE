@@ -172,7 +172,8 @@ def mount_image(fuse_available, tmp_path):
                 return f"{letter}:"
         raise RuntimeError("No available drive letters found (D: through Z:)")
 
-    def _mount(image, driver=None, extra_args=None, timeout=_MOUNT_TIMEOUT):
+    def _mount(image, driver=None, extra_args=None, timeout=_MOUNT_TIMEOUT,
+               mountmgr=False):
         # Build mountpoint
         if sys.platform.startswith("win"):
             # Windows: use drive-letter mounts for reliable os.path.ismount()
@@ -188,6 +189,9 @@ def mount_image(fuse_available, tmp_path):
 
         # Build command -- pass drive letter without trailing backslash on Windows
         mp_arg = mountpoint_str if sys.platform.startswith("win") else str(mountpoint)
+        if mountmgr:
+            assert sys.platform.startswith("win")
+            mp_arg = "\\\\.\\" + mountpoint_str
         cmd = [
             sys.executable, "-m", "amifuse", "mount",
             str(image),

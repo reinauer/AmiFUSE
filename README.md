@@ -221,11 +221,18 @@ amifuse unmount R:
 
 The single quotes are PowerShell quoting; they are not part of the device name.
 
-The drive letter created by this elevated mount is visible to elevated
-programs in that logon session. Normal Explorer windows and unelevated
-applications cannot see it. Access the mounted files from the Administrator
-PowerShell session, and run `amifuse unmount R:` from an Administrator shell.
-The normal desktop tray cannot reliably discover or unmount elevated mounts.
+Elevated drive-letter mounts use the Windows mount manager, making `R:`
+visible in normal Explorer windows and unelevated applications. This also
+applies to image files mounted from an Administrator shell. Ordinary
+unelevated image mounts keep their existing per-session drive letters.
+You can explicitly request the global form with `--mountpoint '\\.\R:'`;
+this requires Administrator privileges. Both forms refer to the same drive
+for `amifuse unmount`.
+
+Run `amifuse unmount R:` from an Administrator shell for an elevated mount.
+The normal desktop tray cannot reliably discover or unmount elevated mounts,
+even though Explorer can access their files. Global visibility does not
+change file permissions or grant the tray access to elevated control events.
 
 Mounts are read-only by default. To enable writes to the card itself:
 

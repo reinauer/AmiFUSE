@@ -20,6 +20,32 @@ volume-control tests use simulated Win32 devices. A real Windows CF/SD
 reader still needs a write/unmount/reopen test before claiming hardware
 validation.
 
+### Global Windows drive letters
+
+Elevated drive-letter mounts use WinFsp's mount-manager form. The Windows
+mount tests cover both automatic selection from `R:` and explicit
+`\\.\R:` syntax, check the volume's mount-manager GUID, write through the
+drive, unmount using the opposite alias, check drive removal, and remount
+to verify persistence. These tests require Administrator privileges.
+
+An interactive Windows desktop test is also needed to verify the UAC
+boundary; a service-context CI runner does not reproduce a split-token
+Explorer session:
+
+1. From Administrator PowerShell, mount a disposable copy of an image with
+   `amifuse mount .\test.hdf --partition DH0 --mountpoint R: --write`.
+2. From normal Explorer and a non-Administrator PowerShell window, confirm
+   that `R:\` is visible, create a test file, and read its contents back.
+3. From the Administrator shell, run `amifuse unmount R:`. Confirm the drive
+   disappears from both shells and Explorer.
+4. Remount the image read-only and confirm the test file and contents remain.
+5. Repeat using `--mountpoint '\\.\R:'` and unmount with `R:`. An occupied
+   letter must be rejected without replacing its existing drive.
+
+Use the Administrator CLI to unmount elevated mounts; the normal desktop
+tray cannot manage them. Do not broaden shutdown-event permissions to test
+visibility.
+
 This repo currently has two testing layers:
 
 - top-level AmiFuse integration and smoke tests
