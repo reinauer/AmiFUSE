@@ -870,14 +870,17 @@ def _find_amifuse_mounts_cim():
 
 
 def _deduplicate_fusepy_children(mounts: list) -> list:
-    """Filter out fusepy child processes from mount list.
+    """Collapse a mount's process chain to the process that serves it.
 
-    fusepy spawns a child process for FUSE operations. Both parent and child
-    appear in process scanning, causing duplicate tray entries (e.g., "D:" and
-    "?"). Filter out mounts whose parent_pid matches another mount's pid.
+    One mount can appear as a parent and child with the same command line:
+    a Windows venv's python.exe/pythonw.exe is a launcher that runs the base
+    interpreter as a child, and a daemonizing FUSE mount forks. Both show up
+    in process scanning, causing duplicate tray entries (e.g., "D:" and "?").
+    Keep the innermost process: it owns the mount and, on Windows, the
+    unmount events named after its PID.
     """
-    pids = {m["pid"] for m in mounts}
-    return [m for m in mounts if m.get("parent_pid") not in pids]
+    parent_pids = {m.get("parent_pid") for m in mounts}
+    return [m for m in mounts if m["pid"] not in parent_pids]
 
 
 # ---------------------------------------------------------------------------
