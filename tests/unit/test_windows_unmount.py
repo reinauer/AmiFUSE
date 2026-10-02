@@ -197,6 +197,21 @@ def test_drive_mount_owner_matches_root_aliases(monkeypatch, requested, mounted)
     assert platform._find_mount_owner_pids(Path(requested)) == [42]
 
 
+def test_mount_owner_is_process_behind_venv_launcher(monkeypatch):
+    # A venv's python.exe re-runs the same command line under the base
+    # interpreter; only that child creates the PID-named unmount events.
+    from amifuse import platform
+
+    cmd = {"mountpoint": "J:", "image": "pfs.hdf", "uptime_seconds": 1,
+           "filesystem_type": None}
+    monkeypatch.setattr(platform, "sys", SimpleNamespace(platform="win32"))
+    monkeypatch.setattr(platform, "_find_amifuse_mounts_windows", lambda: [
+        dict(cmd, pid=100, parent_pid=50),   # venv launcher
+        dict(cmd, pid=200, parent_pid=100),  # base interpreter
+    ])
+    assert platform._find_mount_owner_pids(Path("J:")) == [200]
+
+
 @pytest.mark.parametrize("replies", [[], [(0, 0, 0, 209)], [(0, 0, -1, 0)]])
 def test_flush_requires_handler_acknowledgement(replies):
     from amifuse.fuse_fs import HandlerBridge
@@ -222,7 +237,7 @@ def test_flush_requires_handler_acknowledgement(replies):
 def test_native_unmount_across_processes(tmp_path):
     marker = tmp_path / "flushed"
     code = '''
-import sys, threading
+import os, sys, threading
 from pathlib import Path
 from amifuse import windows_unmount as w
 requested = threading.Event()
@@ -230,7 +245,7 @@ w._fuse_exit_callback = lambda: requested.set
 c = w.UnmountControl()
 try:
     c.start()
-    print("ready", flush=True)
+    print("ready", os.getpid(), flush=True)
     if not requested.wait(10):
         raise RuntimeError("no request")
     Path(sys.argv[1]).write_text("flushed")
@@ -242,8 +257,10 @@ finally:
     proc = subprocess.Popen([sys.executable, "-c", code, str(marker)],
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     try:
-        assert proc.stdout.readline().strip() == "ready"
-        unmount.request_unmount(proc.pid, timeout=10)
+        # Not proc.pid: in a venv that is the launcher, not the interpreter.
+        ready, pid = proc.stdout.readline().split()
+        assert ready == "ready"
+        unmount.request_unmount(int(pid), timeout=10)
         assert marker.read_text() == "flushed"
         assert proc.wait(timeout=10) == 0
     finally:

@@ -933,16 +933,16 @@ class TestPidExists:
 class TestDeduplicateFusepyChildren:
     """Tests for _deduplicate_fusepy_children()."""
 
-    def test_deduplicate_filters_child(self):
+    def test_deduplicate_keeps_innermost_process(self):
         from amifuse.platform import _deduplicate_fusepy_children
 
         mounts = [
             {"pid": 100, "parent_pid": 1, "mountpoint": "/mnt/a"},
-            {"pid": 200, "parent_pid": 100, "mountpoint": None},
+            {"pid": 200, "parent_pid": 100, "mountpoint": "/mnt/a"},
+            {"pid": 300, "parent_pid": 200, "mountpoint": "/mnt/a"},
         ]
         result = _deduplicate_fusepy_children(mounts)
-        assert len(result) == 1
-        assert result[0]["pid"] == 100
+        assert [m["pid"] for m in result] == [300]
 
     def test_deduplicate_keeps_unrelated_processes(self):
         from amifuse.platform import _deduplicate_fusepy_children
