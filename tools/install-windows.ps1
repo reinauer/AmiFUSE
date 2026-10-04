@@ -75,6 +75,20 @@ function Test-HasWinget {
     return ($null -ne (Get-Command winget -ErrorAction SilentlyContinue))
 }
 
+# Run a native command, stream its stdout and stderr to the console, and
+# return its exit code. Under PowerShell 5.1 with $ErrorActionPreference =
+# "Stop", a stderr line redirected with 2>&1 becomes a terminating
+# NativeCommandError: the script dies on the first stderr line (even a pip
+# warning), and only that one line is shown -- never the actual error. The
+# exit code, not stderr, decides failure; "Continue" applies to this
+# function's scope only.
+function Invoke-Native {
+    param([string]$FilePath, [string[]]$ArgumentList)
+    $ErrorActionPreference = "Continue"
+    & $FilePath @ArgumentList 2>&1 | ForEach-Object { Write-Host $_ }
+    return $LASTEXITCODE
+}
+
 # Run <exe> --version and return version info, or $null if it isn't a usable
 # Python. Never throws.
 function Get-PythonVersionInfo {
@@ -496,8 +510,8 @@ if (($userPath -split ';') -notcontains $venvScripts) {
 # G4 -- pip bootstrap / upgrade in the venv
 # ---------------------------------------------------------------------------
 Write-Step "Bootstrapping pip in the venv..."
-python -m ensurepip --upgrade 2>&1 | ForEach-Object { Write-Host $_ }
-python -m pip install --upgrade pip 2>&1 | ForEach-Object { Write-Host $_ }
+$null = Invoke-Native python @('-m', 'ensurepip', '--upgrade')
+$null = Invoke-Native python @('-m', 'pip', 'install', '--upgrade', 'pip')
 
 $pipVer = python -m pip --version 2>&1
 if ($LASTEXITCODE -ne 0) {
@@ -512,7 +526,9 @@ Write-Ok "pip ready: $pipVer"
 Write-Step "Installing AmiFUSE..."
 
 $devMode = $false
-$repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..") -ErrorAction SilentlyContinue).Path
+# .ProviderPath, not .Path: when the script runs from a UNC path, .Path carries
+# a "Microsoft.PowerShell.Core\FileSystem::" prefix that git and pip can't use.
+$repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..") -ErrorAction SilentlyContinue).ProviderPath
 $pyprojectPath = if ($repoRoot) { Join-Path $repoRoot "pyproject.toml" } else { $null }
 if ($pyprojectPath -and (Test-Path $pyprojectPath)) {
     $content = Get-Content $pyprojectPath -Raw
@@ -527,24 +543,39 @@ if ($devMode) {
     # pulled transitively (via amitools-amifuse[vamos]) resolves without an sdist
     # build. The import check below is the fast/clear guard.
     #
-    # setuptools_scm (upstream pyproject build config) derives the version from git
-    # and lists tracked files via os.path.relpath(file, cwd). That crashes when the
-    # repo is on a mapped network drive (git returns UNC paths, cwd is a drive letter
-    # -- "path is on mount '\\host\share', start on mount 'U:'") and also when the
-    # repo came from a GitHub ZIP (no .git -> "unable to determine version"). Pinning
-    # SETUPTOOLS_SCM_PRETEND_VERSION_FOR_AMIFUSE bypasses both the file-finder and
-    # version derivation. The package-scoped form (suffix canonicalized to "amifuse")
-    # targets ONLY our package -- the unscoped var would force this version onto any
-    # other setuptools_scm-based package built from sdist in the same isolated build
-    # env (e.g. transitive amitools-amifuse). Prefer the latest git tag (plain git
-    # works on the network drive; only setuptools_scm's relpath fails), else a
+    # setuptools_scm (upstream pyproject build config) lists tracked files at
+    # their real path (symlinks and mapped drives resolved, so a network share
+    # becomes \\host\share\...) and then takes os.path.relpath(file, cwd), where
+    # cwd is the path handed to pip. If those two are on different mounts the
+    # build dies with "path is on mount '\\host\share', start on mount 'U:'".
+    # setuptools_scm 10 lists the files even when the version is pretended (see
+    # below), so install from the real path: cwd and file list then agree. On a
+    # plain local clone this is the same path.
+    $realRoot = & {
+        $ErrorActionPreference = "Continue"
+        python -c "import os, sys; print(os.path.realpath(sys.argv[1]))" $repoRoot 2>$null
+    }
+    if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($realRoot)) {
+        $repoRoot = "$realRoot".Trim()
+    }
+    # A repo from a GitHub ZIP has no .git ("unable to determine version").
+    # SETUPTOOLS_SCM_PRETEND_VERSION_FOR_AMIFUSE bypasses version derivation. The
+    # package-scoped form (suffix canonicalized to "amifuse") targets ONLY our
+    # package -- the unscoped var would force this version onto any other
+    # setuptools_scm-based package built from sdist in the same isolated build
+    # env (e.g. transitive amitools-amifuse). Prefer the latest git tag, else a
     # harmless static fallback -- the version is cosmetic for an editable dev install.
     # Only call git if it exists: a ZIP-download user on a fresh box may not have it,
     # and with $ErrorActionPreference = "Stop" a bare git call would raise a
     # terminating CommandNotFoundException (2>$null does NOT suppress that).
+    # "Continue" in the child scope: under PowerShell 5.1 even a 2>$null'd git
+    # error (e.g. no tags) is otherwise a terminating NativeCommandError.
     $scmVersion = $null
     if (Get-Command git -ErrorAction SilentlyContinue) {
-        $scmVersion = (git -C $repoRoot describe --tags --abbrev=0 2>$null)
+        $scmVersion = & {
+            $ErrorActionPreference = "Continue"
+            git -C $repoRoot describe --tags --abbrev=0 2>$null
+        }
     }
     # Decide on the STRING being empty, NOT $LASTEXITCODE -- when git is skipped
     # $LASTEXITCODE holds a stale value from an earlier external command.
@@ -556,10 +587,9 @@ if ($devMode) {
     $prevScmVersion = $env:SETUPTOOLS_SCM_PRETEND_VERSION_FOR_AMIFUSE
     try {
         $env:SETUPTOOLS_SCM_PRETEND_VERSION_FOR_AMIFUSE = $scmVersion
-        python -m pip install -e "$repoRoot[windows]" 2>&1 | ForEach-Object { Write-Host $_ }
         # Capture the pip exit code BEFORE finally runs -- any command in finally
         # (e.g. Remove-Item) could clobber $LASTEXITCODE before the check below.
-        $pipExit = $LASTEXITCODE
+        $pipExit = Invoke-Native python @('-m', 'pip', 'install', '-e', "$repoRoot[windows]")
     } finally {
         if ($null -eq $prevScmVersion) {
             Remove-Item Env:SETUPTOOLS_SCM_PRETEND_VERSION_FOR_AMIFUSE -ErrorAction SilentlyContinue
@@ -580,15 +610,13 @@ if ($devMode) {
     # guard is ever reached. G1 should keep us in 3.9-3.13, so this normally just
     # installs a wheel.
     Write-Step "Installing machine68k-amifuse (wheel only)..."
-    python -m pip install --only-binary=:all: machine68k-amifuse 2>&1 | ForEach-Object { Write-Host $_ }
-    if ($LASTEXITCODE -ne 0) {
+    if ((Invoke-Native python @('-m', 'pip', 'install', '--only-binary=:all:', 'machine68k-amifuse')) -ne 0) {
         $pv = (python --version 2>&1)
         Write-Err "No compatible machine68k-amifuse wheel for this Python -- need Python 3.9-3.13 (have $pv)."
         exit 1
     }
     Write-Step "Installing AmiFUSE from PyPI..."
-    python -m pip install amifuse pystray Pillow 2>&1 | ForEach-Object { Write-Host $_ }
-    if ($LASTEXITCODE -ne 0) {
+    if ((Invoke-Native python @('-m', 'pip', 'install', 'amifuse', 'pystray', 'Pillow')) -ne 0) {
         Write-Err "Failed to install amifuse/pystray/Pillow from PyPI."
         exit 1
     }
@@ -596,8 +624,7 @@ if ($devMode) {
 
 # Final G5 verification: machine68k must import (wheel installed correctly).
 Write-Step "Verifying machine68k import..."
-python -c "import machine68k" 2>&1 | ForEach-Object { Write-Host $_ }
-if ($LASTEXITCODE -ne 0) {
+if ((Invoke-Native python @('-c', 'import machine68k')) -ne 0) {
     $pv = (python --version 2>&1)
     Write-Err "No compatible machine68k-amifuse wheel for this Python -- need Python 3.9-3.13 (have $pv)."
     exit 1

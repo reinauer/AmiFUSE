@@ -28,3 +28,5 @@ if not "%_rc%"=="0" (
 echo.
 rem Hold the window open so the outcome above is readable after a double-click.
 pause
+rem pause resets errorlevel to 0; hand the installer's own code to the caller.
+exit /b %_rc%
