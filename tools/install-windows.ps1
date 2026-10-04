@@ -563,26 +563,44 @@ if ($devMode) {
     # package-scoped form (suffix canonicalized to "amifuse") targets ONLY our
     # package -- the unscoped var would force this version onto any other
     # setuptools_scm-based package built from sdist in the same isolated build
-    # env (e.g. transitive amitools-amifuse). Prefer the latest git tag, else a
-    # harmless static fallback -- the version is cosmetic for an editable dev install.
+    # env (e.g. transitive amitools-amifuse). Derive the version the way
+    # setuptools_scm would (guess-next-dev, no local part): the tag itself on a
+    # clean tagged commit, else the next patch release as .devN, N commits past
+    # the tag (v0.6.0-30-g1234abc -> 0.6.1.dev30; a dirty tree on the tag ->
+    # 0.6.1.dev0). The bare tag would label every dev install as that release.
+    # Without git or tags, fall back to 0.0.0.
     # Only call git if it exists: a ZIP-download user on a fresh box may not have it,
     # and with $ErrorActionPreference = "Stop" a bare git call would raise a
     # terminating CommandNotFoundException (2>$null does NOT suppress that).
+    # Only call it on a checkout with its own .git: otherwise git walks upward
+    # and would report the version of whatever repo encloses a ZIP download.
     # "Continue" in the child scope: under PowerShell 5.1 even a 2>$null'd git
     # error (e.g. no tags) is otherwise a terminating NativeCommandError.
+    # safe.directory names exactly this checkout, for this one call: git refuses
+    # a checkout on a share owned by another account ("detected dubious
+    # ownership"), and pip is about to run this repo's build code anyway.
     $scmVersion = $null
-    if (Get-Command git -ErrorAction SilentlyContinue) {
+    if ((Get-Command git -ErrorAction SilentlyContinue) -and (Test-Path -LiteralPath (Join-Path $repoRoot ".git"))) {
         $scmVersion = & {
             $ErrorActionPreference = "Continue"
-            git -C $repoRoot describe --tags --abbrev=0 2>$null
+            git -c "safe.directory=$repoRoot" -C $repoRoot describe --tags --long --dirty 2>$null
         }
     }
     # Decide on the STRING being empty, NOT $LASTEXITCODE -- when git is skipped
     # $LASTEXITCODE holds a stale value from an earlier external command.
+    # Only vX.Y.Z tags are mapped; any other tag (e.g. a pre-release) installs
+    # as the bare tag.
     if ([string]::IsNullOrWhiteSpace($scmVersion)) {
         $scmVersion = "0.0.0"
+        Write-Err "Could not read a version from git; installing as $scmVersion."
+    } elseif ($scmVersion.Trim() -match '^v?(\d+)\.(\d+)\.(\d+)-(\d+)-g[0-9a-f]+(-dirty)?$') {
+        if ($Matches[4] -eq '0' -and -not $Matches[5]) {
+            $scmVersion = "$($Matches[1]).$($Matches[2]).$($Matches[3])"
+        } else {
+            $scmVersion = "$($Matches[1]).$($Matches[2]).$([int]$Matches[3] + 1).dev$($Matches[4])"
+        }
     } else {
-        $scmVersion = $scmVersion.Trim() -replace '^v', ''
+        $scmVersion = $scmVersion.Trim() -replace '-\d+-g[0-9a-f]+(-dirty)?$', '' -replace '^v', ''
     }
     $prevScmVersion = $env:SETUPTOOLS_SCM_PRETEND_VERSION_FOR_AMIFUSE
     try {
