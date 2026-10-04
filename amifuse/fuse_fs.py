@@ -2056,6 +2056,14 @@ class AmigaFuseFS(_FuseOperations):
         # For read-only mounts, strip write bits
         if not self.bridge._write_enabled:
             base_mode &= ~(0o222)
+        # WinFsp builds each file's ACL from the mode, granting group and
+        # other to the mounting user's group and Everyone. Amiga files rarely
+        # carry GRP/OTR bits, so without this any other Windows account (a
+        # global drive letter, a second logged-in user) can list the root but
+        # open nothing beneath it. Mirror the owner's read/execute bits only;
+        # write access for other accounts stays opt-in via the Amiga bits.
+        if sys.platform.startswith("win"):
+            base_mode |= ((base_mode & 0o500) >> 3) | ((base_mode & 0o500) >> 6)
         result = {
             "st_mode": base_mode | (0o040000 if is_dir else 0o100000),
             "st_nlink": 2 if is_dir else 1,
