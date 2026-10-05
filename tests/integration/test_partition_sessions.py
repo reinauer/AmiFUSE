@@ -2,6 +2,7 @@
 
 from contextlib import ExitStack
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import time
@@ -50,6 +51,14 @@ def run_cli(*args):
                             capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, result.stdout + result.stderr
     return result
+
+
+def wait_unmounted(proc):
+    # FUSE-T in macOS CI can exit with SIGPIPE after successful unmount.
+    # Require process exit without forcing it; the remount below checks that
+    # writes persisted and that the partition lock was released.
+    expected = (0, -signal.SIGPIPE) if sys.platform == "darwin" else (0,)
+    assert proc.wait(timeout=10) in expected
 
 
 @pytest.fixture(params=[("pfs3aio", 0x50465303),
@@ -173,10 +182,10 @@ def test_concurrent_partition_mounts(partition_image, mount_image):
     (first_mount / "first").write_bytes(b"first partition")
     (second_mount / "second").write_bytes(b"second partition")
     run_cli("unmount", first_mount)
-    assert first.wait(timeout=10) == 0
+    wait_unmounted(first)
     (second_mount / "after").write_bytes(b"first mount already closed")
     run_cli("unmount", second_mount)
-    assert second.wait(timeout=10) == 0
+    wait_unmounted(second)
     for partition, files in [("DH0", {"first": b"first partition"}),
                              ("DH1", {"second": b"second partition",
                                       "after": b"first mount already closed"})]:
@@ -185,5 +194,5 @@ def test_concurrent_partition_mounts(partition_image, mount_image):
         for name, content in files.items():
             assert (Path(mount) / name).read_bytes() == content
         run_cli("unmount", mount)
-        assert proc.wait(timeout=10) == 0
+        wait_unmounted(proc)
     assert image.read_bytes()[:len(metadata)] == metadata
