@@ -1915,7 +1915,13 @@ class AmigaFuseFS(_FuseOperations):
 
     def _root_stat(self):
         now = int(time.time())
-        perm = 0o777 if self.bridge._write_enabled else 0o755
+        if sys.platform.startswith("win"):
+            # WinFsp maps group/other permissions to host ACLs. A global
+            # drive must not grant other accounts root create/delete access.
+            # uid/gid=-1 in mount_fuse keeps ownership with the mounting user.
+            perm = 0o755 if self.bridge._write_enabled else 0o555
+        else:
+            perm = 0o777 if self.bridge._write_enabled else 0o755
         return {
             "st_mode": (perm | 0o040000),
             "st_nlink": 2,
