@@ -123,6 +123,23 @@ class MountState(NamedTuple):
     reason: Optional[str]
     dos_error: Optional[int] = None
 
+
+class StartupDiskRejected(SystemExit):
+    """An explicit negative startup reply, rather than a handler failure."""
+
+    def __init__(self, res1: int, res2: int):
+        self.res1 = res1
+        self.res2 = res2
+        reasons = {
+            0: "no reason code supplied (wrong --driver for this filesystem?)",
+            218: "device not mounted",
+            225: "not a DOS disk",
+            226: "no disk present",
+        }
+        reason = reasons.get(res2, f"DOS error {res2}")
+        self.reason = f"handler rejected the disk: {reason}"
+        super().__init__(f"Error: no usable volume mounted: {self.reason}")
+
 # Upper bound for the path-keyed metadata caches. They are TTL-based but
 # otherwise unbounded, so a full traversal of a huge image would pin every
 # path in memory for the TTL. Entries are inserted in timestamp order, so
@@ -370,15 +387,9 @@ class HandlerBridge:
         if self._debug:
             print(f"[amifuse] Startup packet result: res1={startup_res1} res2={startup_res2}")
         if startup_res1 == 0:
-            # Handler rejected the disk - likely invalid filesystem signature
-            error_msgs = {
-                218: "Not a valid DOS disk (NDOS)",
-                225: "Not a DOS disk",
-                226: "Wrong disk type",
-                303: "Object not found",
-            }
-            error_desc = error_msgs.get(startup_res2, f"error code {startup_res2}")
-            raise SystemExit(f"Filesystem handler rejected the disk: {error_desc}")
+            if not replies:
+                raise SystemExit("Filesystem handler did not reply to the startup packet")
+            raise StartupDiskRejected(startup_res1, startup_res2)
         self._update_handler_port_from_startup()
         if self._debug:
             print(
@@ -3694,7 +3705,13 @@ def _create_bridge_from_args(args, command: str, read_only: bool = True):
             except Exception:
                 pass
         if use_json:
-            print(_json.dumps(_json_error(command, "HANDLER_ERROR", str(e))))
+            if isinstance(e, StartupDiskRejected):
+                print(_json.dumps(_json_error(
+                    command, "NOT_MOUNTED", f"No usable volume mounted: {e.reason}",
+                    details={"dos_error": e.res2},
+                )))
+            else:
+                print(_json.dumps(_json_error(command, "HANDLER_ERROR", str(e))))
             sys.exit(1)
         raise
     except Exception as e:
