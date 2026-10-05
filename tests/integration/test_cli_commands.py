@@ -17,6 +17,43 @@ import pytest
 pytestmark = pytest.mark.integration
 
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _run_amifuse(*args: str, timeout: float = 30.0) -> subprocess.CompletedProcess:
+    """Run amifuse as a subprocess and return the CompletedProcess."""
+    return subprocess.run(
+        [sys.executable, "-m", "amifuse", *args],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
+
+
+def _parse_json_stdout(proc: subprocess.CompletedProcess) -> dict:
+    """Extract the JSON object from stdout, ignoring vamos debug noise.
+
+    The vamos m68k emulator may print 'can't expunge ...' and 'orphan: ...'
+    lines to stdout before the actual JSON.  This helper finds the first
+    '{' and parses from there.
+    """
+    text = proc.stdout
+    idx = text.find("{")
+    assert idx != -1, (
+        f"No JSON object found in stdout.\n"
+        f"stdout: {text!r}\nstderr: {proc.stderr!r}"
+    )
+    return json.loads(text[idx:])
+
+
+# ---------------------------------------------------------------------------
+# Damaged-volume refusal
+# ---------------------------------------------------------------------------
+
+
 @pytest.mark.parametrize("command,path", [
     ("hash", "S/Startup-Sequence"), ("hash", "/"),
     ("read", "S/Startup-Sequence"), ("read", "/"),
@@ -49,37 +86,6 @@ def test_file_commands_reject_unmounted_adf(ofs_adf_image, fixture_root, tmp_pat
     assert data["error"]["details"]["disk_type"] == 0x4E444F53
     assert output.read_bytes() == b"must not truncate existing output"
     assert image.read_bytes() == before
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
-def _run_amifuse(*args: str, timeout: float = 30.0) -> subprocess.CompletedProcess:
-    """Run amifuse as a subprocess and return the CompletedProcess."""
-    return subprocess.run(
-        [sys.executable, "-m", "amifuse", *args],
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        check=False,
-    )
-
-
-def _parse_json_stdout(proc: subprocess.CompletedProcess) -> dict:
-    """Extract the JSON object from stdout, ignoring vamos debug noise.
-
-    The vamos m68k emulator may print 'can't expunge ...' and 'orphan: ...'
-    lines to stdout before the actual JSON.  This helper finds the first
-    '{' and parses from there.
-    """
-    text = proc.stdout
-    idx = text.find("{")
-    assert idx != -1, (
-        f"No JSON object found in stdout.\n"
-        f"stdout: {text!r}\nstderr: {proc.stderr!r}"
-    )
-    return json.loads(text[idx:])
 
 
 # ---------------------------------------------------------------------------
