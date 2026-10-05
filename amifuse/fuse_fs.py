@@ -315,7 +315,8 @@ class HandlerBridge:
                 else:
                     print(
                         f"[amifuse] WARNING: Partition extends to byte {part_end_byte:,} "
-                        f"but image is only {image_size:,} bytes. Data may be incomplete."
+                        f"but image is only {image_size:,} bytes. Data may be incomplete.",
+                        file=sys.stderr,
                     )
 
         self.vh.set_scsi_backend(self.backend, debug=debug)
