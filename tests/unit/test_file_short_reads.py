@@ -1,0 +1,201 @@
+"""Incomplete extraction must not publish a digest or replace an output."""
+
+import io
+import json
+import os
+import stat
+from types import SimpleNamespace
+from unittest.mock import Mock
+
+import pytest
+
+from amifuse import fuse_fs as fs
+
+
+@pytest.fixture
+def read_context(tmp_path, monkeypatch):
+    output = tmp_path / "output"
+    output.write_bytes(b"keep me")
+    args = SimpleNamespace(image=tmp_path / "image", file="file", json=True,
+                           out=str(output))
+    bridge = Mock()
+    bridge.is_mounted.return_value = fs.MountState(True, None, None)
+    bridge.stat_path.return_value = {"dir_type": -3, "size": 5}
+    bridge.open_file.return_value = (123, 0)
+    monkeypatch.setattr(fs, "_create_bridge_from_args", lambda *a: (bridge, None))
+    return args, bridge, output
+
+
+@pytest.mark.parametrize("command", ["hash", "read"])
+@pytest.mark.parametrize("chunks", [[b""], [b"ab", b""]])
+@pytest.mark.parametrize("use_json", [False, True])
+def test_short_read_fails(read_context, capsys, command, chunks, use_json):
+    args, bridge, output = read_context
+    args.json = use_json
+    bridge.read_handle.side_effect = chunks
+    with pytest.raises(SystemExit) as caught:
+        getattr(fs, "cmd_" + command)(args)
+    captured = capsys.readouterr()
+    if use_json:
+        assert caught.value.code == 1
+        result = json.loads(captured.out)
+        assert result["status"] == "error"
+        assert result["error"]["code"] == "HANDLER_ERROR"
+        message = result["error"]["message"]
+        assert "hash" not in result
+    else:
+        assert captured.out == ""
+        message = str(caught.value)
+    assert f"expected 5 bytes, got {len(chunks[0])}" in message
+    assert output.read_bytes() == b"keep me"
+    assert list(output.parent.iterdir()) == [output]
+    bridge.close_file.assert_called_once_with(123)
+    bridge.backend.close.assert_called_once()
+
+
+@pytest.mark.parametrize("failure", ["read", "close", "replace"])
+@pytest.mark.parametrize("existing", [True, False])
+def test_extraction_failure_preserves_destination(read_context, monkeypatch, capsys,
+                                                 failure, existing):
+    args, bridge, output = read_context
+    if not existing:
+        output.unlink()
+    bridge.read_handle.return_value = b"hello"
+    error = OSError("injected failure")
+    if failure == "read":
+        bridge.read_handle.side_effect = [b"ab", error]
+    elif failure == "close":
+        bridge.close_file.side_effect = error
+    else:
+        monkeypatch.setattr(fs.os, "replace", Mock(side_effect=error))
+    with pytest.raises(SystemExit):
+        fs.cmd_read(args)
+    assert "injected failure" in json.loads(capsys.readouterr().out)["error"]["message"]
+    assert output.exists() is existing
+    if existing:
+        assert output.read_bytes() == b"keep me"
+    assert not list(output.parent.glob(".amifuse-*"))
+    bridge.backend.close.assert_called_once()
+
+
+@pytest.mark.parametrize("data", [b"", b"hello"])
+def test_complete_read_replaces_output(read_context, capsys, data):
+    args, bridge, output = read_context
+    bridge.stat_path.return_value["size"] = len(data)
+    bridge.read_handle.side_effect = [data]
+    old_mode = stat.S_IMODE(output.stat().st_mode)
+    fs.cmd_read(args)
+    assert json.loads(capsys.readouterr().out)["status"] == "ok"
+    assert output.read_bytes() == data
+    assert stat.S_IMODE(output.stat().st_mode) == old_mode
+    assert not list(output.parent.glob(".amifuse-*"))
+
+
+def test_stdout_short_read_fails_without_closing_stream(read_context, monkeypatch):
+    args, bridge, _ = read_context
+    args.out, args.json = "-", False
+    bridge.read_handle.side_effect = [b"ab", b""]
+    stream = io.BytesIO()
+    monkeypatch.setattr(fs, "sys", SimpleNamespace(stdout=SimpleNamespace(buffer=stream)))
+    with pytest.raises(SystemExit, match="expected 5 bytes, got 2"):
+        fs.cmd_read(args)
+    assert stream.getvalue() == b"ab"
+    assert not stream.closed
+
+
+def test_symlink_output_keeps_link(read_context, capsys):
+    args, bridge, output = read_context
+    link = output.with_name("link")
+    try:
+        link.symlink_to(output.name)
+    except OSError:
+        pytest.skip("symlink creation is unavailable")
+    args.out = str(link)
+    bridge.read_handle.return_value = b"hello"
+    fs.cmd_read(args)
+    assert json.loads(capsys.readouterr().out)["status"] == "ok"
+    assert link.is_symlink()
+    assert output.read_bytes() == b"hello"
+
+
+def test_null_device_remains_a_stream(read_context, capsys, monkeypatch):
+    args, bridge, _ = read_context
+    args.out = os.devnull
+    bridge.read_handle.return_value = b"hello"
+    # Windows access() can deny NUL although opening the stream succeeds.
+    monkeypatch.setattr(fs.os, "access", lambda *args: False)
+    fs.cmd_read(args)
+    assert json.loads(capsys.readouterr().out)["status"] == "ok"
+
+
+@pytest.mark.parametrize("use_json", [False, True])
+def test_read_only_destination_is_preserved(read_context, capsys, use_json):
+    args, bridge, output = read_context
+    args.json = use_json
+    bridge.read_handle.return_value = b"hello"
+    old_mode = output.stat().st_mode
+    output.chmod(stat.S_IREAD)
+    try:
+        if os.access(output, os.W_OK):
+            pytest.skip("Current user can write read-only files")
+        with pytest.raises(SystemExit) as caught:
+            fs.cmd_read(args)
+        captured = capsys.readouterr()
+        if use_json:
+            assert caught.value.code == 1
+            error = json.loads(captured.out)["error"]
+            assert error["code"] == "HANDLER_ERROR"
+            assert "Cannot create output file" in error["message"]
+        else:
+            assert "cannot create output file" in str(caught.value)
+        assert output.read_bytes() == b"keep me"
+        assert not list(output.parent.glob(".amifuse-*"))
+        bridge.read_handle.assert_not_called()
+        bridge.backend.close.assert_called_once()
+    finally:
+        output.chmod(old_mode)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX umask permissions")
+@pytest.mark.parametrize("mask", [0o022, 0o002, 0o077])
+def test_new_output_uses_umask(read_context, capsys, mask):
+    args, bridge, output = read_context
+    output.unlink()
+    bridge.read_handle.return_value = b"hello"
+    old_mask = os.umask(mask)
+    try:
+        fs.cmd_read(args)
+    finally:
+        os.umask(old_mask)
+    assert json.loads(capsys.readouterr().out)["status"] == "ok"
+    assert output.read_bytes() == b"hello"
+    assert stat.S_IMODE(output.stat().st_mode) == 0o666 & ~mask
+    assert not list(output.parent.glob(".amifuse-*"))
+
+
+def test_read_only_staged_file_is_removed_after_replace_failure(
+        read_context, monkeypatch, capsys):
+    args, bridge, output = read_context
+    old_mode = output.stat().st_mode
+
+    def read_and_protect(*args):
+        # The target can become read-only after the initial access check.
+        output.chmod(stat.S_IREAD)
+        return b"hello"
+
+    def fail_replace(source, destination):
+        assert not source.stat().st_mode & stat.S_IWRITE
+        raise PermissionError("replacement denied")
+
+    bridge.read_handle.side_effect = read_and_protect
+    monkeypatch.setattr(fs.os, "replace", fail_replace)
+    try:
+        with pytest.raises(SystemExit) as caught:
+            fs.cmd_read(args)
+        assert caught.value.code == 1
+        assert "replacement denied" in json.loads(capsys.readouterr().out)["error"]["message"]
+        assert output.read_bytes() == b"keep me"
+        assert not list(output.parent.glob(".amifuse-*"))
+        bridge.backend.close.assert_called_once()
+    finally:
+        output.chmod(old_mode)
