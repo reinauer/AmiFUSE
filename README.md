@@ -229,6 +229,12 @@ You can explicitly request the global form with `--mountpoint '\\.\R:'`;
 this requires Administrator privileges. Both forms refer to the same drive
 for `amifuse unmount`.
 
+The drive letter must be unused in both the Administrator shell and the
+normal desktop session. An elevated process cannot detect drive mappings
+that exist only in the normal session, such as network or `subst` drives;
+those mappings take precedence over a global drive with the same letter
+in that session, so Explorer would continue to show the existing drive.
+
 Run `amifuse unmount R:` from an Administrator shell for an elevated mount.
 The normal desktop tray cannot reliably discover or unmount elevated mounts,
 even though Explorer can access their files. Global visibility does not
