@@ -250,16 +250,12 @@ class HandlerBridge:
 
     def _initialize(self, image, driver, block_size, read_only, debug,
                     trace, partition, adf_info, iso_info):
-        # For MBR images with multiple 0x76 partitions, find the right one
-        mbr_idx = None
-        if partition and adf_info is None and iso_info is None:
-            from .rdb_inspect import find_partition_mbr_index
-            mbr_idx = find_partition_mbr_index(image, block_size, partition)
         self.backend = BlockDeviceBackend(
             image, block_size=block_size, read_only=read_only, adf_info=adf_info,
-            iso_info=iso_info, mbr_partition_index=mbr_idx,
+            iso_info=iso_info, partition_scope=True, partition=partition,
         )
         self.backend.open()
+        mbr_idx = self.backend.mbr_partition_index
         self.vh = VamosHandlerRuntime()
         # Use 68020 CPU for compatibility with SFS and other modern handlers
         self.vh.setup(cpu="68020")
