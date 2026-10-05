@@ -4618,9 +4618,13 @@ def cmd_unmount(args):
         else:
             killed_pids = kill_mount_owner_processes(mountpoint)
         if not killed_pids:
-            raise SystemExit(
-                f"No amifuse process found for mountpoint {mountpoint}."
-            )
+            message = f"No amifuse process found for mountpoint {mountpoint}."
+            if sys.platform.startswith("win") and not plat.is_windows_admin():
+                message += (
+                    " If it was mounted from an Administrator shell, "
+                    "unmount it from an Administrator shell."
+                )
+            raise SystemExit(message)
         print(f"Unmounted {mountpoint} (stopped "
               f"{'processes' if len(killed_pids) > 1 else 'process'}"
               f" {', '.join(str(p) for p in killed_pids)}).")

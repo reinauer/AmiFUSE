@@ -89,3 +89,20 @@ def test_unmount_checks_normal_drive_root(windows, monkeypatch, requested):
     fuse_fs.cmd_unmount(SimpleNamespace(mountpoint=PureWindowsPath(requested)))
     probe.assert_called_once_with(Path("R:\\"))
     stop.assert_called_once_with([42])
+
+
+@pytest.mark.parametrize("elevated", [False, True])
+def test_unmount_without_owner_suggests_administrator_shell(windows, monkeypatch, elevated):
+    from amifuse import fuse_fs
+
+    monkeypatch.setattr(fuse_fs, "sys", SimpleNamespace(platform="win32"))
+    monkeypatch.setattr(fuse_fs.os.path, "ismount", Mock(return_value=True))
+    monkeypatch.setattr(platform, "is_windows_admin", lambda: elevated)
+    monkeypatch.setattr(platform, "_find_mount_owner_pids", lambda mp: [])
+    stop = Mock(return_value=[])
+    monkeypatch.setattr(platform, "stop_mount_processes", stop)
+    with pytest.raises(SystemExit) as caught:
+        fuse_fs.cmd_unmount(SimpleNamespace(mountpoint=PureWindowsPath("R:")))
+    assert "No amifuse process found" in str(caught.value)
+    assert ("Administrator shell" in str(caught.value)) is not elevated
+    stop.assert_called_once_with([])
