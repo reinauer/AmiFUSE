@@ -3990,8 +3990,10 @@ def cmd_hash(args):
             f"Supported: {', '.join(supported)}")
 
     bridge, temp_driver = _create_bridge_from_args(args, "hash")
+    mount_details = None
     try:
         state = _check_file_command_mount(bridge, "hash", use_json)
+        mount_details = _mount_state_details(state)
         normalized = "/" + file_path.lstrip("/")
         stat = bridge.stat_path(normalized)
         if stat is None:
@@ -4061,7 +4063,7 @@ def cmd_hash(args):
     except Exception as e:
         if use_json:
             print(json.dumps(_json_error("hash", "HANDLER_ERROR",
-                f"Hash computation failed: {e}")))
+                f"Hash computation failed: {e}", details=mount_details)))
             sys.exit(1)
         raise SystemExit(f"Error computing hash: {e}")
     finally:
@@ -4163,8 +4165,10 @@ def cmd_read(args):
         sys.exit(1)
 
     bridge, temp_driver = _create_bridge_from_args(args, "read")
+    mount_details = None
     try:
         state = _check_file_command_mount(bridge, "read", use_json)
+        mount_details = _mount_state_details(state)
         normalized = "/" + file_path.lstrip("/")
         stat = bridge.stat_path(normalized)
         if stat is None:
@@ -4253,7 +4257,7 @@ def cmd_read(args):
     except Exception as e:
         if use_json:
             print(json.dumps(_json_error("read", "HANDLER_ERROR",
-                f"File extraction failed: {e}")))
+                f"File extraction failed: {e}", details=mount_details)))
             sys.exit(1)
         raise SystemExit(f"Error extracting file: {e}")
     finally:
