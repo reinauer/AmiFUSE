@@ -4036,6 +4036,11 @@ def cmd_hash(args):
                     break
                 h.update(data)
                 bytes_read += len(data)
+            if bytes_read != file_size:
+                raise OSError(
+                    f"Incomplete read of {file_path}: expected {file_size} "
+                    f"bytes, got {bytes_read}"
+                )
         finally:
             bridge.close_file(fh_addr)
 
@@ -4143,10 +4148,13 @@ def _ensure_parent_dirs(bridge, path: str, use_json: bool = False,
 def cmd_read(args):
     """Handle the 'read' subcommand."""
     import json
+    import tempfile
 
     use_json = getattr(args, "json", False)
     file_path = args.file
     out_path = getattr(args, "out", None)
+    temp_output = None
+    output_staging = None
 
     # Default output name = basename of Amiga path
     if out_path is None:
@@ -4206,7 +4214,22 @@ def cmd_read(args):
                 out_fd = sys.stdout.buffer
             else:
                 try:
-                    out_fd = open(out_path, "wb")
+                    # Follow symlinks as open(..., "wb") did. Stage regular
+                    # files beside the destination for an atomic replacement;
+                    # special outputs such as /dev/null remain streams.
+                    destination = Path(out_path).resolve()
+                    if destination.exists() and not destination.is_file():
+                        out_fd = open(destination, "wb")
+                    else:
+                        if destination.exists() and not os.access(destination, os.W_OK):
+                            raise PermissionError(f"Output is not writable: {destination}")
+                        # Keep partial data private while normal file creation
+                        # applies the caller's umask to the eventual output.
+                        output_staging = tempfile.TemporaryDirectory(
+                            dir=destination.parent, prefix=".amifuse-",
+                        )
+                        temp_output = Path(output_staging.name) / "output"
+                        out_fd = open(temp_output, "xb")
                 except OSError as e:
                     if use_json:
                         print(json.dumps(_json_error("read", "HANDLER_ERROR",
@@ -4222,11 +4245,22 @@ def cmd_read(args):
                         break
                     out_fd.write(data)
                     bytes_read += len(data)
+                if bytes_read != file_size:
+                    raise OSError(
+                        f"Incomplete read of {file_path}: expected {file_size} "
+                        f"bytes, got {bytes_read}"
+                    )
             finally:
                 if not stdout_mode:
                     out_fd.close()
         finally:
             bridge.close_file(fh_addr)
+
+        if temp_output is not None:
+            if destination.exists():
+                os.chmod(temp_output, destination.stat().st_mode & 0o777)
+            os.replace(temp_output, destination)
+            temp_output = None
 
         if use_json:
             result = _json_result("read",
@@ -4257,7 +4291,16 @@ def cmd_read(args):
             sys.exit(1)
         raise SystemExit(f"Error extracting file: {e}")
     finally:
-        _cleanup_bridge(bridge, temp_driver)
+        try:
+            if output_staging is not None:
+                # TemporaryDirectory also handles read-only staged files on
+                # Windows when a replacement fails after copying the mode.
+                try:
+                    output_staging.cleanup()
+                except OSError as e:
+                    print(f"Warning: cannot remove temporary output: {e}", file=sys.stderr)
+        finally:
+            _cleanup_bridge(bridge, temp_driver)
 
 
 def cmd_write(args):
