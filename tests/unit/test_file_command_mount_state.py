@@ -55,6 +55,25 @@ def test_unmounted_rejected_before_file_operations(command_context, capsys, comm
     assert output.read_bytes() == b"keep existing output"
 
 
+@pytest.mark.parametrize("command", ["hash", "read", "write"])
+def test_unexpected_failure_keeps_mount_context(command_context, capsys, command):
+    args, bridge, output = command_context
+    args.file = "file"
+    bridge.is_mounted.return_value = fs.MountState(None, None, "no disk info")
+    bridge.stat_path.return_value = {"dir_type": -3, "size": 5}
+    bridge.open_file.side_effect = RuntimeError("handler crashed")
+    with pytest.raises(SystemExit) as caught:
+        getattr(fs, "cmd_" + command)(args)
+    assert caught.value.code == 1
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert error["code"] == "HANDLER_ERROR"
+    assert "handler crashed" in error["message"]
+    assert error["details"] == {"filesystem_responsive": None,
+                                "mount_state_reason": "no disk info"}
+    bridge.backend.close.assert_called_once()
+    assert output.read_bytes() == b"keep existing output"
+
+
 @pytest.mark.parametrize("command", ["hash", "read"])
 @pytest.mark.parametrize("mounted", [True, None])
 @pytest.mark.parametrize("directory", [False, True])
