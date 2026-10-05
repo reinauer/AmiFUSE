@@ -25,6 +25,25 @@ PROT_RW_D = 0x02  # ----rw-d (typical .info file)
 PROT_NO_READ = 0x08  # ----_wed (read-protected)
 
 
+@pytest.mark.parametrize("platform,write_enabled,expected", [
+    ("win32", True, 0o040755),
+    ("win32", False, 0o040555),
+    ("linux", True, 0o040777),
+    ("linux", False, 0o040755),
+    ("darwin", True, 0o040777),
+    ("darwin", False, 0o040755),
+])
+def test_root_write_access_is_owner_only_on_windows(
+    fuse_mock, monkeypatch, platform, write_enabled, expected
+):
+    fs = _make_fs(fuse_mock, monkeypatch, write_enabled=write_enabled)
+    monkeypatch.setattr("sys.platform", platform)
+    attrs = fs.getattr("/")
+    assert attrs["st_mode"] == expected
+    assert attrs["st_uid"] == fs._uid
+    assert attrs["st_gid"] == fs._gid
+
+
 def _make_fs(fuse_mock, monkeypatch, write_enabled):
     import amifuse.fuse_fs as fuse_fs_mod
 

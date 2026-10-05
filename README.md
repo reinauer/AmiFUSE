@@ -240,6 +240,10 @@ The normal desktop tray cannot reliably discover or unmount elevated mounts,
 even though Explorer can access their files. Global visibility does not
 change file permissions or grant the tray access to elevated control events.
 
+On Windows, the mount root grants write access only to the mounting account.
+If you elevate using a different administrator account, your normal desktop
+account can read and list the mounted files but does not gain root write access.
+
 Mounts are read-only by default. To enable writes to the card itself:
 
 ```powershell
