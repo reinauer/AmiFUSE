@@ -149,6 +149,7 @@ def test_batch_signals_all_mounts_and_collects_failures(monkeypatch):
 def test_windows_cli_uses_control_without_taskkill(monkeypatch):
     from amifuse import fuse_fs, platform
 
+    monkeypatch.setattr(platform, "is_windows_admin", lambda: False)
     monkeypatch.setattr(fuse_fs, "sys", SimpleNamespace(platform="win32"))
     monkeypatch.setattr(platform, "sys", SimpleNamespace(platform="win32"))
     monkeypatch.setattr(os.path, "ismount", lambda p: True)
