@@ -327,6 +327,13 @@ amifuse unmount /Volumes/PDH0   # macOS
 amifuse unmount ./mnt           # Linux
 ```
 
+Different, nonoverlapping RDB partitions in one image can be mounted in
+separate sessions concurrently, including with `--write`. Read-only sessions
+can also share the same partition. A writable session excludes all other
+access to its partition, and whole-image sessions exclude partition mounts.
+Each handler is restricted to its selected partition; physical disks, ADFs,
+and ISOs retain whole-device or whole-image locking.
+
 ## Additional Tools
 
 ### rdb-inspect
