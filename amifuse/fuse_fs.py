@@ -3326,11 +3326,18 @@ def mount_fuse(
             from .windows_unmount import UnmountControl
             control = UnmountControl()
             operations._unmount_control = control
-        fuse_class(
-            operations,
-            fuse_mountpoint,
-            **fuse_kwargs,
-        )
+        try:
+            fuse_class(
+                operations,
+                fuse_mountpoint,
+                **fuse_kwargs,
+            )
+        except RuntimeError as exc:
+            if not sys.platform.startswith("win") or debug:
+                raise
+            raise SystemExit(
+                f"WinFsp could not mount '{mountpoint}': {exc}"
+            ) from exc
     finally:
         if control is not None:
             control.close()

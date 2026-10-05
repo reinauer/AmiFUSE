@@ -201,6 +201,48 @@ class TestMountFuseOptions:
 
         return captured
 
+    @pytest.mark.parametrize("host", ["win32", "linux"])
+    @pytest.mark.parametrize("debug", [False, True])
+    def test_mount_failure_keeps_cleanup(
+        self, monkeypatch, mock_mount_fuse_deps, tmp_path, host, debug
+    ):
+        from amifuse import fuse_fs, platform, windows_unmount
+
+        driver, icon = tmp_path / "driver", tmp_path / "icon"
+        driver.write_bytes(b"driver")
+        icon.write_bytes(b"icon")
+        monkeypatch.setattr(fuse_fs, "sys", SimpleNamespace(platform=host))
+        monkeypatch.setattr(platform, "get_fuse_mountpoint", lambda mp: str(mp))
+        monkeypatch.setattr(
+            fuse_fs, "extract_embedded_driver",
+            lambda *a, **kw: (driver, "DOS3", 0x444F5303),
+        )
+        monkeypatch.setattr(platform, "pre_generate_volume_icon", lambda *a, **kw: icon)
+        failure = RuntimeError(1)
+        fuse = MagicMock(side_effect=failure)
+        monkeypatch.setattr(fuse_fs, "FUSE", fuse)
+        bridge = fuse_fs.HandlerBridge.return_value
+        control = windows_unmount.UnmountControl.return_value
+
+        translated = host == "win32" and not debug
+        with pytest.raises(SystemExit if translated else RuntimeError) as caught:
+            fuse_fs.mount_fuse(
+                Path("test.hdf"), None, Path("R:"), None,
+                icons=True, debug=debug, foreground=True,
+            )
+        if translated:
+            assert str(caught.value) == "WinFsp could not mount 'R:': 1"
+        else:
+            assert caught.value is failure
+        fuse.assert_called_once()
+        bridge.close.assert_called_once()
+        if host == "win32":
+            control.close.assert_called_once()
+        else:
+            windows_unmount.UnmountControl.assert_not_called()
+        assert not driver.exists()
+        assert not icon.exists()
+
     @pytest.mark.parametrize("elevated, expected", [(True, "\\\\.\\R:"), (False, "R:")])
     def test_windows_drive_passed_to_fuse(self, monkeypatch, mock_mount_fuse_deps, elevated, expected):
         from amifuse import platform, fuse_fs
