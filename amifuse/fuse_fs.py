@@ -73,7 +73,7 @@ from .startup_runner import (
 )
 from amitools.vamos.libstructs.dos import FileInfoBlockStruct, FileHandleStruct, DosPacketStruct, InfoDataStruct  # type: ignore
 from amitools.vamos.lib.dos.DosProtection import DosProtection  # type: ignore
-from .image_access import is_windows_disk
+from amitools.util.Win32Disk import is_windows_disk  # type: ignore
 
 from . import __version__
 
