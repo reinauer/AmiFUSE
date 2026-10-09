@@ -59,7 +59,7 @@ class _FuseOperations:
     def symlink(self, target, source):
         raise FuseOSError(errno.EROFS)
 
-from .driver_runtime import BlockDeviceBackend
+from .driver_runtime import BlockDeviceBackend, ImageInUseError
 from .vamos_runner import VamosHandlerRuntime
 from .bootstrap import BootstrapAllocator
 from .process_mgr import ProcessManager
@@ -3414,14 +3414,17 @@ def format_volume(
     print(f"DOS type: {dt_str} (0x{dostype:08x})")
 
     try:
-        bridge = HandlerBridge(
-            image,
-            driver,
-            block_size=block_size,
-            read_only=False,
-            debug=debug,
-            partition=partition,
-        )
+        try:
+            bridge = HandlerBridge(
+                image,
+                driver,
+                block_size=block_size,
+                read_only=False,
+                debug=debug,
+                partition=partition,
+            )
+        except ImageInUseError as exc:
+            raise SystemExit(f"Error: {exc}") from exc
         _raise_if_handler_crashed(bridge, "format startup")
 
         # Inhibit the volume so the handler releases it for formatting
@@ -3724,10 +3727,18 @@ def _create_bridge_from_args(args, command: str, read_only: bool = True):
                 temp_driver.unlink(missing_ok=True)
             except Exception:
                 pass
+        # A busy image is not a handler fault; the handler never started.
+        in_use = isinstance(e, ImageInUseError)
         if use_json:
-            print(_json.dumps(_json_error(command, "HANDLER_ERROR",
-                f"Failed to initialize filesystem handler: {e}")))
+            if in_use:
+                error = _json_error(command, "IMAGE_IN_USE", str(e))
+            else:
+                error = _json_error(command, "HANDLER_ERROR",
+                    f"Failed to initialize filesystem handler: {e}")
+            print(_json.dumps(error))
             sys.exit(1)
+        if in_use:
+            raise SystemExit(f"Error: {e}")
         raise SystemExit(f"Error initializing handler: {e}")
 
     return bridge, temp_driver
