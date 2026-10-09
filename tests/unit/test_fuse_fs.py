@@ -442,6 +442,52 @@ class TestMountFuseOptions:
         mock_bridge.close.assert_called_once()
         mock_fuse.assert_not_called()
 
+    @pytest.mark.parametrize("error", [
+        OSError("cannot lock partition in /tmp/test.iso: busy"),
+        ValueError("Partition DH0 overlaps RDB metadata"),
+    ])
+    @pytest.mark.parametrize("debug", [False, True])
+    def test_mount_reports_bridge_refusal_without_traceback(
+            self, monkeypatch, fuse_mock, error, debug):
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        fake_rdb = MagicMock()
+        fake_rdb.detect_adf.return_value = None
+        fake_rdb.detect_iso.return_value = MagicMock(
+            volume_id="TestISO", block_size=2048, cylinders=1, heads=1,
+            sectors_per_track=1, total_blocks=1,
+        )
+        monkeypatch.setitem(sys.modules, "amifuse.rdb_inspect", fake_rdb)
+        monkeypatch.setitem(sys.modules, "amitools", MagicMock())
+        monkeypatch.setitem(sys.modules, "amitools.fs", MagicMock())
+        monkeypatch.setitem(sys.modules, "amitools.fs.DosType", MagicMock())
+
+        import amifuse.platform as plat_mod
+        monkeypatch.setattr(plat_mod, "check_fuse_available", lambda: None)
+        monkeypatch.setattr(plat_mod, "validate_mountpoint", lambda mp: None)
+        monkeypatch.setattr(plat_mod, "should_auto_create_mountpoint", lambda mp: True)
+        monkeypatch.setattr(fuse_fs_mod, "HandlerBridge", MagicMock(side_effect=error))
+        mock_fuse = MagicMock()
+        monkeypatch.setattr(fuse_fs_mod, "FUSE", mock_fuse)
+
+        expected = type(error) if debug else SystemExit
+        with pytest.raises(expected) as exc_info:
+            fuse_fs_mod.mount_fuse(
+                image=Path("/tmp/test.iso"),
+                driver=Path("/tmp/test.handler"),
+                mountpoint=Path("/mnt/test"),
+                block_size=None,
+                foreground=True,
+                debug=debug,
+            )
+
+        if debug:
+            assert exc_info.value is error
+        else:
+            assert str(exc_info.value) == f"Cannot mount {Path('/tmp/test.iso')}: {error}"
+            assert exc_info.value.__cause__ is error
+        mock_fuse.assert_not_called()
+
 
 class TestFormatVolume:
     def test_format_stops_after_flush_and_syncs_backend(self, monkeypatch, fuse_mock):

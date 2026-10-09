@@ -3276,17 +3276,23 @@ def mount_fuse(
     if icons:
         print("[amifuse] icon mode enabled; Amiga icons will appear as macOS custom icons")
 
-    bridge = HandlerBridge(
-        image,
-        driver,
-        block_size=block_size,
-        read_only=not write,
-        debug=debug,
-        trace=trace,
-        partition=partition,
-        adf_info=adf_info,
-        iso_info=iso_info,
-    )
+    try:
+        bridge = HandlerBridge(
+            image,
+            driver,
+            block_size=block_size,
+            read_only=not write,
+            debug=debug,
+            trace=trace,
+            partition=partition,
+            adf_info=adf_info,
+            iso_info=iso_info,
+        )
+    except (OSError, ValueError) as exc:
+        # Lock conflicts and invalid partitions are expected refusals.
+        if debug:
+            raise
+        raise SystemExit(f"Cannot mount {image}: {exc}") from exc
     if _handler_has_crashed(bridge):
         bridge.close()
         raise SystemExit("Filesystem handler crashed during startup; mount aborted.")
