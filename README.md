@@ -275,9 +275,9 @@ python -m pip install -e './amitools[vamos]'
 python -m pip install -e '.[windows]'
 ```
 
-The published `amitools-amifuse 0.8.0.post8` dependency supports ordinary
-image files but does not include physical-disk support. Until a release
-containing that support is available, use the source installation above.
+The published `amitools-amifuse 0.8.0.post10` dependency includes
+physical-disk support and partition range locks; the source installation
+above is only needed to test unreleased amitools changes.
 
 ### Diagnosing Issues
 
@@ -333,6 +333,12 @@ can also share the same partition. A writable session excludes all other
 access to its partition, and whole-image sessions exclude partition mounts.
 Each handler is restricted to its selected partition; physical disks, ADFs,
 and ISOs retain whole-device or whole-image locking.
+
+Without `--partition`, a session uses the first partition, so it can run
+alongside sessions on other partitions. Whole-image sessions are ADF, ISO and
+physical-disk sessions, and sessions from tools that lock the entire file.
+On platforms without byte-range locks (for example 32-bit Linux and the BSDs),
+every session locks the whole image.
 
 ## Additional Tools
 

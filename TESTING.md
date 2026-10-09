@@ -3,12 +3,11 @@
 ## Windows physical-disk release checks
 
 The amitools submodule tracks the `Drop_AccessStruct` branch, which
-includes physical-disk support.
+includes physical-disk support and partition range locks.
 
 The installed-wheel CI job checks ordinary-image commands with the
-declared minimum `amitools-amifuse 0.8.0.post8`. Physical-disk support needs
-the source checkout until an amitools release includes it; update the
-dependency floor when making that support available in packaged installs.
+declared minimum `amitools-amifuse 0.8.0.post10`, which includes the same
+support.
 
 Windows CI exercises named locks and unmount events across real processes
 without opening a physical disk. The mount persistence test requires a
