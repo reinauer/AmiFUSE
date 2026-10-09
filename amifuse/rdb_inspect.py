@@ -51,6 +51,7 @@ class ISOInfo:
 
 # MBR partition type for Amiga RDB partition (used by Emu68)
 MBR_TYPE_AMIGA_RDB = 0x76
+MBR_SECTOR_SIZE = 512  # MBR entries count 512-byte sectors
 
 
 @dataclass
@@ -516,6 +517,20 @@ def _lenient_rdisk_open(rdisk) -> List[str]:
     return warnings
 
 
+def _mbr_partition_device(blkdev, mbr_part) -> Optional[OffsetBlockDevice]:
+    """Map an MBR partition, given in 512-byte sectors, onto blkdev's blocks.
+
+    Returns None if the partition does not start on a block boundary, since
+    an RDB using larger blocks cannot then be addressed inside it.
+    """
+    ratio = blkdev.block_bytes // MBR_SECTOR_SIZE
+    if ratio < 1 or mbr_part.start_lba % ratio:
+        return None
+    return OffsetBlockDevice(
+        blkdev, mbr_part.start_lba // ratio, mbr_part.num_sectors // ratio
+    )
+
+
 def open_rdisk(
     image: Path,
     block_size: Optional[int] = None,
@@ -607,8 +622,19 @@ def open_rdisk(
             amiga_parts = [amiga_parts[mbr_partition_index]]
 
         # Try each 0x76 partition until we find one with a valid RDB
+        misaligned = []
         for mbr_part in amiga_parts:
-            offset_dev = OffsetBlockDevice(blkdev, mbr_part.start_lba, mbr_part.num_sectors)
+            # An earlier partition may have reopened the device with its
+            # RDB's block size; map and scan each one in its own units.
+            if blkdev.block_bytes != initial_block_size:
+                blkdev.close()
+                blkdev = RawBlockDevice(str(image), read_only=read_only,
+                                        block_bytes=initial_block_size)
+                blkdev.open()
+            offset_dev = _mbr_partition_device(blkdev, mbr_part)
+            if offset_dev is None:
+                misaligned.append((mbr_part, initial_block_size))
+                continue
 
             rdb_block, new_block_size = _scan_for_rdb(offset_dev, block_size)
 
@@ -617,7 +643,10 @@ def open_rdisk(
                 blkdev.close()
                 blkdev = RawBlockDevice(str(image), read_only=read_only, block_bytes=new_block_size)
                 blkdev.open()
-                offset_dev = OffsetBlockDevice(blkdev, mbr_part.start_lba, mbr_part.num_sectors)
+                offset_dev = _mbr_partition_device(blkdev, mbr_part)
+                if offset_dev is None:
+                    misaligned.append((mbr_part, new_block_size))
+                    continue
                 rdb_block, _ = _scan_for_rdb(offset_dev, block_size)
 
             if rdb_block is not None:
@@ -644,9 +673,14 @@ def open_rdisk(
 
         # No valid RDB found in any 0x76 partition
         blkdev.close()
+        reasons = "".join(
+            f"; partition {part.index} at LBA {part.start_lba} is not aligned "
+            f"to the RDB's {size}-byte blocks"
+            for part, size in misaligned
+        )
         raise IOError(
             f"MBR with {len(amiga_parts)} Amiga partition(s) found, "
-            f"but none contain a valid RDB: {image}"
+            f"but none contain a valid RDB: {image}{reasons}"
         )
 
     # Check for other partition types to give helpful error messages
