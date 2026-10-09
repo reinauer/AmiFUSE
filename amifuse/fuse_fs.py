@@ -387,6 +387,8 @@ class HandlerBridge:
             print(f"[amifuse] Startup packet result: res1={startup_res1} res2={startup_res2}")
         if startup_res1 == 0:
             if not replies:
+                # A crash also stops the replies; report it as a crash.
+                _raise_if_handler_crashed(self, "startup")
                 raise SystemExit("Filesystem handler did not reply to the startup packet")
             raise StartupDiskRejected(startup_res1, startup_res2)
         self._update_handler_port_from_startup()

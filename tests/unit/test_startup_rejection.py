@@ -10,12 +10,14 @@ from amifuse import fuse_fs as fs
 
 
 @pytest.mark.parametrize("res2", [0, 225, 999])
-@pytest.mark.parametrize("replied", [True, False])
-def test_startup_refusal_requires_a_reply(tmp_path, monkeypatch, res2, replied):
+@pytest.mark.parametrize("replied,crashed", [(True, False), (False, False),
+                                             (False, True)])
+def test_startup_refusal_requires_a_reply(tmp_path, monkeypatch, res2, replied,
+                                          crashed):
     backend, runtime = Mock(), MagicMock()
     bootstrap = Mock()
     bootstrap.alloc_all.return_value = {"part": None}
-    state = SimpleNamespace(process_addr=1, stdpkt_addr=2, crashed=False,
+    state = SimpleNamespace(process_addr=1, stdpkt_addr=2, crashed=crashed,
                             main_loop_pc=3)
     launcher = Mock()
     launcher.launch_with_startup.return_value = state
@@ -38,6 +40,8 @@ def test_startup_refusal_requires_a_reply(tmp_path, monkeypatch, res2, replied):
         assert caught.value.res2 == res2
         if res2 == 0:
             assert "wrong --driver" in str(caught.value)
+    elif crashed:
+        assert str(caught.value) == "Filesystem handler crashed during startup."
     else:
         assert "did not reply" in str(caught.value)
     backend.close.assert_called_once()
@@ -73,3 +77,4 @@ def test_factory_classifies_refusal_and_cleans_driver(tmp_path, monkeypatch, cap
         if refused:
             assert str(caught.value).startswith("Error: no usable volume mounted:")
     assert not driver.exists()
+
