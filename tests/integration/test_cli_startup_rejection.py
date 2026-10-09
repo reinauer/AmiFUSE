@@ -42,6 +42,13 @@ def test_sfs_rejected_by_ffs(fixture_root, tmp_path, command, use_json):
     else:
         message = proc.stderr
         assert "Error: no usable volume mounted:" in message
+        if command == "verify":
+            # Same report as a disk refused after startup.
+            assert proc.stdout.splitlines() == [
+                "Volume: (none)",
+                "  Filesystem responsive: NO -- handler rejected the disk: "
+                "no reason code supplied (wrong --driver for this filesystem?)",
+            ]
     assert "wrong --driver" in message
     assert image.read_bytes() == before
     assert output.read_bytes() == b"keep me"

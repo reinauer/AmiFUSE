@@ -3868,7 +3868,14 @@ def cmd_verify(args):
             sys.exit(1)
         raise SystemExit("Error: --expect-size requires --file")
 
-    bridge, temp_driver = _create_bridge_from_args(args, "verify")
+    try:
+        bridge, temp_driver = _create_bridge_from_args(args, "verify")
+    except StartupDiskRejected as e:
+        # Match the report for a disk refused after startup. JSON mode has
+        # already been answered by _create_bridge_from_args.
+        print(f"File: {file_path}" if file_path else "Volume: (none)")
+        print(f"  Filesystem responsive: NO -- {e.reason}")
+        raise
     try:
         # Reject a disk that the handler conclusively identified as unusable
         # before either verification path can manufacture a successful result.

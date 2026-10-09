@@ -78,3 +78,17 @@ def test_factory_classifies_refusal_and_cleans_driver(tmp_path, monkeypatch, cap
             assert str(caught.value).startswith("Error: no usable volume mounted:")
     assert not driver.exists()
 
+
+@pytest.mark.parametrize("file_arg", [None, "dir/file"])
+def test_verify_text_reports_startup_refusal(monkeypatch, capsys, file_arg):
+    failure = fs.StartupDiskRejected(0, 225)
+    monkeypatch.setattr(fs, "_create_bridge_from_args", Mock(side_effect=failure))
+    args = SimpleNamespace(image="image", json=False, file=file_arg,
+                           expect_size=None)
+    with pytest.raises(SystemExit) as caught:
+        fs.cmd_verify(args)
+    assert caught.value is failure
+    assert capsys.readouterr().out.splitlines() == [
+        f"File: {file_arg}" if file_arg else "Volume: (none)",
+        "  Filesystem responsive: NO -- handler rejected the disk: not a DOS disk",
+    ]
