@@ -17,6 +17,7 @@ from amitools.vamos.libstructs import IORequestStruct, SCSICmdStruct
 from amitools.vamos.machine.mock import MockMemory
 from amitools.vamos.mem import MemoryAlloc
 
+import amifuse.driver_runtime as driver_runtime
 from amifuse.driver_runtime import BlockDeviceBackend
 
 
@@ -260,5 +261,34 @@ def test_scsi_request_recovers_after_partition_error(tmp_path, write, direct_scs
                 assert ior.error.val == (TDERR_NOT_SPECIFIED if rejected else 0)
                 assert ior.actual.val == (0 if rejected else 512)
         assert backend.read_blocks(32) == (b"x" * 512 if write else bytes(512))
+    finally:
+        backend.close()
+
+
+@pytest.mark.parametrize("platform,pointer,expected", [
+    ("win32", 8, True),
+    ("darwin", 8, True),
+    ("linux", 8, True),
+    ("linux", 4, False),
+    ("freebsd14", 8, False),
+])
+def test_range_lock_support_by_platform(monkeypatch, platform, pointer, expected):
+    monkeypatch.setattr(driver_runtime.sys, "platform", platform)
+    monkeypatch.setattr(driver_runtime.ctypes, "sizeof", lambda _type: pointer)
+    assert driver_runtime._range_locks_supported() is expected
+
+
+def test_partition_session_keeps_whole_image_lock_without_range_locks(
+        tmp_path, monkeypatch):
+    image = tmp_path / "two.hdf"
+    _make_rdb(image, (("DH0", (1, 4)), ("DH1", (5, 9))))
+    monkeypatch.setattr(driver_runtime, "_range_locks_supported", lambda: False)
+    backend = BlockDeviceBackend(image, partition_scope=True, partition="DH1")
+    backend.open()
+    try:
+        assert backend.exclusive
+        assert backend._block_range == (160, 320)
+        with pytest.raises(OSError):
+            backend.read_blocks(0)
     finally:
         backend.close()
