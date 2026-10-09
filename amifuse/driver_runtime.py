@@ -4,6 +4,7 @@ MBR, ADF, or ISO) onto host file I/O for the filesystem handler runtime.
 """
 
 import ctypes
+import errno
 import sys
 import stat
 from pathlib import Path
@@ -31,6 +32,31 @@ def _range_locks_supported():
     if sys.platform in ("win32", "darwin"):
         return True
     return sys.platform.startswith("linux") and ctypes.sizeof(ctypes.c_void_p) == 8
+
+
+class ImageInUseError(OSError):
+    """Another session holds a conflicting lock on the image or partition."""
+
+
+# msvcrt.locking reports contention as EACCES, flock and fcntl as EAGAIN
+# or EWOULDBLOCK (the same value on Linux and macOS). LockFileEx in the
+# partition range locks reports ERROR_LOCK_VIOLATION.
+_LOCK_CONFLICT_ERRNOS = {errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK}
+_LOCK_CONFLICT_WINERRORS = {33}
+
+
+def _is_lock_conflict(exc):
+    """Return whether a lock failure means that another session holds it."""
+    while exc is not None:
+        # A failure to open the image names it and is a real access error.
+        if isinstance(exc, OSError) and exc.filename is None:
+            winerror = getattr(exc, "winerror", None)
+            if winerror is not None:
+                return winerror in _LOCK_CONFLICT_WINERRORS
+            if exc.errno in _LOCK_CONFLICT_ERRNOS:
+                return True
+        exc = exc.__cause__
+    return False
 
 
 class BlockDeviceBackend:
@@ -77,7 +103,11 @@ class BlockDeviceBackend:
     def open(self):
         if self.blkdev is not None:
             return
-        self.host_lock.acquire()
+        try:
+            self.host_lock.acquire()
+        except OSError as exc:
+            self._raise_if_in_use(exc)
+            raise
         try:
             if self.partition_scope and self.partition is not None:
                 from .rdb_inspect import find_partition_mbr_index
@@ -127,9 +157,27 @@ class BlockDeviceBackend:
                         and other.start_lba < container.start_lba + container.num_sectors):
                     raise ValueError("Overlapping MBR containers cannot be shared")
         if isinstance(self.host_lock, PartitionFileLock):
-            self.host_lock.lock_range((offset + start) * self.block_size,
-                                      (end - start) * self.block_size)
+            try:
+                self.host_lock.lock_range((offset + start) * self.block_size,
+                                          (end - start) * self.block_size)
+            except OSError as exc:
+                self._raise_if_in_use(exc, name)
+                raise
         self._block_range = (start, end)
+
+    def _raise_if_in_use(self, exc, partition=None):
+        # Physical disks are excluded between AmiFUSE and vamos sessions by
+        # a named mutex first, so a lock failure on the device itself comes
+        # from another program. Keep amitools' own message for those.
+        if is_windows_disk(self.image) or not _is_lock_conflict(exc):
+            return
+        image = Path(self.image)
+        target = (f"Partition {partition} of {image.name}" if partition
+                  else image.name)
+        raise ImageInUseError(
+            f"{target} is in use by another AmiFUSE or vamos session "
+            "(for example a mount); unmount it or read through the mount"
+        ) from exc
 
     def _open_image(self):
         from .rdb_inspect import open_rdisk
