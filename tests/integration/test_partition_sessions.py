@@ -1,6 +1,7 @@
 """Concurrent real handler sessions without requiring a host FUSE driver."""
 
 from contextlib import ExitStack
+import json
 from pathlib import Path
 import signal
 import subprocess
@@ -112,7 +113,14 @@ def test_concurrent_handler_writes_persist(partition_image, tmp_path):
              str(driver), "--partition", "DH0"], capture_output=True,
             text=True, timeout=15)
         assert conflict.returncode != 0
-        assert "cannot lock partition" in conflict.stdout + conflict.stderr
+        assert conflict.stderr.startswith(
+            "Error: Partition DH0 of two.hdf is in use by another AmiFUSE")
+        json_conflict = subprocess.run(
+            [sys.executable, "-m", "amifuse", "ls", str(image), "--driver",
+             str(driver), "--partition", "DH0", "--json"], capture_output=True,
+            text=True, timeout=15)
+        assert json_conflict.returncode == 1
+        assert json.loads(json_conflict.stdout)["error"]["code"] == "IMAGE_IN_USE"
         for index, (proc, stop) in enumerate(workers):
             stop.touch()
             out, err = proc.communicate(timeout=20)
