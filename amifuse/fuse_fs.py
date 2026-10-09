@@ -4148,13 +4148,11 @@ def _ensure_parent_dirs(bridge, path: str, use_json: bool = False,
 def cmd_read(args):
     """Handle the 'read' subcommand."""
     import json
-    import tempfile
 
     use_json = getattr(args, "json", False)
     file_path = args.file
     out_path = getattr(args, "out", None)
     temp_output = None
-    output_staging = None
 
     # Default output name = basename of Amiga path
     if out_path is None:
@@ -4223,13 +4221,14 @@ def cmd_read(args):
                     else:
                         if destination.exists() and not os.access(destination, os.W_OK):
                             raise PermissionError(f"Output is not writable: {destination}")
-                        # Keep partial data private while normal file creation
-                        # applies the caller's umask to the eventual output.
-                        output_staging = tempfile.TemporaryDirectory(
-                            dir=destination.parent, prefix=".amifuse-",
-                        )
-                        temp_output = Path(output_staging.name) / "output"
-                        out_fd = open(temp_output, "xb")
+                        # A plain file beside the destination is created like
+                        # the output itself: the umask applies on POSIX and the
+                        # directory's inherited ACL on Windows. os.replace keeps
+                        # those, so a private staging directory would not do.
+                        staged = destination.with_name(
+                            f".amifuse-{os.urandom(8).hex()}.tmp")
+                        out_fd = open(staged, "xb")
+                        temp_output = staged
                 except OSError as e:
                     if use_json:
                         print(json.dumps(_json_error("read", "HANDLER_ERROR",
@@ -4292,11 +4291,15 @@ def cmd_read(args):
         raise SystemExit(f"Error extracting file: {e}")
     finally:
         try:
-            if output_staging is not None:
-                # TemporaryDirectory also handles read-only staged files on
-                # Windows when a replacement fails after copying the mode.
+            if temp_output is not None:
                 try:
-                    output_staging.cleanup()
+                    # Windows cannot delete a staged file that became
+                    # read-only when the destination's mode was copied.
+                    try:
+                        os.chmod(temp_output, 0o600)
+                    except FileNotFoundError:
+                        pass
+                    temp_output.unlink(missing_ok=True)
                 except OSError as e:
                     print(f"Warning: cannot remove temporary output: {e}", file=sys.stderr)
         finally:

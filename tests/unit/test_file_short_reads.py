@@ -3,7 +3,9 @@
 import io
 import json
 import os
+import re
 import stat
+import subprocess
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -199,3 +201,61 @@ def test_read_only_staged_file_is_removed_after_replace_failure(
         bridge.backend.close.assert_called_once()
     finally:
         output.chmod(old_mode)
+
+
+def test_output_is_staged_beside_destination(read_context, capsys):
+    args, bridge, output = read_context
+    staged = []
+
+    def read(*args):
+        # A private staging directory would give the output its own ACL.
+        staged.extend(output.parent.glob(".amifuse-*"))
+        return b"hello"
+
+    bridge.read_handle.side_effect = read
+    fs.cmd_read(args)
+    assert json.loads(capsys.readouterr().out)["status"] == "ok"
+    assert len(staged) == 1
+    assert staged[0].parent == output.parent
+    assert staged[0].name.endswith(".tmp")
+    assert not staged[0].exists()
+
+
+def _sddl(path, tmp_path):
+    # /save writes the DACL as SDDL, which names accounts by SID and so does
+    # not depend on the Windows display language.
+    saved = tmp_path / f"{path.name}.acl"
+    subprocess.run(["icacls", str(path), "/save", str(saved)],
+                   capture_output=True, check=True)
+    raw = saved.read_bytes()
+    text = raw.decode("utf-16" if raw[:2] == b"\xff\xfe" else "utf-16-le")
+    return text.strip("\ufeff\x00\r\n").splitlines()[-1].strip("\x00")
+
+
+# Inherited BUILTIN\Users access, the ACE granted to the output directory.
+INHERITED_USERS_ACE = re.compile(r"\(A;[^;]*ID[^;]*;[^;]*;;;BU\)")
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows ACL inheritance")
+@pytest.mark.parametrize("existing", [True, False])
+def test_output_inherits_directory_acl(read_context, capsys, tmp_path, existing):
+    args, bridge, output = read_context
+    # tmp_path is owner-only, like a private staging directory, so give the
+    # output directory an inheritable ACE that only it can pass on.
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    subprocess.run(["icacls", str(shared), "/grant", "*S-1-5-32-545:(OI)(CI)(RX)"],
+                   capture_output=True, check=True)
+    output = shared / "output"
+    if existing:
+        output.write_bytes(b"keep me")
+    args.out = str(output)
+    reference = shared / "reference"
+    with open(reference, "wb") as stream:
+        stream.write(b"x")
+    bridge.read_handle.return_value = b"hello"
+    fs.cmd_read(args)
+    assert json.loads(capsys.readouterr().out)["status"] == "ok"
+    acl = _sddl(output, tmp_path)
+    assert acl == _sddl(reference, tmp_path)
+    assert INHERITED_USERS_ACE.search(acl), acl
