@@ -2,10 +2,8 @@
 
 ## Windows physical-disk release checks
 
-The physical-disk dependency from amitools PR #3 is merged. The submodule
-pins `1e739090adfc914c039fe8df8863ef79ed351805` on `Drop_AccessStruct`,
-the branch tracked by `.gitmodules`. Source checkouts no longer depend on
-the companion feature branch remaining available.
+The amitools submodule tracks the `Drop_AccessStruct` branch, which
+includes physical-disk support.
 
 The installed-wheel CI job checks ordinary-image commands with the
 declared minimum `amitools-amifuse 0.8.0.post8`. Physical-disk support needs
