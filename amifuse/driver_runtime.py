@@ -105,10 +105,14 @@ class BlockDeviceBackend:
         start = env.low_cyl * cyl_blocks
         end = (env.high_cyl + 1) * cyl_blocks
         reserved_end = self.rdb.rdb.log_drv.rdb_blk_hi + 1
-        if (env.surfaces <= 0 or env.blk_per_trk <= 0 or start < reserved_end
-                or end <= start or start >= self.blkdev.num_blocks
+        name = part.get_drive_name()
+        if env.surfaces <= 0 or env.blk_per_trk <= 0 or end <= start:
+            raise ValueError(f"Partition {name} has invalid geometry")
+        if (start < reserved_end
                 or any(start <= block < end for block in self.rdb.get_used_blocks())):
-            raise ValueError("Invalid partition bounds or overlap with RDB metadata")
+            raise ValueError(f"Partition {name} overlaps RDB metadata")
+        # A partition starting past the end of a plain image is reported as
+        # a truncated image by HandlerBridge; _check_range bounds the I/O.
         # OffsetBlockDevice addresses an RDB within an MBR container. Locks
         # must use absolute host offsets, while handler I/O stays RDB-relative.
         offset = getattr(self.blkdev, "offset", 0)

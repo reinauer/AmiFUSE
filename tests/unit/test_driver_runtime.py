@@ -212,7 +212,7 @@ def test_partition_cannot_overlap_rdb_metadata(tmp_path):
         disk.close()
         raw.close()
     backend = BlockDeviceBackend(image, partition_scope=True, read_only=False)
-    with pytest.raises(ValueError, match="RDB metadata"):
+    with pytest.raises(ValueError, match="Partition DH0 overlaps RDB metadata"):
         backend.open()
     assert not backend.host_lock.is_locked
 
@@ -261,6 +261,43 @@ def test_scsi_request_recovers_after_partition_error(tmp_path, write, direct_scs
                 assert ior.error.val == (TDERR_NOT_SPECIFIED if rejected else 0)
                 assert ior.actual.val == (0 if rejected else 512)
         assert backend.read_blocks(32) == (b"x" * 512 if write else bytes(512))
+    finally:
+        backend.close()
+
+
+def test_partition_with_invalid_geometry_is_named(tmp_path):
+    image = tmp_path / "bad.hdf"
+    _make_rdb(image)
+    raw = RawBlockDevice(str(image), read_only=False)
+    raw.open()
+    disk = RDisk(raw)
+    try:
+        assert disk.open()
+        part = disk.get_partition(0).part_blk
+        part.dos_env.high_cyl = part.dos_env.low_cyl - 1
+        part.write()
+    finally:
+        disk.close()
+        raw.close()
+    backend = BlockDeviceBackend(image, partition_scope=True, read_only=False)
+    with pytest.raises(ValueError, match="Partition DH0 has invalid geometry"):
+        backend.open()
+    assert not backend.host_lock.is_locked
+
+
+def test_partition_past_truncated_image_opens_for_diagnosis(tmp_path):
+    # HandlerBridge reports the truncation; the backend must not refuse the
+    # partition as invalid first, and must still bound its I/O.
+    image = tmp_path / "short.hdf"
+    _make_rdb(image, (("DH0", (1, 4)), ("DH1", (5, 9))))
+    with image.open("r+b") as stream:
+        stream.truncate(150 * 512)
+    backend = BlockDeviceBackend(image, partition_scope=True, partition="DH1")
+    backend.open()
+    try:
+        assert backend._block_range == (160, 320)
+        with pytest.raises(OSError, match="exceeds disk image"):
+            backend.read_blocks(160)
     finally:
         backend.close()
 
