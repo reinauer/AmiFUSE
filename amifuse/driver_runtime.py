@@ -3,6 +3,7 @@ Block-device backend that maps an Amiga disk image (plain RDB, Emu68-style
 MBR, ADF, or ISO) onto host file I/O for the filesystem handler runtime.
 """
 
+import ctypes
 import sys
 import stat
 from pathlib import Path
@@ -21,6 +22,15 @@ from amitools.fs.blkdev.RawBlockDevice import RawBlockDevice  # type: ignore  # 
 from amitools.fs.rdb.RDisk import RDisk  # type: ignore  # noqa: E402
 from amitools.vamos.disk import HostFileLock, PartitionFileLock  # type: ignore  # noqa: E402
 from amitools.util.Win32Disk import is_windows_disk  # noqa: E402
+
+
+def _range_locks_supported():
+    """Return whether PartitionFileLock can lock byte ranges on this host."""
+    # amitools implements Windows, macOS and 64-bit Linux. Elsewhere, such
+    # as 32-bit Linux and the BSDs, sessions keep the whole-image lock.
+    if sys.platform in ("win32", "darwin"):
+        return True
+    return sys.platform.startswith("linux") and ctypes.sizeof(ctypes.c_void_p) == 8
 
 
 class BlockDeviceBackend:
@@ -46,7 +56,8 @@ class BlockDeviceBackend:
         self.partition = partition
         self._block_range = None
         # Physical disks keep their existing whole-device exclusion policy.
-        if (self.partition_scope and not is_windows_disk(image)
+        if (self.partition_scope and _range_locks_supported()
+                and not is_windows_disk(image)
                 and stat.S_ISREG(Path(image).stat().st_mode)):
             self.host_lock = PartitionFileLock(image, read_only=read_only)
 
