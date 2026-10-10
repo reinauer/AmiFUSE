@@ -4227,7 +4227,19 @@ def cmd_read(args):
                         # those, so a private staging directory would not do.
                         staged = destination.with_name(
                             f".amifuse-{os.urandom(8).hex()}.tmp")
-                        out_fd = open(staged, "xb")
+                        try:
+                            out_fd = open(staged, "xb")
+                        except OSError as e:
+                            # Name the directory, not a path the user never
+                            # asked for. Even an existing writable output
+                            # needs a new entry in its directory.
+                            where = f"cannot stage output in {destination.parent}"
+                            cause = e.strerror or str(e)
+                            if isinstance(e, PermissionError):
+                                message = f"{where} (directory not writable): {cause}"
+                            else:
+                                message = f"{where}: {cause}"
+                            raise type(e)(message) from e
                         temp_output = staged
                 except OSError as e:
                     if use_json:

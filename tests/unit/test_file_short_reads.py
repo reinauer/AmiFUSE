@@ -259,3 +259,76 @@ def test_output_inherits_directory_acl(read_context, capsys, tmp_path, existing)
     acl = _sddl(output, tmp_path)
     assert acl == _sddl(reference, tmp_path)
     assert INHERITED_USERS_ACE.search(acl), acl
+
+
+@pytest.mark.parametrize("use_json", [False, True])
+@pytest.mark.parametrize("existing", [True, False])
+def test_unwritable_directory_names_the_cause(read_context, capsys, monkeypatch,
+                                              use_json, existing):
+    args, bridge, output = read_context
+    args.json = use_json
+    if not existing:
+        output.unlink()
+    bridge.read_handle.return_value = b"hello"
+    real_open = open
+
+    def deny_staging(path, mode="r", *a, **kw):
+        if mode == "xb":
+            raise PermissionError(13, "Permission denied", str(path))
+        return real_open(path, mode, *a, **kw)
+
+    monkeypatch.setattr("builtins.open", deny_staging)
+    with pytest.raises(SystemExit) as caught:
+        fs.cmd_read(args)
+    if use_json:
+        message = json.loads(capsys.readouterr().out)["error"]["message"]
+    else:
+        message = str(caught.value)
+    assert (f"cannot stage output in {output.parent.resolve()} "
+            "(directory not writable): Permission denied") in message
+    assert ".amifuse-" not in message
+    assert output.exists() is existing
+    bridge.read_handle.assert_not_called()
+    bridge.backend.close.assert_called_once()
+
+
+@pytest.mark.skipif(os.name == "nt" or os.geteuid() == 0,
+                    reason="POSIX directory permissions")
+def test_writable_output_in_read_only_directory(tmp_path, read_context, capsys):
+    args, bridge, output = read_context
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    target = locked / "out"
+    target.write_bytes(b"keep me")
+    args.out = str(target)
+    bridge.read_handle.return_value = b"hello"
+    locked.chmod(0o555)
+    try:
+        with pytest.raises(SystemExit):
+            fs.cmd_read(args)
+    finally:
+        locked.chmod(0o755)
+    message = json.loads(capsys.readouterr().out)["error"]["message"]
+    assert "directory not writable" in message
+    assert target.read_bytes() == b"keep me"
+    assert list(locked.iterdir()) == [target]
+
+
+@pytest.mark.parametrize("use_json", [False, True])
+def test_missing_output_directory_names_the_directory(read_context, capsys, use_json):
+    args, bridge, output = read_context
+    args.json = use_json
+    missing = output.parent / "nodir"
+    args.out = str(missing / "out.txt")
+    bridge.read_handle.return_value = b"hello"
+    with pytest.raises(SystemExit) as caught:
+        fs.cmd_read(args)
+    if use_json:
+        message = json.loads(capsys.readouterr().out)["error"]["message"]
+    else:
+        message = str(caught.value)
+    assert f"cannot stage output in {missing.resolve()}: " in message
+    assert ".amifuse-" not in message
+    assert not missing.exists()
+    bridge.read_handle.assert_not_called()
+    bridge.backend.close.assert_called_once()
