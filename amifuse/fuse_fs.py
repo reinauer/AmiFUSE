@@ -4078,6 +4078,11 @@ def cmd_hash(args):
                     break
                 h.update(data)
                 bytes_read += len(data)
+            if bytes_read != file_size:
+                raise OSError(
+                    f"Incomplete read of {file_path}: expected {file_size} "
+                    f"bytes, got {bytes_read}"
+                )
         finally:
             bridge.close_file(fh_addr)
 
@@ -4189,6 +4194,7 @@ def cmd_read(args):
     use_json = getattr(args, "json", False)
     file_path = args.file
     out_path = getattr(args, "out", None)
+    temp_output = None
 
     # Default output name = basename of Amiga path
     if out_path is None:
@@ -4250,7 +4256,35 @@ def cmd_read(args):
                 out_fd = sys.stdout.buffer
             else:
                 try:
-                    out_fd = open(out_path, "wb")
+                    # Follow symlinks as open(..., "wb") did. Stage regular
+                    # files beside the destination for an atomic replacement;
+                    # special outputs such as /dev/null remain streams.
+                    destination = Path(out_path).resolve()
+                    if destination.exists() and not destination.is_file():
+                        out_fd = open(destination, "wb")
+                    else:
+                        if destination.exists() and not os.access(destination, os.W_OK):
+                            raise PermissionError(f"Output is not writable: {destination}")
+                        # A plain file beside the destination is created like
+                        # the output itself: the umask applies on POSIX and the
+                        # directory's inherited ACL on Windows. os.replace keeps
+                        # those, so a private staging directory would not do.
+                        staged = destination.with_name(
+                            f".amifuse-{os.urandom(8).hex()}.tmp")
+                        try:
+                            out_fd = open(staged, "xb")
+                        except OSError as e:
+                            # Name the directory, not a path the user never
+                            # asked for. Even an existing writable output
+                            # needs a new entry in its directory.
+                            where = f"cannot stage output in {destination.parent}"
+                            cause = e.strerror or str(e)
+                            if isinstance(e, PermissionError):
+                                message = f"{where} (directory not writable): {cause}"
+                            else:
+                                message = f"{where}: {cause}"
+                            raise type(e)(message) from e
+                        temp_output = staged
                 except OSError as e:
                     if use_json:
                         print(json.dumps(_json_error("read", "HANDLER_ERROR",
@@ -4266,11 +4300,22 @@ def cmd_read(args):
                         break
                     out_fd.write(data)
                     bytes_read += len(data)
+                if bytes_read != file_size:
+                    raise OSError(
+                        f"Incomplete read of {file_path}: expected {file_size} "
+                        f"bytes, got {bytes_read}"
+                    )
             finally:
                 if not stdout_mode:
                     out_fd.close()
         finally:
             bridge.close_file(fh_addr)
+
+        if temp_output is not None:
+            if destination.exists():
+                os.chmod(temp_output, destination.stat().st_mode & 0o777)
+            os.replace(temp_output, destination)
+            temp_output = None
 
         if use_json:
             result = _json_result("read",
@@ -4301,7 +4346,20 @@ def cmd_read(args):
             sys.exit(1)
         raise SystemExit(f"Error extracting file: {e}")
     finally:
-        _cleanup_bridge(bridge, temp_driver)
+        try:
+            if temp_output is not None:
+                try:
+                    # Windows cannot delete a staged file that became
+                    # read-only when the destination's mode was copied.
+                    try:
+                        os.chmod(temp_output, 0o600)
+                    except FileNotFoundError:
+                        pass
+                    temp_output.unlink(missing_ok=True)
+                except OSError as e:
+                    print(f"Warning: cannot remove temporary output: {e}", file=sys.stderr)
+        finally:
+            _cleanup_bridge(bridge, temp_driver)
 
 
 def cmd_write(args):
