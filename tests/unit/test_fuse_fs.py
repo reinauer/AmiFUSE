@@ -1535,6 +1535,42 @@ class TestCreateBridgeFromArgs:
         # Temp driver should be cleaned up
         assert not temp_driver.exists()
 
+    @pytest.mark.parametrize("use_json", [True, False])
+    def test_bridge_image_in_use_is_not_a_handler_error(
+        self, fuse_mock, monkeypatch, tmp_path, capsys, use_json,
+    ):
+        """A busy image gets IMAGE_IN_USE, not HANDLER_ERROR."""
+        import amifuse.fuse_fs as fuse_fs_mod
+        ImageInUseError = fuse_fs_mod.ImageInUseError
+
+        image = tmp_path / "test.hdf"
+        image.write_bytes(b"\x00" * 1024)
+        fake_rdb = MagicMock()
+        fake_rdb.detect_adf.return_value = None
+        fake_rdb.detect_iso.return_value = None
+        monkeypatch.setitem(sys.modules, "amifuse.rdb_inspect", fake_rdb)
+        message = "test.hdf is in use by another AmiFUSE or vamos session"
+        monkeypatch.setattr(fuse_fs_mod, "HandlerBridge",
+                            MagicMock(side_effect=ImageInUseError(message)))
+
+        args = argparse.Namespace(
+            image=image,
+            json=use_json,
+            partition=None,
+            driver=tmp_path / "driver",
+            block_size=None,
+            debug=False,
+        )
+        with pytest.raises(SystemExit) as caught:
+            fuse_fs_mod._create_bridge_from_args(args, "ls")
+        if use_json:
+            assert caught.value.code == 1
+            error = json.loads(capsys.readouterr().out)["error"]
+            assert error["code"] == "IMAGE_IN_USE"
+            assert error["message"] == message
+        else:
+            assert str(caught.value) == f"Error: {message}"
+
     def test_bridge_adf_no_driver_json_error(
         self, fuse_mock, monkeypatch, tmp_path, capsys,
     ):

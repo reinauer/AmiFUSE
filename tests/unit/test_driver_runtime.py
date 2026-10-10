@@ -1,5 +1,8 @@
 from contextlib import ExitStack, suppress
+import errno
+import os
 import struct
+import sys
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -329,3 +332,115 @@ def test_partition_session_keeps_whole_image_lock_without_range_locks(
             backend.read_blocks(0)
     finally:
         backend.close()
+
+
+@pytest.mark.parametrize("partition_scope", [True, False])
+def test_whole_image_conflict_reports_image_in_use(tmp_path, partition_scope):
+    image = tmp_path / "disk.hdf"
+    _make_rdb(image)
+    holder = DiskImage(image).open()
+    try:
+        backend = BlockDeviceBackend(image, partition_scope=partition_scope)
+        with pytest.raises(driver_runtime.ImageInUseError) as caught:
+            backend.open()
+        assert str(caught.value).startswith(
+            "disk.hdf is in use by another AmiFUSE or vamos session")
+        assert not backend.host_lock.is_locked
+    finally:
+        holder.close()
+
+
+def test_partition_conflict_reports_partition_in_use(tmp_path):
+    image = tmp_path / "two.hdf"
+    _make_rdb(image, (("DH0", (1, 4)), ("DH1", (5, 9))))
+    first = BlockDeviceBackend(image, partition_scope=True, partition="DH0",
+                               read_only=False)
+    first.open()
+    try:
+        second = BlockDeviceBackend(image, partition_scope=True, partition="DH0")
+        with pytest.raises(driver_runtime.ImageInUseError,
+                           match="^Partition DH0 of two.hdf is in use"):
+            second.open()
+        assert not second.host_lock.is_locked
+    finally:
+        first.close()
+
+
+@pytest.mark.skipif(sys.platform == "win32" or os.geteuid() == 0,
+                    reason="POSIX file permissions")
+def test_unreadable_image_is_not_reported_in_use(tmp_path):
+    image = tmp_path / "disk.hdf"
+    _make_rdb(image)
+    image.chmod(0)
+    try:
+        backend = BlockDeviceBackend(image)
+        with pytest.raises(PermissionError) as caught:
+            backend.open()
+        assert not isinstance(caught.value, driver_runtime.ImageInUseError)
+    finally:
+        image.chmod(0o644)
+
+
+@pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0,
+                    reason="root can write read-only files")
+@pytest.mark.parametrize("partition_scope", [True, False])
+def test_read_only_image_opened_for_writing_is_not_reported_in_use(
+        tmp_path, partition_scope):
+    # Windows reports both this and msvcrt lock contention as EACCES.
+    image = tmp_path / "disk.hdf"
+    _make_rdb(image)
+    image.chmod(0o444)
+    try:
+        backend = BlockDeviceBackend(image, partition_scope=partition_scope,
+                                     read_only=False)
+        with pytest.raises(PermissionError) as caught:
+            backend.open()
+        assert not isinstance(caught.value, driver_runtime.ImageInUseError)
+        assert caught.value.filename == str(image)
+        assert not backend.host_lock.is_locked
+    finally:
+        image.chmod(0o644)
+
+
+def test_physical_disk_lock_failure_keeps_amitools_message(tmp_path, monkeypatch):
+    image = tmp_path / "disk.hdf"
+    _make_rdb(image)
+    backend = BlockDeviceBackend(image)
+    monkeypatch.setattr(driver_runtime, "is_windows_disk", lambda path: True)
+    busy = _wrapped(BlockingIOError(errno.EAGAIN, "busy"))
+    # Returns without raising, so open() re-raises the original error.
+    assert backend._raise_if_in_use(busy) is None
+
+
+def _wrapped(cause):
+    try:
+        try:
+            raise cause
+        except OSError as exc:
+            raise OSError("cannot exclusively lock disk image x: %s" % exc) from exc
+    except OSError as exc:
+        return exc
+
+
+def _winerror(code):
+    exc = OSError(errno.EACCES, "denied")
+    exc.winerror = code
+    return exc
+
+
+@pytest.mark.parametrize("exc,expected", [
+    (_wrapped(PermissionError(errno.EACCES, "Permission denied")), True),
+    (_wrapped(BlockingIOError(errno.EWOULDBLOCK, "busy")), True),
+    (BlockingIOError(errno.EAGAIN, "busy"), True),
+    (_wrapped(_winerror(33)), True),
+    # A sharing violation only reaches here from a physical disk held by
+    # another program; image files report it as an open() error.
+    (_wrapped(_winerror(32)), False),
+    # Access denied on a physical disk needs elevation, not an unmount.
+    (_wrapped(_winerror(5)), False),
+    (PermissionError(errno.EACCES, "Permission denied", "disk.hdf"), False),
+    (_wrapped(OSError(errno.EIO, "I/O error")), False),
+    (OSError("partition locks require a regular image file"), False),
+])
+def test_lock_conflict_classification(exc, expected):
+    assert driver_runtime._is_lock_conflict(exc) is expected
