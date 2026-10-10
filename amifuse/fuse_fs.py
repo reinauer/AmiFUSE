@@ -73,7 +73,7 @@ from .startup_runner import (
 )
 from amitools.vamos.libstructs.dos import FileInfoBlockStruct, FileHandleStruct, DosPacketStruct, InfoDataStruct  # type: ignore
 from amitools.vamos.lib.dos.DosProtection import DosProtection  # type: ignore
-from .image_access import is_windows_disk
+from amitools.util.Win32Disk import is_windows_disk  # type: ignore
 
 from . import __version__
 
@@ -250,16 +250,12 @@ class HandlerBridge:
 
     def _initialize(self, image, driver, block_size, read_only, debug,
                     trace, partition, adf_info, iso_info):
-        # For MBR images with multiple 0x76 partitions, find the right one
-        mbr_idx = None
-        if partition and adf_info is None and iso_info is None:
-            from .rdb_inspect import find_partition_mbr_index
-            mbr_idx = find_partition_mbr_index(image, block_size, partition)
         self.backend = BlockDeviceBackend(
             image, block_size=block_size, read_only=read_only, adf_info=adf_info,
-            iso_info=iso_info, mbr_partition_index=mbr_idx,
+            iso_info=iso_info, partition_scope=True, partition=partition,
         )
         self.backend.open()
+        mbr_idx = self.backend.mbr_partition_index
         self.vh = VamosHandlerRuntime()
         # Use 68020 CPU for compatibility with SFS and other modern handlers
         self.vh.setup(cpu="68020")
@@ -3280,17 +3276,23 @@ def mount_fuse(
     if icons:
         print("[amifuse] icon mode enabled; Amiga icons will appear as macOS custom icons")
 
-    bridge = HandlerBridge(
-        image,
-        driver,
-        block_size=block_size,
-        read_only=not write,
-        debug=debug,
-        trace=trace,
-        partition=partition,
-        adf_info=adf_info,
-        iso_info=iso_info,
-    )
+    try:
+        bridge = HandlerBridge(
+            image,
+            driver,
+            block_size=block_size,
+            read_only=not write,
+            debug=debug,
+            trace=trace,
+            partition=partition,
+            adf_info=adf_info,
+            iso_info=iso_info,
+        )
+    except (OSError, ValueError) as exc:
+        # Lock conflicts and invalid partitions are expected refusals.
+        if debug:
+            raise
+        raise SystemExit(f"Cannot mount {image}: {exc}") from exc
     if _handler_has_crashed(bridge):
         bridge.close()
         raise SystemExit("Filesystem handler crashed during startup; mount aborted.")

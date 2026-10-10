@@ -18,7 +18,7 @@ if str(AMITOOLS_PATH) not in sys.path:
 from amitools.fs.blkdev.RawBlockDevice import RawBlockDevice  # type: ignore  # noqa: E402
 from amitools.fs.rdb.RDisk import RDisk  # type: ignore  # noqa: E402
 import amitools.fs.DosType as DosType  # type: ignore  # noqa: E402
-from amifuse.image_access import image_size, open_image
+from amitools.util.Win32Disk import image_size, open_image  # type: ignore  # noqa: E402
 
 
 # ADF geometry constants
