@@ -184,3 +184,49 @@ def test_unreadable_partition_is_skipped(tmp_path, devices, past_eof, reason,
                    mbr_partition_index=0)
     assert reason in str(caught.value)
     assert devices == {"open": 2, "close": 2}
+
+
+# open_rdisk closes its device whatever fails, and only once.
+@pytest.mark.parametrize("forced", [False, True])
+def test_image_shorter_than_scan_is_closed(tmp_path, devices, forced):
+    # The scan of blocks 0-15 reads past the end of this 8-block image.
+    image = tmp_path / "short.hdf"
+    image.write_bytes(bytes(8 * 512))
+    with pytest.raises(OSError):
+        open_rdisk(image, block_size=512 if forced else None)
+    assert devices == {"open": 1, "close": 1}
+
+
+@pytest.mark.parametrize("in_mbr", [False, True])
+def test_unexpected_error_closes_device(tmp_path, devices, monkeypatch,
+                                       in_mbr):
+    if in_mbr:
+        image = _make_mbr_rdb(tmp_path, 512, 2048)
+    else:
+        _make_rdb(tmp_path, 512)
+        image = tmp_path / "rdb-DH0.hdf"
+
+    def fail(self):
+        raise RuntimeError("injected")
+
+    monkeypatch.setattr(rdb_inspect.RDisk, "open", fail)
+    with pytest.raises(RuntimeError, match="injected"):
+        open_rdisk(image)
+    assert devices == {"open": 1, "close": 1}
+
+
+def test_failed_reopen_leaves_nothing_open(tmp_path, devices, monkeypatch):
+    # Auto-detection reopens at the RDB's 1024-byte blocks; that fails.
+    _make_rdb(tmp_path, 1024)
+    image = tmp_path / "rdb-DH0.hdf"
+
+    class FailsAt1024(rdb_inspect.RawBlockDevice):
+        def open(self):
+            if self.img_file.block_bytes == 1024:
+                raise OSError("injected")
+            super().open()
+
+    monkeypatch.setattr(rdb_inspect, "RawBlockDevice", FailsAt1024)
+    with pytest.raises(OSError, match="injected"):
+        open_rdisk(image)
+    assert devices == {"open": 1, "close": 1}

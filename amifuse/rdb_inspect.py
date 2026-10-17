@@ -612,18 +612,45 @@ def open_rdisk(
     # Read the MBR first: a Windows physical disk opened outside a mount
     # session is locked against other readers until blkdev closes.
     mbr_info = detect_mbr(image)
+    blkdev = None
+
+    def open_at(block_bytes):
+        # Close the previous device first: each open of a physical disk
+        # takes the drive's lock.
+        nonlocal blkdev
+        if blkdev is not None:
+            old, blkdev = blkdev, None
+            old.close()
+        dev = RawBlockDevice(str(image), read_only=read_only, block_bytes=block_bytes)
+        dev.open()
+        blkdev = dev
+        return dev
+
+    # Close the device on any failure; a device that is returned stays open.
+    try:
+        return _locate_rdisk(image, block_size, mbr_partition_index, mbr_info,
+                             open_at)
+    except BaseException:
+        if blkdev is not None:
+            blkdev.close()
+        raise
+
+
+def _locate_rdisk(image, block_size, mbr_partition_index, mbr_info, open_at):
+    """Find and parse the RDB for open_rdisk, which owns the device.
+
+    open_at(block_bytes) opens the image at that block size, closing the
+    device it opened before, and returns it.
+    """
     initial_block_size = block_size or 512
-    blkdev = RawBlockDevice(str(image), read_only=read_only, block_bytes=initial_block_size)
-    blkdev.open()
+    blkdev = open_at(initial_block_size)
 
     # First try direct RDB scan
     rdb_block, new_block_size = _scan_for_rdb(blkdev, block_size)
 
     if new_block_size is not None:
         # Need to reopen with correct block size and rescan
-        blkdev.close()
-        blkdev = RawBlockDevice(str(image), read_only=read_only, block_bytes=new_block_size)
-        blkdev.open()
+        blkdev = open_at(new_block_size)
         rdb_block, _ = _scan_for_rdb(blkdev, block_size)
 
     if rdb_block is not None and mbr_info is not None:
@@ -642,7 +669,6 @@ def open_rdisk(
         try:
             rdisk = _parse_rdb(blkdev, rdb_block)
         except IOError as e:
-            blkdev.close()
             raise IOError(f"Failed to parse RDB at {image}: {e}")
 
         # Check for Parceiro-style MBR+RDB coexistence
@@ -663,7 +689,6 @@ def open_rdisk(
 
         if mbr_partition_index is not None:
             if mbr_partition_index >= len(amiga_parts):
-                blkdev.close()
                 raise IOError(
                     f"MBR partition index {mbr_partition_index} out of range "
                     f"(found {len(amiga_parts)} Amiga partitions)"
@@ -678,10 +703,7 @@ def open_rdisk(
             # An earlier partition may have reopened the device with its
             # RDB's block size; map and scan each one in its own units.
             if blkdev.block_bytes != initial_block_size:
-                blkdev.close()
-                blkdev = RawBlockDevice(str(image), read_only=read_only,
-                                        block_bytes=initial_block_size)
-                blkdev.open()
+                blkdev = open_at(initial_block_size)
             offset_dev = _mbr_partition_device(blkdev, mbr_part)
             if offset_dev is None:
                 skipped.append((mbr_part, " is not aligned to the RDB's "
@@ -699,9 +721,7 @@ def open_rdisk(
 
             if new_block_size is not None:
                 # Need to reopen base device with new block size and rescan
-                blkdev.close()
-                blkdev = RawBlockDevice(str(image), read_only=read_only, block_bytes=new_block_size)
-                blkdev.open()
+                blkdev = open_at(new_block_size)
                 offset_dev = _mbr_partition_device(blkdev, mbr_part)
                 if offset_dev is None:
                     skipped.append((mbr_part, " is not aligned to the RDB's "
@@ -729,7 +749,6 @@ def open_rdisk(
                 return offset_dev, rdisk, mbr_ctx
 
         # No valid RDB found in any 0x76 partition
-        blkdev.close()
         reasons = "".join(
             f"; partition {part.index} at LBA {part.start_lba}{reason}"
             for part, reason in skipped
@@ -753,7 +772,6 @@ def open_rdisk(
     except Exception:
         pass
 
-    blkdev.close()
     raise IOError(error_msg)
 
 
