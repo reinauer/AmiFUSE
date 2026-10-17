@@ -13,13 +13,20 @@ HandlerBridge write API (verified against fuse_fs.py):
   flush_volume()
 """
 
+import errno
 import os
 import shutil
 
 import pytest
 from pathlib import Path
 
-from amifuse.fuse_fs import HandlerBridge
+from amitools.fs import DosType
+from amitools.fs.ADFSVolume import ADFSVolume
+from amitools.fs.FSString import FSString
+from amitools.fs.blkdev.ADFBlockDevice import ADFBlockDevice
+
+from amifuse.fuse_fs import AmigaFuseFS, FuseOSError, HandlerBridge
+from amifuse.rdb_inspect import detect_adf
 
 pytestmark = pytest.mark.integration
 
@@ -93,5 +100,121 @@ class TestHandlerBridgeWriteOps:
         bridge = HandlerBridge(writable_pfs3_image, pfs3_driver, read_only=False)
         try:
             bridge.flush_volume()
+        finally:
+            bridge.close()
+
+
+# B. Writes past end of file -- 2 tests
+
+
+def _make_ffs_adf(path):
+    """Create an FFS floppy image holding one small file."""
+    blkdev = ADFBlockDevice(str(path))
+    blkdev.create()
+    volume = ADFSVolume(blkdev)
+    volume.create(FSString("Probe"), dos_type=DosType.DOS1)
+    volume.write_file(b"FFS probe file\n", FSString("probe.txt"))
+    volume.close()
+    blkdev.close()
+
+
+# (handler, image under fixtures/readonly or None to create one, file in it)
+_VOLUMES = {
+    "pfs3": ("pfs3aio", "pfs.hdf", "/Identify.info"),
+    "sfs": ("SmartFilesystem", "sfs.hdf", "/Prefs.info"),
+    "ofs": ("FastFileSystem", "ofs.adf", "/OFS_README.txt"),
+    "ffs": ("FastFileSystem", None, "/probe.txt"),
+}
+
+
+@pytest.fixture(params=list(_VOLUMES))
+def writable_volume(request, fixture_root, tmp_path):
+    """A copy of a volume per handler, as (image, driver, existing file)."""
+    driver_name, image_name, path = _VOLUMES[request.param]
+    driver = fixture_root / "drivers" / driver_name
+    if not driver.exists():
+        pytest.skip(f"{driver_name} handler not found")
+    if image_name is None:
+        image = tmp_path / "ffs.adf"
+        _make_ffs_adf(image)
+    else:
+        source = fixture_root / "fixtures" / "readonly" / image_name
+        if not source.exists():
+            pytest.skip(f"{image_name} not found")
+        image = tmp_path / image_name
+        shutil.copy2(source, image)
+    return image, driver, path
+
+
+def _bridge(image, driver, read_only=True):
+    return HandlerBridge(image, driver, read_only=read_only,
+                         adf_info=detect_adf(image))
+
+
+class TestWritePastEndOfFile:
+    """Writes past end of file land at their offset, as on POSIX.
+
+    AmigaDOS cannot seek past end of file, so the mount fills the gap with
+    zeros before writing. Each test writes through the FUSE callbacks a
+    mounted volume receives and checks the result from a fresh session.
+    """
+
+    def test_gap_reads_as_zeros(self, writable_volume):
+        image, driver, path = writable_volume
+        bridge = _bridge(image, driver)
+        try:
+            original = bridge.read_file(path, 1 << 20, 0)
+        finally:
+            bridge.close()
+        size = len(original)
+        assert size > 0
+
+        bridge = _bridge(image, driver, read_only=False)
+        try:
+            ops = AmigaFuseFS(bridge)
+            # The second write follows the first and needs no seek.
+            handle = ops.open(path, os.O_RDWR)
+            assert ops.write(path, b"A" * 8, size + 100, handle) == 8
+            assert ops.write(path, b"B" * 8, size + 108, handle) == 8
+            ops.release(path, handle)
+
+            # Blocks freed by a deleted file still hold its data. A new file
+            # that reuses them must still read zeros in its gap.
+            handle = ops.create("/stale.bin", 0o644)
+            assert ops.write("/stale.bin", b"\xa5" * 32768, 0, handle) == 32768
+            ops.release("/stale.bin", handle)
+            ops.unlink("/stale.bin")
+            handle = ops.create("/sparse.bin", 0o644)
+            assert ops.write("/sparse.bin", b"HEADER", 4096, handle) == 6
+            ops.release("/sparse.bin", handle)
+            bridge.flush_volume()
+        finally:
+            bridge.close()
+
+        bridge = _bridge(image, driver)
+        try:
+            after = bridge.read_file(path, 1 << 20, 0)
+            sparse = bridge.read_file("/sparse.bin", 1 << 20, 0)
+        finally:
+            bridge.close()
+        assert after == original + bytes(100) + b"A" * 8 + b"B" * 8
+        assert sparse == bytes(4096) + b"HEADER"
+
+    def test_gap_beyond_volume_fails_without_writing(self, writable_volume):
+        image, driver, path = writable_volume
+        bridge = _bridge(image, driver, read_only=False)
+        try:
+            original = bridge.read_file(path, 1 << 20, 0)
+            ops = AmigaFuseFS(bridge)
+            handle = ops.open(path, os.O_RDWR)
+            # Every test volume is far smaller than 100 MiB, and no
+            # AmigaDOS file can reach 2 GiB.
+            for offset, expected in ((100 << 20, errno.ENOSPC),
+                                     (1 << 31, errno.EFBIG)):
+                with pytest.raises(FuseOSError) as exc_info:
+                    ops.write(path, b"data", offset, handle)
+                assert exc_info.value.args[0] == expected
+            ops.release(path, handle)
+            assert bridge.read_file(path, 1 << 20, 0) == original
         finally:
             bridge.close()
