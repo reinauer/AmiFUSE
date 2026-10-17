@@ -1958,21 +1958,54 @@ class TestFuseWriteErrors:
         bridge.write_handle_at.assert_called_with(self.FH_ADDR, 5, b" world")
         bridge.write_handle_reply.assert_not_called()
 
-    def test_offset_beyond_seek_range_is_efbig(self, write_fs):
+    def test_offset_at_or_beyond_size_limit_is_efbig(self, write_fs):
         import amifuse.fuse_fs as fuse_fs_mod
 
         fs, bridge, handle = self._open(write_fs)
-        top = fuse_fs_mod._LONG_MAX
+        top = fuse_fs_mod._MAX_FILE_SIZE
         # Packet arguments are 32 bits, so 4 GiB + 4 would land at offset 4.
-        for offset in (top + 1, (1 << 32) + 4):
+        for offset in (top, top + 1, (1 << 32) + 4):
             with pytest.raises(fuse_fs_mod.FuseOSError) as exc_info:
                 fs.write("/file", b"data", offset, handle)
             assert exc_info.value.args[0] == errno.EFBIG
         bridge.write_handle_at.assert_not_called()
 
-        bridge.write_handle_at.return_value = (4, 0)
-        assert fs.write("/file", b"data", top, handle) == 4
-        bridge.write_handle_at.assert_called_once_with(self.FH_ADDR, top, b"data")
+    @pytest.mark.parametrize("sequential", [False, True], ids=["seek", "sequential"])
+    def test_write_across_size_limit_is_cut_short(self, write_fs, sequential):
+        """A file must not end where ACTION_SEEK cannot reach.
+
+        A write across the limit writes up to it, and the next write fails
+        with EFBIG, whether or not it needs a seek.
+        """
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        fs, bridge, handle = self._open(write_fs)
+        top = fuse_fs_mod._MAX_FILE_SIZE
+        start = top - 16
+        if sequential:
+            # Leave the cached position at start, so the write needs no seek.
+            bridge.write_handle_at.return_value = (8, 0)
+            fs.write("/file", b"x" * 8, start - 8, handle)
+            send = bridge.write_handle_reply
+        else:
+            send = bridge.write_handle_at
+        send.return_value = (16, 0)
+
+        assert fs.write("/file", b"y" * 32, start, handle) == 16
+        assert send.call_args.args[-1] == b"y" * 16
+        send.reset_mock()
+        with pytest.raises(fuse_fs_mod.FuseOSError) as exc_info:
+            fs.write("/file", b"z", top, handle)
+        assert exc_info.value.args[0] == errno.EFBIG
+        send.assert_not_called()
+
+    def test_empty_write_changes_nothing(self, write_fs):
+        """POSIX: a zero-length write does not extend the file."""
+        fs, bridge, handle = self._open(write_fs)
+
+        assert fs.write("/file", b"", 1 << 20, handle) == 0
+        bridge.write_handle_at.assert_not_called()
+        bridge.write_handle_reply.assert_not_called()
 
     def test_writes_past_end_of_file_land_at_their_offsets(self, write_fs):
         import amifuse.fuse_fs as fuse_fs_mod

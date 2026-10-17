@@ -207,8 +207,8 @@ class TestWritePastEndOfFile:
             original = bridge.read_file(path, 1 << 20, 0)
             ops = AmigaFuseFS(bridge)
             handle = ops.open(path, os.O_RDWR)
-            # Every test volume is far smaller than 100 MiB, and no
-            # AmigaDOS file can reach 2 GiB.
+            # Every test volume is far smaller than 100 MiB, and a file may
+            # not grow past 2 GiB - 1, the largest offset ACTION_SEEK takes.
             for offset, expected in ((100 << 20, errno.ENOSPC),
                                      (1 << 31, errno.EFBIG)):
                 with pytest.raises(FuseOSError) as exc_info:
