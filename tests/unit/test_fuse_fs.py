@@ -528,6 +528,122 @@ class TestFormatVolume:
         mock_bridge.backend.sync.assert_called_once_with()
         mock_bridge.close.assert_called_once()
 
+    @pytest.mark.parametrize("make_error", [
+        lambda mod: PermissionError(errno.EACCES, "Permission denied", "test.hdf"),
+        lambda mod: mod.ImageInUseError(
+            "test.hdf is in use by another AmiFUSE or vamos session"),
+        lambda mod: ValueError("Partition DH0 overlaps RDB metadata"),
+    ], ids=["read-only", "in-use", "lock-refused"])
+    @pytest.mark.parametrize("debug", [False, True])
+    def test_format_reports_bridge_refusal_without_traceback(
+            self, monkeypatch, make_error, debug):
+        """An image the handler cannot open for writing fails with one line.
+
+        A read-only image, another session's lock and a refused partition
+        lock all stop HandlerBridge before a handler exists. format prints
+        "Error: ..." like mount, and --debug keeps the original exception.
+        """
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        error = make_error(fuse_fs_mod)
+        monkeypatch.setattr(
+            fuse_fs_mod,
+            "get_partition_info",
+            lambda image, block_size, partition: {"dostype": 0x50465303},
+        )
+        bridge_cls = MagicMock(side_effect=error)
+        monkeypatch.setattr(fuse_fs_mod, "HandlerBridge", bridge_cls)
+
+        expected = type(error) if debug else SystemExit
+        with pytest.raises(expected) as exc_info:
+            fuse_fs_mod.format_volume(
+                image=Path("/tmp/test.hdf"),
+                driver=Path("/tmp/test.handler"),
+                block_size=None,
+                partition="DH0",
+                debug=debug,
+            )
+
+        if debug:
+            assert exc_info.value is error
+        else:
+            assert str(exc_info.value) == f"Error: {error}"
+            assert exc_info.value.__cause__ is error
+        bridge_cls.assert_called_once()
+        bridge_cls.return_value.close.assert_not_called()
+
+    @pytest.mark.parametrize("contents, message", [
+        (None, "Error: Can't read from image file"),
+        (bytes(16 * 512), "Error: No valid RDB found in blocks 0-15 at "),
+    ], ids=["missing", "no-rdb"])
+    def test_format_reports_unusable_image_without_traceback(
+            self, monkeypatch, tmp_path, contents, message):
+        """An image without a readable RDB fails with one line.
+
+        Reading the partition's dostype is format's first access to the
+        image, so a missing or unreadable file, or one with no RDB such as
+        an ADF, fails there, before any handler starts.
+        """
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        image = tmp_path / "test.hdf"
+        if contents is not None:
+            image.write_bytes(contents)
+        bridge_cls = MagicMock()
+        monkeypatch.setattr(fuse_fs_mod, "HandlerBridge", bridge_cls)
+
+        with pytest.raises(SystemExit) as exc_info:
+            fuse_fs_mod.format_volume(
+                image=image,
+                driver=tmp_path / "test.handler",
+                block_size=None,
+                partition="DH0",
+            )
+
+        assert str(exc_info.value).startswith(message)
+        assert isinstance(exc_info.value.__cause__, OSError)
+        bridge_cls.assert_not_called()
+
+    @pytest.mark.parametrize("failing, error", [
+        ("get_partition_info", ValueError("block size mismatch: rdb=512 != device=1024")),
+        ("extract_embedded_driver", OSError(errno.ENOSPC, "No space left on device")),
+    ], ids=["partition-info", "embedded-driver"])
+    @pytest.mark.parametrize("debug", [False, True])
+    def test_format_reports_rdb_read_failure_without_traceback(
+            self, monkeypatch, failing, error, debug):
+        """Reading the RDB before the handler starts fails with one line.
+
+        Both RDB reads report OSError and ValueError the same way: an
+        "Error: ..." line, or the original exception with --debug.
+        """
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        monkeypatch.setattr(
+            fuse_fs_mod,
+            "get_partition_info",
+            lambda image, block_size, partition: {"dostype": 0x50465303},
+        )
+        monkeypatch.setattr(fuse_fs_mod, failing, MagicMock(side_effect=error))
+        bridge_cls = MagicMock()
+        monkeypatch.setattr(fuse_fs_mod, "HandlerBridge", bridge_cls)
+
+        expected = type(error) if debug else SystemExit
+        with pytest.raises(expected) as exc_info:
+            fuse_fs_mod.format_volume(
+                image=Path("/tmp/test.hdf"),
+                driver=None,
+                block_size=None,
+                partition="DH0",
+                debug=debug,
+            )
+
+        if debug:
+            assert exc_info.value is error
+        else:
+            assert str(exc_info.value) == f"Error: {error}"
+            assert exc_info.value.__cause__ is error
+        bridge_cls.assert_not_called()
+
 
 class TestUnmountCommand:
     """Tests for the unmount subcommand helper."""
