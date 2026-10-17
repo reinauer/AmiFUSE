@@ -1140,9 +1140,13 @@ class TestHandlerBridgeReadBuf:
         mem.w_block.assert_not_called()
 
 
-def _reply(res1, res2=0):
+PKT = 0x9999        # every packet the mock launcher sends
+STALE_PKT = 0x7777  # a packet whose request timed out earlier
+
+
+def _reply(res1, res2=0, pkt=PKT):
     """One queued packet reply as poll_replies returns it: (msg, pkt, res1, res2)."""
-    return [(0, 0x9999, res1, res2)]
+    return [(0, pkt, res1, res2)]
 
 
 # Reply lists for the read and seek tests below. dp_Res1 is a signed LONG.
@@ -1153,6 +1157,16 @@ SEEK_OK = _reply(0)                  # old position 0
 SEEK_PAST_EOF = _reply(-1, 219)      # ERROR_SEEK_ERROR
 SEEK_ERROR = _reply(-1, 225)         # any other refusal is a failure
 NO_REPLY = []                        # _run_until_replies timed out
+STALE_READ = _reply(5, pkt=STALE_PKT)  # late answer to a timed-out READ
+STALE_SEEK = _reply(4, pkt=STALE_PKT)  # late answer to a timed-out SEEK
+
+
+def _past_end(size):
+    """Replies to a seek refused with ERROR_SEEK_ERROR in a file of size bytes.
+
+    The bridge then seeks to the end and asks for the position there.
+    """
+    return [SEEK_PAST_EOF, SEEK_OK, _reply(size)]
 
 
 class TestHandlerBridgeReadReplies:
@@ -1171,6 +1185,9 @@ class TestHandlerBridgeReadReplies:
         bridge._debug = False
         bridge.state = MagicMock()
         bridge.launcher = MagicMock()
+        for send in ("send_seek_handle", "send_read_handle", "send_end_handle"):
+            getattr(bridge.launcher, send).return_value = (PKT, 0)
+        bridge.launcher.send_findinput.return_value = (self.FH_ADDR, PKT, 0)
         bridge.mem = MagicMock()
         bridge.mem.r_block.side_effect = lambda addr, n: self.PAYLOAD[:n]
         bridge._alloc_read_buf = MagicMock(return_value=SimpleNamespace(addr=0x2000))
@@ -1182,6 +1199,7 @@ class TestHandlerBridgeReadReplies:
         bridge._alloc_fh = MagicMock(return_value=self.FH_ADDR)
         bridge._free_fh = MagicMock()
         bridge.free_lock = MagicMock()
+        bridge._set_neg_cached = MagicMock()
         return bridge
 
     @pytest.mark.parametrize("read, expected", [
@@ -1189,7 +1207,8 @@ class TestHandlerBridgeReadReplies:
         (READ_EOF, b""),
         (READ_ERROR, None),
         (NO_REPLY, None),
-    ], ids=["data", "eof", "handler-error", "no-reply"])
+        (_reply(9), None),
+    ], ids=["data", "eof", "handler-error", "no-reply", "more-than-asked"])
     def test_read_handle(self, fuse_mock, read, expected):
         """read_handle returns b"" only at end of file and None on failure."""
         import amifuse.fuse_fs as fuse_fs_mod
@@ -1203,11 +1222,10 @@ class TestHandlerBridgeReadReplies:
         (SEEK_OK, READ_EOF, b""),
         (SEEK_OK, READ_ERROR, None),
         (SEEK_OK, NO_REPLY, None),
-        (SEEK_PAST_EOF, None, b""),
         (SEEK_ERROR, None, None),
         (NO_REPLY, None, None),
     ], ids=["data", "eof", "read-error", "read-no-reply",
-            "seek-past-eof", "seek-error", "seek-no-reply"])
+            "seek-error", "seek-no-reply"])
     def test_read_handle_at(self, fuse_mock, seek, read, expected):
         """read_handle_at checks the seek before it reads."""
         import amifuse.fuse_fs as fuse_fs_mod
@@ -1220,38 +1238,140 @@ class TestHandlerBridgeReadReplies:
             bridge.state, self.FH_ADDR, 4, fuse_fs_mod.OFFSET_BEGINNING)
         assert bridge.launcher.send_read_handle.called == (read is not None)
 
-    @pytest.mark.parametrize("offset, seek, read, expected", [
-        (0, None, READ_OK, b"hello"),
-        (0, None, READ_EOF, b""),
-        (0, None, READ_ERROR, None),
-        (0, None, NO_REPLY, None),
-        (4, SEEK_OK, READ_OK, b"hello"),
-        (4, SEEK_PAST_EOF, None, b""),
-        (4, SEEK_ERROR, None, None),
-        (4, NO_REPLY, None, None),
+    @pytest.mark.parametrize("reply, outcome, position", [
+        (_reply(7), "OK", 7),
+        (SEEK_PAST_EOF, "PAST_END", None),
+        (SEEK_ERROR, "FAILED", None),
+        (NO_REPLY, "FAILED", None),
+    ], ids=["ok", "past-end", "error", "no-reply"])
+    def test_seek_handle_reports_the_reply(self, fuse_mock, reply, outcome, position):
+        """seek_handle returns the old position, or why the seek failed."""
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        bridge = self._bridge(fuse_fs_mod, reply)
+
+        result = bridge.seek_handle(self.FH_ADDR, 4, fuse_fs_mod.OFFSET_END)
+        assert result == (fuse_fs_mod.SeekResult[outcome], position)
+        bridge.launcher.send_seek_handle.assert_called_once_with(
+            bridge.state, self.FH_ADDR, 4, fuse_fs_mod.OFFSET_END)
+
+    @pytest.mark.parametrize("offset", [0x80000000, 2**32 + 4])
+    def test_offset_past_long_range_is_refused(self, fuse_mock, offset):
+        """An offset that dp_Arg2 cannot hold fails before any packet is sent."""
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        # Sent anyway, the offset would wrap and read from another position.
+        bridge = self._bridge(fuse_fs_mod, SEEK_OK, READ_OK)
+
+        assert bridge.read_handle_at(self.FH_ADDR, offset, 8) is None
+        bridge.launcher.send_seek_handle.assert_not_called()
+        bridge._run_until_replies.assert_not_called()
+
+    @pytest.mark.parametrize("probe, expected", [
+        ([SEEK_OK, _reply(4)], b""),
+        ([SEEK_OK, _reply(3)], b""),
+        ([SEEK_OK, _reply(10)], None),
+        ([SEEK_ERROR], None),
+        ([NO_REPLY], None),
+        ([SEEK_OK, SEEK_ERROR], None),
+    ], ids=["at-end", "past-end", "inside-file", "end-seek-error",
+            "end-seek-no-reply", "position-error"])
+    def test_seek_error_is_eof_only_past_the_end(self, fuse_mock, probe, expected):
+        """ERROR_SEEK_ERROR reads as end of file only if the offset is past the end."""
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        # AROS afs also answers ERROR_SEEK_ERROR when it cannot follow a
+        # damaged file's extension blocks, so the bridge measures the file.
+        bridge = self._bridge(fuse_fs_mod, SEEK_PAST_EOF, *probe)
+
+        assert bridge.read_handle_at(self.FH_ADDR, 4, 8) == expected
+        seeks = [c.args[1:] for c in bridge.launcher.send_seek_handle.call_args_list]
+        assert seeks == [
+            (self.FH_ADDR, 4, fuse_fs_mod.OFFSET_BEGINNING),
+            (self.FH_ADDR, 0, fuse_fs_mod.OFFSET_END),
+            (self.FH_ADDR, 0, fuse_fs_mod.OFFSET_CURRENT),
+        ][:1 + len(probe)]
+        bridge.launcher.send_read_handle.assert_not_called()
+
+    @pytest.mark.parametrize("replies, expected", [
+        ([STALE_READ, SEEK_OK, READ_OK], b"hello"),
+        ([STALE_READ + SEEK_OK, READ_OK], b"hello"),
+        ([SEEK_OK, STALE_SEEK, READ_OK], b"hello"),
+        ([STALE_READ, NO_REPLY], None),
+        ([STALE_READ] * 9, None),
+    ], ids=["alone", "with-answer", "before-read", "then-timeout", "endless"])
+    def test_late_reply_is_not_taken_as_the_answer(self, fuse_mock, replies, expected):
+        """A reply to an earlier packet is dropped, not read as this packet's answer."""
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        # Taken as the seek's answer, a late READ byte count would pass for
+        # the old position; taken as the read's, a seek position would pass
+        # for a byte count.
+        bridge = self._bridge(fuse_fs_mod, *replies)
+
+        assert bridge.read_handle_at(self.FH_ADDR, 4, 8) == expected
+
+    @pytest.mark.parametrize("offset, seeks, read, expected", [
+        (0, [], READ_OK, b"hello"),
+        (0, [], READ_EOF, b""),
+        (0, [], READ_ERROR, None),
+        (0, [], NO_REPLY, None),
+        (4, [SEEK_OK], READ_OK, b"hello"),
+        (4, _past_end(4), None, b""),
+        (4, [SEEK_ERROR], None, None),
+        (4, [NO_REPLY], None, None),
     ], ids=["data", "eof", "read-error", "read-no-reply",
             "seek-data", "seek-past-eof", "seek-error", "seek-no-reply"])
-    def test_read_file_result_and_cleanup(self, fuse_mock, offset, seek, read, expected):
+    def test_read_file_result_and_cleanup(self, fuse_mock, offset, seeks, read, expected):
         """read_file reports failure as None and still releases everything."""
         import amifuse.fuse_fs as fuse_fs_mod
 
         findinput = _reply(-1)  # DOSTRUE
         end = _reply(-1)
-        replies = [findinput]
-        if seek is not None:
-            replies.append(seek)
+        replies = [findinput, *seeks]
         if read is not None:
             replies.append(read)
         replies.append(end)
         bridge = self._bridge(fuse_fs_mod, *replies)
 
         assert bridge.read_file("/dir/file", 8, offset) == expected
-        assert bridge.launcher.send_seek_handle.called == (seek is not None)
+        assert bridge.launcher.send_seek_handle.called == bool(seeks)
         assert bridge.launcher.send_read_handle.called == (read is not None)
         bridge.launcher.send_end_handle.assert_called_once_with(bridge.state, self.FH_ADDR)
         bridge._free_fh.assert_called_once_with(self.FH_ADDR)
         assert [c.args[0] for c in bridge.free_lock.call_args_list] == self.LOCKS[::-1]
         assert bridge._run_until_replies.call_count == len(replies)
+
+    @pytest.mark.parametrize("findinput, expected", [
+        (_reply(0, 205), b""),
+        (_reply(0, 204), b""),
+        (_reply(0, 225), None),
+        (NO_REPLY, None),
+    ], ids=["object-not-found", "dir-not-found", "handler-error", "no-reply"])
+    def test_read_file_open_failure(self, fuse_mock, findinput, expected):
+        """Only a file that does not exist reads as empty when FINDINPUT fails."""
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        bridge = self._bridge(fuse_fs_mod, findinput)
+
+        assert bridge.read_file("/dir/file", 8, 0) == expected
+        assert bridge._set_neg_cached.called == (expected is not None)
+        bridge.launcher.send_read_handle.assert_not_called()
+        bridge._free_fh.assert_called_once_with(self.FH_ADDR)
+        assert [c.args[0] for c in bridge.free_lock.call_args_list] == self.LOCKS[::-1]
+
+    @pytest.mark.parametrize("res2, expected", [(205, b""), (225, None)],
+                             ids=["not-found", "handler-error"])
+    def test_read_file_parent_failure(self, fuse_mock, res2, expected):
+        """A parent directory that fails to lock for another reason is not empty."""
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        bridge = self._bridge(fuse_fs_mod)
+        bridge.locate_path.return_value = (0, res2, [])
+
+        assert bridge.read_file("/dir/file", 8, 0) == expected
+        assert bridge._set_neg_cached.called == (expected is not None)
+        bridge.launcher.send_findinput.assert_not_called()
 
 
 class TestFuseReadErrors:

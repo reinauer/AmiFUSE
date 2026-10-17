@@ -8,6 +8,7 @@ import pytest
 from pathlib import Path
 
 from amifuse.fuse_fs import HandlerBridge
+from amifuse.startup_runner import OFFSET_CURRENT
 
 pytestmark = pytest.mark.integration
 
@@ -105,7 +106,7 @@ class TestHandlerBridgeDirectoryOps:
         assert result.returncode == 0
 
 
-# D. Read failures -- 2 tests
+# D. Read failures -- 4 tests
 
 
 def _root_files(bridge):
@@ -135,6 +136,38 @@ class TestHandlerBridgeReadFailures:
                 assert bridge.read_handle_at(fh_addr, size + 1, 16) == b""
                 assert bridge.read_handle_at(fh_addr, size, 16) == b""
                 assert bridge.read_handle_at(fh_addr, 0, size) == data
+            finally:
+                bridge.close_file(fh_addr)
+        finally:
+            bridge.close()
+
+    def test_offset_past_long_range_fails(self, pfs3_image, pfs3_driver):
+        """An offset that ACTION_SEEK cannot carry fails instead of wrapping."""
+        bridge = HandlerBridge(pfs3_image, pfs3_driver)
+        try:
+            path, data = next(iter(_root_files(bridge).items()))
+            fh_addr, _ = bridge.open_file(path)
+            try:
+                assert bridge.read_handle_at(fh_addr, 2**32 + 1, 16) is None
+                assert bridge.read_handle_at(fh_addr, 1, 16) == data[1:17]
+            finally:
+                bridge.close_file(fh_addr)
+        finally:
+            bridge.close()
+
+    def test_late_reply_is_dropped(self, pfs3_image, pfs3_driver):
+        """A reply to a packet nobody waited for does not answer the next read."""
+        bridge = HandlerBridge(pfs3_image, pfs3_driver)
+        try:
+            path, data = next(iter(_root_files(bridge).items()))
+            fh_addr, _ = bridge.open_file(path)
+            try:
+                assert bridge.read_handle_at(fh_addr, 0, 4) == data[:4]
+                # Stands in for a request that timed out: its reply, the old
+                # position 4, arrives while the bridge waits for the next one.
+                bridge.launcher.send_seek_handle(bridge.state, fh_addr, 0, OFFSET_CURRENT)
+                assert bridge.read_handle_at(fh_addr, 0, len(data)) == data
+                assert bridge.read_handle(fh_addr, 16) == b""
             finally:
                 bridge.close_file(fh_addr)
         finally:
