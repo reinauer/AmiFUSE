@@ -5837,9 +5837,10 @@ class TestPinnedStatCache:
     @pytest.mark.parametrize("length", [0, 2000], ids=["shrink", "grow"])
     def test_truncate_keeps_pinned_size_in_sync(self, write_fs, length):
         """ftruncate on a pinned file must set the cached size too.
-        libfuse2's setattr reply and WinFsp's append offset come from
-        getattr, so a stale size would send the next O_APPEND write past
-        the real end of file, where the gap is filled with zeros.
+        libfuse2's setattr reply and WinFsp's offset for a write to end
+        of file come from getattr, so a stale size would send the next
+        append past the real end of file, where the gap is filled with
+        zeros.
         """
         fs, bridge = write_fs
         bridge.open_file.return_value = (0x4abbc, 0)
