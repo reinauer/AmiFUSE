@@ -3002,8 +3002,13 @@ class TestQueryDiskInfo:
         "id_InUse": 1,  # decoy for volume_node
     }
 
-    def _query(self, fuse_fs_mod, monkeypatch, replies, fields=None):
-        """Run _query_disk_info() against a bridge backed by MockMemory."""
+    def _query(self, fuse_fs_mod, monkeypatch, replies, fields=None, rounds=None):
+        """Run _query_disk_info() against a bridge backed by MockMemory.
+
+        Every wait for replies returns replies, or the next batch from
+        rounds when given. The handler fills the buffer only in a batch
+        that answers the DISK_INFO packet.
+        """
         import threading
 
         if _RealMockMemory is None:
@@ -3017,17 +3022,21 @@ class TestQueryDiskInfo:
         mem = MockMemory(size_kib=64)
         bridge = object.__new__(fuse_fs_mod.HandlerBridge)
         bridge._lock = threading.RLock()
+        bridge._debug = False
         bridge.mem = mem
         bridge.state = MagicMock()
         bridge.launcher = MagicMock()
+        bridge.launcher.send_disk_info.return_value = (PKT, 0)
         bridge.vh = MagicMock()
         info_mem = SimpleNamespace(addr=self.INFO_ADDR)
         bridge.vh.alloc.alloc_memory.return_value = info_mem
+        batches = iter(rounds) if rounds is not None else None
 
         def fake_run_until_replies():
+            batch = next(batches) if batches is not None else replies
             # The real handler fills InfoData in place before replying, so
             # plant the fields here -- the buffer is zeroed before the send.
-            if fields:
+            if fields and any(reply[1] == PKT for reply in batch):
                 info = InfoDataStruct(mem, self.INFO_ADDR)
                 for name, value in fields.items():
                     # Write through the field's own address rather than .val:
@@ -3035,7 +3044,7 @@ class TestQueryDiskInfo:
                     # raw int. The address still comes from the real struct,
                     # so a production offset mistake still fails the test.
                     mem.w32(getattr(info, name).addr, value)
-            return replies
+            return batch
 
         bridge._run_until_replies = fake_run_until_replies
         result = bridge._query_disk_info()
@@ -3084,6 +3093,34 @@ class TestQueryDiskInfo:
 
         assert info is None
         assert res2 is None
+        # The handler can still answer and fill the buffer, so it stays.
+        bridge.vh.alloc.free_memory.assert_not_called()
+
+    # A late answer to a timed-out 64 KiB ACTION_WRITE: dp_Res1 is its count.
+    LATE_WRITE = [(0, STALE_PKT, 65536, 0)]
+
+    def test_late_reply_to_another_packet_is_not_the_answer(self, fuse_mock, monkeypatch):
+        """Read as DOSTRUE, it would give all-zero disk info."""
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        (info, res2), bridge, _ = self._query(
+            fuse_fs_mod, monkeypatch, None, self.PLANTED,
+            rounds=[self.LATE_WRITE, []])
+
+        assert info is None
+        assert res2 is None
+        bridge.vh.alloc.free_memory.assert_not_called()
+
+    def test_answer_after_a_late_reply_is_read(self, fuse_mock, monkeypatch):
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        (info, res2), bridge, info_mem = self._query(
+            fuse_fs_mod, monkeypatch, None, self.PLANTED,
+            rounds=[self.LATE_WRITE, [(0, PKT, 1, 0)]])
+
+        assert res2 is None
+        assert info["bytes_per_block"] == 512
+        assert info["num_blocks"] == 12288
         bridge.vh.alloc.free_memory.assert_called_once_with(info_mem)
 
     def test_zeroed_buffer_when_handler_fills_nothing(self, fuse_mock, monkeypatch):

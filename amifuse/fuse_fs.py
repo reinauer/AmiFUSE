@@ -1436,7 +1436,8 @@ class HandlerBridge:
         things. Silence (no reply at all) says nothing about the volume; an
         explicit DOSFALSE reply carries a res2 error code that often does.
         info is None in both cases, and res2 tells them apart: None for
-        silence, the DOS error code for a refusal.
+        silence, the DOS error code for a refusal. A late reply to an
+        earlier packet is not an answer.
         """
         with self._lock:
             # Allocate InfoDataStruct (9 LONGs = 36 bytes)
@@ -1444,16 +1445,17 @@ class HandlerBridge:
             self.mem.w_block(info_mem.addr, b"\x00" * InfoDataStruct.get_size())
 
             # send_disk_info takes the buffer address (passes as BPTR internally)
-            self.launcher.send_disk_info(self.state, info_mem.addr)
-            replies = self._run_until_replies()
+            pkt_addr, _ = self.launcher.send_disk_info(self.state, info_mem.addr)
+            reply = self._run_until_reply(pkt_addr, "disk_info")
 
-            if not replies:
-                self.vh.alloc.free_memory(info_mem)
+            if reply is None:
+                # The handler can still answer later and fill the buffer
+                # then, so it stays allocated.
                 return None, None
-            if replies[-1][2] == 0:
+            res1, res2 = reply
+            if res1 == 0:
                 # DOSFALSE: the handler answered, refusing the request. The
                 # InfoData buffer is not filled in, but res2 says why.
-                res2 = replies[-1][3]
                 self.vh.alloc.free_memory(info_mem)
                 return None, res2
 
