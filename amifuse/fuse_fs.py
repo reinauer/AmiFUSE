@@ -3383,7 +3383,13 @@ def format_volume(
     bridge = None
 
     # Get partition dostype from RDB
-    part_info = get_partition_info(image, block_size, partition)
+    try:
+        part_info = get_partition_info(image, block_size, partition)
+    except (OSError, ValueError) as exc:
+        # A missing or unreadable image, or one without a usable RDB.
+        if debug:
+            raise
+        raise SystemExit(f"Error: {exc}") from exc
     dostype = part_info["dostype"]
     if dostype is None:
         raise SystemExit(f"Could not determine dostype for partition '{partition}'.")
@@ -3394,8 +3400,10 @@ def format_volume(
     if driver is None:
         try:
             result = extract_embedded_driver(image, block_size, partition)
-        except IOError as e:
-            raise SystemExit(f"Error: {e}")
+        except (OSError, ValueError) as exc:
+            if debug:
+                raise
+            raise SystemExit(f"Error: {exc}") from exc
         if result is None:
             raise SystemExit(
                 "No embedded filesystem driver found for this partition.\n"
@@ -3423,7 +3431,10 @@ def format_volume(
                 debug=debug,
                 partition=partition,
             )
-        except ImageInUseError as exc:
+        except (OSError, ValueError) as exc:
+            # A read-only or busy image, or a refused partition lock.
+            if debug:
+                raise
             raise SystemExit(f"Error: {exc}") from exc
         _raise_if_handler_crashed(bridge, "format startup")
 
