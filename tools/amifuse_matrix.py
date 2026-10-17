@@ -994,6 +994,32 @@ def _verify_rw_session(
         _shutdown_bridge(verify_bridge)
 
 
+def _check_seek_past_end(bridge, path: str, head: bytes):
+    """Reads at and past the end of path must be end of file, not errors."""
+    info = bridge.stat_path(path)
+    if info is None:
+        raise RuntimeError(f"stat failed for {path}")
+    size = int(info.get("size", 0))
+    opened = bridge.open_file(path)
+    if opened is None:
+        raise RuntimeError(f"open failed for {path}")
+    fh_addr, _ = opened
+    try:
+        # Handlers refuse the seek past the end with ERROR_SEEK_ERROR.
+        for offset in (size + 1, size):
+            data = bridge.read_handle_at(fh_addr, offset, 16)
+            if data != b"":
+                got = "an error" if data is None else f"{len(data)} bytes"
+                raise RuntimeError(
+                    f"read at byte {offset} of {size}-byte {path} returned "
+                    f"{got}, not end of file"
+                )
+        if bridge.read_handle_at(fh_addr, 0, 16) != head[:16]:
+            raise RuntimeError(f"read at byte 0 of {path} failed after the end")
+    finally:
+        bridge.close_file(fh_addr)
+
+
 def _run_ro_fixture(fixture: Fixture, HandlerBridge, adf_info, iso_info, inspect_s, inspect_meta):
     init_s, bridge = _timed(
         HandlerBridge,
@@ -1037,6 +1063,9 @@ def _run_ro_fixture(fixture: Fixture, HandlerBridge, adf_info, iso_info, inspect
             if large_data is None:
                 raise RuntimeError(f"read failed for {large_path}")
             large_read_bytes = len(large_data)
+
+        if small_path:
+            _check_seek_past_end(bridge, small_path, small_data)
 
         flush_s, _ = _timed(bridge.flush_volume)
 

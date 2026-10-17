@@ -15,6 +15,7 @@ import sys
 import threading
 import time
 
+from enum import Enum
 from pathlib import Path
 from typing import Dict, List, NamedTuple, Optional, Set, Tuple
 
@@ -66,6 +67,8 @@ from .process_mgr import ProcessManager
 from .startup_runner import (
     HandlerLauncher,
     OFFSET_BEGINNING,
+    OFFSET_CURRENT,
+    OFFSET_END,
     _get_block_state,
     _clear_all_block_state,
     _snapshot_block_state,
@@ -89,8 +92,22 @@ ERROR_OBJECT_NOT_FOUND = 205
 _NOT_FOUND_ERRORS = frozenset({ERROR_DIR_NOT_FOUND, ERROR_OBJECT_NOT_FOUND})
 
 # ACTION_SEEK fails with this code when asked to move past the end of the
-# file, which AmigaDOS does not allow. The handle stays where it was.
+# file, which AmigaDOS does not allow. The handle stays where it was. AROS
+# afs also uses it for a negative offset and for a file whose extension
+# blocks it cannot read, so it does not prove the offset is past the end.
 ERROR_SEEK_ERROR = 219
+
+# ACTION_SEEK carries the offset in dp_Arg2, a signed LONG.
+_LONG_MIN = -0x80000000
+_LONG_MAX = 0x7FFFFFFF
+
+
+class SeekResult(Enum):
+    """How the handler answered ACTION_SEEK; see HandlerBridge.seek_handle."""
+
+    OK = "ok"
+    PAST_END = "past_end"  # refused with ERROR_SEEK_ERROR
+    FAILED = "failed"  # any other refusal, no reply, or an offset out of range
 
 # AmigaDOS error codes a handler can return when it refuses ACTION_DISK_INFO.
 # ERROR_ACTION_NOT_KNOWN is deliberately absent from the unmounted set in
@@ -1083,6 +1100,34 @@ class HandlerBridge:
         for _, pkt_addr, res1, res2 in replies:
             print(f"[amifuse][{label}] pkt=0x{pkt_addr:x} res1={res1} res2={res2}")
 
+    # A handler answers each packet once, so late replies run out; this only
+    # bounds the wait on a handler that never stops replying.
+    _MAX_REPLY_ROUNDS = 8
+
+    def _run_until_reply(self, pkt_addr: int, label: str) -> Optional[Tuple[int, int]]:
+        """Run the handler until it answers the packet at pkt_addr.
+
+        Returns (res1, res2), or None when no answer arrives in time. A
+        packet that timed out is still answered later, while the bridge
+        waits for the next one. Such a reply is dropped: taken as this
+        packet's answer, a READ byte count would pass for a seek position.
+        """
+        for _ in range(self._MAX_REPLY_ROUNDS):
+            replies = self._run_until_replies()
+            self._log_replies(label, replies)
+            if not replies:
+                return None
+            answer = None
+            for _, reply_pkt, res1, res2 in replies:
+                if reply_pkt == pkt_addr:
+                    answer = (res1, res2)
+                elif self._debug:
+                    print(f"[amifuse][{label}] dropped late reply for "
+                          f"pkt=0x{reply_pkt:x}")
+            if answer is not None:
+                return answer
+        return None
+
     def _alloc_fib(self):
         if self._fib_mem is None:
             self._fib_mem = self.vh.alloc.alloc_struct(
@@ -1499,8 +1544,8 @@ class HandlerBridge:
     def read_file(self, path: str, size: int, offset: int) -> Optional[bytes]:
         """Open path, read up to size bytes at offset, and close it again.
 
-        Returns b"" at end of file or when the file cannot be opened, and
-        None when the handler fails the seek or the read.
+        Returns b"" at end of file or when the file does not exist, and None
+        when the handler fails the open, the seek or the read.
         """
         with self._lock:
             if path and path != "/" and self._is_neg_cached(path):
@@ -1515,77 +1560,102 @@ class HandlerBridge:
             if dir_lock == 0 and dir_path != "/":
                 if path and path != "/" and dir_res2 in _NOT_FOUND_ERRORS:
                     self._set_neg_cached(path)
-                return b""
+                return b"" if dir_res2 in _NOT_FOUND_ERRORS else None
             _, name_bptr = self._alloc_bstr(name)
             fh_addr = self._alloc_fh()
-            self.launcher.send_findinput(self.state, name_bptr, dir_lock, fh_addr)
-            replies = self._run_until_replies()
-            self._log_replies("findinput", replies)
-            if not replies or replies[-1][2] == 0:
-                res2 = replies[-1][3] if replies else -1
+            _, pkt_addr, _ = self.launcher.send_findinput(
+                self.state, name_bptr, dir_lock, fh_addr)
+            reply = self._run_until_reply(pkt_addr, "findinput")
+            if reply is None or reply[0] == 0:
+                res2 = reply[1] if reply else -1
                 if path and path != "/" and res2 in _NOT_FOUND_ERRORS:
                     self._set_neg_cached(path)
                 self._free_fh(fh_addr)
                 for l in reversed(locks):
                     self.free_lock(l)
-                return b""
+                return b"" if res2 in _NOT_FOUND_ERRORS else None
             # optional seek
             if offset:
                 data = self.read_handle_at(fh_addr, offset, size)
             else:
                 data = self.read_handle(fh_addr, size)
-            self.launcher.send_end_handle(self.state, fh_addr)
-            self._run_until_replies()
+            pkt_addr, _ = self.launcher.send_end_handle(self.state, fh_addr)
+            self._run_until_reply(pkt_addr, "end")
             self._free_fh(fh_addr)
             for l in reversed(locks):
                 self.free_lock(l)
             return data
 
-    def seek_handle(self, fh_addr: int, offset: int, mode: int = OFFSET_BEGINNING):
+    def seek_handle(self, fh_addr: int, offset: int,
+                    mode: int = OFFSET_BEGINNING) -> Tuple[SeekResult, Optional[int]]:
+        """Move the handle offset bytes from mode, as AmigaDOS Seek() does.
+
+        Returns (SeekResult.OK, old position) on success. A refusal with
+        ERROR_SEEK_ERROR is PAST_END, and any other refusal or no reply is
+        FAILED; the position is then None. An offset that does not fit in a
+        LONG is FAILED without reaching the handler, which would see it
+        wrapped.
+        """
+        if not _LONG_MIN <= offset <= _LONG_MAX:
+            return SeekResult.FAILED, None
         with self._lock:
-            self.launcher.send_seek_handle(self.state, fh_addr, offset, mode)
-            self._run_until_replies()
+            pkt_addr, _ = self.launcher.send_seek_handle(self.state, fh_addr, offset, mode)
+            reply = self._run_until_reply(pkt_addr, "seek")
+        if reply is None:
+            return SeekResult.FAILED, None
+        res1, res2 = reply
+        # Seek() fails only with -1; any other dp_Res1 is the old position.
+        if res1 == -1:
+            if res2 == ERROR_SEEK_ERROR:
+                return SeekResult.PAST_END, None
+            return SeekResult.FAILED, None
+        return SeekResult.OK, res1
 
     def read_handle(self, fh_addr: int, size: int) -> Optional[bytes]:
         """Read up to size bytes from the handle's current position.
 
         Returns b"" at end of file, and None when the handler fails the read
-        (dp_Res1 is -1) or does not reply in time, so that a damaged file
-        cannot pass for a short one.
+        (dp_Res1 is -1), claims more bytes than were asked for, or does not
+        reply in time, so that a damaged file cannot pass for a short one.
         """
         with self._lock:
             buf_mem = self._alloc_read_buf(size)
-            self.launcher.send_read_handle(self.state, fh_addr, buf_mem.addr, size)
-            replies = self._run_until_replies()
-            self._log_replies("read", replies)
-            if not replies:
+            pkt_addr, _ = self.launcher.send_read_handle(
+                self.state, fh_addr, buf_mem.addr, size)
+            reply = self._run_until_reply(pkt_addr, "read")
+            if reply is None:
                 return None
-            res1 = replies[-1][2]
-            if res1 < 0:
+            res1 = reply[0]
+            # More than size would mean the handler wrote past the buffer.
+            if res1 < 0 or res1 > size:
                 return None
             if res1 == 0:
                 return b""
-            nread = min(res1, size)
-            return bytes(self.mem.r_block(buf_mem.addr, nread))
+            return bytes(self.mem.r_block(buf_mem.addr, res1))
 
 
     def read_handle_at(self, fh_addr: int, offset: int, size: int) -> Optional[bytes]:
         """Seek to offset and read up to size bytes from there.
 
         Returns b"" at or past end of file, and None when the seek or the
-        read fails.
+        read fails or the offset does not fit in a LONG.
         """
         with self._lock:
-            self.launcher.send_seek_handle(self.state, fh_addr, offset, OFFSET_BEGINNING)
-            replies = self._run_until_replies()
-            self._log_replies("seek", replies)
-            if not replies:
-                return None
-            if replies[-1][2] < 0:
-                # A seek past end of file is end of file to the reader. Any
-                # other refusal leaves the handle at its old position, and
+            result, _ = self.seek_handle(fh_addr, offset)
+            if result is SeekResult.PAST_END:
+                # End of file only if the offset is past the real end: AROS
+                # afs refuses the same way inside a file it cannot follow.
+                # Seeking to the end to measure it leaves the handle there.
+                if self.seek_handle(fh_addr, 0, OFFSET_END)[0] is not SeekResult.OK:
+                    return None
+                result, end = self.seek_handle(fh_addr, 0, OFFSET_CURRENT)
+                if result is not SeekResult.OK or offset < end:
+                    return None
+                return b""
+            if result is not SeekResult.OK:
+                # A refused seek leaves the handle at its old position, and
                 # reading there would return the wrong bytes.
-                return b"" if replies[-1][3] == ERROR_SEEK_ERROR else None
+                return None
             return self.read_handle(fh_addr, size)
 
 
@@ -4108,6 +4178,14 @@ def cmd_hash(args):
             while bytes_read < file_size:
                 to_read = min(chunk_size, file_size - bytes_read)
                 data = bridge.read_handle(fh_addr, to_read)
+                if data is None:
+                    if use_json:
+                        print(json.dumps(_json_error("hash", "HANDLER_ERROR",
+                            f"Handler failed to read {file_path} at byte {bytes_read}",
+                            details=mount_details)))
+                        sys.exit(1)
+                    raise SystemExit(
+                        f"Error: handler failed to read {file_path} at byte {bytes_read}")
                 if not data:
                     break
                 h.update(data)
@@ -4330,6 +4408,14 @@ def cmd_read(args):
                 while bytes_read < file_size:
                     to_read = min(chunk_size, file_size - bytes_read)
                     data = bridge.read_handle(fh_addr, to_read)
+                    if data is None:
+                        if use_json:
+                            print(json.dumps(_json_error("read", "HANDLER_ERROR",
+                                f"Handler failed to read {file_path} at byte {bytes_read}",
+                                details=mount_details)))
+                            sys.exit(1)
+                        raise SystemExit(
+                            f"Error: handler failed to read {file_path} at byte {bytes_read}")
                     if not data:
                         break
                     out_fd.write(data)

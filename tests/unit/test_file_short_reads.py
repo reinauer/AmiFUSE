@@ -49,7 +49,12 @@ def test_short_read_fails(read_context, capsys, command, chunks, use_json):
     else:
         assert captured.out == ""
         message = str(caught.value)
-    assert f"expected 5 bytes, got {len(chunks[0] or b'')}" in message
+    got = len(chunks[0] or b"")
+    if chunks[-1] is None:
+        assert f"handler failed to read file at byte {got}" in message.lower()
+        assert "Incomplete read" not in message
+    else:
+        assert f"Incomplete read of file: expected 5 bytes, got {got}" in message
     assert output.read_bytes() == b"keep me"
     assert list(output.parent.iterdir()) == [output]
     bridge.close_file.assert_called_once_with(123)
