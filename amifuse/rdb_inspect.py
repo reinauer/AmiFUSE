@@ -536,7 +536,7 @@ def _parse_rdb(dev, rdb_block) -> RDisk:
         # raise ValueError.
         raise IOError(
             f"RDB uses {rdb_block.block_size}-byte blocks, "
-            f"but --block-size {dev.block_bytes} was given"
+            f"but the device was opened with {dev.block_bytes}-byte blocks"
         )
     rdisk = RDisk(dev)
     rdisk.rdb = rdb_block
