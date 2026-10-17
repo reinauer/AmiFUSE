@@ -1646,6 +1646,18 @@ class HandlerBridge:
             return SeekResult.FAILED, None
         return SeekResult.OK, res1
 
+    def _handle_end(self, fh_addr: int) -> Optional[int]:
+        """Move the handle to end of file and return that position.
+
+        Returns None when either seek fails. ACTION_SEEK answers with the
+        old position, so a zero-length OFFSET_CURRENT seek reads the end.
+        """
+        with self._lock:
+            if self.seek_handle(fh_addr, 0, OFFSET_END)[0] is not SeekResult.OK:
+                return None
+            result, end = self.seek_handle(fh_addr, 0, OFFSET_CURRENT)
+        return end if result is SeekResult.OK else None
+
     def read_handle(self, fh_addr: int, size: int) -> Optional[bytes]:
         """Read up to size bytes from the handle's current position.
 
@@ -1680,11 +1692,8 @@ class HandlerBridge:
             if result is SeekResult.PAST_END:
                 # End of file only if the offset is past the real end: AROS
                 # afs refuses the same way inside a file it cannot follow.
-                # Seeking to the end to measure it leaves the handle there.
-                if self.seek_handle(fh_addr, 0, OFFSET_END)[0] is not SeekResult.OK:
-                    return None
-                result, end = self.seek_handle(fh_addr, 0, OFFSET_CURRENT)
-                if result is not SeekResult.OK or offset < end:
+                end = self._handle_end(fh_addr)
+                if end is None or offset < end:
                     return None
                 return b""
             if result is not SeekResult.OK:
@@ -1750,12 +1759,10 @@ class HandlerBridge:
         before, such as a deleted file's data.
         """
         with self._lock:
-            if self.seek_handle(fh_addr, 0, OFFSET_END)[0] is not SeekResult.OK:
-                return -1, 0
-            result, end = self.seek_handle(fh_addr, 0, OFFSET_CURRENT)
+            end = self._handle_end(fh_addr)
             # ERROR_SEEK_ERROR inside the file (AROS afs cannot follow a
             # damaged file's extension blocks) is a failure, not a gap.
-            if result is not SeekResult.OK or end > offset:
+            if end is None or end > offset:
                 return -1, 0
             # Fail before writing anything when the volume cannot hold the
             # gap and the data. Block overhead can still run the fill out of
