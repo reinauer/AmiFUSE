@@ -194,6 +194,8 @@ def _mount_case(case: FormatCase, fuse_fs):
                 f"root listing missing expected entries: {', '.join(missing)}"
             )
         data = fs.bridge.read_file(case.read_path, 64, 0)
+        if data is None:
+            raise RuntimeError(f"read failed for {case.read_path}")
         invocation.update(
             {
                 "volume": str(fs.bridge.volume_name()),

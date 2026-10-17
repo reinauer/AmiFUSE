@@ -58,7 +58,10 @@ def _run_worker(image: str, driver: str, read_size: int, read_count: int):
     sample_bytes = 0
     start = time.perf_counter()
     for entry in sample_files:
-        sample_bytes += len(bridge.read_file(entry["path"], min(entry["size"], read_size), 0))
+        data = bridge.read_file(entry["path"], min(entry["size"], read_size), 0)
+        if data is None:
+            raise RuntimeError(f"read failed for {entry['path']}")
+        sample_bytes += len(data)
     read_s = time.perf_counter() - start
 
     return {

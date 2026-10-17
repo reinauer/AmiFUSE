@@ -29,7 +29,8 @@ def read_context(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("command", ["hash", "read"])
-@pytest.mark.parametrize("chunks", [[b""], [b"ab", b""]])
+# None is a read the handler failed, b"" an early end of file.
+@pytest.mark.parametrize("chunks", [[b""], [b"ab", b""], [None], [b"ab", None]])
 @pytest.mark.parametrize("use_json", [False, True])
 def test_short_read_fails(read_context, capsys, command, chunks, use_json):
     args, bridge, output = read_context
@@ -48,7 +49,7 @@ def test_short_read_fails(read_context, capsys, command, chunks, use_json):
     else:
         assert captured.out == ""
         message = str(caught.value)
-    assert f"expected 5 bytes, got {len(chunks[0])}" in message
+    assert f"expected 5 bytes, got {len(chunks[0] or b'')}" in message
     assert output.read_bytes() == b"keep me"
     assert list(output.parent.iterdir()) == [output]
     bridge.close_file.assert_called_once_with(123)

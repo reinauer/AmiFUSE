@@ -88,6 +88,10 @@ ERROR_DIR_NOT_FOUND = 204
 ERROR_OBJECT_NOT_FOUND = 205
 _NOT_FOUND_ERRORS = frozenset({ERROR_DIR_NOT_FOUND, ERROR_OBJECT_NOT_FOUND})
 
+# ACTION_SEEK fails with this code when asked to move past the end of the
+# file, which AmigaDOS does not allow. The handle stays where it was.
+ERROR_SEEK_ERROR = 219
+
 # AmigaDOS error codes a handler can return when it refuses ACTION_DISK_INFO.
 # ERROR_ACTION_NOT_KNOWN is deliberately absent from the unmounted set in
 # HandlerBridge._UNMOUNTED_DISK_ERRORS: it means the handler does not
@@ -1492,7 +1496,12 @@ class HandlerBridge:
             self._volname = "AmigaFS"
             return self._volname
 
-    def read_file(self, path: str, size: int, offset: int) -> bytes:
+    def read_file(self, path: str, size: int, offset: int) -> Optional[bytes]:
+        """Open path, read up to size bytes at offset, and close it again.
+
+        Returns b"" at end of file or when the file cannot be opened, and
+        None when the handler fails the seek or the read.
+        """
         with self._lock:
             if path and path != "/" and self._is_neg_cached(path):
                 return b""
@@ -1522,21 +1531,9 @@ class HandlerBridge:
                 return b""
             # optional seek
             if offset:
-                self.launcher.send_seek_handle(self.state, fh_addr, offset, OFFSET_BEGINNING)
-                self._run_until_replies()
-            buf_mem = self._alloc_read_buf(size)
-            self.launcher.send_read_handle(self.state, fh_addr, buf_mem.addr, size)
-            replies = self._run_until_replies()
-            self._log_replies("read", replies)
-            if not replies or replies[-1][2] <= 0:
-                self.launcher.send_end_handle(self.state, fh_addr)
-                self._run_until_replies()
-                self._free_fh(fh_addr)
-                for l in reversed(locks):
-                    self.free_lock(l)
-                return b""
-            nread = min(replies[-1][2], size)
-            data = bytes(self.mem.r_block(buf_mem.addr, nread))
+                data = self.read_handle_at(fh_addr, offset, size)
+            else:
+                data = self.read_handle(fh_addr, size)
             self.launcher.send_end_handle(self.state, fh_addr)
             self._run_until_replies()
             self._free_fh(fh_addr)
@@ -1549,28 +1546,47 @@ class HandlerBridge:
             self.launcher.send_seek_handle(self.state, fh_addr, offset, mode)
             self._run_until_replies()
 
-    def read_handle(self, fh_addr: int, size: int) -> bytes:
+    def read_handle(self, fh_addr: int, size: int) -> Optional[bytes]:
+        """Read up to size bytes from the handle's current position.
+
+        Returns b"" at end of file, and None when the handler fails the read
+        (dp_Res1 is -1) or does not reply in time, so that a damaged file
+        cannot pass for a short one.
+        """
         with self._lock:
             buf_mem = self._alloc_read_buf(size)
             self.launcher.send_read_handle(self.state, fh_addr, buf_mem.addr, size)
             replies = self._run_until_replies()
-            if not replies or replies[-1][2] <= 0:
+            self._log_replies("read", replies)
+            if not replies:
+                return None
+            res1 = replies[-1][2]
+            if res1 < 0:
+                return None
+            if res1 == 0:
                 return b""
-            nread = min(replies[-1][2], size)
+            nread = min(res1, size)
             return bytes(self.mem.r_block(buf_mem.addr, nread))
 
 
-    def read_handle_at(self, fh_addr: int, offset: int, size: int) -> bytes:
+    def read_handle_at(self, fh_addr: int, offset: int, size: int) -> Optional[bytes]:
+        """Seek to offset and read up to size bytes from there.
+
+        Returns b"" at or past end of file, and None when the seek or the
+        read fails.
+        """
         with self._lock:
             self.launcher.send_seek_handle(self.state, fh_addr, offset, OFFSET_BEGINNING)
-            self._run_until_replies()
-            buf_mem = self._alloc_read_buf(size)
-            self.launcher.send_read_handle(self.state, fh_addr, buf_mem.addr, size)
             replies = self._run_until_replies()
-            if not replies or replies[-1][2] <= 0:
-                return b""
-            nread = min(replies[-1][2], size)
-            return bytes(self.mem.r_block(buf_mem.addr, nread))
+            self._log_replies("seek", replies)
+            if not replies:
+                return None
+            if replies[-1][2] < 0:
+                # A seek past end of file is end of file to the reader. Any
+                # other refusal leaves the handle at its old position, and
+                # reading there would return the wrong bytes.
+                return b"" if replies[-1][3] == ERROR_SEEK_ERROR else None
+            return self.read_handle(fh_addr, size)
 
 
     def write_handle(self, fh_addr: int, data: bytes) -> int:
@@ -2301,8 +2317,13 @@ class AmigaFuseFS(_FuseOperations):
             else:
                 data = self.bridge.read_handle(fh_addr, size)
             if data is None:
+                # The handler's position is unknown after a failed read or
+                # seek, so the next read must seek explicitly.
+                entry["pos"] = None
                 raise FuseOSError(errno.EIO)
-            entry["pos"] = offset + len(data)
+            # A refused seek past end of file also reads as empty but leaves
+            # the handler's position where it was, so cache only real data.
+            entry["pos"] = offset + len(data) if data else None
             return data
 
     def write(self, path, data, offset, fh):

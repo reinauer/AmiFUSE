@@ -826,6 +826,8 @@ def _exercise_load_session(bridge, fixture: Fixture):
     read_many_start = time.perf_counter()
     for _ in range(fixture.load_read_count):
         data = bridge.read_file(large_path, fixture.load_read_size_bytes, 0)
+        if data is None:
+            raise RuntimeError(f"repeated read failed for {large_path}")
         if len(data) != len(large_payload):
             raise RuntimeError(
                 f"short repeated read: {len(data)} != {len(large_payload)}"
@@ -1024,12 +1026,16 @@ def _run_ro_fixture(fixture: Fixture, HandlerBridge, adf_info, iso_info, inspect
         small_read_bytes = 0
         if small_path:
             small_read_s, small_data = _timed(bridge.read_file, small_path, 4096, 0)
+            if small_data is None:
+                raise RuntimeError(f"read failed for {small_path}")
             small_read_bytes = len(small_data)
 
         large_read_s = 0.0
         large_read_bytes = 0
         if large_path:
             large_read_s, large_data = _timed(bridge.read_file, large_path, 65536, 0)
+            if large_data is None:
+                raise RuntimeError(f"read failed for {large_path}")
             large_read_bytes = len(large_data)
 
         flush_s, _ = _timed(bridge.flush_volume)

@@ -103,3 +103,71 @@ class TestHandlerBridgeDirectoryOps:
         # On platforms where it segfaults, the integration conftest
         # would have already skipped us. So if we reach here, it must work.
         assert result.returncode == 0
+
+
+# D. Read failures -- 2 tests
+
+
+def _root_files(bridge):
+    """Return {path: content} for every non-empty file in the root directory."""
+    files = {}
+    for entry in bridge.list_dir_path("/"):
+        if entry.get("dir_type", 0) < 0 and entry.get("size", 0) > 0:
+            path = "/" + entry["name"]
+            data = bridge.read_file(path, entry["size"], 0)
+            assert data is not None and len(data) == entry["size"], path
+            files[path] = data
+    return files
+
+
+class TestHandlerBridgeReadFailures:
+    """Test that failed reads and seeks are not reported as end of file."""
+
+    def test_seek_past_end_reads_as_eof(self, pfs3_image, pfs3_driver):
+        """Reads at or past end of file return b"" even after an earlier read moved the handle."""
+        bridge = HandlerBridge(pfs3_image, pfs3_driver)
+        try:
+            path, data = next(iter(_root_files(bridge).items()))
+            size = len(data)
+            fh_addr, _ = bridge.open_file(path)
+            try:
+                assert bridge.read_handle_at(fh_addr, 0, 4) == data[:4]
+                assert bridge.read_handle_at(fh_addr, size + 1, 16) == b""
+                assert bridge.read_handle_at(fh_addr, size, 16) == b""
+                assert bridge.read_handle_at(fh_addr, 0, size) == data
+            finally:
+                bridge.close_file(fh_addr)
+        finally:
+            bridge.close()
+
+    def test_read_past_truncated_image_fails(self, pfs3_image, pfs3_driver, tmp_path):
+        """A file whose data lies past the end of a truncated image fails to read."""
+        cut = 2 * 1024 * 1024
+        raw = pfs3_image.read_bytes()
+        bridge = HandlerBridge(pfs3_image, pfs3_driver)
+        try:
+            files = _root_files(bridge)
+        finally:
+            bridge.close()
+        # Content first found at or past the cut has no copy before it, so
+        # the truncated image cannot hold that file's first data block.
+        lost = [p for p, d in files.items() if raw.find(d[:512]) >= cut]
+        kept = [p for p, d in files.items() if 0 <= raw.find(d) <= cut - len(d)]
+        assert lost, "no root file stores its first data block past the cut"
+        assert kept, "no root file is stored wholly before the cut"
+
+        truncated = tmp_path / "pfs-truncated.hdf"
+        truncated.write_bytes(raw[:cut])
+        bridge = HandlerBridge(truncated, pfs3_driver)
+        try:
+            path = lost[0]
+            size = len(files[path])
+            assert bridge.read_file(path, size, 0) is None
+            fh_addr, _ = bridge.open_file(path)
+            try:
+                assert bridge.read_handle_at(fh_addr, 0, size) is None
+            finally:
+                bridge.close_file(fh_addr)
+            assert bridge.read_file(kept[0], len(files[kept[0]]), 0) == files[kept[0]]
+        finally:
+            bridge.close()
