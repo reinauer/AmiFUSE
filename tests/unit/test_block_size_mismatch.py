@@ -43,7 +43,7 @@ def test_direct_rdb_in_other_block_size_is_refused(tmp_path, devices,
         open_rdisk(image, block_size=forced)
     assert str(caught.value) == (
         f"Failed to parse RDB at {image}: RDB uses {rdb_bytes}-byte blocks, "
-        f"but --block-size {forced} was given")
+        f"but the device was opened with {forced}-byte blocks")
     assert devices == {"open": 1, "close": 1}
 
 
@@ -59,7 +59,7 @@ def test_parceiro_rdb_in_other_block_size_is_refused(tmp_path, devices,
         open_rdisk(image, block_size=1024)
     assert str(caught.value) == (
         f"Failed to parse RDB at {image}: RDB uses 512-byte blocks, "
-        f"but --block-size 1024 was given")
+        f"but the device was opened with 1024-byte blocks")
     assert devices == {"open": 1, "close": 1}
 
 
@@ -78,7 +78,7 @@ def test_partition_rdb_in_other_block_size_is_refused(tmp_path, devices,
     assert "none contain a valid RDB" in message
     assert message.endswith(
         f"; partition 0 at LBA {start_lba}: RDB uses 512-byte blocks, "
-        f"but --block-size 1024 was given")
+        f"but the device was opened with 1024-byte blocks")
     assert devices == {"open": 1, "close": 1}
 
 
@@ -132,7 +132,7 @@ def test_damaged_rdb_then_rdb_in_other_block_size(tmp_path, devices):
     assert str(caught.value).endswith(
         "; partition 0 at LBA 64: Corrupt partition block at block 5"
         "; partition 1 at LBA 2048: RDB uses 512-byte blocks, "
-        "but --block-size 4096 was given")
+        "but the device was opened with 4096-byte blocks")
     assert devices == {"open": 1, "close": 1}
 
 
