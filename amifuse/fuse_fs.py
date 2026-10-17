@@ -263,12 +263,10 @@ class HandlerBridge:
             self.vh.enable_trace()
         self.mem = self.vh.alloc.get_mem()
         seg_baddr = self.vh.load_handler(driver)
-        # Build DeviceNode/FSSM using seglist bptr. Open an RDB with the same
-        # block size request as the backend (None auto-detects); floppies use
-        # 512-byte blocks and ISO images their own size.
-        rdb_block_size = block_size if adf_info is None and iso_info is None else 512
+        # Build DeviceNode/FSSM using seglist bptr. Pass the backend's block
+        # size request, so both open the disk the same way.
         ba = BootstrapAllocator(
-            self.vh, image, block_size=rdb_block_size, partition=partition, adf_info=adf_info,
+            self.vh, image, block_size=block_size, partition=partition, adf_info=adf_info,
             iso_info=iso_info, mbr_partition_index=mbr_idx,
         )
         if adf_info:
@@ -308,6 +306,19 @@ class HandlerBridge:
                 print(f"[amifuse] Partition geometry:")
                 print(f"[amifuse]   DosEnvec: LowCyl={start_cyl} HighCyl={end_cyl} Surfaces={dos_env.surfaces} BlkPerTrack={dos_env.blk_per_trk}")
                 print(f"[amifuse]   Calculated: blk_per_cyl={blk_per_cyl} start_blk={start_blk} num_blk={num_blk}")
+
+        # The backend confines I/O to the partition counted in RDB blocks,
+        # while the handler counts the same cylinders in de_SizeBlock units.
+        # If they differ, part of a write would be rejected midway.
+        if boot.get("part") and not adf_info and not iso_info and not read_only:
+            sector_bytes = boot["part"].part_blk.dos_env.block_size * 4
+            if sector_bytes != self.backend.block_size:
+                part_name = partition or f"#{boot['part'].num}"
+                raise SystemExit(
+                    f"Partition '{part_name}' declares {sector_bytes}-byte blocks "
+                    f"but its RDB uses {self.backend.block_size}-byte blocks; "
+                    f"it cannot be opened for writing"
+                )
 
         # Check that the partition data is within the image file
         if boot.get("part") and not adf_info and not iso_info:

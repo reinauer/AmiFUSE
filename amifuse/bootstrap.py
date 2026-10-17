@@ -90,7 +90,7 @@ class SyntheticIsoPartition:
 
 
 class BootstrapAllocator:
-    def __init__(self, vh, image_path: Path, block_size=512, partition=None,
+    def __init__(self, vh, image_path: Path, block_size=None, partition=None,
                  adf_info: Optional[ADFInfo] = None, iso_info: Optional[ISOInfo] = None,
                  mbr_partition_index=None):
         self.vh = vh
@@ -123,7 +123,8 @@ class BootstrapAllocator:
 
     def _read_adf_env(self):
         """Create synthetic partition info for ADF images."""
-        blk = RawBlockDevice(str(self.image_path), read_only=True, block_bytes=self.block_size)
+        blk = RawBlockDevice(str(self.image_path), read_only=True,
+                             block_bytes=self.adf_info.block_size)
         blk.open()
         de = SyntheticDosEnv(self.adf_info)
         part = SyntheticPartition(self.adf_info)
