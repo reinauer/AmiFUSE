@@ -523,6 +523,23 @@ def _lenient_rdisk_open(rdisk) -> List[str]:
     return warnings
 
 
+def _parse_rdb(dev, rdb_block) -> RDisk:
+    """Parse the RDB that _scan_for_rdb found on dev.
+
+    Tries the strict RDisk.open() first, then the lenient parse that
+    tolerates corrupt filesystem blocks. Raises IOError if neither works.
+    """
+    rdisk = RDisk(dev)
+    rdisk.rdb = rdb_block
+    rdisk.rdb_warnings = []
+    if not rdisk.open():
+        # Strict open failed - try lenient parse (tolerates corrupt FS blocks)
+        rdisk = RDisk(dev)
+        rdisk.rdb = rdb_block
+        rdisk.rdb_warnings = _lenient_rdisk_open(rdisk)
+    return rdisk
+
+
 def _mbr_partition_device(blkdev, mbr_part) -> Optional[OffsetBlockDevice]:
     """Map an MBR partition, given in 512-byte sectors, onto blkdev's blocks.
 
@@ -613,20 +630,11 @@ def open_rdisk(
             rdb_block = None
 
     if rdb_block is not None:
-        # Found direct RDB — try strict open first, then lenient fallback
-        rdisk = RDisk(blkdev)
-        rdisk.rdb = rdb_block
-        rdisk.rdb_warnings = []
-        if not rdisk.open():
-            # Strict open failed — try lenient parse (tolerates corrupt FS blocks)
-            rdisk2 = RDisk(blkdev)
-            rdisk2.rdb = rdb_block
-            try:
-                rdisk2.rdb_warnings = _lenient_rdisk_open(rdisk2)
-            except IOError:
-                blkdev.close()
-                raise IOError(f"Failed to parse RDB at {image}")
-            rdisk = rdisk2
+        try:
+            rdisk = _parse_rdb(blkdev, rdb_block)
+        except IOError:
+            blkdev.close()
+            raise IOError(f"Failed to parse RDB at {image}")
 
         # Check for Parceiro-style MBR+RDB coexistence
         mbr_ctx = None
@@ -683,18 +691,10 @@ def open_rdisk(
 
             if rdb_block is not None:
                 # Found RDB in this partition
-                rdisk = RDisk(offset_dev)
-                rdisk.rdb = rdb_block
-                rdisk.rdb_warnings = []
-                if not rdisk.open():
-                    # Try lenient parse
-                    rdisk2 = RDisk(offset_dev)
-                    rdisk2.rdb = rdb_block
-                    try:
-                        rdisk2.rdb_warnings = _lenient_rdisk_open(rdisk2)
-                    except IOError:
-                        continue  # Try next partition
-                    rdisk = rdisk2
+                try:
+                    rdisk = _parse_rdb(offset_dev, rdb_block)
+                except IOError:
+                    continue  # Try next partition
 
                 mbr_ctx = MBRContext(
                     mbr_info=mbr_info,
