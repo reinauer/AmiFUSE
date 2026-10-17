@@ -263,9 +263,12 @@ class HandlerBridge:
             self.vh.enable_trace()
         self.mem = self.vh.alloc.get_mem()
         seg_baddr = self.vh.load_handler(driver)
-        # Build DeviceNode/FSSM using seglist bptr
+        # Build DeviceNode/FSSM using seglist bptr. Open an RDB with the same
+        # block size request as the backend (None auto-detects); floppies use
+        # 512-byte blocks and ISO images their own size.
+        rdb_block_size = block_size if adf_info is None and iso_info is None else 512
         ba = BootstrapAllocator(
-            self.vh, image, partition=partition, adf_info=adf_info,
+            self.vh, image, block_size=rdb_block_size, partition=partition, adf_info=adf_info,
             iso_info=iso_info, mbr_partition_index=mbr_idx,
         )
         if adf_info:
