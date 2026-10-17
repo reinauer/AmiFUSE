@@ -57,10 +57,10 @@ def _open(image, **kwargs):
 
 
 @pytest.mark.parametrize("block_bytes,start_lba", [
-    (512, 64), (1024, 64), (2048, 64),
-    # At LBA 64 a 4096-byte block 8 is the partition's first sector, which
-    # the direct scan reaches before the MBR path (#93).
-    (4096, 2048),
+    (512, 64), (1024, 64), (2048, 64), (4096, 2048),
+    # The direct scan reaches these RDBs when forced, and at LBA 8
+    # also when auto-detected, after reopening at 2048 bytes.
+    (4096, 64), (2048, 32), (2048, 8),
 ])
 @pytest.mark.parametrize("forced", [False, True])
 def test_rdb_block_size_inside_mbr_partition(tmp_path, block_bytes, start_lba,
@@ -108,3 +108,57 @@ def test_later_partition_is_scanned_in_its_own_block_size(tmp_path, first_lba):
                                  (385, _make_rdb(tmp_path, 512, "DH1"))])
     size, offset, _, name, sectors = _open(image)
     assert (size, offset, name, sectors) == (512, 385, "DH1", 385)
+
+
+@pytest.mark.parametrize("forced", [False, True])
+def test_unreadable_rdb_in_scanned_partition_reports_mbr_error(tmp_path,
+                                                                forced):
+    # Forced, the direct scan finds this RDB at block 8 before the MBR
+    # path does. Both fail; report it as auto-detection does.
+    rdb = _with_partition_list(_make_rdb(tmp_path, 4096), 4096, 5)
+    image = _make_mbr(tmp_path, [(64, rdb)])
+    with pytest.raises(OSError) as caught:
+        open_rdisk(image, block_size=4096 if forced else None)
+    assert str(caught.value) == (
+        f"MBR with 1 Amiga partition(s) found, but none contain a valid RDB: "
+        f"{image}")
+
+
+def _make_parceiro(tmp_path, rdb):
+    """Move a 512-byte-block RDB to block 2, behind a FAT32-only MBR."""
+    data = bytearray(rdb)
+    assert not any(data[1024:1536])
+    data[1024:1536] = data[:512]
+    data[:512] = bytes(512)
+    data[446 + 4] = 0x0C
+    struct.pack_into("<II", data, 446 + 8, len(rdb) // 512, 64)
+    data += bytes(64 * 512)
+    data[510:512] = b"\x55\xaa"
+    image = tmp_path / "parceiro.hdf"
+    image.write_bytes(bytes(data))
+    return image
+
+
+@pytest.mark.parametrize("forced", [False, True])
+def test_parceiro_rdb_after_mbr_opens_directly(tmp_path, forced):
+    image = _make_parceiro(tmp_path, _make_rdb(tmp_path, 512))
+    blkdev, rdisk, ctx = open_rdisk(image, block_size=512 if forced else None)
+    try:
+        assert isinstance(blkdev, RawBlockDevice)
+        assert rdisk.rdb.blk_num == 2
+        assert str(rdisk.get_partition(0).get_drive_name()) == "DH0"
+        assert (ctx.scheme, ctx.mbr_partition, ctx.offset_blocks) == (
+            "parceiro", None, 0)
+    finally:
+        rdisk.close()
+        blkdev.close()
+
+
+@pytest.mark.parametrize("forced", [False, True])
+def test_unreadable_parceiro_rdb_is_not_retried_through_mbr(tmp_path, forced):
+    # Without 0x76 entries there is no partition to retry the RDB in.
+    rdb = _with_partition_list(_make_rdb(tmp_path, 512), 512, 5)
+    image = _make_parceiro(tmp_path, rdb)
+    with pytest.raises(OSError) as caught:
+        open_rdisk(image, block_size=512 if forced else None)
+    assert str(caught.value) == f"Failed to parse RDB at {image}"
