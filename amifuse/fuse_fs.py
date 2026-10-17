@@ -1739,20 +1739,21 @@ class HandlerBridge:
         with self._lock:
             result, _ = self.seek_handle(fh_addr, offset)
             if result is SeekResult.PAST_END:
-                res1, res2 = self._extend_with_zeros(fh_addr, offset, len(data))
-                if res1 < 0:
-                    return res1, res2
-            elif result is not SeekResult.OK:
+                return self._write_past_end(fh_addr, offset, data)
+            if result is not SeekResult.OK:
                 return -1, 0
             return self.write_handle_reply(fh_addr, data)
 
-    def _extend_with_zeros(self, fh_addr: int, offset: int, size: int) -> Tuple[int, int]:
-        """Extend the file with zeros from its end to offset.
+    def _write_past_end(self, fh_addr: int, offset: int, data: bytes) -> Tuple[int, int]:
+        """Fill the file with zeros from its end to offset, then write data.
 
         AmigaDOS cannot seek past end of file, so this writes the gap
-        instead. size is the length of the data that will follow, which
-        needs room too. Returns (0, 0) with the handle at offset, or
-        (-1, dp_Res2) on failure, which may leave part of the gap written.
+        instead. Returns (dp_Res1, dp_Res2) like write_handle_reply(). A
+        write that fails once the fill has begun shrinks the file back to
+        its old end, so the zeros do not stay behind and fill the volume.
+
+        The bridge lock is held until the fill ends, and a writable mount
+        serves one request at a time, so a large gap stalls the whole mount.
 
         ACTION_SET_FILE_SIZE would extend the file in one packet, but FFS,
         OFS and pfs3aio leave the new range holding whatever its blocks held
@@ -1773,16 +1774,25 @@ class HandlerBridge:
                 free_blocks = max(info["num_blocks"] - info["num_blocks_used"], 0)
                 # The file's last block may still have room before a new one
                 # is needed.
-                if offset - end + size > free_blocks * bpb + (-end % bpb):
+                if offset - end + len(data) > free_blocks * bpb + (-end % bpb):
                     return -1, ERROR_DISK_FULL
             zeros = bytes(min(offset - end, ZERO_FILL_CHUNK))
-            while end < offset:
-                n = min(offset - end, len(zeros))
+            written, res2 = 0, 0
+            pos = end
+            while pos < offset:
+                n = min(offset - pos, len(zeros))
                 written, res2 = self.write_handle_reply(fh_addr, zeros[:n])
                 if written != n:
-                    return -1, res2
-                end += n
-            return 0, 0
+                    written = -1
+                    break
+                pos += n
+            if written >= 0:
+                written, res2 = self.write_handle_reply(fh_addr, data)
+            if written < 0:
+                # Shrinking never exposes old blocks. If it fails as well,
+                # the zeros written so far stay.
+                self.set_handle_size(fh_addr, end)
+            return written, res2
 
     def set_handle_size(self, fh_addr: int, size: int, mode: int = OFFSET_BEGINNING) -> int:
         with self._lock:

@@ -1718,16 +1718,20 @@ class _FakeHandlerFile:
     ACTION_SEEK refuses to move past end of file with ERROR_SEEK_ERROR and
     leaves the handle where it was, as pfs3aio, SFS and FFS do. ACTION_WRITE
     writes at the handle's position and fails with ERROR_DISK_FULL when the
-    file would grow past capacity. seek_reply, when set, answers every
-    seek instead. Each send returns the packet address its reply carries.
+    file would grow past capacity. ACTION_SET_FILE_SIZE shrinks the file.
+    seek_reply and set_size_reply, when set, answer every seek or size
+    change instead. Each send returns the packet address its reply carries.
     """
 
-    def __init__(self, data, capacity=1 << 20, seek_reply=None):
+    def __init__(self, data, capacity=1 << 20, seek_reply=None,
+                 set_size_reply=None):
         self.data = bytearray(data)
         self.pos = 0
         self.capacity = capacity
         self.seek_reply = seek_reply
+        self.set_size_reply = set_size_reply
         self.writes = []  # length of every ACTION_WRITE
+        self.set_sizes = []  # size of every ACTION_SET_FILE_SIZE
         self.buf = b""
         self.reply = NO_REPLY
 
@@ -1756,6 +1760,16 @@ class _FakeHandlerFile:
             self.reply = _reply(size)
         return PKT, 0
 
+    def set_size(self, state, fh_addr, size, mode):
+        self.set_sizes.append(size)
+        if self.set_size_reply is not None:
+            self.reply = self.set_size_reply
+        else:
+            del self.data[size:]
+            self.pos = min(self.pos, size)
+            self.reply = _reply(size)
+        return PKT, 0
+
 
 def _fake_write_bridge(fuse_fs_mod, handler, free_blocks=2048):
     """Build a bridge whose handler is the fake file.
@@ -1772,6 +1786,7 @@ def _fake_write_bridge(fuse_fs_mod, handler, free_blocks=2048):
     bridge.launcher = MagicMock()
     bridge.launcher.send_seek_handle.side_effect = handler.seek
     bridge.launcher.send_write_handle.side_effect = handler.write
+    bridge.launcher.send_set_file_size.side_effect = handler.set_size
     bridge.mem = MagicMock()
     bridge.mem.w_block.side_effect = handler.w_block
     bridge._alloc_read_buf = MagicMock(return_value=SimpleNamespace(addr=0x2000))
@@ -1862,23 +1877,49 @@ class TestHandlerBridgeWriteAt:
 
         assert bridge.write_handle_at(self.FH_ADDR, offset, self.DATA) == expected
         if expected[0] < 0:
-            # Refused before anything was written.
+            # Refused before anything was written, so nothing to undo.
             assert handler.writes == []
+            assert handler.set_sizes == []
             assert handler.data == self.ORIGINAL
         else:
             assert len(handler.data) == offset + 4
 
-    def test_disk_full_during_fill_keeps_handler_error(self, fuse_mock):
+    @pytest.mark.parametrize("runs_out", ["in-fill", "in-data"])
+    def test_disk_full_shrinks_file_back(self, fuse_mock, runs_out):
+        """A write that fails after the fill began leaves the old size.
+
+        The volume reports room, but the handler runs out of it in the
+        second chunk of zeros, or in the data after a complete fill.
+        """
         import amifuse.fuse_fs as fuse_fs_mod
 
         chunk = fuse_fs_mod.ZERO_FILL_CHUNK
-        # The volume reports room, but the handler runs out in the second chunk.
-        handler = _FakeHandlerFile(self.ORIGINAL, capacity=chunk + 100)
+        offset = len(self.ORIGINAL) + 2 * chunk
+        if runs_out == "in-fill":
+            capacity, writes = chunk + 100, [chunk, chunk]
+        else:
+            capacity, writes = offset + 2, [chunk, chunk, 4]
+        handler = _FakeHandlerFile(self.ORIGINAL, capacity=capacity)
+        bridge = _fake_write_bridge(fuse_fs_mod, handler)
+
+        assert bridge.write_handle_at(self.FH_ADDR, offset, self.DATA) == (-1, 221)
+        assert handler.writes == writes
+        assert handler.set_sizes == [len(self.ORIGINAL)]
+        assert handler.data == self.ORIGINAL
+
+    def test_failed_shrink_keeps_handler_error(self, fuse_mock):
+        """When the shrink fails too, the zeros stay and the write fails."""
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        chunk = fuse_fs_mod.ZERO_FILL_CHUNK
+        handler = _FakeHandlerFile(self.ORIGINAL, capacity=chunk + 100,
+                                   set_size_reply=_reply(-1, 225))
         bridge = _fake_write_bridge(fuse_fs_mod, handler)
         offset = len(self.ORIGINAL) + 2 * chunk
 
         assert bridge.write_handle_at(self.FH_ADDR, offset, self.DATA) == (-1, 221)
-        assert handler.writes == [chunk, chunk]
+        assert handler.set_sizes == [len(self.ORIGINAL)]
+        assert handler.data == self.ORIGINAL + bytes(chunk)
 
     # A late READ reply in the same batch must not pass for the write's.
     @pytest.mark.parametrize("reply, expected", [

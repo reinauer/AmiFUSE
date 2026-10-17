@@ -104,7 +104,7 @@ class TestHandlerBridgeWriteOps:
             bridge.close()
 
 
-# B. Writes past end of file -- 3 tests
+# B. Writes past end of file -- 4 tests
 
 
 def _make_ffs_adf(path):
@@ -240,3 +240,35 @@ class TestWritePastEndOfFile:
             assert bridge.read_file("/log.txt", 1 << 20, 0) == b"append"
         finally:
             bridge.close()
+
+    def test_fill_that_runs_out_of_space_is_undone(self, writable_volume):
+        image, driver, path = writable_volume
+        bridge = _bridge(image, driver, read_only=False)
+        try:
+            original = bridge.read_file(path, 1 << 20, 0)
+            info = bridge.get_disk_info()
+            free = info["num_blocks"] - info["num_blocks_used"]
+            # Block overhead can leave less room than the free space the
+            # handler reports. Report 64 blocks too many, so the fill passes
+            # the free-space check and runs out part way.
+            bridge.get_disk_info = lambda: dict(
+                info, num_blocks_used=info["num_blocks_used"] - 64)
+            ops = AmigaFuseFS(bridge)
+            handle = ops.open(path, os.O_RDWR)
+            offset = len(original) + (free + 32) * info["bytes_per_block"]
+            with pytest.raises(FuseOSError) as exc_info:
+                ops.write(path, b"data", offset, handle)
+            assert exc_info.value.args[0] == errno.ENOSPC
+            ops.release(path, handle)
+            bridge.flush_volume()
+        finally:
+            bridge.close()
+
+        bridge = _bridge(image, driver)
+        try:
+            assert bridge.read_file(path, 1 << 20, 0) == original
+            after = bridge.get_disk_info()
+        finally:
+            bridge.close()
+        # The zeros written before the handler ran out are gone again.
+        assert after["num_blocks_used"] == info["num_blocks_used"]
