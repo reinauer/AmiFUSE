@@ -801,6 +801,9 @@ def find_partition_mbr_index(
     named partition.  Returns the 0-based index into the list of 0x76
     partitions, or None if the image is not MBR, has only one 0x76 partition,
     or the partition is found in the default (first) RDB.
+
+    Raises IOError if a forced block_size rules out an RDB that holds the
+    partition at its own block size.
     """
     mbr_info = detect_mbr(image)
     if mbr_info is None or not mbr_info.has_amiga_partitions:
@@ -808,18 +811,30 @@ def find_partition_mbr_index(
     amiga_parts = [p for p in mbr_info.partitions if p.partition_type == MBR_TYPE_AMIGA_RDB]
     if len(amiga_parts) <= 1:
         return None
-    for idx in range(len(amiga_parts)):
+
+    def holds_partition(idx, size):
+        # True or False if 0x76 partition idx opens at size, None if not.
         try:
-            blkdev, rdisk, _ = open_rdisk(image, block_size=block_size, mbr_partition_index=idx)
+            blkdev, rdisk, _ = open_rdisk(image, block_size=size, mbr_partition_index=idx)
             try:
-                part = rdisk.find_partition_by_string(str(partition_name))
-                if part is not None:
-                    return idx
+                return rdisk.find_partition_by_string(str(partition_name)) is not None
             finally:
                 rdisk.close()
                 blkdev.close()
         except IOError:
-            continue
+            return None
+
+    for idx in range(len(amiga_parts)):
+        found = holds_partition(idx, block_size)
+        if found:
+            return idx
+        if found is None and block_size is not None and holds_partition(idx, None):
+            # The forced size skips an RDB holding the name, so a later match,
+            # or none, would differ from what auto-detection resolves.
+            raise IOError(
+                f"Partition {partition_name} is in an RDB that does not open "
+                f"with {block_size}-byte blocks"
+            )
     return None
 
 
