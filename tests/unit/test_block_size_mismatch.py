@@ -1,5 +1,7 @@
 """A --block-size that the RDB does not use is an open error, not a crash."""
 
+import struct
+
 import pytest
 
 from amitools.fs.blkdev.RawBlockDevice import RawBlockDevice
@@ -144,3 +146,41 @@ def test_damaged_rdb_then_rdb_in_forced_block_size(tmp_path, devices):
         rdisk.close()
         blkdev.close()
     assert devices == {"open": 1, "close": 1}
+
+
+# An unreadable 0x76 entry is skipped like one without a valid RDB, so a
+# later entry still opens and the device is closed once either way.
+def _unreadable_then_valid(tmp_path, past_eof):
+    image = _make_mbr(tmp_path, [(64, bytes(512)),
+                                 (256, _make_rdb(tmp_path, 512, "DH1"))])
+    if past_eof:
+        data = bytearray(image.read_bytes())
+        struct.pack_into("<I", data, 446 + 8, 1 << 20)  # entry 0 start LBA
+        image.write_bytes(bytes(data))
+    return image
+
+
+@pytest.mark.parametrize("past_eof,reason", [
+    # The scan of 1-block entry 0 reads beyond it at block 1.
+    (False, "partition 0 at LBA 64: Read beyond partition: 1+1 > 1"),
+    (True, "partition 0 at LBA 1048576: Invalid image file block num"),
+], ids=["one-block", "past-eof"])
+@pytest.mark.parametrize("forced", [False, True])
+def test_unreadable_partition_is_skipped(tmp_path, devices, past_eof, reason,
+                                         forced):
+    image = _unreadable_then_valid(tmp_path, past_eof)
+    blkdev, rdisk, ctx = open_rdisk(image, block_size=512 if forced else None)
+    try:
+        assert ctx.mbr_partition.index == 1
+        assert str(rdisk.get_partition(0).get_drive_name()) == "DH1"
+    finally:
+        rdisk.close()
+        blkdev.close()
+    assert devices == {"open": 1, "close": 1}
+
+    # Alone, the entry is reported with the reason.
+    with pytest.raises(OSError) as caught:
+        open_rdisk(image, block_size=512 if forced else None,
+                   mbr_partition_index=0)
+    assert reason in str(caught.value)
+    assert devices == {"open": 2, "close": 2}

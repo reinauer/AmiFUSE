@@ -688,7 +688,14 @@ def open_rdisk(
                                           f"{initial_block_size}-byte blocks"))
                 continue
 
-            rdb_block, new_block_size = _scan_for_rdb(offset_dev, block_size)
+            # An entry that cannot be read or parsed is skipped with its
+            # reason. Leave blkdev open: closing offset_dev closes it, and
+            # the next entry may reuse it.
+            try:
+                rdb_block, new_block_size = _scan_for_rdb(offset_dev, block_size)
+            except IOError as e:
+                skipped.append((mbr_part, f": {e}"))
+                continue
 
             if new_block_size is not None:
                 # Need to reopen base device with new block size and rescan
@@ -700,15 +707,17 @@ def open_rdisk(
                     skipped.append((mbr_part, " is not aligned to the RDB's "
                                               f"{new_block_size}-byte blocks"))
                     continue
-                rdb_block, _ = _scan_for_rdb(offset_dev, block_size)
+                try:
+                    rdb_block, _ = _scan_for_rdb(offset_dev, block_size)
+                except IOError as e:
+                    skipped.append((mbr_part, f": {e}"))
+                    continue
 
             if rdb_block is not None:
                 # Found RDB in this partition
                 try:
                     rdisk = _parse_rdb(offset_dev, rdb_block)
                 except IOError as e:
-                    # Try the next partition. Leave blkdev open: closing
-                    # offset_dev closes it, and the next one may reuse it.
                     skipped.append((mbr_part, f": {e}"))
                     continue
 
