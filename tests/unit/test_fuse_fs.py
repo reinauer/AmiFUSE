@@ -5734,6 +5734,24 @@ class TestPinnedStatCache:
 
         assert fs._stat_cache["/Makefile"][1]["st_size"] == 100
 
+    @pytest.mark.parametrize("length", [0, 2000], ids=["shrink", "grow"])
+    def test_truncate_keeps_pinned_size_in_sync(self, write_fs, length):
+        """ftruncate on a pinned file must set the cached size too.
+        libfuse2's setattr reply and WinFsp's append offset come from
+        getattr, so a stale size would send the next O_APPEND write past
+        the real end of file, where the gap is filled with zeros.
+        """
+        fs, bridge = write_fs
+        bridge.open_file.return_value = (0x4abbc, 0)
+        bridge.write_handle_at.return_value = (1000, 0)
+        bridge.set_handle_size.return_value = length
+        fh = fs.create("/log", 0o100664)
+        fs.write("/log", b"x" * 1000, 0, fh)
+
+        fs.truncate("/log", length, fh)
+
+        assert fs.getattr("/log")["st_size"] == length
+
     def test_unlink_discards_pin(self, write_fs):
         """unlink() must clean up _pinned_stats so a later create() of the
         same name starts from a fresh slate.

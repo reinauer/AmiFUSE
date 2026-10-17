@@ -104,7 +104,7 @@ class TestHandlerBridgeWriteOps:
             bridge.close()
 
 
-# B. Writes past end of file -- 2 tests
+# B. Writes past end of file -- 3 tests
 
 
 def _make_ffs_adf(path):
@@ -216,5 +216,27 @@ class TestWritePastEndOfFile:
                 assert exc_info.value.args[0] == expected
             ops.release(path, handle)
             assert bridge.read_file(path, 1 << 20, 0) == original
+        finally:
+            bridge.close()
+
+    def test_append_after_truncate_lands_at_new_end(self, writable_volume):
+        image, driver, _ = writable_volume
+        bridge = _bridge(image, driver, read_only=False)
+        try:
+            ops = AmigaFuseFS(bridge)
+            handle = ops.create("/log.txt", 0o644)
+            assert ops.write("/log.txt", b"x" * 1000, 0, handle) == 1000
+            ops.truncate("/log.txt", 0, handle)
+            # An O_APPEND write arrives at the size getattr reports.
+            size = ops.getattr("/log.txt")["st_size"]
+            assert ops.write("/log.txt", b"append", size, handle) == 6
+            ops.release("/log.txt", handle)
+            bridge.flush_volume()
+        finally:
+            bridge.close()
+
+        bridge = _bridge(image, driver)
+        try:
+            assert bridge.read_file("/log.txt", 1 << 20, 0) == b"append"
         finally:
             bridge.close()
