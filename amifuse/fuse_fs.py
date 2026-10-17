@@ -103,6 +103,11 @@ ERROR_SEEK_ERROR = 219
 _LONG_MIN = -0x80000000
 _LONG_MAX = 0x7FFFFFFF
 
+# The largest file a write may leave. Sequential writes could grow a file
+# further, but a seek could not reach its end and fib_Size, also a signed
+# LONG, could not hold its size.
+_MAX_FILE_SIZE = _LONG_MAX
+
 
 class SeekResult(Enum):
     """How the handler answered ACTION_SEEK; see HandlerBridge.seek_handle."""
@@ -2595,6 +2600,19 @@ class AmigaFuseFS(_FuseOperations):
             entry["pos"] = offset + len(data) if data else None
             return data
 
+    @staticmethod
+    def _fit_file_size_limit(offset: int, size: int) -> int:
+        """Return how many of size bytes at offset fit within _MAX_FILE_SIZE.
+
+        Raises EFBIG when offset is past the limit, or at it with bytes to
+        write. With size 0 this checks a file length, such as a truncate
+        target.
+        """
+        room = _MAX_FILE_SIZE - offset
+        if room < 0 or (room == 0 and size > 0):
+            raise FuseOSError(errno.EFBIG)
+        return min(size, room)
+
     def write(self, path, data, offset, fh):
         self._log_op("write", path, f"offset={offset} size={len(data)} fh={fh}")
         self._check_handler_alive()
@@ -2608,9 +2626,12 @@ class AmigaFuseFS(_FuseOperations):
         with entry["lock"]:
             if entry.get("closed"):
                 raise FuseOSError(errno.EIO)
+            data = data[:self._fit_file_size_limit(offset, len(data))]
+            if not data:
+                # POSIX: a zero-length write changes nothing, even past end
+                # of file.
+                return 0
             if entry["pos"] is None or offset != entry["pos"]:
-                if offset > _LONG_MAX:
-                    raise FuseOSError(errno.EFBIG)
                 written, res2 = self.bridge.write_handle_at(fh_addr, offset, data)
             else:
                 written, res2 = self.bridge.write_handle_reply(fh_addr, data)
