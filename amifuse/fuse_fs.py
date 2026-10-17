@@ -3108,8 +3108,22 @@ def extract_embedded_driver(
                 data = fs.get_data()
                 # Create temp file that persists until program exits
                 fd, temp_path = tempfile.mkstemp(suffix=f"_{dt_str}.handler", prefix="amifuse_")
-                os.write(fd, data)
-                os.close(fd)
+                try:
+                    # The file object closes fd even if a write fails, and
+                    # retries short writes until all of data is written.
+                    with os.fdopen(fd, "wb") as handler_file:
+                        handler_file.write(data)
+                except OSError as exc:
+                    os.unlink(temp_path)
+                    # Name the temp file, so that a full temp directory is
+                    # not mistaken for a problem with the image.
+                    raise OSError(
+                        f"cannot write the filesystem driver to the temporary "
+                        f"file {temp_path}: {exc}"
+                    ) from exc
+                except BaseException:
+                    os.unlink(temp_path)
+                    raise
                 return Path(temp_path), dt_str, target_dostype
 
         return None
@@ -3382,6 +3396,13 @@ def format_volume(
     import amitools.fs.DosType as DosType
     bridge = None
 
+    # Name a missing image or a directory plainly, as the file commands do.
+    if not is_windows_disk(image):
+        if not image.exists():
+            raise SystemExit(f"Error: image file not found: {image}")
+        if image.is_dir():
+            raise SystemExit(f"Error: image is a directory: {image}")
+
     # Get partition dostype from RDB
     try:
         part_info = get_partition_info(image, block_size, partition)
@@ -3415,13 +3436,15 @@ def format_volume(
     else:
         driver_desc = str(driver)
 
-    print(__banner__)
-    print(f"Formatting partition '{partition}' in {image}")
-    print(f"Filesystem driver: {driver_desc}")
-    print(f"Volume name: {volname}")
-    print(f"DOS type: {dt_str} (0x{dostype:08x})")
-
     try:
+        # Inside the try, so that a failing print, such as a volume name
+        # the console cannot encode, still removes an extracted driver.
+        print(__banner__)
+        print(f"Formatting partition '{partition}' in {image}")
+        print(f"Filesystem driver: {driver_desc}")
+        print(f"Volume name: {volname}")
+        print(f"DOS type: {dt_str} (0x{dostype:08x})")
+
         try:
             bridge = HandlerBridge(
                 image,
@@ -3432,7 +3455,10 @@ def format_volume(
                 partition=partition,
             )
         except (OSError, ValueError) as exc:
-            # A read-only or busy image, or a refused partition lock.
+            # Any OSError or ValueError from the whole constructor: opening
+            # and locking the image (read-only, busy, a refused partition
+            # lock), loading the handler, the bootstrap's RDB read and the
+            # startup run. As broad as mount's catch on purpose.
             if debug:
                 raise
             raise SystemExit(f"Error: {exc}") from exc
