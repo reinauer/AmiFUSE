@@ -678,10 +678,12 @@ def open_rdisk(
             f"to the RDB's {size}-byte blocks"
             for part, size in misaligned
         )
-        raise IOError(
-            f"MBR with {len(amiga_parts)} Amiga partition(s) found, "
-            f"but none contain a valid RDB: {image}{reasons}"
-        )
+        if mbr_partition_index is not None:
+            found = f"MBR partition {amiga_parts[0].index} does not contain a valid RDB"
+        else:
+            found = (f"MBR with {len(amiga_parts)} Amiga partition(s) found, "
+                     f"but none contain a valid RDB")
+        raise IOError(f"{found}: {image}{reasons}")
 
     # Check for other partition types to give helpful error messages
     error_msg = f"No valid RDB found in blocks 0-15 at {image}"
@@ -918,24 +920,23 @@ def print_inspect_report(image: Path, block_size: Optional[int], full: bool) -> 
 
     Handles plain-RDB, Parceiro-style MBR+RDB, and Emu68-style multi-RDB
     layouts. Shared by `amifuse inspect` and the rdb-inspect tool. Raises
-    SystemExit when the initial open fails; per-RDB failures in a multi-RDB
-    image are reported inline and skipped.
+    SystemExit when the image cannot be opened, or when no RDB of a multi-RDB
+    image can; per-RDB failures in a multi-RDB image are reported inline and
+    skipped.
     """
     amiga_parts = amiga_rdb_partitions(image)
     if len(amiga_parts) > 1:
-        # Show the MBR table once using the first partition's context
-        try:
-            blkdev, rdisk, mbr_ctx = open_rdisk(
-                image, block_size=block_size, mbr_partition_index=0
-            )
-        except IOError as e:
-            raise SystemExit(f"Error: {e}")
-        for line in format_mbr_info(mbr_ctx):
+        # Show the MBR table once, from the table itself, so an unreadable
+        # first RDB is reported inline below like any other.
+        header = MBRContext(
+            mbr_info=detect_mbr(image), mbr_partition=amiga_parts[0],
+            offset_blocks=amiga_parts[0].start_lba,
+        )
+        for line in format_mbr_info(header):
             print(line)
-        rdisk.close()
-        blkdev.close()
 
         # Show each RDB
+        opened = 0
         for rdb_idx in range(len(amiga_parts)):
             try:
                 blkdev, rdisk, mbr_ctx = open_rdisk(
@@ -944,6 +945,7 @@ def print_inspect_report(image: Path, block_size: Optional[int], full: bool) -> 
             except IOError as e:
                 print(f"\nMBR partition [{amiga_parts[rdb_idx].index}]: Error: {e}")
                 continue
+            opened += 1
             try:
                 print(f"\n=== Amiga RDB in MBR partition [{mbr_ctx.mbr_partition.index}]"
                       f" (offset: {mbr_ctx.offset_blocks} sectors) ===\n")
@@ -952,6 +954,11 @@ def print_inspect_report(image: Path, block_size: Optional[int], full: bool) -> 
             finally:
                 rdisk.close()
                 blkdev.close()
+        if not opened:
+            raise SystemExit(
+                f"Error: MBR with {len(amiga_parts)} Amiga partitions found, "
+                f"but none contain a valid RDB: {image}"
+            )
         return
 
     # Single RDB (plain or Parceiro-style)
