@@ -62,7 +62,12 @@ def fuse_mock(monkeypatch):
 
     dummy_cls = type("Dummy", (), {})
 
-    _stub_module("amifuse.driver_runtime", BlockDeviceBackend=dummy_cls)
+    _stub_module(
+        "amifuse.driver_runtime",
+        BlockDeviceBackend=dummy_cls,
+        # Like the real class, an OSError that fuse_fs tells apart by type.
+        ImageInUseError=type("ImageInUseError", (OSError,), {}),
+    )
     _stub_module("amifuse.vamos_runner", VamosHandlerRuntime=dummy_cls)
     _stub_module("amifuse.bootstrap", BootstrapAllocator=dummy_cls)
     _stub_module("amifuse.process_mgr", ProcessManager=dummy_cls)
