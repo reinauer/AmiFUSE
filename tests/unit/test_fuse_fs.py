@@ -1712,6 +1712,287 @@ class TestFuseReadErrors:
         assert exc_info.value.args[0] == errno.EIO
 
 
+class _FakeHandlerFile:
+    """One open file with the seek and write behaviour of a real handler.
+
+    ACTION_SEEK refuses to move past end of file with ERROR_SEEK_ERROR and
+    leaves the handle where it was, as pfs3aio, SFS and FFS do. ACTION_WRITE
+    writes at the handle's position and fails with ERROR_DISK_FULL when the
+    file would grow past capacity. seek_reply, when set, answers every
+    seek instead. Each send returns the packet address its reply carries.
+    """
+
+    def __init__(self, data, capacity=1 << 20, seek_reply=None):
+        self.data = bytearray(data)
+        self.pos = 0
+        self.capacity = capacity
+        self.seek_reply = seek_reply
+        self.writes = []  # length of every ACTION_WRITE
+        self.buf = b""
+        self.reply = NO_REPLY
+
+    def w_block(self, addr, data):
+        self.buf = bytes(data)
+
+    def seek(self, state, fh_addr, offset, mode):
+        # OFFSET_BEGINNING, OFFSET_CURRENT, OFFSET_END
+        base = {-1: 0, 0: self.pos, 1: len(self.data)}[mode]
+        if self.seek_reply is not None:
+            self.reply = self.seek_reply
+        elif 0 <= base + offset <= len(self.data):
+            self.reply = _reply(self.pos)
+            self.pos = base + offset
+        else:
+            self.reply = _reply(-1, 219)
+        return PKT, 0
+
+    def write(self, state, fh_addr, addr, size):
+        self.writes.append(size)
+        if self.pos + size > self.capacity:
+            self.reply = _reply(-1, 221)
+        else:
+            self.data[self.pos:self.pos + size] = self.buf[:size]
+            self.pos += size
+            self.reply = _reply(size)
+        return PKT, 0
+
+
+def _fake_write_bridge(fuse_fs_mod, handler, free_blocks=2048):
+    """Build a bridge whose handler is the fake file.
+
+    The volume reports free_blocks free 512-byte blocks, or no disk info
+    when free_blocks is None.
+    """
+    import threading
+
+    bridge = object.__new__(fuse_fs_mod.HandlerBridge)
+    bridge._lock = threading.RLock()
+    bridge._debug = False
+    bridge.state = MagicMock()
+    bridge.launcher = MagicMock()
+    bridge.launcher.send_seek_handle.side_effect = handler.seek
+    bridge.launcher.send_write_handle.side_effect = handler.write
+    bridge.mem = MagicMock()
+    bridge.mem.w_block.side_effect = handler.w_block
+    bridge._alloc_read_buf = MagicMock(return_value=SimpleNamespace(addr=0x2000))
+    bridge._run_until_replies = MagicMock(side_effect=lambda: handler.reply)
+    info = None
+    if free_blocks is not None:
+        info = {"num_blocks": 4096, "num_blocks_used": 4096 - free_blocks,
+                "bytes_per_block": 512}
+    bridge.get_disk_info = MagicMock(return_value=info)
+    return bridge
+
+
+class TestHandlerBridgeWriteAt:
+    """write_handle_at puts the data at the requested offset or fails.
+
+    AmigaDOS cannot seek past end of file, so a write there must first fill
+    the gap with zeros. A failure must never turn into a write at the
+    handle's old position.
+    """
+
+    FH_ADDR = 0x3000
+    ORIGINAL = b"0123456789"
+    DATA = b"DATA"
+
+    @pytest.mark.parametrize("offset", [0, 6, 10, 11, 110],
+                             ids=["start", "across-eof", "at-eof",
+                                  "one-past-eof", "past-eof"])
+    def test_write_lands_at_offset(self, fuse_mock, offset):
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        handler = _FakeHandlerFile(self.ORIGINAL)
+        handler.pos = 3  # an earlier read left the handle inside the file
+        bridge = _fake_write_bridge(fuse_fs_mod, handler)
+
+        assert bridge.write_handle_at(self.FH_ADDR, offset, self.DATA) == (4, 0)
+        # Earlier bytes are untouched and a gap reads as zeros.
+        expected = bytearray(self.ORIGINAL.ljust(offset, b"\0"))
+        expected[offset:offset + 4] = self.DATA
+        assert handler.data == expected
+        assert handler.pos == offset + 4
+        # Only a write past end of file sends zeros first.
+        gap = max(offset - len(self.ORIGINAL), 0)
+        assert handler.writes == ([gap] if gap else []) + [4]
+
+    def test_large_gap_is_filled_in_chunks(self, fuse_mock):
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        chunk = fuse_fs_mod.ZERO_FILL_CHUNK
+        handler = _FakeHandlerFile(self.ORIGINAL)
+        bridge = _fake_write_bridge(fuse_fs_mod, handler)
+        offset = len(self.ORIGINAL) + 2 * chunk + 5
+
+        assert bridge.write_handle_at(self.FH_ADDR, offset, self.DATA) == (4, 0)
+        assert handler.writes == [chunk, chunk, 5, 4]
+        assert handler.data == self.ORIGINAL + bytes(2 * chunk + 5) + self.DATA
+        # No buffer larger than one chunk, whatever the gap.
+        sizes = [c.args[0] for c in bridge._alloc_read_buf.call_args_list]
+        assert max(sizes) == chunk
+
+    @pytest.mark.parametrize("refusal", [_reply(-1, 225), NO_REPLY],
+                             ids=["seek-error", "seek-no-reply"])
+    def test_refused_seek_fails_without_writing(self, fuse_mock, refusal):
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        handler = _FakeHandlerFile(self.ORIGINAL, seek_reply=refusal)
+        bridge = _fake_write_bridge(fuse_fs_mod, handler)
+
+        assert bridge.write_handle_at(self.FH_ADDR, 4, self.DATA) == (-1, 0)
+        assert handler.writes == []
+        assert handler.data == self.ORIGINAL
+
+    # need is the gap plus the data. The file ends 10 bytes into a 512-byte
+    # block, so 502 more bytes fit before the handler needs a free block.
+    @pytest.mark.parametrize("free_blocks, need, expected", [
+        (2, 1024, (4, 0)),
+        (None, 1024, (4, 0)),
+        (1, 1024, (-1, 221)),
+        (1, 512 + 502, (4, 0)),
+        (1, 512 + 503, (-1, 221)),
+    ], ids=["fits", "no-disk-info", "too-large", "fits-last-block",
+            "one-byte-over"])
+    def test_gap_must_fit_in_free_space(self, fuse_mock, free_blocks, need, expected):
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        handler = _FakeHandlerFile(self.ORIGINAL)
+        bridge = _fake_write_bridge(fuse_fs_mod, handler, free_blocks)
+        offset = len(self.ORIGINAL) + need - len(self.DATA)
+
+        assert bridge.write_handle_at(self.FH_ADDR, offset, self.DATA) == expected
+        if expected[0] < 0:
+            # Refused before anything was written.
+            assert handler.writes == []
+            assert handler.data == self.ORIGINAL
+        else:
+            assert len(handler.data) == offset + 4
+
+    def test_disk_full_during_fill_keeps_handler_error(self, fuse_mock):
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        chunk = fuse_fs_mod.ZERO_FILL_CHUNK
+        # The volume reports room, but the handler runs out in the second chunk.
+        handler = _FakeHandlerFile(self.ORIGINAL, capacity=chunk + 100)
+        bridge = _fake_write_bridge(fuse_fs_mod, handler)
+        offset = len(self.ORIGINAL) + 2 * chunk
+
+        assert bridge.write_handle_at(self.FH_ADDR, offset, self.DATA) == (-1, 221)
+        assert handler.writes == [chunk, chunk]
+
+    # A late READ reply in the same batch must not pass for the write's.
+    @pytest.mark.parametrize("reply, expected", [
+        (_reply(4), (4, 0)),
+        (_reply(-1, 221), (-1, 221)),
+        (NO_REPLY, (-1, 0)),
+        (_reply(-1, 221) + STALE_READ, (-1, 221)),
+    ], ids=["written", "handler-error", "no-reply", "stale-reply"])
+    def test_write_handle_reply_keeps_res2(self, fuse_mock, reply, expected):
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        handler = _FakeHandlerFile(b"")
+        bridge = _fake_write_bridge(fuse_fs_mod, handler)
+        bridge._run_until_replies = MagicMock(side_effect=[reply, reply])
+
+        assert bridge.write_handle_reply(self.FH_ADDR, self.DATA) == expected
+        # write_handle keeps returning only the count, for the CLI.
+        assert bridge.write_handle(self.FH_ADDR, self.DATA) == expected[0]
+
+
+class TestFuseWriteErrors:
+    """AmigaFuseFS.write reports a failed write with the closest errno.
+
+    The FUSE layer caches each handle's position to skip the seek on
+    sequential writes. After a failed write or seek the handler's position
+    is unknown, so the next write must seek again.
+    """
+
+    FH_ADDR = 0x3000
+
+    def _open(self, write_fs):
+        import os
+
+        fs, bridge = write_fs
+        bridge.open_file.return_value = (self.FH_ADDR, 0)
+        return fs, bridge, fs.open("/file", os.O_RDWR)
+
+    @pytest.mark.parametrize("res2, expected", [
+        (221, errno.ENOSPC),
+        (214, errno.EROFS),
+        (225, errno.EIO),
+        (0, errno.EIO),
+    ], ids=["disk-full", "write-protected", "other", "no-reply"])
+    def test_failed_write_maps_errno_and_next_write_seeks(self, write_fs, res2, expected):
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        fs, bridge, handle = self._open(write_fs)
+        bridge.write_handle_at.return_value = (5, 0)
+        assert fs.write("/file", b"hello", 0, handle) == 5
+
+        bridge.write_handle_reply.return_value = (-1, res2)
+        with pytest.raises(fuse_fs_mod.FuseOSError) as exc_info:
+            fs.write("/file", b" world", 5, handle)
+        assert exc_info.value.args[0] == expected
+        bridge.write_handle_reply.assert_called_once_with(self.FH_ADDR, b" world")
+
+        # The retry seeks instead of trusting the cached position.
+        bridge.write_handle_at.return_value = (6, 0)
+        assert fs.write("/file", b" world", 5, handle) == 6
+        bridge.write_handle_at.assert_called_with(self.FH_ADDR, 5, b" world")
+        bridge.write_handle_reply.assert_called_once()
+
+    def test_failed_seek_write_forgets_position(self, write_fs):
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        fs, bridge, handle = self._open(write_fs)
+        bridge.write_handle_at.return_value = (5, 0)
+        fs.write("/file", b"hello", 0, handle)
+
+        bridge.write_handle_at.return_value = (-1, 0)
+        with pytest.raises(fuse_fs_mod.FuseOSError) as exc_info:
+            fs.write("/file", b"later", 100, handle)
+        assert exc_info.value.args[0] == errno.EIO
+
+        bridge.write_handle_at.return_value = (6, 0)
+        fs.write("/file", b" world", 5, handle)
+        bridge.write_handle_at.assert_called_with(self.FH_ADDR, 5, b" world")
+        bridge.write_handle_reply.assert_not_called()
+
+    def test_offset_beyond_seek_range_is_efbig(self, write_fs):
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        fs, bridge, handle = self._open(write_fs)
+        top = fuse_fs_mod._LONG_MAX
+        # Packet arguments are 32 bits, so 4 GiB + 4 would land at offset 4.
+        for offset in (top + 1, (1 << 32) + 4):
+            with pytest.raises(fuse_fs_mod.FuseOSError) as exc_info:
+                fs.write("/file", b"data", offset, handle)
+            assert exc_info.value.args[0] == errno.EFBIG
+        bridge.write_handle_at.assert_not_called()
+
+        bridge.write_handle_at.return_value = (4, 0)
+        assert fs.write("/file", b"data", top, handle) == 4
+        bridge.write_handle_at.assert_called_once_with(self.FH_ADDR, top, b"data")
+
+    def test_writes_past_end_of_file_land_at_their_offsets(self, write_fs):
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        # The reproduction from the bug report: two writes past end of file,
+        # the second one sequential to the first.
+        fs, bridge, handle = self._open(write_fs)
+        original = bytes(range(32))
+        handler = _FakeHandlerFile(original)
+        fake = _fake_write_bridge(fuse_fs_mod, handler)
+        bridge.write_handle_at = fake.write_handle_at
+        bridge.write_handle_reply = fake.write_handle_reply
+
+        assert fs.write("/file", b"A" * 8, 132, handle) == 8
+        assert fs.write("/file", b"B" * 8, 140, handle) == 8
+        assert handler.data == original + bytes(100) + b"A" * 8 + b"B" * 8
+        # The zero fill, then both writes, the second without a seek.
+        assert handler.writes == [100, 8, 8]
+
+
 class TestHandlerBridgeBstrRing:
     """Verify bstr ring buffer frees old allocation on growth."""
 
@@ -5433,7 +5714,7 @@ class TestPinnedStatCache:
         bridge.open_file.return_value = (0x4abbc, 0)
         # write() picks write_handle_at when entry["pos"] is None (which it
         # is right after create()).
-        bridge.write_handle_at.return_value = 100
+        bridge.write_handle_at.return_value = (100, 0)
         fh = fs.create("/Makefile", 0o100664)
         # Initial primed size is 0.
         assert fs._stat_cache["/Makefile"][1]["st_size"] == 0

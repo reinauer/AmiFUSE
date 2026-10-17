@@ -109,6 +109,20 @@ class SeekResult(Enum):
     PAST_END = "past_end"  # refused with ERROR_SEEK_ERROR
     FAILED = "failed"  # any other refusal, no reply, or an offset out of range
 
+
+# A write past end of file fills the gap with zeros in chunks of this size,
+# so a large gap needs no more memory than an ordinary write.
+ZERO_FILL_CHUNK = 64 * 1024
+
+# AmigaDOS error codes from a failed ACTION_WRITE that have a closer errno
+# than EIO.
+ERROR_DISK_WRITE_PROTECTED = 214
+ERROR_DISK_FULL = 221
+_WRITE_ERRNOS = {
+    ERROR_DISK_WRITE_PROTECTED: errno.EROFS,
+    ERROR_DISK_FULL: errno.ENOSPC,
+}
+
 # AmigaDOS error codes a handler can return when it refuses ACTION_DISK_INFO.
 # ERROR_ACTION_NOT_KNOWN is deliberately absent from the unmounted set in
 # HandlerBridge._UNMOUNTED_DISK_ERRORS: it means the handler does not
@@ -1674,29 +1688,87 @@ class HandlerBridge:
 
 
     def write_handle(self, fh_addr: int, data: bytes) -> int:
-        with self._lock:
-            buf_mem = self._alloc_read_buf(len(data))
-            self.mem.w_block(buf_mem.addr, data)
-            self.launcher.send_write_handle(self.state, fh_addr, buf_mem.addr, len(data))
-            replies = self._run_until_replies()
-            self._log_replies("write", replies)
-            if not replies:
-                return -1
-            return replies[-1][2]
+        """Write data at the handle's current position.
 
-    def write_handle_at(self, fh_addr: int, offset: int, data: bytes) -> int:
+        Returns the number of bytes written, or -1 when the write fails.
+        Callers that need the handler's error code want write_handle_reply().
+        """
+        return self.write_handle_reply(fh_addr, data)[0]
+
+    def write_handle_reply(self, fh_addr: int, data: bytes) -> Tuple[int, int]:
+        """Send ACTION_WRITE and return (dp_Res1, dp_Res2).
+
+        dp_Res1 is the number of bytes written, or -1 when the handler fails
+        the write, and dp_Res2 then holds its AmigaDOS error code. A write
+        that gets no reply returns (-1, 0).
+        """
         with self._lock:
-            self.launcher.send_seek_handle(self.state, fh_addr, offset, OFFSET_BEGINNING)
-            replies = self._run_until_replies()
-            self._log_replies("seek", replies)
             buf_mem = self._alloc_read_buf(len(data))
             self.mem.w_block(buf_mem.addr, data)
-            self.launcher.send_write_handle(self.state, fh_addr, buf_mem.addr, len(data))
-            replies = self._run_until_replies()
-            self._log_replies("write", replies)
-            if not replies:
-                return -1
-            return replies[-1][2]
+            pkt_addr, _ = self.launcher.send_write_handle(
+                self.state, fh_addr, buf_mem.addr, len(data))
+            reply = self._run_until_reply(pkt_addr, "write")
+            if reply is None:
+                return -1, 0
+            return reply
+
+    def write_handle_at(self, fh_addr: int, offset: int, data: bytes) -> Tuple[int, int]:
+        """Write data at offset and return (dp_Res1, dp_Res2) like write_handle_reply().
+
+        A write past end of file first fills the gap with zeros, as POSIX
+        requires. Any other failed seek, including one to an offset that
+        does not fit in a LONG, fails the write instead of writing at the
+        handle's old position.
+        """
+        with self._lock:
+            result, _ = self.seek_handle(fh_addr, offset)
+            if result is SeekResult.PAST_END:
+                res1, res2 = self._extend_with_zeros(fh_addr, offset, len(data))
+                if res1 < 0:
+                    return res1, res2
+            elif result is not SeekResult.OK:
+                return -1, 0
+            return self.write_handle_reply(fh_addr, data)
+
+    def _extend_with_zeros(self, fh_addr: int, offset: int, size: int) -> Tuple[int, int]:
+        """Extend the file with zeros from its end to offset.
+
+        AmigaDOS cannot seek past end of file, so this writes the gap
+        instead. size is the length of the data that will follow, which
+        needs room too. Returns (0, 0) with the handle at offset, or
+        (-1, dp_Res2) on failure, which may leave part of the gap written.
+
+        ACTION_SET_FILE_SIZE would extend the file in one packet, but FFS,
+        OFS and pfs3aio leave the new range holding whatever its blocks held
+        before, such as a deleted file's data.
+        """
+        with self._lock:
+            if self.seek_handle(fh_addr, 0, OFFSET_END)[0] is not SeekResult.OK:
+                return -1, 0
+            result, end = self.seek_handle(fh_addr, 0, OFFSET_CURRENT)
+            # ERROR_SEEK_ERROR inside the file (AROS afs cannot follow a
+            # damaged file's extension blocks) is a failure, not a gap.
+            if result is not SeekResult.OK or end > offset:
+                return -1, 0
+            # Fail before writing anything when the volume cannot hold the
+            # gap and the data. Block overhead can still run the fill out of
+            # space near the limit, and the handler then reports disk full.
+            info = self.get_disk_info()
+            if info and info["bytes_per_block"]:
+                bpb = info["bytes_per_block"]
+                free_blocks = max(info["num_blocks"] - info["num_blocks_used"], 0)
+                # The file's last block may still have room before a new one
+                # is needed.
+                if offset - end + size > free_blocks * bpb + (-end % bpb):
+                    return -1, ERROR_DISK_FULL
+            zeros = bytes(min(offset - end, ZERO_FILL_CHUNK))
+            while end < offset:
+                n = min(offset - end, len(zeros))
+                written, res2 = self.write_handle_reply(fh_addr, zeros[:n])
+                if written != n:
+                    return -1, res2
+                end += n
+            return 0, 0
 
     def set_handle_size(self, fh_addr: int, size: int, mode: int = OFFSET_BEGINNING) -> int:
         with self._lock:
@@ -2424,11 +2496,16 @@ class AmigaFuseFS(_FuseOperations):
             if entry.get("closed"):
                 raise FuseOSError(errno.EIO)
             if entry["pos"] is None or offset != entry["pos"]:
-                written = self.bridge.write_handle_at(fh_addr, offset, data)
+                if offset > _LONG_MAX:
+                    raise FuseOSError(errno.EFBIG)
+                written, res2 = self.bridge.write_handle_at(fh_addr, offset, data)
             else:
-                written = self.bridge.write_handle(fh_addr, data)
+                written, res2 = self.bridge.write_handle_reply(fh_addr, data)
             if written < 0:
-                raise FuseOSError(errno.EIO)
+                # The handler's position is unknown after a failed write or
+                # seek, so the next write must seek explicitly.
+                entry["pos"] = None
+                raise FuseOSError(_WRITE_ERRNOS.get(res2, errno.EIO))
             entry["pos"] = offset + written
             entry["dirty"] = True  # Mark as needing flush on close
         # Keep pinned stat cache in sync so a mid-write getattr (e.g. cp -v
