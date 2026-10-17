@@ -531,6 +531,12 @@ def _mbr_partition_device(blkdev, mbr_part) -> Optional[OffsetBlockDevice]:
     )
 
 
+def _no_valid_rdb_message(image: Path, count: int) -> str:
+    """Describe an MBR none of whose `count` 0x76 partitions has an RDB."""
+    return (f"MBR with {count} Amiga partition(s) found, "
+            f"but none contain a valid RDB: {image}")
+
+
 def open_rdisk(
     image: Path,
     block_size: Optional[int] = None,
@@ -679,11 +685,11 @@ def open_rdisk(
             for part, size in misaligned
         )
         if mbr_partition_index is not None:
-            found = f"MBR partition {amiga_parts[0].index} does not contain a valid RDB"
+            found = (f"MBR partition {amiga_parts[0].index} does not contain "
+                     f"a valid RDB: {image}")
         else:
-            found = (f"MBR with {len(amiga_parts)} Amiga partition(s) found, "
-                     f"but none contain a valid RDB")
-        raise IOError(f"{found}: {image}{reasons}")
+            found = _no_valid_rdb_message(image, len(amiga_parts))
+        raise IOError(f"{found}{reasons}")
 
     # Check for other partition types to give helpful error messages
     error_msg = f"No valid RDB found in blocks 0-15 at {image}"
@@ -859,7 +865,11 @@ def amiga_rdb_partitions(image: Path) -> List[MBRPartition]:
     More than one entry means the image carries multiple independent RDBs
     (Emu68-style multi-RDB disk).
     """
-    mbr_info = detect_mbr(image)
+    return _amiga_partitions(detect_mbr(image))
+
+
+def _amiga_partitions(mbr_info: Optional[MBRInfo]) -> List[MBRPartition]:
+    """Return the 0x76 entries of an already parsed MBR, [] if none."""
     if mbr_info is None or not mbr_info.has_amiga_partitions:
         return []
     return [p for p in mbr_info.partitions if p.partition_type == MBR_TYPE_AMIGA_RDB]
@@ -924,40 +934,55 @@ def print_inspect_report(image: Path, block_size: Optional[int], full: bool) -> 
     image can; per-RDB failures in a multi-RDB image are reported inline and
     skipped.
     """
-    amiga_parts = amiga_rdb_partitions(image)
+    mbr_info = detect_mbr(image)
+    amiga_parts = _amiga_partitions(mbr_info)
     if len(amiga_parts) > 1:
-        # Show the MBR table once, from the table itself, so an unreadable
-        # first RDB is reported inline below like any other.
-        header = MBRContext(
-            mbr_info=detect_mbr(image), mbr_partition=amiga_parts[0],
-            offset_blocks=amiga_parts[0].start_lba,
-        )
-        for line in format_mbr_info(header):
-            print(line)
-
-        # Show each RDB
-        opened = 0
-        for rdb_idx in range(len(amiga_parts)):
+        # Open every RDB before printing, so the MBR header can describe the
+        # first one that opened. Each section holds one partition's report
+        # lines, or the reason it could not be opened.
+        header_ctx = None
+        sections = []
+        for rdb_idx, mbr_part in enumerate(amiga_parts):
             try:
                 blkdev, rdisk, mbr_ctx = open_rdisk(
                     image, block_size=block_size, mbr_partition_index=rdb_idx
                 )
             except IOError as e:
-                print(f"\nMBR partition [{amiga_parts[rdb_idx].index}]: Error: {e}")
+                sections.append([f"\nMBR partition [{mbr_part.index}]: Error: {e}"])
                 continue
-            opened += 1
             try:
-                print(f"\n=== Amiga RDB in MBR partition [{mbr_ctx.mbr_partition.index}]"
-                      f" (offset: {mbr_ctx.offset_blocks} sectors) ===\n")
-                for line in format_rdisk_report(rdisk, full=full):
-                    print(line)
+                if mbr_ctx.mbr_partition is None:
+                    # Parceiro-style: open_rdisk found the disk's own RDB,
+                    # which it does whichever 0x76 partition is selected.
+                    # Report it once, as for a single RDB.
+                    lines = [""]
+                else:
+                    lines = [f"\n=== Amiga RDB in MBR partition [{mbr_ctx.mbr_partition.index}]"
+                             f" (offset: {mbr_ctx.offset_blocks} sectors) ===\n"]
+                lines += format_rdisk_report(rdisk, full=full)
             finally:
                 rdisk.close()
                 blkdev.close()
-        if not opened:
+            if header_ctx is None:
+                header_ctx = mbr_ctx
+            sections.append(lines)
+            if mbr_ctx.mbr_partition is None:
+                break
+
+        if header_ctx is not None:
+            header = format_mbr_info(header_ctx)
+        else:
+            # Nothing opened, so no partition is active: show the table alone.
+            header = ["MBR Partition Table detected (Emu68-style)", ""]
+            header += format_mbr_table(mbr_info)
+        for line in header:
+            print(line)
+        for lines in sections:
+            for line in lines:
+                print(line)
+        if header_ctx is None:
             raise SystemExit(
-                f"Error: MBR with {len(amiga_parts)} Amiga partitions found, "
-                f"but none contain a valid RDB: {image}"
+                f"Error: {_no_valid_rdb_message(image, len(amiga_parts))}"
             )
         return
 
@@ -1010,8 +1035,14 @@ def format_mbr_info(mbr_ctx: MBRContext) -> List[str]:
         lines.append(f"  Partition offset: {mbr_ctx.offset_blocks} sectors ({mbr_ctx.offset_blocks * 512 // 1024 // 1024} MB)")
         lines.append(f"  Partition size: {mbr_ctx.mbr_partition.num_sectors} sectors ({mbr_ctx.mbr_partition.num_sectors * 512 // 1024 // 1024} MB)")
     lines.append("")
-    lines.append("  MBR partitions:")
-    for p in mbr_ctx.mbr_info.partitions:
+    lines.extend(format_mbr_table(mbr_ctx.mbr_info))
+    return lines
+
+
+def format_mbr_table(mbr_info: MBRInfo) -> List[str]:
+    """Format the MBR partition entries as a list of lines for display."""
+    lines = ["  MBR partitions:"]
+    for p in mbr_info.partitions:
         type_str = _MBR_TYPE_NAMES.get(p.partition_type, f"0x{p.partition_type:02x}")
         boot_str = " (bootable)" if p.bootable else ""
         size_mb = p.num_sectors * 512 // 1024 // 1024
