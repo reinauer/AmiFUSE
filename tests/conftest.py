@@ -66,6 +66,8 @@ def fuse_mock(monkeypatch):
         "amifuse.driver_runtime",
         BlockDeviceBackend=dummy_cls,
         # Like the real class, an OSError that fuse_fs tells apart by type.
+        # Tests must raise fuse_fs.ImageInUseError, not this stub's: fuse_fs
+        # keeps the class it bound on first import.
         ImageInUseError=type("ImageInUseError", (OSError,), {}),
     )
     _stub_module("amifuse.vamos_runner", VamosHandlerRuntime=dummy_cls)
