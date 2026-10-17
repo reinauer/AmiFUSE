@@ -1,4 +1,10 @@
-"""An RDB inside an MBR 0x76 partition may use blocks larger than sectors."""
+"""Locating an RDB on a disk with an MBR.
+
+An RDB inside an MBR 0x76 partition may use blocks larger than sectors,
+which lets the direct scan of blocks 0-15 reach it. Such an RDB belongs to
+its partition and opens through the MBR. A Parceiro-style RDB outside every
+0x76 entry opens directly, and a failure to parse it is reported as such.
+"""
 
 from contextlib import ExitStack
 import struct
@@ -10,6 +16,7 @@ from amitools.fs.blkdev.DiskGeometry import DiskGeometry
 from amitools.fs.blkdev.RawBlockDevice import RawBlockDevice
 from amitools.fs.rdb.RDisk import RDisk
 
+from amifuse.driver_runtime import BlockDeviceBackend
 from amifuse.rdb_inspect import open_rdisk
 
 
@@ -113,8 +120,9 @@ def test_later_partition_is_scanned_in_its_own_block_size(tmp_path, first_lba):
 @pytest.mark.parametrize("forced", [False, True])
 def test_unreadable_rdb_in_scanned_partition_reports_mbr_error(tmp_path,
                                                                 forced):
-    # Forced, the direct scan finds this RDB at block 8 before the MBR
-    # path does. Both fail; report it as auto-detection does.
+    # Forced, the direct scan finds this RDB at block 8, inside the
+    # partition, so only the MBR path opens it; report it as
+    # auto-detection does.
     rdb = _with_partition_list(_make_rdb(tmp_path, 4096), 4096, 5)
     image = _make_mbr(tmp_path, [(64, rdb)])
     with pytest.raises(OSError) as caught:
@@ -122,6 +130,23 @@ def test_unreadable_rdb_in_scanned_partition_reports_mbr_error(tmp_path,
     assert str(caught.value) == (
         f"MBR with 1 Amiga partition(s) found, but none contain a valid RDB: "
         f"{image}")
+
+
+@pytest.mark.parametrize("forced", [False, True])
+def test_partition_rdb_readable_at_disk_level_opens_in_partition(tmp_path,
+                                                                 forced):
+    # A copy of the PART block at disk-level block 1 lets this RDB parse
+    # with disk-relative block numbers when the forced scan finds it at
+    # block 8. It lies inside the partition, so it opens there instead.
+    rdb = _make_rdb(tmp_path, 4096)
+    part = struct.unpack_from(">I", rdb, 28)[0]  # rdb_PartitionList
+    image = _make_mbr(tmp_path, [(64, rdb)])
+    data = bytearray(image.read_bytes())
+    assert not any(data[part * 4096:(part + 1) * 4096])
+    data[part * 4096:(part + 1) * 4096] = rdb[part * 4096:(part + 1) * 4096]
+    image.write_bytes(bytes(data))
+    assert _open(image, block_size=4096 if forced else None) == (
+        4096, 8, 160, "DH0", 64)
 
 
 def _make_parceiro(tmp_path, rdb):
@@ -139,9 +164,22 @@ def _make_parceiro(tmp_path, rdb):
     return image
 
 
+def _add_amiga_partition(image, lba, rdb):
+    """Add a 0x76 entry holding another RDB, far from the direct one."""
+    data = bytearray(image.read_bytes())
+    data += bytes(lba * 512 + len(rdb) - len(data))
+    data[446 + 16 + 4] = 0x76
+    struct.pack_into("<II", data, 446 + 16 + 8, lba, len(rdb) // 512)
+    data[lba * 512:] = rdb
+    image.write_bytes(bytes(data))
+
+
+@pytest.mark.parametrize("amiga_entry", [False, True])
 @pytest.mark.parametrize("forced", [False, True])
-def test_parceiro_rdb_after_mbr_opens_directly(tmp_path, forced):
+def test_parceiro_rdb_after_mbr_opens_directly(tmp_path, forced, amiga_entry):
     image = _make_parceiro(tmp_path, _make_rdb(tmp_path, 512))
+    if amiga_entry:
+        _add_amiga_partition(image, 4096, _make_rdb(tmp_path, 512, "DH1"))
     blkdev, rdisk, ctx = open_rdisk(image, block_size=512 if forced else None)
     try:
         assert isinstance(blkdev, RawBlockDevice)
@@ -154,11 +192,21 @@ def test_parceiro_rdb_after_mbr_opens_directly(tmp_path, forced):
         blkdev.close()
 
 
+@pytest.mark.parametrize("amiga_entry", [False, True])
 @pytest.mark.parametrize("forced", [False, True])
-def test_unreadable_parceiro_rdb_is_not_retried_through_mbr(tmp_path, forced):
-    # Without 0x76 entries there is no partition to retry the RDB in.
+def test_unreadable_parceiro_rdb_is_not_retried_through_mbr(tmp_path, forced,
+                                                            amiga_entry):
+    # The RDB lies outside every 0x76 entry, so another partition's RDB
+    # must not stand in for it, nor turn its error into "not found".
     rdb = _with_partition_list(_make_rdb(tmp_path, 512), 512, 5)
     image = _make_parceiro(tmp_path, rdb)
+    if amiga_entry:
+        _add_amiga_partition(image, 4096, _make_rdb(tmp_path, 512, "DH1"))
+    block_size = 512 if forced else None
     with pytest.raises(OSError) as caught:
-        open_rdisk(image, block_size=512 if forced else None)
+        open_rdisk(image, block_size=block_size)
     assert str(caught.value) == f"Failed to parse RDB at {image}"
+    backend = BlockDeviceBackend(image, block_size, partition_scope=True,
+                                 partition="DH0")
+    with pytest.raises(OSError, match="Failed to parse RDB"):
+        backend.open()

@@ -126,9 +126,9 @@ def api(monkeypatch):
     assert not fake.handles
 
 
-def make_rdb(tmp_path, api):
+def make_rdb(tmp_path, api, block_bytes=512):
     path = tmp_path / "disk.hdf"
-    raw = RawBlockDevice(str(path), block_bytes=512)
+    raw = RawBlockDevice(str(path), block_bytes=block_bytes)
     raw.create(320)
     rdisk = RDisk(raw)
     try:
@@ -364,6 +364,26 @@ def test_rdb_inside_mbr_uses_locked_device(tmp_path, api):
         backend.close()
     assert api.data[:-512] == original[:-512]
     assert api.data[-512:] == b"z" * 512
+
+
+@pytest.mark.parametrize("forced", [False, True])
+def test_rdb_inside_mbr_found_outside_a_session(tmp_path, api, forced):
+    # Opened outside a mount session, the device holds the drive's lock
+    # until it closes, so the MBR must be read before it opens. Forced, the
+    # direct scan also reaches this RDB, at block 8 (LBA 64).
+    make_rdb(tmp_path, api, block_bytes=4096)
+    api.data[:0] = bytes(64 * 512)
+    api.data[510:512] = b"\x55\xaa"
+    api.data[450] = 0x76
+    struct.pack_into("<II", api.data, 454, 64, 320 * 8)
+    dev, rdisk, ctx = open_rdisk(Path(DEVICE),
+                                 block_size=4096 if forced else None)
+    try:
+        assert (dev.block_bytes, dev.offset, ctx.offset_blocks) == (4096, 8, 64)
+        assert str(rdisk.get_partition(0).get_drive_name()) == "DH0"
+    finally:
+        rdisk.close()
+        dev.close()
 
 
 @pytest.mark.parametrize("code", [1, 2, 3, 5, 21, 50])
