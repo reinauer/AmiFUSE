@@ -2549,6 +2549,15 @@ class AmigaFuseFS(_FuseOperations):
                 if entry["pos"] is not None:
                     entry["pos"] = min(entry["pos"], length)
                 entry["dirty"] = True  # Truncate modifies the file
+            # A pinned size is all getattr reports until release, and
+            # write() only ever raises it. Left stale, it would place the
+            # next O_APPEND write past the new end of file.
+            if path in self._pinned_stats:
+                with self._cache_lock:
+                    cached = self._stat_cache.get(path)
+                    if cached is not None:
+                        ts, stat = cached
+                        self._stat_cache[path] = (ts, dict(stat, st_size=length))
         finally:
             if temp_handle:
                 self.release(path, fh)
