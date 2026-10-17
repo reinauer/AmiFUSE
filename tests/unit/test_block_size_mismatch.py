@@ -268,3 +268,20 @@ def test_failed_reopen_leaves_nothing_open(tmp_path, devices, monkeypatch):
     with pytest.raises(OSError, match="injected"):
         open_rdisk(image)
     assert devices == {"open": 1, "close": 1}
+
+
+def test_failed_close_keeps_the_open_error(tmp_path, devices, monkeypatch):
+    # The error that ended the open is the one to report, not a failure
+    # of the cleanup that followed it.
+    _make_rdb(tmp_path, 512)
+    image = tmp_path / "rdb-DH0.hdf"
+
+    class FailingClose(rdb_inspect.RawBlockDevice):
+        def close(self):
+            super().close()
+            raise OSError("close failed")
+
+    monkeypatch.setattr(rdb_inspect, "RawBlockDevice", FailingClose)
+    with pytest.raises(OSError, match="^Failed to parse RDB"):
+        open_rdisk(image, block_size=1024)
+    assert devices == {"open": 1, "close": 1}

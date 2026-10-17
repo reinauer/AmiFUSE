@@ -646,7 +646,10 @@ def open_rdisk(
                              open_at)
     except BaseException:
         if blkdev is not None:
-            blkdev.close()
+            try:
+                blkdev.close()
+            except BaseException:
+                pass  # Report the error that ended the open, not this one.
         raise
 
 
