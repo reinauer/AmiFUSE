@@ -1,4 +1,4 @@
-"""A --block-size that the RDB does not use is an open error, not a crash."""
+"""How open_rdisk fails: the errors it reports, skips and cleans up after."""
 
 import errno
 import struct
