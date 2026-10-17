@@ -527,8 +527,17 @@ def _parse_rdb(dev, rdb_block) -> RDisk:
     """Parse the RDB that _scan_for_rdb found on dev.
 
     Tries the strict RDisk.open() first, then the lenient parse that
-    tolerates corrupt filesystem blocks. Raises IOError if neither works.
+    tolerates corrupt filesystem blocks. Raises IOError, saying why, if
+    neither works or the RDB uses another block size than dev.
     """
+    if rdb_block.block_size != dev.block_bytes:
+        # Only a forced block size gets here: otherwise _scan_for_rdb has
+        # the device reopened at the RDB's size. Both parses below would
+        # raise ValueError.
+        raise IOError(
+            f"RDB uses {rdb_block.block_size}-byte blocks, "
+            f"but --block-size {dev.block_bytes} was given"
+        )
     rdisk = RDisk(dev)
     rdisk.rdb = rdb_block
     rdisk.rdb_warnings = []
@@ -632,9 +641,9 @@ def open_rdisk(
     if rdb_block is not None:
         try:
             rdisk = _parse_rdb(blkdev, rdb_block)
-        except IOError:
+        except IOError as e:
             blkdev.close()
-            raise IOError(f"Failed to parse RDB at {image}")
+            raise IOError(f"Failed to parse RDB at {image}: {e}")
 
         # Check for Parceiro-style MBR+RDB coexistence
         mbr_ctx = None
@@ -662,7 +671,9 @@ def open_rdisk(
             amiga_parts = [amiga_parts[mbr_partition_index]]
 
         # Try each 0x76 partition until we find one with a valid RDB
-        misaligned = []
+        # (partition, reason) for the error below; each reason reads on
+        # from "partition N at LBA L".
+        skipped = []
         for mbr_part in amiga_parts:
             # An earlier partition may have reopened the device with its
             # RDB's block size; map and scan each one in its own units.
@@ -673,7 +684,8 @@ def open_rdisk(
                 blkdev.open()
             offset_dev = _mbr_partition_device(blkdev, mbr_part)
             if offset_dev is None:
-                misaligned.append((mbr_part, initial_block_size))
+                skipped.append((mbr_part, " is not aligned to the RDB's "
+                                          f"{initial_block_size}-byte blocks"))
                 continue
 
             rdb_block, new_block_size = _scan_for_rdb(offset_dev, block_size)
@@ -685,7 +697,8 @@ def open_rdisk(
                 blkdev.open()
                 offset_dev = _mbr_partition_device(blkdev, mbr_part)
                 if offset_dev is None:
-                    misaligned.append((mbr_part, new_block_size))
+                    skipped.append((mbr_part, " is not aligned to the RDB's "
+                                              f"{new_block_size}-byte blocks"))
                     continue
                 rdb_block, _ = _scan_for_rdb(offset_dev, block_size)
 
@@ -693,8 +706,11 @@ def open_rdisk(
                 # Found RDB in this partition
                 try:
                     rdisk = _parse_rdb(offset_dev, rdb_block)
-                except IOError:
-                    continue  # Try next partition
+                except IOError as e:
+                    # Try the next partition. Leave blkdev open: closing
+                    # offset_dev closes it, and the next one may reuse it.
+                    skipped.append((mbr_part, f": {e}"))
+                    continue
 
                 mbr_ctx = MBRContext(
                     mbr_info=mbr_info,
@@ -706,9 +722,8 @@ def open_rdisk(
         # No valid RDB found in any 0x76 partition
         blkdev.close()
         reasons = "".join(
-            f"; partition {part.index} at LBA {part.start_lba} is not aligned "
-            f"to the RDB's {size}-byte blocks"
-            for part, size in misaligned
+            f"; partition {part.index} at LBA {part.start_lba}{reason}"
+            for part, reason in skipped
         )
         if mbr_partition_index is not None:
             found = (f"MBR partition {amiga_parts[0].index} does not contain "

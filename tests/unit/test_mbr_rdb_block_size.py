@@ -129,7 +129,7 @@ def test_unreadable_rdb_in_scanned_partition_reports_mbr_error(tmp_path,
         open_rdisk(image, block_size=4096 if forced else None)
     assert str(caught.value) == (
         f"MBR with 1 Amiga partition(s) found, but none contain a valid RDB: "
-        f"{image}")
+        f"{image}; partition 0 at LBA 64: Corrupt partition block at block 5")
 
 
 @pytest.mark.parametrize("forced", [False, True])
@@ -205,7 +205,8 @@ def test_unreadable_parceiro_rdb_is_not_retried_through_mbr(tmp_path, forced,
     block_size = 512 if forced else None
     with pytest.raises(OSError) as caught:
         open_rdisk(image, block_size=block_size)
-    assert str(caught.value) == f"Failed to parse RDB at {image}"
+    assert str(caught.value) == (
+        f"Failed to parse RDB at {image}: Corrupt partition block at block 5")
     backend = BlockDeviceBackend(image, block_size, partition_scope=True,
                                  partition="DH0")
     with pytest.raises(OSError, match="Failed to parse RDB"):

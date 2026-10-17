@@ -1,0 +1,146 @@
+"""A --block-size that the RDB does not use is an open error, not a crash."""
+
+import pytest
+
+from amitools.fs.blkdev.RawBlockDevice import RawBlockDevice
+
+import amifuse.rdb_inspect as rdb_inspect
+from amifuse.rdb_inspect import find_partition_mbr_index, open_rdisk
+from tests.unit.test_mbr_rdb_block_size import (
+    _add_amiga_partition, _make_mbr, _make_mbr_rdb, _make_parceiro,
+    _make_rdb, _with_partition_list,
+)
+
+
+@pytest.fixture
+def devices(monkeypatch):
+    # Count the block devices open_rdisk opens and closes.
+    counts = {"open": 0, "close": 0}
+
+    class CountingDevice(RawBlockDevice):
+        def open(self):
+            super().open()
+            counts["open"] += 1
+
+        def close(self):
+            super().close()
+            counts["close"] += 1
+
+    monkeypatch.setattr(rdb_inspect, "RawBlockDevice", CountingDevice)
+    return counts
+
+
+@pytest.mark.parametrize("rdb_bytes,forced", [
+    (512, 1024), (512, 2048), (512, 4096), (1024, 512), (2048, 512),
+])
+def test_direct_rdb_in_other_block_size_is_refused(tmp_path, devices,
+                                                    rdb_bytes, forced):
+    _make_rdb(tmp_path, rdb_bytes)
+    image = tmp_path / "rdb-DH0.hdf"
+    with pytest.raises(OSError) as caught:
+        open_rdisk(image, block_size=forced)
+    assert str(caught.value) == (
+        f"Failed to parse RDB at {image}: RDB uses {rdb_bytes}-byte blocks, "
+        f"but --block-size {forced} was given")
+    assert devices == {"open": 1, "close": 1}
+
+
+@pytest.mark.parametrize("amiga_entry", [False, True])
+def test_parceiro_rdb_in_other_block_size_is_refused(tmp_path, devices,
+                                                     amiga_entry):
+    # The RDB at LBA 2 lies outside every 0x76 entry, so it is parsed at
+    # disk level and its error is not replaced by another partition's.
+    image = _make_parceiro(tmp_path, _make_rdb(tmp_path, 512))
+    if amiga_entry:
+        _add_amiga_partition(image, 4096, _make_rdb(tmp_path, 1024, "DH1"))
+    with pytest.raises(OSError) as caught:
+        open_rdisk(image, block_size=1024)
+    assert str(caught.value) == (
+        f"Failed to parse RDB at {image}: RDB uses 512-byte blocks, "
+        f"but --block-size 1024 was given")
+    assert devices == {"open": 1, "close": 1}
+
+
+@pytest.mark.parametrize("start_lba", [
+    2048,
+    # The direct scan reaches this RDB too, at block 4, inside the
+    # partition, so it is left to the MBR path.
+    8,
+])
+def test_partition_rdb_in_other_block_size_is_refused(tmp_path, devices,
+                                                       start_lba):
+    image = _make_mbr_rdb(tmp_path, 512, start_lba)
+    with pytest.raises(OSError) as caught:
+        open_rdisk(image, block_size=1024)
+    message = str(caught.value)
+    assert "none contain a valid RDB" in message
+    assert message.endswith(
+        f"; partition 0 at LBA {start_lba}: RDB uses 512-byte blocks, "
+        f"but --block-size 1024 was given")
+    assert devices == {"open": 1, "close": 1}
+
+
+def _two_rdbs(tmp_path):
+    # DH0's RDB uses 512-byte blocks, DH1's 1024-byte blocks.
+    return _make_mbr(tmp_path, [(64, _make_rdb(tmp_path, 512, "DH0")),
+                                (256, _make_rdb(tmp_path, 1024, "DH1"))])
+
+
+def test_later_partition_in_forced_block_size_opens(tmp_path, devices):
+    image = _two_rdbs(tmp_path)
+    blkdev, rdisk, ctx = open_rdisk(image, block_size=1024)
+    try:
+        assert ctx.mbr_partition.index == 1
+        assert str(rdisk.get_partition(0).get_drive_name()) == "DH1"
+    finally:
+        rdisk.close()
+        blkdev.close()
+    assert devices == {"open": 1, "close": 1}
+
+
+def test_partition_lookup_skips_rdb_in_other_block_size(tmp_path, devices):
+    # --partition DH1 searches each RDB in turn, then opens the one found.
+    image = _two_rdbs(tmp_path)
+    index = find_partition_mbr_index(image, 1024, "DH1")
+    assert index == 1
+    blkdev, rdisk, _ = open_rdisk(image, block_size=1024,
+                                  mbr_partition_index=index)
+    try:
+        assert rdisk.find_partition_by_string("DH1") is not None
+    finally:
+        rdisk.close()
+        blkdev.close()
+    assert devices["open"] == devices["close"]
+
+
+def _damaged_then(tmp_path, rdb_bytes):
+    # A 4096-byte-block RDB at LBA 64 whose partition list points at an
+    # empty block, then DH1 at LBA 2048. Forced to 4096 bytes, the direct
+    # scan finds the damaged RDB at block 8, inside partition 0, and
+    # leaves both partitions to the MBR path.
+    damaged = _with_partition_list(_make_rdb(tmp_path, 4096), 4096, 5)
+    return _make_mbr(tmp_path, [(64, damaged),
+                                (2048, _make_rdb(tmp_path, rdb_bytes, "DH1"))])
+
+
+def test_damaged_rdb_then_rdb_in_other_block_size(tmp_path, devices):
+    image = _damaged_then(tmp_path, 512)
+    with pytest.raises(OSError) as caught:
+        open_rdisk(image, block_size=4096)
+    assert str(caught.value).endswith(
+        "; partition 0 at LBA 64: Corrupt partition block at block 5"
+        "; partition 1 at LBA 2048: RDB uses 512-byte blocks, "
+        "but --block-size 4096 was given")
+    assert devices == {"open": 1, "close": 1}
+
+
+def test_damaged_rdb_then_rdb_in_forced_block_size(tmp_path, devices):
+    image = _damaged_then(tmp_path, 4096)
+    blkdev, rdisk, ctx = open_rdisk(image, block_size=4096)
+    try:
+        assert ctx.mbr_partition.index == 1
+        assert str(rdisk.get_partition(0).get_drive_name()) == "DH1"
+    finally:
+        rdisk.close()
+        blkdev.close()
+    assert devices == {"open": 1, "close": 1}
