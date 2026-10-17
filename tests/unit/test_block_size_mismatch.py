@@ -202,6 +202,40 @@ def test_unreadable_partition_is_skipped(tmp_path, devices, past_eof, reason,
     assert devices == {"open": 2, "close": 2}
 
 
+# A partition list pointing at block 200 of a 160-block RDB makes the
+# strict RDisk.open() raise rather than return False.
+def test_partition_list_past_image_end_fails_to_parse(tmp_path, devices):
+    rdb = _make_rdb(tmp_path, 512)
+    image = tmp_path / "rdb-DH0.hdf"
+    image.write_bytes(_with_partition_list(rdb, 512, 200))
+    with pytest.raises(OSError) as caught:
+        open_rdisk(image)
+    assert str(caught.value) == (
+        f"Failed to parse RDB at {image}: "
+        f"Invalid image file block num: got 200 but max is 160")
+    assert devices == {"open": 1, "close": 1}
+
+
+def test_partition_list_past_partition_end_is_skipped(tmp_path, devices):
+    bad = _with_partition_list(_make_rdb(tmp_path, 512), 512, 200)
+    image = _make_mbr(tmp_path, [(64, bad),
+                                 (256, _make_rdb(tmp_path, 512, "DH1"))])
+    blkdev, rdisk, ctx = open_rdisk(image)
+    try:
+        assert ctx.mbr_partition.index == 1
+        assert str(rdisk.get_partition(0).get_drive_name()) == "DH1"
+    finally:
+        rdisk.close()
+        blkdev.close()
+    assert devices == {"open": 1, "close": 1}
+
+    with pytest.raises(OSError) as caught:
+        open_rdisk(image, mbr_partition_index=0)
+    assert str(caught.value).endswith(
+        "; partition 0 at LBA 64: Read beyond partition: 200+1 > 160")
+    assert devices == {"open": 2, "close": 2}
+
+
 @pytest.mark.parametrize("block", [64, 65], ids=["scan", "parse"])
 def test_failing_read_in_partition_is_not_skipped(tmp_path, devices,
                                                   monkeypatch, block):
