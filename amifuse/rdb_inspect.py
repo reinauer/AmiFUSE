@@ -175,6 +175,14 @@ def detect_mbr(image: Path) -> Optional[MBRInfo]:
     return MBRInfo(partitions=partitions, has_amiga_partitions=has_amiga)
 
 
+class RDBContentError(OSError):
+    """The disk's contents, not a failing read, rule out an RDB.
+
+    open_rdisk skips a 0x76 partition for this error and lets any other
+    OSError, such as a device or media error, end the open.
+    """
+
+
 class OffsetBlockDevice:
     """Block device wrapper that adds an offset to all block operations.
 
@@ -199,7 +207,10 @@ class OffsetBlockDevice:
     def read_block(self, blk_num: int, num_blks: int = 1) -> bytes:
         """Read blocks with offset applied."""
         if blk_num + num_blks > self.num_blocks:
-            raise IOError(f"Read beyond partition: {blk_num}+{num_blks} > {self.num_blocks}")
+            # The partition is shorter than the RDB scan, or the RDB points
+            # outside it.
+            raise RDBContentError(
+                f"Read beyond partition: {blk_num}+{num_blks} > {self.num_blocks}")
         return self.base.read_block(self.offset + blk_num, num_blks)
 
     def write_block(self, blk_num: int, data: bytes, num_blks: int = 1):
@@ -471,7 +482,7 @@ def _lenient_rdisk_open(rdisk) -> List[str]:
         p = Partition(rdisk.rawblk, part_blk, num, rdb.log_drv.cyl_blks, rdisk)
         num += 1
         if not p.read():
-            raise IOError(f"Corrupt partition block at block {part_blk}")
+            raise RDBContentError(f"Corrupt partition block at block {part_blk}")
         rdisk.parts.append(p)
         rdisk.used_blks.append(p.get_blk_num())
         part_blk = p.get_next_partition_blk()
@@ -527,14 +538,15 @@ def _parse_rdb(dev, rdb_block) -> RDisk:
     """Parse the RDB that _scan_for_rdb found on dev.
 
     Tries the strict RDisk.open() first, then the lenient parse that
-    tolerates corrupt filesystem blocks. Raises IOError, saying why, if
-    neither works or the RDB uses another block size than dev.
+    tolerates corrupt filesystem blocks. Raises RDBContentError, saying
+    why, if neither works or the RDB uses another block size than dev.
+    Other OSErrors, such as a failing read, propagate.
     """
     if rdb_block.block_size != dev.block_bytes:
         # Only a forced block size gets here: otherwise _scan_for_rdb has
         # the device reopened at the RDB's size. Both parses below would
         # raise ValueError.
-        raise IOError(
+        raise RDBContentError(
             f"RDB uses {rdb_block.block_size}-byte blocks, "
             f"but the device was opened with {dev.block_bytes}-byte blocks"
         )
@@ -607,7 +619,9 @@ def open_rdisk(
             inside a 0x76 partition's sectors belongs to that partition and
             is opened only through the MBR, so a failure reports the MBR
             error. Any other direct RDB that fails to parse raises "Failed
-            to parse RDB" without trying the 0x76 partitions.
+            to parse RDB" without trying the 0x76 partitions. A 0x76
+            partition is skipped only for RDBContentError; any other
+            OSError in it, such as a device or media error, ends the open.
     """
     # Read the MBR first: a Windows physical disk opened outside a mount
     # session is locked against other readers until blkdev closes.
@@ -709,13 +723,16 @@ def _locate_rdisk(image, block_size, mbr_partition_index, mbr_info, open_at):
                 skipped.append((mbr_part, " is not aligned to the RDB's "
                                           f"{initial_block_size}-byte blocks"))
                 continue
+            if offset_dev.offset >= blkdev.num_blocks:
+                skipped.append((mbr_part, " starts past the end of the image"))
+                continue
 
-            # An entry that cannot be read or parsed is skipped with its
-            # reason. Leave blkdev open: closing offset_dev closes it, and
-            # the next entry may reuse it.
+            # An entry whose contents rule out an RDB is skipped with its
+            # reason; any other OSError ends the open. Leave blkdev open:
+            # closing offset_dev closes it, and the next entry may reuse it.
             try:
                 rdb_block, new_block_size = _scan_for_rdb(offset_dev, block_size)
-            except IOError as e:
+            except RDBContentError as e:
                 skipped.append((mbr_part, f": {e}"))
                 continue
 
@@ -729,7 +746,7 @@ def _locate_rdisk(image, block_size, mbr_partition_index, mbr_info, open_at):
                     continue
                 try:
                     rdb_block, _ = _scan_for_rdb(offset_dev, block_size)
-                except IOError as e:
+                except RDBContentError as e:
                     skipped.append((mbr_part, f": {e}"))
                     continue
 
@@ -737,7 +754,7 @@ def _locate_rdisk(image, block_size, mbr_partition_index, mbr_info, open_at):
                 # Found RDB in this partition
                 try:
                     rdisk = _parse_rdb(offset_dev, rdb_block)
-                except IOError as e:
+                except RDBContentError as e:
                     skipped.append((mbr_part, f": {e}"))
                     continue
 

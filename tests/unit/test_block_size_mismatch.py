@@ -1,5 +1,6 @@
 """A --block-size that the RDB does not use is an open error, not a crash."""
 
+import errno
 import struct
 
 import pytest
@@ -163,7 +164,7 @@ def _unreadable_then_valid(tmp_path, past_eof):
 @pytest.mark.parametrize("past_eof,reason", [
     # The scan of 1-block entry 0 reads beyond it at block 1.
     (False, "partition 0 at LBA 64: Read beyond partition: 1+1 > 1"),
-    (True, "partition 0 at LBA 1048576: Invalid image file block num"),
+    (True, "partition 0 at LBA 1048576 starts past the end of the image"),
 ], ids=["one-block", "past-eof"])
 @pytest.mark.parametrize("forced", [False, True])
 def test_unreadable_partition_is_skipped(tmp_path, devices, past_eof, reason,
@@ -184,6 +185,28 @@ def test_unreadable_partition_is_skipped(tmp_path, devices, past_eof, reason,
                    mbr_partition_index=0)
     assert reason in str(caught.value)
     assert devices == {"open": 2, "close": 2}
+
+
+@pytest.mark.parametrize("block", [64, 65], ids=["scan", "parse"])
+def test_failing_read_in_partition_is_not_skipped(tmp_path, devices,
+                                                  monkeypatch, block):
+    # A read error says nothing about entry 0's contents, so it ends the
+    # open instead of opening entry 1. Block 64 holds entry 0's RDB and
+    # block 65 its partition block.
+    image = _make_mbr(tmp_path, [(64, _make_rdb(tmp_path, 512, "DH0")),
+                                 (256, _make_rdb(tmp_path, 512, "DH1"))])
+
+    class FailingRead(rdb_inspect.RawBlockDevice):
+        def read_block(self, blk_num, num_blks=1):
+            if blk_num == block:
+                raise OSError(errno.EIO, "injected")
+            return super().read_block(blk_num, num_blks)
+
+    monkeypatch.setattr(rdb_inspect, "RawBlockDevice", FailingRead)
+    with pytest.raises(OSError) as caught:
+        open_rdisk(image)
+    assert caught.value.errno == errno.EIO
+    assert devices == {"open": 1, "close": 1}
 
 
 # open_rdisk closes its device whatever fails, and only once.
