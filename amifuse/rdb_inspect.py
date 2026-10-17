@@ -81,7 +81,7 @@ class MBRContext:
     """
     mbr_info: MBRInfo           # Full MBR partition table info
     mbr_partition: Optional[MBRPartition]  # 0x76 partition (Emu68), None for Parceiro
-    offset_blocks: int          # Block offset from start of disk (0 for Parceiro)
+    offset_blocks: int          # In 512-byte MBR sectors, not RDB blocks (0 for Parceiro)
     scheme: str = "emu68"       # "emu68" or "parceiro"
 
 
@@ -348,6 +348,12 @@ def _scan_for_rdb(blkdev, block_size: Optional[int] = None):
     for blk_num in range(16):
         rdb = RDBlock(blkdev, blk_num)
         if rdb.read():
+            # Skip an RDSK block declaring a block size other than a power of
+            # two from 512 to 32768, as for a bad checksum. Other sizes do not
+            # map onto 512-byte MBR sectors, and 0 or huge ones cannot be read.
+            size = rdb.block_size
+            if not 512 <= size <= 32768 or size & (size - 1):
+                continue
             # Check if we need to adjust block size
             if block_size is None and rdb.block_size != blkdev.block_bytes:
                 # Need to reopen with correct block size
