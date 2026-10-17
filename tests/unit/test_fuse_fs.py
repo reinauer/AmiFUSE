@@ -8,9 +8,12 @@ installed.
 import argparse
 import builtins
 import errno
+import io
 import json
+import os
 import signal
 import sys
+import tempfile
 import types
 from types import SimpleNamespace
 from pathlib import Path
@@ -490,9 +493,12 @@ class TestMountFuseOptions:
 
 
 class TestFormatVolume:
-    def test_format_stops_after_flush_and_syncs_backend(self, monkeypatch, fuse_mock):
+    def test_format_stops_after_flush_and_syncs_backend(
+            self, monkeypatch, fuse_mock, tmp_path):
         import amifuse.fuse_fs as fuse_fs_mod
 
+        image = tmp_path / "test.hdf"
+        image.write_bytes(b"")
         fake_dostype = MagicMock()
         fake_dostype.num_to_tag_str.return_value = "SFS0"
         monkeypatch.setitem(sys.modules, "amitools", MagicMock())
@@ -515,7 +521,7 @@ class TestFormatVolume:
         )
 
         fuse_fs_mod.format_volume(
-            image=Path("/tmp/test.hdf"),
+            image=image,
             driver=Path("/tmp/test.handler"),
             block_size=None,
             partition="SDH0",
@@ -536,15 +542,19 @@ class TestFormatVolume:
     ], ids=["read-only", "in-use", "lock-refused"])
     @pytest.mark.parametrize("debug", [False, True])
     def test_format_reports_bridge_refusal_without_traceback(
-            self, monkeypatch, make_error, debug):
+            self, monkeypatch, tmp_path, make_error, debug):
         """An image the handler cannot open for writing fails with one line.
 
         A read-only image, another session's lock and a refused partition
-        lock all stop HandlerBridge before a handler exists. format prints
-        "Error: ..." like mount, and --debug keeps the original exception.
+        lock all stop HandlerBridge before a handler exists, and --debug
+        keeps the original exception. The "Error: ..." line deliberately
+        matches the file commands and format's existing busy-image
+        message, not mount's "Cannot mount <image>: ...".
         """
         import amifuse.fuse_fs as fuse_fs_mod
 
+        image = tmp_path / "test.hdf"
+        image.write_bytes(b"")
         error = make_error(fuse_fs_mod)
         monkeypatch.setattr(
             fuse_fs_mod,
@@ -557,7 +567,7 @@ class TestFormatVolume:
         expected = type(error) if debug else SystemExit
         with pytest.raises(expected) as exc_info:
             fuse_fs_mod.format_volume(
-                image=Path("/tmp/test.hdf"),
+                image=image,
                 driver=Path("/tmp/test.handler"),
                 block_size=None,
                 partition="DH0",
@@ -570,25 +580,46 @@ class TestFormatVolume:
             assert str(exc_info.value) == f"Error: {error}"
             assert exc_info.value.__cause__ is error
         bridge_cls.assert_called_once()
-        bridge_cls.return_value.close.assert_not_called()
 
-    @pytest.mark.parametrize("contents, message", [
-        (None, "Error: Can't read from image file"),
-        (bytes(16 * 512), "Error: No valid RDB found in blocks 0-15 at "),
-    ], ids=["missing", "no-rdb"])
-    def test_format_reports_unusable_image_without_traceback(
-            self, monkeypatch, tmp_path, contents, message):
-        """An image without a readable RDB fails with one line.
+    @pytest.mark.parametrize("kind", ["missing", "directory"])
+    def test_format_reports_missing_image_or_directory(
+            self, monkeypatch, tmp_path, kind):
+        """A path that is not an image file fails with one plain line.
 
-        Reading the partition's dostype is format's first access to the
-        image, so a missing or unreadable file, or one with no RDB such as
-        an ADF, fails there, before any handler starts.
+        The wording matches the file commands, rather than the RDB
+        reader's "Can't read from image file" or "Empty image file
+        detected!".
         """
         import amifuse.fuse_fs as fuse_fs_mod
 
         image = tmp_path / "test.hdf"
-        if contents is not None:
-            image.write_bytes(contents)
+        if kind == "directory":
+            image.mkdir()
+        bridge_cls = MagicMock()
+        monkeypatch.setattr(fuse_fs_mod, "HandlerBridge", bridge_cls)
+
+        with pytest.raises(SystemExit) as exc_info:
+            fuse_fs_mod.main(["format", str(image), "DH0"])
+
+        # A string exit code is printed to stderr with exit status 1.
+        assert exc_info.value.code == {
+            "missing": f"Error: image file not found: {image}",
+            "directory": f"Error: image is a directory: {image}",
+        }[kind]
+        bridge_cls.assert_not_called()
+
+    def test_format_reports_unusable_image_without_traceback(
+            self, monkeypatch, tmp_path):
+        """An image without a readable RDB fails with one line.
+
+        Reading the partition's dostype is format's first look inside the
+        image, so an unreadable file, or one with no RDB such as an ADF,
+        fails there, before any handler starts.
+        """
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        image = tmp_path / "test.hdf"
+        image.write_bytes(bytes(16 * 512))
         bridge_cls = MagicMock()
         monkeypatch.setattr(fuse_fs_mod, "HandlerBridge", bridge_cls)
 
@@ -600,7 +631,8 @@ class TestFormatVolume:
                 partition="DH0",
             )
 
-        assert str(exc_info.value).startswith(message)
+        assert str(exc_info.value).startswith(
+            "Error: No valid RDB found in blocks 0-15 at ")
         assert isinstance(exc_info.value.__cause__, OSError)
         bridge_cls.assert_not_called()
 
@@ -610,7 +642,7 @@ class TestFormatVolume:
     ], ids=["partition-info", "embedded-driver"])
     @pytest.mark.parametrize("debug", [False, True])
     def test_format_reports_rdb_read_failure_without_traceback(
-            self, monkeypatch, failing, error, debug):
+            self, monkeypatch, tmp_path, failing, error, debug):
         """Reading the RDB before the handler starts fails with one line.
 
         Both RDB reads report OSError and ValueError the same way: an
@@ -618,6 +650,8 @@ class TestFormatVolume:
         """
         import amifuse.fuse_fs as fuse_fs_mod
 
+        image = tmp_path / "test.hdf"
+        image.write_bytes(b"")
         monkeypatch.setattr(
             fuse_fs_mod,
             "get_partition_info",
@@ -630,7 +664,7 @@ class TestFormatVolume:
         expected = type(error) if debug else SystemExit
         with pytest.raises(expected) as exc_info:
             fuse_fs_mod.format_volume(
-                image=Path("/tmp/test.hdf"),
+                image=image,
                 driver=None,
                 block_size=None,
                 partition="DH0",
@@ -643,6 +677,114 @@ class TestFormatVolume:
             assert str(exc_info.value) == f"Error: {error}"
             assert exc_info.value.__cause__ is error
         bridge_cls.assert_not_called()
+
+    @pytest.mark.parametrize("failure, expected", [
+        ("bridge-refused", SystemExit),
+        ("unprintable-volname", UnicodeEncodeError),
+    ], ids=["bridge-refused", "unprintable-volname"])
+    def test_format_removes_extracted_driver_on_failure(
+            self, monkeypatch, tmp_path, failure, expected):
+        """The handler extracted from the RDB is removed when format fails.
+
+        That holds for a refused image, and for a progress line the console
+        cannot print, such as a volume name a cp1252 console cannot encode.
+        """
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        image = tmp_path / "test.hdf"
+        image.write_bytes(b"")
+        handler = tmp_path / "amifuse_test.handler"
+        handler.write_bytes(b"handler")
+        monkeypatch.setattr(
+            fuse_fs_mod,
+            "get_partition_info",
+            lambda image, block_size, partition: {"dostype": 0x50465303},
+        )
+        monkeypatch.setattr(
+            fuse_fs_mod,
+            "extract_embedded_driver",
+            lambda image, block_size, partition: (handler, "PFS3", 0x50465303),
+        )
+        monkeypatch.setattr(fuse_fs_mod, "HandlerBridge", MagicMock(
+            side_effect=PermissionError(errno.EACCES, "Permission denied", str(image))))
+        volname = "Empty"
+        if failure == "unprintable-volname":
+            monkeypatch.setattr(
+                sys, "stdout", io.TextIOWrapper(io.BytesIO(), encoding="cp1252"))
+            volname = "Snow\u2603"
+
+        with pytest.raises(expected):
+            fuse_fs_mod.format_volume(
+                image=image,
+                driver=None,
+                block_size=None,
+                partition="DH0",
+                volname=volname,
+            )
+
+        assert not handler.exists()
+
+
+class TestExtractEmbeddedDriver:
+    """The filesystem handler extracted from the RDB to a temp file."""
+
+    DATA = bytes(range(256)) * 300
+
+    @pytest.fixture(autouse=True)
+    def rdisk(self, monkeypatch):
+        import amifuse.rdb_inspect as rdb_inspect
+
+        fs = MagicMock()
+        fs.fshd.dos_type = 0x50465303
+        fs.get_data.return_value = self.DATA
+        rdisk = MagicMock()
+        rdisk.find_partition_by_string.return_value.part_blk.dos_env.dos_type = 0x50465303
+        rdisk.fs = [fs]
+        monkeypatch.setattr(rdb_inspect, "find_partition_mbr_index", lambda *a: None)
+        monkeypatch.setattr(
+            rdb_inspect, "open_rdisk", lambda *a, **kw: (MagicMock(), rdisk, None))
+        return rdisk
+
+    def test_write_failure_removes_temp_file(self, monkeypatch, tmp_path):
+        """A write the OS refuses closes and removes the temp file and names it."""
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        handler = tmp_path / "amifuse_test.handler"
+        fds = []
+
+        # A descriptor the OS refuses to write through stands in for a full
+        # temp directory, wherever the write fails.
+        def read_only_mkstemp(suffix="", prefix="", dir=None, text=False):
+            handler.write_bytes(b"")
+            fds.append(os.open(handler, os.O_RDONLY))
+            return fds[-1], str(handler)
+
+        monkeypatch.setattr(tempfile, "mkstemp", read_only_mkstemp)
+
+        with pytest.raises(OSError) as exc_info:
+            fuse_fs_mod.extract_embedded_driver(tmp_path / "test.hdf", None, "DH0")
+
+        # The message names the temp file, not the image.
+        assert str(handler) in str(exc_info.value)
+        assert isinstance(exc_info.value.__cause__, OSError)
+        assert not handler.exists()
+        with pytest.raises(OSError):
+            os.fstat(fds[0])
+
+    def test_short_writes_still_write_whole_handler(self, monkeypatch, tmp_path):
+        """The driver is not written with a bare os.write, which can write short."""
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        real_write = os.write
+        monkeypatch.setattr(
+            os, "write", lambda fd, data: real_write(fd, bytes(data[:4096])))
+
+        path, _, _ = fuse_fs_mod.extract_embedded_driver(
+            tmp_path / "test.hdf", None, "DH0")
+
+        assert path.parent == tmp_path
+        assert path.read_bytes() == self.DATA
 
 
 class TestUnmountCommand:
