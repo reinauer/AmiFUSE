@@ -116,6 +116,21 @@ def test_partition_lookup_skips_rdb_in_other_block_size(tmp_path, devices):
     assert devices["open"] == devices["close"]
 
 
+@pytest.mark.parametrize("later", ["DH0", "DH1"])
+def test_partition_lookup_refuses_name_in_skipped_rdb(tmp_path, devices,
+                                                      later):
+    # Entry 0's DH0 is the one auto-detection finds. Forced to 1024
+    # bytes, that RDB is skipped, so the lookup must not settle for a
+    # later DH0 or report DH0 missing.
+    image = _make_mbr(tmp_path, [(64, _make_rdb(tmp_path, 512, "DH0")),
+                                 (256, _make_rdb(tmp_path, 1024, later))])
+    with pytest.raises(OSError) as caught:
+        find_partition_mbr_index(image, 1024, "DH0")
+    assert str(caught.value) == (
+        "Partition DH0 is in an RDB that does not open with 1024-byte blocks")
+    assert devices["open"] == devices["close"]
+
+
 def _damaged_then(tmp_path, rdb_bytes):
     # A 4096-byte-block RDB at LBA 64 whose partition list points at an
     # empty block, then DH1 at LBA 2048. Forced to 4096 bytes, the direct
