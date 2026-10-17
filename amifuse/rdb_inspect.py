@@ -563,7 +563,17 @@ def open_rdisk(
     Returns:
         Tuple of (block_device, rdisk, mbr_context).
         mbr_context is None for plain RDB disks, or MBRContext for MBR disks.
+
+    Raises:
+        IOError: If no RDB can be opened. An RDB found by the direct scan
+            inside a 0x76 partition's sectors belongs to that partition and
+            is opened only through the MBR, so a failure reports the MBR
+            error. Any other direct RDB that fails to parse raises "Failed
+            to parse RDB" without trying the 0x76 partitions.
     """
+    # Read the MBR first: a Windows physical disk opened outside a mount
+    # session is locked against other readers until blkdev closes.
+    mbr_info = detect_mbr(image)
     initial_block_size = block_size or 512
     blkdev = RawBlockDevice(str(image), read_only=read_only, block_bytes=initial_block_size)
     blkdev.open()
@@ -578,8 +588,18 @@ def open_rdisk(
         blkdev.open()
         rdb_block, _ = _scan_for_rdb(blkdev, block_size)
 
-    mbr_info = detect_mbr(image)
-    rdisk = None
+    if rdb_block is not None and mbr_info is not None:
+        # The scan can reach the RDB of a 0x76 partition (block 8 of a
+        # forced 4096-byte size is LBA 64). Its block numbers are relative
+        # to that partition, so leave it to the MBR path below even if it
+        # would parse here. That path reuses blkdev or reopens it.
+        offset = rdb_block.blk_num * blkdev.block_bytes
+        if any(p.partition_type == MBR_TYPE_AMIGA_RDB
+               and p.start_lba * MBR_SECTOR_SIZE <= offset
+               < (p.start_lba + p.num_sectors) * MBR_SECTOR_SIZE
+               for p in mbr_info.partitions):
+            rdb_block = None
+
     if rdb_block is not None:
         # Found direct RDB — try strict open first, then lenient fallback
         rdisk = RDisk(blkdev)
@@ -592,18 +612,10 @@ def open_rdisk(
             try:
                 rdisk2.rdb_warnings = _lenient_rdisk_open(rdisk2)
             except IOError:
-                if mbr_info is None or not mbr_info.has_amiga_partitions:
-                    blkdev.close()
-                    raise IOError(f"Failed to parse RDB at {image}")
-                # The scan can reach the RDB of a 0x76 partition (block 8 of
-                # a forced 4096-byte size is LBA 64), whose block numbers
-                # are relative to that partition. Retry it through the MBR
-                # below, which reuses blkdev or reopens it at
-                # initial_block_size, so blkdev stays open here.
-                rdisk2 = None
+                blkdev.close()
+                raise IOError(f"Failed to parse RDB at {image}")
             rdisk = rdisk2
 
-    if rdisk is not None:
         # Check for Parceiro-style MBR+RDB coexistence
         mbr_ctx = None
         if mbr_info is not None and rdb_block.blk_num > 0:
@@ -615,7 +627,7 @@ def open_rdisk(
             )
         return blkdev, rdisk, mbr_ctx
 
-    # No usable direct RDB - check for MBR with 0x76 partitions
+    # No direct RDB outside the 0x76 partitions - check those partitions
     if mbr_info is not None and mbr_info.has_amiga_partitions:
         # Find 0x76 partitions
         amiga_parts = [p for p in mbr_info.partitions if p.partition_type == MBR_TYPE_AMIGA_RDB]
