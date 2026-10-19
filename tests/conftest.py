@@ -76,7 +76,10 @@ def fuse_mock(monkeypatch):
     _stub_module(
         "amifuse.startup_runner",
         HandlerLauncher=dummy_cls,
-        OFFSET_BEGINNING=0,
+        # startup_runner's values, so tests can tell the seek modes apart.
+        OFFSET_BEGINNING=-1,
+        OFFSET_CURRENT=0,
+        OFFSET_END=1,
         _get_block_state=lambda *args, **kwargs: None,
         _clear_all_block_state=lambda *args, **kwargs: None,
         _has_blocked_state=lambda *args, **kwargs: False,
