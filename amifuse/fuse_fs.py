@@ -2926,6 +2926,14 @@ class AmigaFuseFS(_FuseOperations):
             print(f"[FUSE][truncate] path={path} length={length} fh={fh}")
         if not self.bridge._write_enabled:
             raise FuseOSError(errno.EROFS)
+        # ACTION_SET_FILE_SIZE carries the size in dp_Arg2, a signed LONG,
+        # so the handler sees only the low 32 bits of the length: 4 GiB + 4
+        # and -4 GiB + 4 both arrive as 4. Fail a negative length with
+        # EINVAL, as truncate(2) does, and one above 0x7FFFFFFF with EFBIG,
+        # as write() does.
+        if length < 0:
+            raise FuseOSError(errno.EINVAL)
+        self._fit_file_size_limit(length, 0)
         if fh is None:
             fh = self.open(path, os.O_WRONLY)
             temp_handle = True
