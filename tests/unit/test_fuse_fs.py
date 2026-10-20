@@ -2190,37 +2190,194 @@ class TestHandlerBridgeWriteChunks:
         sizes = [c.args[0] for c in bridge._alloc_read_buf.call_args_list]
         assert max(sizes) == chunk
 
+    def test_only_a_write_of_several_chunks_measures_the_end(self, fuse_mock):
+        """A write of one chunk sends no seek. A larger write seeks to the
+        end and back before its first chunk and lands where the handle was."""
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        chunk = fuse_fs_mod.IO_CHUNK
+        handler = _FakeHandlerFile(self.ORIGINAL)
+        handler.pos = 3  # an earlier write left the handle inside the file
+        bridge = _fake_write_bridge(fuse_fs_mod, handler)
+        one, two = _pattern(chunk), _pattern(chunk + 1)
+
+        assert bridge.write_handle_reply(self.FH_ADDR, one) == (chunk, 0)
+        bridge.launcher.send_seek_handle.assert_not_called()
+        assert bridge.write_handle_reply(self.FH_ADDR, two) == (chunk + 1, 0)
+        seeks = [c.args[1:] for c in bridge.launcher.send_seek_handle.call_args_list]
+        assert seeks == [(self.FH_ADDR, 0, fuse_fs_mod.OFFSET_END),
+                         (self.FH_ADDR, 3 + chunk, fuse_fs_mod.OFFSET_BEGINNING)]
+        assert handler.data == self.ORIGINAL[:3] + one + two
+
+    @pytest.mark.parametrize("failed_seek", [1, 2], ids=["to-end", "back"])
+    @pytest.mark.parametrize("seek_reply", [NO_REPLY, SEEK_ERROR],
+                             ids=["no-reply", "refused"])
+    def test_write_whose_handle_may_have_moved_fails(self, fuse_mock, seek_reply,
+                                                     failed_seek):
+        """A write of several chunks fails without sending any data when a
+        seek that measures the end may have moved the handle. After a
+        failed seek back, the data would land at the end instead of at the
+        handle."""
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        chunk = fuse_fs_mod.IO_CHUNK
+        handler = _FakeHandlerFile(self.ORIGINAL)
+        handler.pos = 3
+        bridge = _fake_write_bridge(fuse_fs_mod, handler)
+        seeks = bridge.launcher.send_seek_handle
+
+        def seek(state, fh_addr, offset, mode):
+            if seeks.call_count == failed_seek:
+                handler.reply = seek_reply
+                return PKT, 0
+            return handler.seek(state, fh_addr, offset, mode)
+
+        seeks.side_effect = seek
+        assert bridge.write_handle_reply(self.FH_ADDR, _pattern(2 * chunk)) == (-1, 0)
+        assert seeks.call_count == failed_seek
+        assert handler.writes == []
+        assert handler.set_sizes == []
+        assert handler.data == self.ORIGINAL
+
+    # The end of a 0x81000000-byte file as dp_Res1, a signed LONG, carries it.
+    WRAPPED_END = 0x81000000 - (1 << 32)
+
+    @pytest.mark.parametrize("fails", [False, True], ids=["written", "fails"])
+    @pytest.mark.parametrize("unmeasured", ["past-end", "wrapped"])
+    def test_write_whose_end_cannot_be_measured_is_not_undone(
+            self, fuse_mock, unmeasured, fails):
+        """A write of several chunks into a file of 2 GiB or more goes out
+        without the undo, at the handle's position.
+
+        pfs3aio refuses the seek to the end of such a file with
+        ERROR_SEEK_ERROR and leaves the handle where it was. SmartFilesystem
+        answers the seek back with the end wrapped negative, and the handle
+        is back at its position. A write that ends at or below 0x7FFFFFFF
+        cannot grow such a file, so a failure has nothing to shrink.
+        """
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        chunk = fuse_fs_mod.IO_CHUNK
+        original = bytes(4 * chunk)
+        handler = _FakeHandlerFile(
+            original, write_replies={1: _reply(-1, 221)} if fails else None)
+        handler.pos = 3
+        bridge = _fake_write_bridge(fuse_fs_mod, handler)
+        seeks = bridge.launcher.send_seek_handle
+
+        def seek(state, fh_addr, offset, mode):
+            if unmeasured == "past-end":
+                handler.reply = SEEK_PAST_EOF
+                return PKT, 0
+            sent = handler.seek(state, fh_addr, offset, mode)
+            if seeks.call_count == 2:
+                handler.reply = _reply(self.WRAPPED_END)
+            return sent
+
+        seeks.side_effect = seek
+        data = _pattern(2 * chunk)
+        expected = (-1, 221) if fails else (len(data), 0)
+        assert bridge.write_handle_reply(self.FH_ADDR, data) == expected
+        assert seeks.call_count == (1 if unmeasured == "past-end" else 2)
+        assert handler.set_sizes == []
+        written = data[:chunk] if fails else data
+        assert handler.data == original[:3] + written + original[3 + len(written):]
+
+    @pytest.mark.parametrize("failed", [1, 2])
     @pytest.mark.parametrize("reply, expected", [
         (_reply(-1, 221), (-1, 221)),
         (NO_REPLY, (-1, 0)),
         ("too-many", (-1, 0)),
     ], ids=["disk-full", "no-reply", "more-than-sent"])
-    def test_failed_chunk_fails_write(self, fuse_mock, reply, expected):
-        """A chunk that fails after another was written fails the whole write.
+    def test_failed_chunk_at_end_is_undone(self, fuse_mock, reply, expected,
+                                           failed):
+        """A write at end of file whose later chunk fails shrinks the file
+        back to its old end and keeps the error.
 
-        The chunks before it stay written. The handler can also have
-        written part of the chunk it failed, so no byte count would say
-        where the handle is.
+        The chunks before the failed one were on disk, so the file had
+        grown by them. A handler can also have written part of the chunk
+        it failed, so no byte count would say where the handle is.
         """
         import amifuse.fuse_fs as fuse_fs_mod
 
         chunk = fuse_fs_mod.IO_CHUNK
         if reply == "too-many":
             reply = _reply(chunk + 1)
-        handler = _FakeHandlerFile(b"", write_replies={1: reply})
+        handler = _FakeHandlerFile(self.ORIGINAL, write_replies={failed: reply})
+        handler.pos = len(self.ORIGINAL)
+        bridge = _fake_write_bridge(fuse_fs_mod, handler)
+
+        assert bridge.write_handle_reply(self.FH_ADDR, _pattern(3 * chunk)) == expected
+        assert handler.writes == [chunk] * (failed + 1)
+        assert handler.set_sizes == [len(self.ORIGINAL)]
+        assert handler.data == self.ORIGINAL
+
+    @pytest.mark.parametrize("with_answer", [False, True],
+                             ids=["before-answer", "with-answer"])
+    def test_late_chunk_reply_is_not_the_shrink_answer(self, fuse_mock,
+                                                       with_answer):
+        """After a chunk that got no reply, the shrink back takes the answer
+        to its own packet, not the chunk's late reply.
+
+        A handler still answers a packet that timed out while the bridge
+        waits on the next packet, in a round of its own or in one with the
+        next packet's answer.
+        """
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        chunk = fuse_fs_mod.IO_CHUNK
+        handler = _FakeHandlerFile(self.ORIGINAL, write_replies={1: NO_REPLY})
+        handler.pos = len(self.ORIGINAL)
+        bridge = _fake_write_bridge(fuse_fs_mod, handler)
+        late = []
+
+        def run():
+            if handler.reply is NO_REPLY:
+                # The chunk's byte count arrives in the next round.
+                late.append(_reply(chunk, pkt=STALE_PKT))
+                return NO_REPLY
+            if not late:
+                return handler.reply
+            if with_answer:
+                return handler.reply + late.pop()
+            return late.pop()
+
+        bridge._run_until_replies.side_effect = run
+        answers = []  # what each shrink took for its answer
+        set_size = bridge.set_handle_size
+
+        def spy(*args):
+            answers.append(set_size(*args))
+            return answers[-1]
+
+        bridge.set_handle_size = spy
+        assert bridge.write_handle_reply(self.FH_ADDR, _pattern(3 * chunk)) == (-1, 0)
+        assert handler.set_sizes == [len(self.ORIGINAL)]
+        assert answers == [len(self.ORIGINAL)]
+        assert handler.data == self.ORIGINAL
+
+    def test_failed_chunk_past_old_end_cuts_back_to_it(self, fuse_mock):
+        """A write from inside the file that fails past its old end shrinks
+        the file back to that end. The bytes it overwrote stay."""
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        chunk = fuse_fs_mod.IO_CHUNK
+        end = chunk + chunk // 2
+        handler = _FakeHandlerFile(bytes(end), write_replies={2: _reply(-1, 221)})
         bridge = _fake_write_bridge(fuse_fs_mod, handler)
         data = _pattern(3 * chunk)
 
-        assert bridge.write_handle_reply(self.FH_ADDR, data) == expected
-        assert handler.writes == [chunk, chunk]
-        assert handler.data == data[:chunk]
+        assert bridge.write_handle_reply(self.FH_ADDR, data) == (-1, 221)
+        assert handler.set_sizes == [end]
+        assert handler.data == data[:end]
 
-    def test_shrink_back_seeks_to_start(self, fuse_mock):
-        """After the shrink back of a failed write past end of file, the
-        handle seeks to 0.
+    @pytest.mark.parametrize("where", ["at-end", "past-end"])
+    def test_shrink_back_seeks_to_start(self, fuse_mock, where):
+        """After shrinking a failed write back, the handle seeks to 0.
 
         SmartFilesystem then fails a write at the new end until the handle
-        moves, and the shrink leaves the handle there.
+        moves, and the shrink leaves the handle there. This holds for a
+        write at end of file and for the data after a zero fill.
         """
         import amifuse.fuse_fs as fuse_fs_mod
 
@@ -2228,7 +2385,11 @@ class TestHandlerBridgeWriteChunks:
         handler = _FakeHandlerFile(self.ORIGINAL, write_replies={1: _reply(-1, 221)})
         bridge = _fake_write_bridge(fuse_fs_mod, handler)
         data = _pattern(2 * chunk)
-        result = bridge.write_handle_at(self.FH_ADDR, len(self.ORIGINAL) + 100, data)
+        if where == "at-end":
+            handler.pos = len(self.ORIGINAL)
+            result = bridge.write_handle_reply(self.FH_ADDR, data)
+        else:
+            result = bridge.write_handle_at(self.FH_ADDR, len(self.ORIGINAL) + 100, data)
 
         assert result == (-1, 221)
         assert handler.set_sizes == [len(self.ORIGINAL)]
@@ -2237,6 +2398,23 @@ class TestHandlerBridgeWriteChunks:
         assert bridge.launcher.send_seek_handle.call_args.args[1:] == (
             self.FH_ADDR, 0, fuse_fs_mod.OFFSET_BEGINNING)
         assert handler.pos == 0
+
+    def test_failed_chunk_inside_file_is_kept(self, fuse_mock):
+        """A failure inside the file cannot be undone: the file keeps its
+        size, the chunks before the failed one stay written, and the error
+        is kept."""
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        chunk = fuse_fs_mod.IO_CHUNK
+        original = bytes(4 * chunk)
+        handler = _FakeHandlerFile(original, write_replies={1: _reply(-1, 221)})
+        bridge = _fake_write_bridge(fuse_fs_mod, handler)
+        data = _pattern(3 * chunk)
+
+        assert bridge.write_handle_reply(self.FH_ADDR, data) == (-1, 221)
+        assert handler.writes == [chunk, chunk]
+        assert handler.set_sizes == []
+        assert handler.data == data[:chunk] + original[chunk:]
 
     def test_short_chunk_ends_write(self, fuse_mock):
         """A chunk the handler writes short ends the write with the count so far."""
@@ -2309,14 +2487,15 @@ class TestHandlerBridgeWriteChunks:
         data = _pattern(9 << 20)
 
         assert fs.write("/big.bin", data, 0, handle) == len(data)
+        seeks = fake.launcher.send_seek_handle.call_count
         assert fs.write("/big.bin", b"tail", len(data), handle) == 4
+        assert fake.launcher.send_seek_handle.call_count == seeks
         assert handler.data == data + b"tail"
-        assert fake.launcher.send_seek_handle.call_count == 1
         assert max(handler.writes) == fuse_fs_mod.IO_CHUNK
 
     def test_fuse_write_that_fails_part_way(self, write_fs):
-        """A write that runs out of space part way fails with ENOSPC, and
-        the next write seeks."""
+        """A write that runs out of space part way fails with ENOSPC and
+        leaves the file as it was, and the next write seeks."""
         import amifuse.fuse_fs as fuse_fs_mod
 
         chunk = fuse_fs_mod.IO_CHUNK
@@ -2328,8 +2507,37 @@ class TestHandlerBridgeWriteChunks:
             fs.write("/big.bin", data, 0, handle)
         assert exc_info.value.args[0] == errno.ENOSPC
         assert handler.writes == [chunk, chunk]
+        assert handler.data == b""
+        seeks = fake.launcher.send_seek_handle.call_count
         assert fs.write("/big.bin", b"x", 0, handle) == 1
-        assert fake.launcher.send_seek_handle.call_count == 2
+        assert fake.launcher.send_seek_handle.call_count == seeks + 1
+        assert handler.data == b"x"
+
+    def test_fuse_failed_write_keeps_created_size(self, write_fs):
+        """After a write that fails past the end of a new file, getattr
+        reports the size the file kept, and the next write seeks to its
+        offset and lands there."""
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        chunk = fuse_fs_mod.IO_CHUNK
+        handler = _FakeHandlerFile(b"", capacity=chunk + 100)
+        fs, bridge = write_fs
+        fake = _fake_write_bridge(fuse_fs_mod, handler)
+        bridge.open_file.return_value = (self.FH_ADDR, 0)
+        bridge.write_handle_at = fake.write_handle_at
+        bridge.write_handle_reply = fake.write_handle_reply
+        handle = fs.create("/new.bin", 0o644)
+
+        assert fs.write("/new.bin", b"head", 0, handle) == 4
+        # At the cached position, so it goes straight to write_handle_reply.
+        with pytest.raises(fuse_fs_mod.FuseOSError) as exc_info:
+            fs.write("/new.bin", _pattern(3 * chunk), 4, handle)
+        assert exc_info.value.args[0] == errno.ENOSPC
+        assert handler.data == b"head"
+        assert fs.getattr("/new.bin")["st_size"] == 4
+        assert fs.write("/new.bin", b"tail", 4, handle) == 4
+        assert handler.data == b"headtail"
+        assert fs.getattr("/new.bin")["st_size"] == 8
 
 
 class TestHandlerBridgeWriteAt:
