@@ -1928,17 +1928,18 @@ class _FakeHandlerFile:
     standing in for the old data the real handlers leave in the new range.
     A shrink models FastFileSystem only: it leaves the handle at the new
     end of file even from a position below it, where pfs3aio and SFS leave
-    the handle in place. seek_reply and set_size_reply, when set, answer
-    every seek or size change instead, and seek_mode_reply, a (mode,
-    reply) pair, answers every seek from that mode. Each send returns the
-    packet address its reply carries.
+    the handle in place. seek_reply, write_reply and set_size_reply, when
+    set, answer every seek, write or size change instead, and
+    seek_mode_reply, a (mode, reply) pair, answers every seek from that
+    mode. Each send returns the packet address its reply carries.
     """
 
     STALE = b"\xa5"
 
     def __init__(self, data, capacity=1 << 20, seek_reply=None,
                  set_size_reply=None, seek_past_end=False,
-                 seek_mode_reply=None, read_replies=None, write_replies=None):
+                 seek_mode_reply=None, write_reply=None, read_replies=None,
+                 write_replies=None):
         self.data = bytearray(data)
         self.pos = 0
         self.capacity = capacity
@@ -1946,6 +1947,7 @@ class _FakeHandlerFile:
         self.set_size_reply = set_size_reply
         self.seek_past_end = seek_past_end
         self.seek_mode_reply = seek_mode_reply
+        self.write_reply = write_reply
         self.writes = []  # length of every ACTION_WRITE
         self.set_sizes = []  # size of every ACTION_SET_FILE_SIZE
         # The number of an ACTION_READ or ACTION_WRITE, counted from 0,
@@ -1994,7 +1996,9 @@ class _FakeHandlerFile:
             self.writes.append(size)
             return PKT, 0
         self.writes.append(size)
-        if self.pos + size > self.capacity:
+        if self.write_reply is not None:
+            self.reply = self.write_reply
+        elif self.pos + size > self.capacity:
             self.reply = _reply(-1, 221)
         else:
             self.data[self.pos:self.pos + size] = self.buf[:size]
@@ -2761,6 +2765,7 @@ class TestHandlerBridgeSetSize:
         bridge = _fake_write_bridge(fuse_fs_mod, handler)
 
         assert bridge.set_handle_size(self.FH_ADDR, size, mode) == -1
+        assert bridge.set_handle_size_reply(self.FH_ADDR, size, mode) == (-1, 0)
         bridge.launcher.send_set_file_size.assert_not_called()
         bridge._run_until_replies.assert_not_called()
         assert handler.data == self.ORIGINAL
@@ -2777,6 +2782,21 @@ class TestHandlerBridgeSetSize:
         assert bridge.set_handle_size(self.FH_ADDR, size) == 7
         bridge.launcher.send_set_file_size.assert_called_once_with(
             bridge.state, self.FH_ADDR, size, fuse_fs_mod.OFFSET_BEGINNING)
+
+    @pytest.mark.parametrize("reply, expected", [
+        (_reply(4), (4, 0)),
+        (_reply(-1, 214), (-1, 214)),
+        (NO_REPLY, (-1, 0)),
+    ], ids=["changed", "refused", "no-reply"])
+    def test_reply_carries_error_code(self, fuse_mock, reply, expected):
+        """set_handle_size_reply keeps dp_Res2; set_handle_size drops it."""
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        handler = _FakeHandlerFile(self.ORIGINAL, set_size_reply=reply)
+        bridge = _fake_write_bridge(fuse_fs_mod, handler)
+
+        assert bridge.set_handle_size_reply(self.FH_ADDR, 4) == expected
+        assert bridge.set_handle_size(self.FH_ADDR, 4) == expected[0]
 
     @pytest.mark.parametrize("rounds, expected", [
         ([LATE_WRITE, _reply(4)], 4),
@@ -2814,9 +2834,11 @@ class TestFuseWriteErrors:
     @pytest.mark.parametrize("res2, expected", [
         (221, errno.ENOSPC),
         (214, errno.EROFS),
+        (223, errno.EACCES),
         (225, errno.EIO),
         (0, errno.EIO),
-    ], ids=["disk-full", "write-protected", "other", "no-reply"])
+    ], ids=["disk-full", "write-protected", "file-protected", "other",
+            "no-reply"])
     def test_failed_write_maps_errno_and_next_write_seeks(self, write_fs, res2, expected):
         import amifuse.fuse_fs as fuse_fs_mod
 
@@ -3187,6 +3209,20 @@ class TestHandlerBridgeTruncate:
         assert handler.data == self.ORIGINAL + bytes(90)
         assert handler.set_sizes == []
 
+    @pytest.mark.parametrize("refusal, expected", [
+        (_reply(-1, 214), (-1, 214)),
+        (NO_REPLY, (-1, 0)),
+    ], ids=["write-protected", "no-reply"])
+    def test_refused_shrink_keeps_error_code(self, fuse_mock, refusal, expected):
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        handler = _FakeHandlerFile(self.ORIGINAL, set_size_reply=refusal)
+        bridge = _fake_write_bridge(fuse_fs_mod, handler)
+
+        assert bridge.truncate_handle(self.FH_ADDR, 4) == expected
+        assert handler.set_sizes == [4]
+        assert handler.writes == []
+
 
 def _fake_write_fs(fuse_fs_mod, handler, free_blocks=2048):
     """Build a writable AmigaFuseFS over _fake_write_bridge's bridge.
@@ -3239,6 +3275,42 @@ class TestFuseTruncateGrow:
         assert handler.data == self.ORIGINAL[:4]
         assert handler.set_sizes == [4]
         assert handler.writes == []
+
+    @pytest.mark.parametrize("res2, expected", [
+        (214, errno.EROFS),
+        (225, errno.EIO),
+    ], ids=["write-protected", "other"])
+    def test_refused_shrink_maps_errno(self, fuse_mock, res2, expected):
+        """A shrink the handler refuses maps its error as a grow does."""
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        handler = _FakeHandlerFile(self.ORIGINAL, set_size_reply=_reply(-1, res2))
+        fs = _fake_write_fs(fuse_fs_mod, handler)
+
+        with pytest.raises(fuse_fs_mod.FuseOSError) as exc_info:
+            fs.truncate("/file", 4)
+        assert exc_info.value.args[0] == expected
+        assert handler.data == self.ORIGINAL
+
+    @pytest.mark.parametrize("res2, expected", [
+        (214, errno.EROFS),
+        (223, errno.EACCES),
+        (225, errno.EIO),
+    ], ids=["write-protected", "file-protected", "other"])
+    def test_refused_grow_maps_errno(self, fuse_mock, res2, expected):
+        """A grow whose zeros the handler refuses maps its error as write()
+        does. A file whose protection bits forbid writing still takes
+        ACTION_SET_FILE_SIZE on all four handlers, but not ACTION_WRITE,
+        which fails with ERROR_WRITE_PROTECTED."""
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        handler = _FakeHandlerFile(self.ORIGINAL, write_reply=_reply(-1, res2))
+        fs = _fake_write_fs(fuse_fs_mod, handler)
+
+        with pytest.raises(fuse_fs_mod.FuseOSError) as exc_info:
+            fs.truncate("/file", 100)
+        assert exc_info.value.args[0] == expected
+        assert handler.data == self.ORIGINAL
 
     def test_grow_beyond_free_space_is_enospc(self, fuse_mock):
         """The grow fails before anything is written."""
