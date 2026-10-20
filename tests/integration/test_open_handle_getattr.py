@@ -148,6 +148,20 @@ def test_exclusive_handle_follows_a_directory_rename(ops):
     assert not ops._pinned_stats
 
 
+def test_delete_deferred_after_a_rename_runs_at_the_last_release(ops):
+    """WinFsp passes release() the name a file was opened under."""
+    _write_file(ops, "/w.bin", 3000)
+    h1 = ops.open("/w.bin", os.O_RDWR)
+    ops.rename("/w.bin", "/v.bin")
+    h2 = ops.open("/v.bin", os.O_RDONLY)
+    assert ops.unlink("/v.bin") == 0  # in use: deferred to release()
+    ops.release("/v.bin", h2)
+    assert ops.bridge.stat_path("/v.bin") is not None
+    ops.release("/w.bin", h1)
+    assert ops.bridge.stat_path("/v.bin") is None
+    assert not ops._pending_deletes
+
+
 def test_exclusive_handle_reports_written_size(ops):
     """FINDOUTPUT handles hide the file from the handler until release()."""
     _write_file(ops, "/f.bin", 3000)
