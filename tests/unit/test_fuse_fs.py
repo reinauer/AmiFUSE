@@ -1647,11 +1647,11 @@ STALE_WRITE = _reply(4096, pkt=STALE_PKT)  # late answer to a timed-out WRITE
 
 
 class TestHandlerBridgeLookupReplies:
-    """LOCATE, EXAMINE and FREE_LOCK take only their own replies.
+    """LOCATE, EXAMINE, FREE_LOCK and RENAME_OBJECT take only their own replies.
 
     A write that timed out is answered later, while the next lookup waits.
     Its late byte count must not pass for a lock, which would be examined
-    and freed instead of the real one.
+    and freed instead of the real one, or for a rename's DOSTRUE.
     """
 
     DIR_LOCK = 0x10
@@ -1666,7 +1666,7 @@ class TestHandlerBridgeLookupReplies:
         bridge._debug = False
         bridge.state = MagicMock()
         bridge.launcher = MagicMock()
-        for send in ("send_locate", "send_examine", "send_free_lock"):
+        for send in ("send_locate", "send_examine", "send_free_lock", "send_rename_object"):
             getattr(bridge.launcher, send).return_value = (PKT, 0)
         bridge._run_until_replies = MagicMock(side_effect=list(replies))
         bridge._is_neg_cached = MagicMock(return_value=False)
@@ -1738,6 +1738,22 @@ class TestHandlerBridgeLookupReplies:
         bridge.free_lock(self.FILE_LOCK)
 
         assert bridge._run_until_replies.call_count == 2
+
+    @pytest.mark.parametrize("replies, expected", [
+        ([STALE_WRITE, _reply(0, 203)], (0, 203)),
+        ([STALE_WRITE, NO_REPLY], (0, -1)),
+        ([STALE_WRITE, _reply(-1, 0)], (-1, 0)),
+    ], ids=["refused", "no-reply", "renamed"])
+    def test_rename_object_reports_its_own_reply(self, fuse_mock, replies, expected):
+        """A late byte count must not pass for DOSTRUE: rename() would
+        report success for a rename the handler refused, here with
+        ERROR_OBJECT_EXISTS, or never answered.
+        """
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        bridge = self._bridge(fuse_fs_mod, *replies)
+
+        assert bridge.rename_object(0, "a", 0, "b") == expected
 
 
 class TestFuseReadErrors:
