@@ -2047,12 +2047,14 @@ class HandlerBridge:
 
         Returns None when either seek fails. ACTION_SEEK answers with the
         old position, so a zero-length OFFSET_CURRENT seek reads the end.
+        dp_Res1 is a signed LONG, so the end of a file of 2 GiB or more
+        arrives negative; that is None too.
         """
         with self._lock:
             if self.seek_handle(fh_addr, 0, OFFSET_END)[0] is not SeekResult.OK:
                 return None
             result, end = self.seek_handle(fh_addr, 0, OFFSET_CURRENT)
-        return end if result is SeekResult.OK else None
+        return end if result is SeekResult.OK and end >= 0 else None
 
     def _handle_extent(self, fh_addr: int) -> Optional[Tuple[Optional[int], Optional[int]]]:
         """Return (position, end of file) and leave the handle where it was.
