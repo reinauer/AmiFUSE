@@ -259,6 +259,8 @@ class TestWritePastEndOfFile:
             with pytest.raises(FuseOSError) as exc_info:
                 ops.write(path, b"data", offset, handle)
             assert exc_info.value.args[0] == errno.ENOSPC
+            # SmartFilesystem failed this write until the handle moved.
+            assert ops.write(path, b"tail", len(original), handle) == 4
             ops.release(path, handle)
             bridge.flush_volume()
         finally:
@@ -266,7 +268,7 @@ class TestWritePastEndOfFile:
 
         bridge = _bridge(image, driver)
         try:
-            assert bridge.read_file(path, 1 << 20, 0) == original
+            assert bridge.read_file(path, 1 << 20, 0) == original + b"tail"
             after = bridge.get_disk_info()
         finally:
             bridge.close()

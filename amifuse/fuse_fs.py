@@ -2117,6 +2117,25 @@ class HandlerBridge:
                     break
             return done, res2
 
+    def _shrink_back(self, fh_addr: int, end: int) -> None:
+        """Shrink the file back to end after a failed write, then seek to 0.
+
+        Shrinking never exposes old blocks. If it fails, what was written
+        stays, and the write keeps its own error.
+
+        SmartFilesystem needs the seek. After a write that ran out of space
+        on a full volume once at least one of its packets was written, and
+        the shrink back, it fails a write at the new end until the handle
+        moves. A seek to where the handle already is does not count, so
+        the handle goes to the start of the file. The seek's result is not
+        checked: if the seek fails, SmartFilesystem can fail the next write
+        at that end. AmigaFuseFS.write drops its cached position after a
+        failed write, so its next write seeks from 0.
+        """
+        with self._lock:
+            self.set_handle_size(fh_addr, end)
+            self.seek_handle(fh_addr, 0)
+
     def write_handle_at(self, fh_addr: int, offset: int, data: bytes) -> Tuple[int, int]:
         """Write data at offset and return (dp_Res1, dp_Res2) like write_handle_reply().
 
@@ -2180,7 +2199,7 @@ class HandlerBridge:
             if written < 0:
                 # Shrinking never exposes old blocks. If it fails as well,
                 # the zeros written so far stay.
-                self.set_handle_size(fh_addr, end)
+                self._shrink_back(fh_addr, end)
             return written, res2
 
     def set_handle_size(self, fh_addr: int, size: int, mode: int = OFFSET_BEGINNING) -> int:

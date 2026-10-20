@@ -2102,6 +2102,29 @@ class TestHandlerBridgeWriteChunks:
         assert handler.writes == [chunk, chunk]
         assert handler.data == data[:chunk]
 
+    def test_shrink_back_seeks_to_start(self, fuse_mock):
+        """After the shrink back of a failed write past end of file, the
+        handle seeks to 0.
+
+        SmartFilesystem then fails a write at the new end until the handle
+        moves, and the shrink leaves the handle there.
+        """
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        chunk = fuse_fs_mod.IO_CHUNK
+        handler = _FakeHandlerFile(self.ORIGINAL, write_replies={1: _reply(-1, 221)})
+        bridge = _fake_write_bridge(fuse_fs_mod, handler)
+        data = _pattern(2 * chunk)
+        result = bridge.write_handle_at(self.FH_ADDR, len(self.ORIGINAL) + 100, data)
+
+        assert result == (-1, 221)
+        assert handler.set_sizes == [len(self.ORIGINAL)]
+        sent = [name for name, _, _ in bridge.launcher.method_calls]
+        assert sent[-2:] == ["send_set_file_size", "send_seek_handle"]
+        assert bridge.launcher.send_seek_handle.call_args.args[1:] == (
+            self.FH_ADDR, 0, fuse_fs_mod.OFFSET_BEGINNING)
+        assert handler.pos == 0
+
     def test_short_chunk_ends_write(self, fuse_mock):
         """A chunk the handler writes short ends the write with the count so far."""
         import amifuse.fuse_fs as fuse_fs_mod
