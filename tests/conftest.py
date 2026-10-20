@@ -107,6 +107,12 @@ def fuse_mock(monkeypatch):
         def __str__(self):
             return f"----rwed" if self._bits == 0 else f"p={self._bits}"
 
+        def to_host_mode(self):
+            # Owner bits only. As in amitools, R, W and E are active low
+            # (FIBF_READ 8, FIBF_WRITE 4, FIBF_EXECUTE 2): 0 is rwx.
+            return sum(mode for bit, mode in ((8, 0o400), (4, 0o200), (2, 0o100))
+                       if not self._bits & bit)
+
     _stub_module("amitools.vamos.lib")
     _stub_module("amitools.vamos.lib.dos")
     _stub_module("amitools.vamos.lib.dos.DosProtection", DosProtection=_FakeDosProtection)
