@@ -162,6 +162,25 @@ def test_delete_deferred_after_a_rename_runs_at_the_last_release(ops):
     assert not ops._pending_deletes
 
 
+def test_delete_deferred_before_a_directory_rename_follows_it(ops):
+    """The delete runs under the new path, and a file created later under
+    the old one survives its release().
+    """
+    ops.mkdir("/d", 0o755)
+    _write_file(ops, "/d/x", 3000)
+    fh = ops.open("/d/x", os.O_RDWR)
+    assert ops.unlink("/d/x") == 0  # in use: deferred to release()
+    ops.rename("/d", "/e")
+    ops.release("/d/x", fh)
+    assert ops.bridge.stat_path("/e/x") is None
+    assert not ops._pending_deletes
+
+    ops.mkdir("/d", 0o755)
+    _write_file(ops, "/d/x", 100)
+    assert ops.bridge.stat_path("/d/x")["size"] == 100
+    assert ops.getattr("/d/x")["st_size"] == 100
+
+
 def test_exclusive_handle_reports_written_size(ops):
     """FINDOUTPUT handles hide the file from the handler until release()."""
     _write_file(ops, "/f.bin", 3000)
