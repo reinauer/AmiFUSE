@@ -126,7 +126,12 @@ class SeekResult(Enum):
 # The most bytes one ACTION_READ or ACTION_WRITE carries. Larger reads and
 # writes go out in packets of this size, so that the buffer in emulated
 # memory stays small and each packet is a short piece of work for the
-# handler.
+# handler. Another size must still fit two limits:
+# - The buffer is FUSE_READBUF, which grows to the largest packet and stays
+#   for the life of the mount, out of 8 MiB of emulated memory.
+# - The handler's work on one packet, on OFS about 16.3 million cycles per
+#   MiB written and 9.8 million per MiB read, must end within the reply wait
+#   of _run_until_replies.
 IO_CHUNK = 64 * 1024
 
 # The size of the host-side buffer of zeros that fills the gap before a
@@ -2084,6 +2089,12 @@ class HandlerBridge:
         any packet (dp_Res1 is -1), claims more bytes than were asked for,
         or does not reply in time, so that a damaged file cannot pass for a
         short one.
+
+        One call holds the bridge lock for the whole read, so the other
+        callbacks, which a read-only mount runs on threads of their own,
+        wait for it: about 0.2 s per MiB on OFS. Every packet's bytes stay
+        in host memory until the read ends, and joining them briefly takes
+        twice that.
         """
         with self._lock:
             parts = []
@@ -2168,6 +2179,12 @@ class HandlerBridge:
         another handle, since FastFileSystem stops a shrink only at another
         handle past the new end, and every other handle is at or below the
         old end.
+
+        One call holds the bridge lock for the whole write, about 0.4 s per
+        MiB on OFS, and a writable mount serves one request at a time, so
+        every other callback waits for it. The caller's data stays in host
+        memory until the write ends, and each packet copies at most
+        IO_CHUNK bytes of it.
         """
         with self._lock:
             if len(data) <= IO_CHUNK:
