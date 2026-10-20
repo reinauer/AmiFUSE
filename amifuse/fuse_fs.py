@@ -127,6 +127,11 @@ class SeekResult(Enum):
 # so a large gap needs no more memory than an ordinary write.
 ZERO_FILL_CHUNK = 64 * 1024
 
+# The most bytes one ACTION_READ carries. Larger reads go out in packets of
+# this size, so that the buffer in emulated memory stays small and each
+# packet is a short piece of work for the handler.
+IO_CHUNK = 64 * 1024
+
 # AmigaDOS error codes from a failed ACTION_WRITE that have a closer errno
 # than EIO.
 ERROR_DISK_WRITE_PROTECTED = 214
@@ -2045,24 +2050,33 @@ class HandlerBridge:
     def read_handle(self, fh_addr: int, size: int) -> Optional[bytes]:
         """Read up to size bytes from the handle's current position.
 
-        Returns b"" at end of file, and None when the handler fails the read
-        (dp_Res1 is -1), claims more bytes than were asked for, or does not
-        reply in time, so that a damaged file cannot pass for a short one.
+        The read goes out as ACTION_READ packets of at most IO_CHUNK bytes,
+        one after another, and ends at the first short one, which is end of
+        file. Returns b"" at end of file, and None when the handler fails
+        any packet (dp_Res1 is -1), claims more bytes than were asked for,
+        or does not reply in time, so that a damaged file cannot pass for a
+        short one.
         """
         with self._lock:
-            buf_mem = self._alloc_read_buf(size)
-            pkt_addr, _ = self.launcher.send_read_handle(
-                self.state, fh_addr, buf_mem.addr, size)
-            reply = self._run_until_reply(pkt_addr, "read")
-            if reply is None:
-                return None
-            res1 = reply[0]
-            # More than size would mean the handler wrote past the buffer.
-            if res1 < 0 or res1 > size:
-                return None
-            if res1 == 0:
-                return b""
-            return bytes(self.mem.r_block(buf_mem.addr, res1))
+            parts = []
+            while size > 0:
+                n = min(size, IO_CHUNK)
+                buf_mem = self._alloc_read_buf(n)
+                pkt_addr, _ = self.launcher.send_read_handle(
+                    self.state, fh_addr, buf_mem.addr, n)
+                reply = self._run_until_reply(pkt_addr, "read")
+                if reply is None:
+                    return None
+                res1 = reply[0]
+                # More than n would mean the handler wrote past the buffer.
+                if res1 < 0 or res1 > n:
+                    return None
+                if res1:
+                    parts.append(bytes(self.mem.r_block(buf_mem.addr, res1)))
+                if res1 < n:
+                    break
+                size -= n
+            return b"".join(parts)
 
 
     def read_handle_at(self, fh_addr: int, offset: int, size: int) -> Optional[bytes]:
