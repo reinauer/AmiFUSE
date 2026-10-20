@@ -20,7 +20,7 @@ import time
 
 from enum import Enum
 from pathlib import Path
-from typing import Dict, List, NamedTuple, Optional, Set, Tuple
+from typing import Dict, List, NamedTuple, Optional, Sequence, Set, Tuple
 
 from .platform import kill_mount_owner_processes
 
@@ -94,6 +94,7 @@ __banner__ = f"amifuse {__version__} - Copyright (C) 2025-2026 by Stefan Reinaue
 # these justify a negative-cache entry: transient failures such as
 # ERROR_OBJECT_IN_USE (202) must not make an existing file report ENOENT
 # for the cache TTL.
+ERROR_OBJECT_IN_USE = 202
 ERROR_DIR_NOT_FOUND = 204
 ERROR_OBJECT_NOT_FOUND = 205
 _NOT_FOUND_ERRORS = frozenset({ERROR_DIR_NOT_FOUND, ERROR_OBJECT_NOT_FOUND})
@@ -2316,7 +2317,8 @@ class HandlerBridge:
                 self._shrink_back(fh_addr, end)
             return written, res2
 
-    def truncate_handle(self, fh_addr: int, length: int) -> Tuple[int, int]:
+    def truncate_handle(self, fh_addr: int, length: int,
+                        others: Sequence[int] = ()) -> Tuple[int, int]:
         """Make the file length bytes long, as POSIX ftruncate() does.
 
         Returns (new size, 0), or (-1, error) when the change fails: a
@@ -2330,8 +2332,9 @@ class HandlerBridge:
         hold them. ACTION_SET_FILE_SIZE would add the range in one packet,
         but AmigaDOS does not define its bytes, and FFS, OFS, pfs3aio and
         SFS leave whatever the new blocks held before, such as a deleted
-        file's data. A shrink, or a truncate to the current size, is one
-        ACTION_SET_FILE_SIZE.
+        file's data. A shrink is one ACTION_SET_FILE_SIZE. A truncate to
+        the measured end of file sends none: BFFS refuses every
+        ACTION_SET_FILE_SIZE, even one that would change nothing.
 
         The end of file tells a grow from a shrink; a seek to the length
         cannot. BFFS built with ALLOW_SPARSE_FILES accepts a seek past end
@@ -2340,6 +2343,16 @@ class HandlerBridge:
         write_handle_at: pfs3aio refuses the seek to the end of a file of
         2 GiB or more, SFS answers it with an end dp_Res1 cannot carry,
         and AROS afs can fail the seek to the end of a damaged file.
+
+        SetFileSize() leaves no other handle on the file past its new end.
+        FFS stops a shrink at such a handle and replies with the size it
+        reached, and SFS refuses it with ERROR_OBJECT_IN_USE. After either
+        reply, each handle in others moves to the start of its file and
+        the shrink is sent once more. A shrink that gets no reply is not
+        sent again: the handler may still hold its packet, and more
+        packets would reuse its memory sooner. For the same reason the
+        moves end at the first seek that fails, and the shrink is then not
+        sent again. The size returned can still differ from length.
         """
         # A fill past 0x7FFFFFFF would leave a file no seek can reach the
         # end of, and ACTION_SET_FILE_SIZE carries the size in a LONG.
@@ -2350,6 +2363,9 @@ class HandlerBridge:
             grow = False
             if length:
                 end = self._handle_end(fh_addr)
+                if end == length:
+                    # Nothing to change, and BFFS would refuse the packet.
+                    return length, 0
                 if end is not None:
                     grow = length > end
                 else:
@@ -2363,6 +2379,20 @@ class HandlerBridge:
                 written, res2 = self._write_past_end(fh_addr, length, b"")
                 return (length, 0) if written >= 0 else (-1, res2)
             size, res2 = self.set_handle_size_reply(fh_addr, length)
+            # Send it again only after a reply that shows the stop: a size
+            # past length, as from FFS, or ERROR_OBJECT_IN_USE (202) from
+            # SFS. Any other refusal, such as BFFS's DOSFALSE, is not about
+            # other handles, and with no reply the handler may still hold
+            # the packet.
+            if others and (size > length
+                           or (size < 0 and res2 == ERROR_OBJECT_IN_USE)):
+                # A seek to 0 is not expected to be refused, so one that
+                # fails may have had no reply and still be with the handler.
+                # all() stops at it, and the shrink is not sent again: the
+                # first reply stands, and truncate() fails with EIO.
+                if all(self.seek_handle(other, 0)[0] is SeekResult.OK
+                       for other in others):
+                    size, res2 = self.set_handle_size_reply(fh_addr, length)
             return (size, 0) if size >= 0 else (-1, res2)
 
     def set_handle_size(self, fh_addr: int, size: int, mode: int = OFFSET_BEGINNING) -> int:
@@ -3205,29 +3235,55 @@ class AmigaFuseFS(_FuseOperations):
         try:
             with self._fh_lock:
                 entry = self._fh_cache.get(fh)
+                # Every other open file handle on the volume, on any file:
+                # handlers match names case-insensitively, so an entry's
+                # path does not tell which handles share its file.
+                # Directory and icon handles have no fh_addr. A handle past
+                # 0x7FFFFFFF is left alone: no seek can return it there, so
+                # its next read would fail.
+                others = [e for h, e in self._fh_cache.items()
+                          if h != fh and "fh_addr" in e and not e.get("closed")
+                          and (e["pos"] or 0) <= _LONG_MAX]
             if entry is None:
                 raise FuseOSError(errno.EIO)
             fh_addr = entry["fh_addr"]
             with entry["lock"]:
                 if entry.get("closed"):
                     raise FuseOSError(errno.EIO)
-                size, res2 = self.bridge.truncate_handle(fh_addr, length)
+                # A shrink that stops short or is refused as in use moves
+                # the other handles and is sent again. Every read and write
+                # carries its offset, so the handler's position for another
+                # handle is only a cache.
+                size, res2 = self.bridge.truncate_handle(
+                    fh_addr, length, [e["fh_addr"] for e in others])
                 # truncate_handle moves the handle, and handlers differ in
                 # where a size change leaves it, so the next read or write
-                # seeks.
+                # seeks. The retry moves the others, and a pfs3aio shrink
+                # moves any past the new end to it, so they seek too. A
+                # writable mount serves one request at a time, so no other
+                # callback is using them.
                 entry["pos"] = None
+                for other in others:
+                    other["pos"] = None
                 if size < 0:
                     raise FuseOSError(_WRITE_ERRNOS.get(res2, errno.EIO))
                 entry["dirty"] = True  # Truncate modifies the file
             # A pinned size is all getattr reports until release, and
             # write() only ever raises it. Left stale, it would place the
             # next O_APPEND write past the new end of file. The pin is under
-            # the handle's path.
+            # the handle's path. A shrink that stopped short left the file at
+            # size. A smaller size means the handler changed nothing: BFFS
+            # replies 0 to every ACTION_SET_FILE_SIZE.
             path = _handle_path(entry, path)
-            if path in self._pinned_stats:
+            if path in self._pinned_stats and size >= length:
                 with self._cache_lock:
                     if path in self._stat_cache:
-                        self._pin_stat(path, length)
+                        self._pin_stat(path, size)
+            # Still short of length after any retry, or not changed at all.
+            # EIO is also what SmartFilesystem's refusal of such a shrink
+            # gives.
+            if size != length:
+                raise FuseOSError(errno.EIO)
         finally:
             if temp_handle:
                 self.release(path, fh)

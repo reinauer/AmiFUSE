@@ -1932,6 +1932,14 @@ class _FakeHandlerFile:
     set, answer every seek, write or size change instead, and
     seek_mode_reply, a (mode, reply) pair, answers every seek from that
     mode. Each send returns the packet address its reply carries.
+
+    others maps the address of each other handle on the file to its
+    position. Any address not in it is the handle at pos, which makes every
+    truncate. A shrink stops at the furthest other handle past the new end
+    and replies with the size it reached, as FFS does, and the handle at
+    pos ends at that size. With moves_others set, it shrinks fully and
+    moves those handles to the new end, as pfs3aio does. A shrink also
+    stops at stop_at, which stands in for a handle the mount cannot move.
     """
 
     STALE = b"\xa5"
@@ -1942,12 +1950,16 @@ class _FakeHandlerFile:
                  write_replies=None):
         self.data = bytearray(data)
         self.pos = 0
+        self.others = {}
+        self.moves_others = False
         self.capacity = capacity
         self.seek_reply = seek_reply
         self.set_size_reply = set_size_reply
         self.seek_past_end = seek_past_end
         self.seek_mode_reply = seek_mode_reply
         self.write_reply = write_reply
+        self.stop_at = 0
+        self.seeks = []  # (address, offset, mode) of every ACTION_SEEK
         self.writes = []  # length of every ACTION_WRITE
         self.set_sizes = []  # size of every ACTION_SET_FILE_SIZE
         # The number of an ACTION_READ or ACTION_WRITE, counted from 0,
@@ -1957,6 +1969,15 @@ class _FakeHandlerFile:
         self.reads = []  # length of every ACTION_READ
         self.buf = b""
         self.reply = NO_REPLY
+
+    def _pos(self, fh_addr):
+        return self.others.get(fh_addr, self.pos)
+
+    def _move(self, fh_addr, pos):
+        if fh_addr in self.others:
+            self.others[fh_addr] = pos
+        else:
+            self.pos = pos
 
     def w_block(self, addr, data):
         self.buf = bytes(data)
@@ -1969,23 +1990,26 @@ class _FakeHandlerFile:
         if len(self.reads) in self.read_replies:
             self.reply = self.read_replies[len(self.reads)]
         else:
-            self.buf = bytes(self.data[self.pos:self.pos + size])
-            self.pos += len(self.buf)
+            pos = self._pos(fh_addr)
+            self.buf = bytes(self.data[pos:pos + size])
+            self._move(fh_addr, pos + len(self.buf))
             self.reply = _reply(len(self.buf))
         self.reads.append(size)
         return PKT, 0
 
     def seek(self, state, fh_addr, offset, mode):
+        self.seeks.append((fh_addr, offset, mode))
+        pos = self._pos(fh_addr)
         # OFFSET_BEGINNING, OFFSET_CURRENT, OFFSET_END
-        base = {-1: 0, 0: self.pos, 1: len(self.data)}[mode]
+        base = {-1: 0, 0: pos, 1: len(self.data)}[mode]
         if self.seek_reply is not None:
             self.reply = self.seek_reply
         elif self.seek_mode_reply and self.seek_mode_reply[0] == mode:
             self.reply = self.seek_mode_reply[1]
         elif 0 <= base + offset <= len(self.data) or (
                 self.seek_past_end and base + offset >= 0):
-            self.reply = _reply(self.pos)
-            self.pos = base + offset
+            self.reply = _reply(pos)
+            self._move(fh_addr, base + offset)
         else:
             self.reply = _reply(-1, 219)
         return PKT, 0
@@ -1996,13 +2020,14 @@ class _FakeHandlerFile:
             self.writes.append(size)
             return PKT, 0
         self.writes.append(size)
+        pos = self._pos(fh_addr)
         if self.write_reply is not None:
             self.reply = self.write_reply
-        elif self.pos + size > self.capacity:
+        elif pos + size > self.capacity:
             self.reply = _reply(-1, 221)
         else:
-            self.data[self.pos:self.pos + size] = self.buf[:size]
-            self.pos += size
+            self.data[pos:pos + size] = self.buf[:size]
+            self._move(fh_addr, pos + size)
             self.reply = _reply(size)
         return PKT, 0
 
@@ -2011,10 +2036,17 @@ class _FakeHandlerFile:
         if self.set_size_reply is not None:
             self.reply = self.set_size_reply
         else:
-            if size < len(self.data):
+            shrink = size < len(self.data)
+            stops = [min(self.stop_at, len(self.data))]
+            if not self.moves_others:
+                stops += self.others.values()
+            size = max(size, *stops)
+            if shrink:
                 self.pos = size
             del self.data[size:]
             self.data += self.STALE * (size - len(self.data))
+            for other, pos in self.others.items():
+                self.others[other] = min(pos, size)
             self.reply = _reply(size)
         return PKT, 0
 
@@ -2958,7 +2990,8 @@ class TestFuseTruncateLength:
         fs, bridge = write_fs
         bridge.open_file.return_value = (self.FH_ADDR, 0)
         # The handler reaches every length it is sent.
-        bridge.truncate_handle.side_effect = lambda fh_addr, length: (length, 0)
+        bridge.truncate_handle.side_effect = (
+            lambda fh_addr, length, others=(): (length, 0))
         return fs, bridge
 
     @pytest.mark.parametrize("length", [0x80000000, 1 << 32, (1 << 32) + 4])
@@ -3027,7 +3060,7 @@ class TestFuseTruncateLength:
         fs, bridge = writable
         handle = fs.open("/file", os.O_WRONLY) if use_handle else None
         assert fs.truncate("/file", 0x7FFFFFFF, handle) == 0
-        bridge.truncate_handle.assert_called_once_with(self.FH_ADDR, 0x7FFFFFFF)
+        bridge.truncate_handle.assert_called_once_with(self.FH_ADDR, 0x7FFFFFFF, [])
 
     def test_read_only_mount_raises_erofs_first(self, fs_with_mock_bridge):
         """A read-only mount reports EROFS whatever the length."""
@@ -3069,8 +3102,7 @@ class TestHandlerBridgeTruncate:
         sizes = [c.args[0] for c in bridge._alloc_read_buf.call_args_list]
         assert max(sizes) == chunk
 
-    @pytest.mark.parametrize("length", [0, 4, 10],
-                             ids=["empty", "shrink", "same-size"])
+    @pytest.mark.parametrize("length", [0, 4], ids=["empty", "shrink"])
     def test_shrink_sends_set_file_size(self, fuse_mock, length):
         import amifuse.fuse_fs as fuse_fs_mod
 
@@ -3080,6 +3112,18 @@ class TestHandlerBridgeTruncate:
         assert bridge.truncate_handle(self.FH_ADDR, length) == (length, 0)
         assert handler.data == self.ORIGINAL[:length]
         assert handler.set_sizes == [length]
+        assert handler.writes == []
+
+    def test_same_size_sends_nothing(self, fuse_mock):
+        """A file already length bytes long needs no ACTION_SET_FILE_SIZE."""
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        handler = _FakeHandlerFile(self.ORIGINAL)
+        bridge = _fake_write_bridge(fuse_fs_mod, handler)
+
+        assert bridge.truncate_handle(self.FH_ADDR, 10) == (10, 0)
+        assert handler.data == self.ORIGINAL
+        assert handler.set_sizes == []
         assert handler.writes == []
 
     # The file ends 10 bytes into a 512-byte block, so 502 more bytes fit
@@ -3371,6 +3415,330 @@ class TestFuseTruncateGrow:
         assert fs.truncate("/file", 4, handle) == 0
         assert fs.write("/file", b"Z", 2, handle) == 1
         assert handler.data == b"01Z3"
+
+
+class TestFuseTruncateWithOtherHandles:
+    """AmigaFuseFS.truncate ends the file at length while other handles
+    are open.
+
+    SetFileSize() leaves no other handle on the file past its new end:
+    FastFileSystem stops a shrink at such a handle and replies with the
+    size it reached, and SmartFilesystem refuses it as in use. After either
+    reply the mount moves its other handles to the start of their files
+    and sends the shrink once more, and every other handle not past 2 GiB
+    seeks on its next read or write.
+    """
+
+    CONTENT = bytes(range(256)) * 12  # 3072 bytes
+    FH_ADDR = 0x3000  # what every open but _open_other's returns
+    OTHER = 0x3100
+    BIG = 0x3200
+
+    def _open_other(self, fs, handler, pos, flags=os.O_RDONLY,
+                    fh_addr=OTHER, path="/file"):
+        """Open another handle on the file, left at pos as by a read."""
+        fs.bridge.open_file.return_value = (fh_addr, 0)
+        handle = fs.open(path, flags)
+        fs.bridge.open_file.return_value = (self.FH_ADDR, 0)
+        handler.others[fh_addr] = pos
+        fs._fh_cache[handle]["pos"] = pos
+        return handle
+
+    @pytest.mark.parametrize("use_handle", [False, True], ids=["path", "handle"])
+    def test_shrink_stopped_by_other_handle_is_retried(self, fuse_mock,
+                                                       use_handle):
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        handler = _FakeHandlerFile(self.CONTENT)
+        fs = _fake_write_fs(fuse_fs_mod, handler)
+        other = self._open_other(fs, handler, 2000)
+        handle = fs.open("/file", os.O_RDWR) if use_handle else None
+
+        assert fs.truncate("/file", 100, handle) == 0
+        assert handler.set_sizes == [100, 100]
+        assert handler.data == self.CONTENT[:100]
+        # The retry moved the other handle, so its next read seeks.
+        assert handler.others[self.OTHER] == 0
+        assert fs._fh_cache[other]["pos"] is None
+
+    def test_reader_at_end_of_file_is_moved(self, fuse_mock):
+        """read() forgets its position at end of file, so a reader that
+        read the whole file has none cached, yet it stops a shrink."""
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        handler = _FakeHandlerFile(self.CONTENT)
+        fs = _fake_write_fs(fuse_fs_mod, handler)
+        reader = self._open_other(fs, handler, 3072)
+        fs._fh_cache[reader]["pos"] = None
+
+        assert fs.truncate("/file", 100) == 0
+        assert handler.set_sizes == [100, 100]
+        assert handler.others[self.OTHER] == 0
+        assert handler.data == self.CONTENT[:100]
+
+    def test_every_handle_past_the_new_end_is_moved(self, fuse_mock):
+        """Moving only one of two handles past the new end would leave the
+        second shrink stopped at the other."""
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        handler = _FakeHandlerFile(self.CONTENT)
+        fs = _fake_write_fs(fuse_fs_mod, handler)
+        others = [self.OTHER, self.OTHER + 1]
+        self._open_other(fs, handler, 2000, fh_addr=others[0])
+        self._open_other(fs, handler, 3000, fh_addr=others[1])
+
+        assert fs.truncate("/file", 100) == 0
+        assert handler.set_sizes == [100, 100]
+        assert [handler.others[a] for a in others] == [0, 0]
+        assert handler.data == self.CONTENT[:100]
+
+    @pytest.mark.parametrize("other_open", [False, True],
+                             ids=["no-other-handle", "other-handle"])
+    def test_shrink_still_short_is_eio(self, fuse_mock, other_open):
+        """The shrink is sent again only when there is a handle to move."""
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        handler = _FakeHandlerFile(self.CONTENT)
+        handler.stop_at = 2000
+        fs = _fake_write_fs(fuse_fs_mod, handler)
+        if other_open:
+            self._open_other(fs, handler, 2000)
+
+        with pytest.raises(fuse_fs_mod.FuseOSError) as exc_info:
+            fs.truncate("/file", 100)
+        assert exc_info.value.args[0] == errno.EIO
+        assert handler.set_sizes == ([100, 100] if other_open else [100])
+        assert handler.data == self.CONTENT[:2000]
+
+    @pytest.mark.parametrize("refusal, retried, expected", [
+        (_reply(-1, 202), True, errno.EIO),
+        (_reply(-1, 214), False, errno.EROFS),
+        (_reply(-1, 225), False, errno.EIO),
+        # BFFS's DOSFALSE; 205 is ERROR_OBJECT_NOT_FOUND.
+        (_reply(0, 205), False, errno.EIO),
+        (NO_REPLY, False, errno.EIO),
+    ], ids=["in-use", "write-protected", "other", "dosfalse", "no-reply"])
+    def test_only_a_reply_that_shows_the_stop_is_retried(
+            self, fuse_mock, refusal, retried, expected):
+        """SmartFilesystem refuses a shrink past another handle with
+        ERROR_OBJECT_IN_USE (202), so the shrink is sent again. Any other
+        refusal is not about other handles, and a shrink with no reply may
+        still be with the handler, so neither moves a handle."""
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        handler = _FakeHandlerFile(self.CONTENT, set_size_reply=refusal)
+        fs = _fake_write_fs(fuse_fs_mod, handler)
+        other = self._open_other(fs, handler, 2000)
+
+        with pytest.raises(fuse_fs_mod.FuseOSError) as exc_info:
+            fs.truncate("/file", 100)
+        assert exc_info.value.args[0] == expected
+        assert handler.set_sizes == ([100, 100] if retried else [100])
+        moved = [s for s in handler.seeks if s[0] == self.OTHER]
+        assert moved == ([(self.OTHER, 0, fuse_fs_mod.OFFSET_BEGINNING)]
+                         if retried else [])
+        # A failed truncate still leaves the other handle to seek, so a
+        # write at its old offset lands there, also after the retry moved it.
+        assert fs.write("/file", b"xy", 2000, other) == 2
+        assert handler.data[2000:2002] == b"xy"
+
+    def test_unanswered_shrink_with_seven_others_is_sent_once(self, fuse_mock):
+        """The bridge builds packets in a ring of eight, so seven seeks and
+        a second shrink would rebuild the unanswered shrink's packet while
+        the handler may still hold it."""
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        handler = _FakeHandlerFile(self.CONTENT, set_size_reply=NO_REPLY)
+        fs = _fake_write_fs(fuse_fs_mod, handler)
+        others = [self.OTHER + i for i in range(7)]
+        for fh_addr in others:
+            self._open_other(fs, handler, 2000, fh_addr=fh_addr)
+
+        with pytest.raises(fuse_fs_mod.FuseOSError) as exc_info:
+            fs.truncate("/file", 100)
+        assert exc_info.value.args[0] == errno.EIO
+        assert handler.set_sizes == [100]
+        assert [s for s in handler.seeks if s[0] in others] == []
+
+    def test_unanswered_seek_in_retry_stops_sending(self, fuse_mock):
+        """A seek in the retry that gets no reply may still be with the
+        handler. With nine other handles, eight more seeks and the second
+        shrink would follow it, and the eighth would rebuild its packet in
+        the bridge's ring of eight, so nothing more is sent."""
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        handler = _FakeHandlerFile(self.CONTENT)
+        fs = _fake_write_fs(fuse_fs_mod, handler)
+        others = [self.OTHER + i for i in range(9)]
+        for fh_addr in others:
+            self._open_other(fs, handler, 2000, fh_addr=fh_addr)
+        seek = handler.seek
+
+        def seek_unanswered(state, fh_addr, offset, mode):
+            packet = seek(state, fh_addr, offset, mode)
+            if fh_addr == others[0]:
+                handler.reply = NO_REPLY
+            return packet
+
+        fs.bridge.launcher.send_seek_handle.side_effect = seek_unanswered
+
+        with pytest.raises(fuse_fs_mod.FuseOSError) as exc_info:
+            fs.truncate("/file", 100)
+        assert exc_info.value.args[0] == errno.EIO
+        assert handler.set_sizes == [100]
+        assert [s for s in handler.seeks if s[0] in others] == [
+            (others[0], 0, fuse_fs_mod.OFFSET_BEGINNING)]
+        # The file ends where the first shrink stopped.
+        assert handler.data == self.CONTENT[:2000]
+
+    def test_failed_grow_moves_nothing(self, fuse_mock):
+        """Another handle can stop only a shrink, so a grow that fails is
+        not tried again."""
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        handler = _FakeHandlerFile(self.CONTENT)
+        fs = _fake_write_fs(fuse_fs_mod, handler, free_blocks=1)
+        self._open_other(fs, handler, 2000)
+
+        with pytest.raises(fuse_fs_mod.FuseOSError) as exc_info:
+            fs.truncate("/file", 8192)
+        assert exc_info.value.args[0] == errno.ENOSPC
+        assert [s for s in handler.seeks if s[0] == self.OTHER] == []
+        assert handler.data == self.CONTENT
+
+    def test_handle_past_long_max_is_left_alone(self, fuse_mock):
+        """A seek offset is a signed LONG, so a reader past 0x7FFFFFFF in a
+        file of 2 GiB or more could not seek back to where it reads next.
+        A truncate neither moves it nor makes it forget its position."""
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        handler = _FakeHandlerFile(self.CONTENT)
+        fs = _fake_write_fs(fuse_fs_mod, handler)
+        self._open_other(fs, handler, 2000)
+        # The fake holds one file, so the big file's reader sits at 0 in it.
+        big = self._open_other(fs, handler, 0, fh_addr=self.BIG,
+                               path="/big.hdf")
+        fs._fh_cache[big]["pos"] = 0x80000000
+
+        assert fs.truncate("/file", 100) == 0
+        assert handler.data == self.CONTENT[:100]
+        assert [s for s in handler.seeks if s[0] == self.BIG] == []
+        assert fs._fh_cache[big]["pos"] == 0x80000000
+
+    def test_handle_at_long_max_forgets_its_position(self, fuse_mock):
+        """A seek can return a handle at 0x7FFFFFFF there, so it forgets
+        its position like any other: pfs3aio moves it to the new end."""
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        handler = _FakeHandlerFile(self.CONTENT)
+        handler.moves_others = True
+        fs = _fake_write_fs(fuse_fs_mod, handler)
+        other = self._open_other(fs, handler, 0x7FFFFFFF)
+
+        assert fs.truncate("/file", 100) == 0
+        assert handler.others[self.OTHER] == 100
+        assert fs._fh_cache[other]["pos"] is None
+
+    @pytest.mark.parametrize("use_handle", [False, True], ids=["path", "handle"])
+    def test_only_other_file_handles_move(self, fuse_mock, use_handle):
+        """The retry moves neither the truncating handle nor a directory or
+        icon handle, which have no handler handle to move."""
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        handler = _FakeHandlerFile(self.CONTENT)
+        fs = _fake_write_fs(fuse_fs_mod, handler)
+        directory = fs.opendir("/")
+        dir_entry = dict(fs._fh_cache[directory])
+        # A virtual Icon\r handle, as a mount with --icons serves on macOS.
+        fs._icons_enabled = True
+        fs._icon_handler = MagicMock(**{"is_icon_file.return_value": True})
+        fs._has_valid_icon = MagicMock(return_value=True)
+        icon = fs.open("/Icon\r", os.O_RDONLY)
+        fs._icons_enabled, fs._icon_handler = False, None
+        icon_entry = dict(fs._fh_cache[icon])
+        self._open_other(fs, handler, 2000)
+        handle = fs.open("/file", os.O_RDWR) if use_handle else None
+
+        assert fs.truncate("/file", 100, handle) == 0
+        # The truncating handle only measures the end of file.
+        assert handler.seeks == [
+            (self.FH_ADDR, 0, fuse_fs_mod.OFFSET_END),
+            (self.FH_ADDR, 0, fuse_fs_mod.OFFSET_CURRENT),
+            (self.OTHER, 0, fuse_fs_mod.OFFSET_BEGINNING),
+        ]
+        assert fs._fh_cache[directory] == dir_entry
+        assert fs._fh_cache[icon] == icon_entry
+
+    def test_shrink_makes_other_handles_seek(self, fuse_mock):
+        """pfs3aio moves a handle past the new end of file to it, so a
+        write at the position cached before the shrink must seek."""
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        handler = _FakeHandlerFile(self.CONTENT)
+        handler.moves_others = True
+        fs = _fake_write_fs(fuse_fs_mod, handler)
+        other = self._open_other(fs, handler, 0, os.O_RDWR)
+        assert fs.write("/file", b"ab", 2000, other) == 2
+        handle = fs.open("/file", os.O_RDWR)
+        handler.seeks.clear()
+
+        # An overwrite: ftruncate to 0, then the new data.
+        assert fs.truncate("/file", 0, handle) == 0
+        # The shrink reached its length, so it is not sent again and the
+        # other handle is not moved; it only forgets its position.
+        assert handler.set_sizes == [0]
+        assert [s for s in handler.seeks if s[0] == self.OTHER] == []
+        assert fs.write("/file", b"NEW", 0, handle) == 3
+        assert fs.write("/file", b"cd", 2002, other) == 2
+        assert handler.data == b"NEW" + bytes(1999) + b"cd"
+
+    def test_cached_size_is_the_size_reached(self, fuse_mock):
+        """ftruncate() on a file created in this session: getattr reports
+        the size a shrink stopped short at, which is the size it now has."""
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        handler = _FakeHandlerFile(b"")
+        fs = _fake_write_fs(fuse_fs_mod, handler)
+        handle = fs.create("/new", 0o644)
+        assert fs.write("/new", self.CONTENT, 0, handle) == 3072
+        handler.stop_at = 2000
+
+        with pytest.raises(fuse_fs_mod.FuseOSError) as exc_info:
+            fs.truncate("/new", 100, handle)
+        assert exc_info.value.args[0] == errno.EIO
+        assert fs.getattr("/new")["st_size"] == 2000
+
+    def test_unchanged_file_keeps_cached_size(self, fuse_mock):
+        """BFFS replies DOSFALSE to every ACTION_SET_FILE_SIZE and leaves
+        the file as it was, so getattr keeps the size it has."""
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        # 205 is ERROR_OBJECT_NOT_FOUND.
+        handler = _FakeHandlerFile(b"", set_size_reply=_reply(0, 205))
+        fs = _fake_write_fs(fuse_fs_mod, handler)
+        handle = fs.create("/new", 0o644)
+        assert fs.write("/new", self.CONTENT, 0, handle) == 3072
+
+        with pytest.raises(fuse_fs_mod.FuseOSError) as exc_info:
+            fs.truncate("/new", 100, handle)
+        assert exc_info.value.args[0] == errno.EIO
+        assert fs.getattr("/new")["st_size"] == 3072
+
+    @pytest.mark.parametrize("use_handle", [False, True], ids=["path", "handle"])
+    def test_truncate_to_current_size_sends_nothing(self, fuse_mock,
+                                                    use_handle):
+        """BFFS refuses every ACTION_SET_FILE_SIZE, so a truncate that
+        changes nothing succeeds without one."""
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        # 205 is ERROR_OBJECT_NOT_FOUND.
+        handler = _FakeHandlerFile(self.CONTENT, set_size_reply=_reply(0, 205))
+        fs = _fake_write_fs(fuse_fs_mod, handler)
+        handle = fs.open("/file", os.O_RDWR) if use_handle else None
+
+        assert fs.truncate("/file", 3072, handle) == 0
+        assert handler.set_sizes == []
+        assert handler.data == self.CONTENT
 
 
 class TestHandlerBridgeBstrRing:

@@ -430,3 +430,121 @@ class TestTruncateGrow:
         else:
             assert after == original
             assert used == info["num_blocks_used"]
+
+
+# E. Truncate while other handles are open -- 3 tests
+
+
+class TestTruncateWithOtherHandles:
+    """truncate() ends the file at length while other handles are open.
+
+    SetFileSize() leaves no other handle on the file past its new end.
+    FastFileSystem stops a shrink at such a handle and replies with the size
+    it reached, SmartFilesystem refuses the shrink, and pfs3aio makes it and
+    moves the handle to the new end. The mount moves its other handles to
+    the start of their files and sends the shrink again, and every other
+    handle seeks on its next read or write.
+    """
+
+    CONTENT = bytes(range(256)) * 12  # 3072 bytes
+
+    # By path, and as an overwrite does it: ftruncate to 0 on a new handle,
+    # then the new data. Handlers match names case-insensitively, so a
+    # reader opened as /F.BIN holds the same file.
+    @pytest.mark.parametrize("length, use_handle, reader_path", [
+        (100, False, "/f.bin"), (0, True, "/f.bin"), (100, False, "/F.BIN"),
+    ], ids=["path", "handle", "other-case"])
+    def test_shrink_past_a_reader(self, writable_volume, length, use_handle,
+                                  reader_path):
+        image, driver, _ = writable_volume
+        expected = b"NEW" if use_handle else self.CONTENT[:length]
+        bridge = _bridge(image, driver, read_only=False)
+        try:
+            ops = AmigaFuseFS(bridge)
+            handle = ops.create("/f.bin", 0o644)
+            assert ops.write("/f.bin", self.CONTENT, 0, handle) == 3072
+            ops.release("/f.bin", handle)
+            reader = ops.open(reader_path, os.O_RDONLY)
+            assert ops.read(reader_path, 2000, 0, reader) == self.CONTENT[:2000]
+            handle = ops.open("/f.bin", os.O_WRONLY) if use_handle else None
+            assert ops.truncate("/f.bin", length, handle) == 0
+            if use_handle:
+                assert ops.write("/f.bin", b"NEW", 0, handle) == 3
+                ops.release("/f.bin", handle)
+            # pfs3aio moved the reader to the new end of file, so a read
+            # that skipped its seek would return NEW.
+            assert ops.read(reader_path, 100, 2000, reader) == b""
+            ops.release(reader_path, reader)
+            assert ops.getattr("/f.bin")["st_size"] == len(expected)
+            bridge.flush_volume()
+        finally:
+            bridge.close()
+
+        bridge = _bridge(image, driver)
+        try:
+            assert bridge.read_file("/f.bin", 1 << 20, 0) == expected
+        finally:
+            bridge.close()
+
+    def test_writer_on_another_file_keeps_its_data(self, writable_volume):
+        """The retry moves the handles on other files too. A writer moved
+        part way through its file goes on at its own offset."""
+        image, driver, _ = writable_volume
+        data = bytes((i * 7) & 0xFF for i in range(5000))
+        bridge = _bridge(image, driver, read_only=False)
+        try:
+            ops = AmigaFuseFS(bridge)
+            handle = ops.create("/f.bin", 0o644)
+            assert ops.write("/f.bin", self.CONTENT, 0, handle) == 3072
+            ops.release("/f.bin", handle)
+            reader = ops.open("/f.bin", os.O_RDONLY)
+            assert ops.read("/f.bin", 2000, 0, reader) == self.CONTENT[:2000]
+            writer = ops.create("/g.bin", 0o644)
+            assert ops.write("/g.bin", data[:3000], 0, writer) == 3000
+            assert ops.truncate("/f.bin", 100) == 0
+            assert ops.write("/g.bin", data[3000:], 3000, writer) == 2000
+            ops.release("/g.bin", writer)
+            ops.release("/f.bin", reader)
+            bridge.flush_volume()
+        finally:
+            bridge.close()
+
+        bridge = _bridge(image, driver)
+        try:
+            assert bridge.read_file("/f.bin", 1 << 20, 0) == self.CONTENT[:100]
+            assert bridge.read_file("/g.bin", 1 << 20, 0) == data
+        finally:
+            bridge.close()
+
+    def test_truncate_by_path_under_a_writer(self, writable_volume, request):
+        """truncate -s 0 while a writer holds the file open at its end, as
+        logrotate's copytruncate does. The writer then goes on at its own
+        offset, as on POSIX."""
+        image, driver, _ = writable_volume
+        if driver.name == "pfs3aio":
+            request.applymarker(pytest.mark.xfail(
+                strict=True, raises=FuseOSError,
+                reason="pfs3aio will not open a file for writing while "
+                       "another handle writes it, so truncate() by path "
+                       "fails with ENOENT"))
+        bridge = _bridge(image, driver, read_only=False)
+        try:
+            ops = AmigaFuseFS(bridge)
+            handle = ops.create("/log.txt", 0o644)
+            ops.release("/log.txt", handle)
+            writer = ops.open("/log.txt", os.O_WRONLY)
+            assert ops.write("/log.txt", self.CONTENT, 0, writer) == 3072
+            assert ops.truncate("/log.txt", 0) == 0
+            # The truncate moved the writer, so this write must seek.
+            assert ops.write("/log.txt", b"more", 3072, writer) == 4
+            ops.release("/log.txt", writer)
+            bridge.flush_volume()
+        finally:
+            bridge.close()
+
+        bridge = _bridge(image, driver)
+        try:
+            after = bridge.read_file("/log.txt", 1 << 20, 0)
+        finally:
+            bridge.close()
+        assert after == bytes(3072) + b"more"
