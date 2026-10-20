@@ -1802,7 +1802,7 @@ class TestFuseReadErrors:
 
 
 class _FakeHandlerFile:
-    """One open file with the seek and write behaviour of a real handler.
+    """One open file with the seek, read and write behaviour of a real handler.
 
     ACTION_SEEK refuses to move past end of file with ERROR_SEEK_ERROR and
     leaves the handle where it was, as pfs3aio, SFS and FFS do. ACTION_WRITE
@@ -1813,7 +1813,7 @@ class _FakeHandlerFile:
     """
 
     def __init__(self, data, capacity=1 << 20, seek_reply=None,
-                 set_size_reply=None):
+                 set_size_reply=None, read_replies=None):
         self.data = bytearray(data)
         self.pos = 0
         self.capacity = capacity
@@ -1821,11 +1821,29 @@ class _FakeHandlerFile:
         self.set_size_reply = set_size_reply
         self.writes = []  # length of every ACTION_WRITE
         self.set_sizes = []  # size of every ACTION_SET_FILE_SIZE
+        # The number of an ACTION_READ, counted from 0, mapped to the reply
+        # it gets instead, without moving the handle.
+        self.read_replies = read_replies or {}
+        self.reads = []  # length of every ACTION_READ
         self.buf = b""
         self.reply = NO_REPLY
 
     def w_block(self, addr, data):
         self.buf = bytes(data)
+
+    def r_block(self, addr, size):
+        return self.buf[:size]
+
+    def read(self, state, fh_addr, addr, size):
+        """ACTION_READ reads from the handle's position up to end of file."""
+        if len(self.reads) in self.read_replies:
+            self.reply = self.read_replies[len(self.reads)]
+        else:
+            self.buf = bytes(self.data[self.pos:self.pos + size])
+            self.pos += len(self.buf)
+            self.reply = _reply(len(self.buf))
+        self.reads.append(size)
+        return PKT, 0
 
     def seek(self, state, fh_addr, offset, mode):
         # OFFSET_BEGINNING, OFFSET_CURRENT, OFFSET_END
@@ -1874,10 +1892,12 @@ def _fake_write_bridge(fuse_fs_mod, handler, free_blocks=2048):
     bridge.state = MagicMock()
     bridge.launcher = MagicMock()
     bridge.launcher.send_seek_handle.side_effect = handler.seek
+    bridge.launcher.send_read_handle.side_effect = handler.read
     bridge.launcher.send_write_handle.side_effect = handler.write
     bridge.launcher.send_set_file_size.side_effect = handler.set_size
     bridge.mem = MagicMock()
     bridge.mem.w_block.side_effect = handler.w_block
+    bridge.mem.r_block.side_effect = handler.r_block
     bridge._alloc_read_buf = MagicMock(return_value=SimpleNamespace(addr=0x2000))
     bridge._run_until_replies = MagicMock(side_effect=lambda: handler.reply)
     info = None
@@ -1886,6 +1906,144 @@ def _fake_write_bridge(fuse_fs_mod, handler, free_blocks=2048):
                 "bytes_per_block": 512}
     bridge.get_disk_info = MagicMock(return_value=info)
     return bridge
+
+
+def _pattern(size):
+    """size bytes in which word k (4 bytes, big-endian) holds k.
+
+    Any aligned 4 bytes then show which offset they came from.
+    """
+    words = (size + 3) // 4
+    return b"".join(k.to_bytes(4, "big") for k in range(words))[:size]
+
+
+class TestHandlerBridgeReadChunks:
+    """A read larger than IO_CHUNK goes out as one ACTION_READ per chunk.
+
+    A single packet for the whole request needed a buffer of that size in
+    emulated memory, which has 8 MiB, and on OFS, from about 1 MiB, kept
+    the handler working for 10 million cycles or more.
+    """
+
+    FH_ADDR = 0x3000
+
+    def test_large_read_is_split(self, fuse_mock):
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        chunk = fuse_fs_mod.IO_CHUNK
+        content = _pattern(3 * chunk)
+        handler = _FakeHandlerFile(content)
+        bridge = _fake_write_bridge(fuse_fs_mod, handler)
+
+        size = 2 * chunk + 5
+        assert bridge.read_handle(self.FH_ADDR, size) == content[:size]
+        assert handler.reads == [chunk, chunk, 5]
+        assert handler.pos == size
+        # No buffer larger than one chunk, whatever the request.
+        sizes = [c.args[0] for c in bridge._alloc_read_buf.call_args_list]
+        assert max(sizes) == chunk
+
+    @pytest.mark.parametrize("chunks, extra", [(1, 100), (2, 0), (0, 0)],
+                             ids=["short-chunk", "empty-chunk", "empty-file"])
+    def test_short_chunk_ends_read(self, fuse_mock, chunks, extra):
+        """A chunk shorter than asked for is end of file: no packet follows."""
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        chunk = fuse_fs_mod.IO_CHUNK
+        content = _pattern(chunks * chunk + extra)
+        handler = _FakeHandlerFile(content)
+        bridge = _fake_write_bridge(fuse_fs_mod, handler)
+
+        assert bridge.read_handle(self.FH_ADDR, 4 * chunk) == content
+        assert handler.reads == [chunk] * (chunks + 1)
+
+    def test_empty_read_sends_no_packet(self, fuse_mock):
+        """A read of 0 bytes returns b"" without sending a packet."""
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        handler = _FakeHandlerFile(_pattern(100))
+        bridge = _fake_write_bridge(fuse_fs_mod, handler)
+
+        assert bridge.read_handle(self.FH_ADDR, 0) == b""
+        assert handler.reads == []
+        bridge._alloc_read_buf.assert_not_called()
+
+    @pytest.mark.parametrize("reply", [READ_ERROR, NO_REPLY, "too-many"],
+                             ids=["handler-error", "no-reply", "more-than-asked"])
+    def test_failed_chunk_fails_read(self, fuse_mock, reply):
+        """A chunk that fails after another arrived fails the whole read.
+
+        Returning the bytes before it would pass a damaged file off as a
+        short one.
+        """
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        chunk = fuse_fs_mod.IO_CHUNK
+        if reply == "too-many":
+            reply = _reply(chunk + 1)
+        handler = _FakeHandlerFile(_pattern(3 * chunk), read_replies={1: reply})
+        bridge = _fake_write_bridge(fuse_fs_mod, handler)
+
+        assert bridge.read_handle(self.FH_ADDR, 3 * chunk) is None
+        assert handler.reads == [chunk, chunk]
+
+    def test_read_at_offset_seeks_once(self, fuse_mock):
+        """read_handle_at seeks once, then reads every chunk from there."""
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        chunk = fuse_fs_mod.IO_CHUNK
+        content = _pattern(3 * chunk)
+        handler = _FakeHandlerFile(content)
+        handler.pos = 3  # an earlier read left the handle inside the file
+        bridge = _fake_write_bridge(fuse_fs_mod, handler)
+
+        offset, size = 10, 2 * chunk + 5
+        assert bridge.read_handle_at(self.FH_ADDR, offset, size) == content[offset:offset + size]
+        seeks = [c.args[1:] for c in bridge.launcher.send_seek_handle.call_args_list]
+        assert seeks == [(self.FH_ADDR, offset, fuse_fs_mod.OFFSET_BEGINNING)]
+        assert handler.reads == [chunk, chunk, 5]
+
+    def _open(self, fuse_fs_mod, fs_with_mock_bridge, handler):
+        """Open /big.bin through the FUSE layer on a bridge backed by the fake."""
+        fs, bridge = fs_with_mock_bridge
+        fake = _fake_write_bridge(fuse_fs_mod, handler)
+        bridge.open_file.return_value = (self.FH_ADDR, 0)
+        bridge.read_handle = fake.read_handle
+        bridge.read_handle_at = fake.read_handle_at
+        return fs, fake, fs.open("/big.bin", os.O_RDONLY)
+
+    def test_fuse_read_larger_than_file(self, fs_with_mock_bridge):
+        """The reproduction from the bug report: one read() of 8 MiB.
+
+        It returns the whole 1.5 MiB file, and the next read continues
+        from the end without a seek.
+        """
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        content = _pattern(1536 * 1024)
+        handler = _FakeHandlerFile(content)
+        fs, fake, handle = self._open(fuse_fs_mod, fs_with_mock_bridge, handler)
+
+        assert fs.read("/big.bin", 8 << 20, 0, handle) == content
+        assert fs.read("/big.bin", 4096, len(content), handle) == b""
+        assert fake.launcher.send_seek_handle.call_count == 1
+        assert max(handler.reads) == fuse_fs_mod.IO_CHUNK
+
+    def test_fuse_read_with_failed_chunk_is_eio(self, fs_with_mock_bridge):
+        """A failed chunk fails read() with EIO, and the next read seeks."""
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        chunk = fuse_fs_mod.IO_CHUNK
+        content = _pattern(3 * chunk)
+        handler = _FakeHandlerFile(content, read_replies={1: NO_REPLY})
+        fs, fake, handle = self._open(fuse_fs_mod, fs_with_mock_bridge, handler)
+
+        with pytest.raises(fuse_fs_mod.FuseOSError) as exc_info:
+            fs.read("/big.bin", 3 * chunk, 0, handle)
+        assert exc_info.value.args[0] == errno.EIO
+        # The handle moved by the chunk that arrived; the retry seeks back.
+        assert fs.read("/big.bin", 3 * chunk, 0, handle) == content
+        assert fake.launcher.send_seek_handle.call_count == 2
 
 
 class TestHandlerBridgeWriteAt:
