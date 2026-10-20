@@ -2022,6 +2022,32 @@ class HandlerBridge:
             result, end = self.seek_handle(fh_addr, 0, OFFSET_CURRENT)
         return end if result is SeekResult.OK else None
 
+    def _handle_extent(self, fh_addr: int) -> Optional[Tuple[Optional[int], Optional[int]]]:
+        """Return (position, end of file) and leave the handle where it was.
+
+        ACTION_SEEK answers with the old position, so a seek to the end
+        reads the position and the seek back reads the end. Returns None
+        when the handle may have moved: the seek to the end failed other
+        than with ERROR_SEEK_ERROR or got no reply, or the seek back did
+        not succeed.
+
+        The end is None when it cannot be measured but the handle stayed.
+        pfs3aio refuses the seek to the end of a file of 2 GiB or more with
+        ERROR_SEEK_ERROR, which leaves the handle unmoved, and the position
+        is then None as well. SmartFilesystem answers the seek back with an
+        end that dp_Res1, a signed LONG, carries as negative.
+        """
+        with self._lock:
+            result, start = self.seek_handle(fh_addr, 0, OFFSET_END)
+            if result is SeekResult.PAST_END:
+                return None, None
+            if result is not SeekResult.OK:
+                return None
+            result, end = self.seek_handle(fh_addr, start)
+        if result is not SeekResult.OK:
+            return None
+        return start, (end if end >= 0 else None)
+
     def read_handle(self, fh_addr: int, size: int) -> Optional[bytes]:
         """Read up to size bytes from the handle's current position.
 
@@ -2094,9 +2120,47 @@ class HandlerBridge:
         AmigaDOS error code. A packet that gets no reply fails the write
         with (-1, 0).
 
-        A failure part way leaves the packets before it written, and a
-        handler can write part of the packet it fails, so the handle's
-        position is then unknown.
+        A failed write of more than one packet that would have extended
+        the file shrinks it back to its old end and keeps the error, as
+        _write_past_end does after a failed fill. Only such a write
+        measures the old end first, with two seeks. A write of one packet
+        costs nothing more but is not undone: pfs3aio and SmartFilesystem
+        leave nothing of a packet they fail, but FastFileSystem keeps the
+        part it wrote. A write into a file whose end cannot be measured
+        goes out without the undo. On pfs3aio and SmartFilesystem that is
+        a file of 2 GiB or more, which the write cannot grow, since
+        AmigaFuseFS ends every write at or below 0x7FFFFFFF. Only when the
+        seeks may have moved the handle does the write fail before sending
+        any data. Inside the old end a failure cannot be undone: the
+        packets before it stay written. A handler can write part of the
+        packet it fails, so the handle's position is unknown after any
+        failure.
+
+        The undo calls set_handle_size directly: the end is measured
+        already, and a shrink needs no fill. Nor does it need a retry for
+        another handle, since FastFileSystem stops a shrink only at another
+        handle past the new end, and every other handle is at or below the
+        old end.
+        """
+        with self._lock:
+            if len(data) <= IO_CHUNK:
+                return self._write_packets(fh_addr, data)
+            extent = self._handle_extent(fh_addr)
+            if extent is None:
+                return -1, 0
+            start, end = extent
+            written, res2 = self._write_packets(fh_addr, data)
+            if written < 0 and end is not None and start + len(data) > end:
+                # A failure before the old end left the file that size, and
+                # shrinking to it then changes nothing.
+                self._shrink_back(fh_addr, end)
+            return written, res2
+
+    def _write_packets(self, fh_addr: int, data: bytes) -> Tuple[int, int]:
+        """Send data as ACTION_WRITE packets, as write_handle_reply() does.
+
+        Unlike write_handle_reply(), this never measures or shrinks the
+        file, for callers that undo a failure themselves.
         """
         with self._lock:
             done, res2 = 0, 0
@@ -2189,13 +2253,13 @@ class HandlerBridge:
             pos = end
             while pos < offset:
                 n = min(offset - pos, len(zeros))
-                written, res2 = self.write_handle_reply(fh_addr, zeros[:n])
+                written, res2 = self._write_packets(fh_addr, zeros[:n])
                 if written != n:
                     written = -1
                     break
                 pos += n
             if written >= 0:
-                written, res2 = self.write_handle_reply(fh_addr, data)
+                written, res2 = self._write_packets(fh_addr, data)
             if written < 0:
                 # Shrinking never exposes old blocks. If it fails as well,
                 # the zeros written so far stay.

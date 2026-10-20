@@ -8,6 +8,7 @@ cycles or more. Each test works on a copy of a volume through the FUSE
 callbacks a mounted volume receives.
 """
 
+import errno
 import os
 import shutil
 
@@ -18,7 +19,7 @@ from amitools.fs.ADFSVolume import ADFSVolume
 from amitools.fs.FSString import FSString
 from amitools.fs.blkdev.ADFBlockDevice import ADFBlockDevice
 
-from amifuse.fuse_fs import IO_CHUNK, AmigaFuseFS, HandlerBridge
+from amifuse.fuse_fs import IO_CHUNK, AmigaFuseFS, FuseOSError, HandlerBridge
 from amifuse.rdb_inspect import detect_adf
 
 pytestmark = pytest.mark.integration
@@ -60,7 +61,19 @@ _VOLUMES = {
 @pytest.fixture(params=list(_VOLUMES))
 def large_volume(request, fixture_root, tmp_path):
     """A copy of a volume per handler, as (image, driver, partition, size)."""
-    driver_name, image_name, partition, size = _VOLUMES[request.param]
+    return _copy_volume(request.param, fixture_root, tmp_path)
+
+
+# The FFS partition is left out: filling its 40 MiB of free space would
+# take a write of over 40 MiB to check what the FFS floppy checks.
+@pytest.fixture(params=["ofs", "ffs", "pfs3", "sfs"])
+def small_volume(request, fixture_root, tmp_path):
+    """A copy of a volume with at most 6 MiB free, as large_volume returns it."""
+    return _copy_volume(request.param, fixture_root, tmp_path)
+
+
+def _copy_volume(name, fixture_root, tmp_path):
+    driver_name, image_name, partition, size = _VOLUMES[name]
     driver = fixture_root / "drivers" / driver_name
     if not driver.exists():
         pytest.skip(f"{driver_name} handler not found")
@@ -151,3 +164,44 @@ class TestLargeTransfers:
         finally:
             bridge.close()
         assert b"".join(parts) == content + b"tail"
+
+    def test_write_larger_than_free_space_is_undone(self, small_volume):
+        """One write() of more than IO_CHUNK bytes at end of file that runs
+        out of space leaves the file at its old size and frees every block
+        it took, and the next write on the same handle lands at that end.
+
+        In one packet such a write left nothing behind on pfs3aio and
+        SmartFilesystem. In packets, those before the failed one were on
+        the disk and kept the free space they had used. A write of one
+        packet is not undone, and FastFileSystem keeps the part of it that
+        it wrote. After the shrink, SmartFilesystem failed the next write
+        at the new end until the handle moved.
+        """
+        image, driver, partition, _ = small_volume
+        head = _pattern(1000)
+        bridge = _bridge(image, driver, partition, read_only=False)
+        try:
+            ops = AmigaFuseFS(bridge)
+            handle = ops.create(PATH, 0o644)
+            assert ops.write(PATH, head, 0, handle) == len(head)
+            info = bridge.get_disk_info()
+            free = info["num_blocks"] - info["num_blocks_used"]
+            data = _pattern(free * info["bytes_per_block"] + (512 << 10))
+            with pytest.raises(FuseOSError) as exc_info:
+                ops.write(PATH, data, len(head), handle)
+            assert exc_info.value.args[0] == errno.ENOSPC
+            # What getattr reports for a new file until it is closed.
+            assert ops.getattr(PATH)["st_size"] == len(head)
+            assert ops.write(PATH, b"tail", len(head), handle) == 4
+            ops.release(PATH, handle)
+            bridge.flush_volume()
+        finally:
+            bridge.close()
+
+        bridge = _bridge(image, driver, partition)
+        try:
+            assert bridge.read_file(PATH, 1 << 20, 0) == head + b"tail"
+            after = bridge.get_disk_info()
+        finally:
+            bridge.close()
+        assert after["num_blocks_used"] == info["num_blocks_used"]
