@@ -2975,6 +2975,19 @@ class AmigaFuseFS(_FuseOperations):
                     moved = _renamed_path(entry.get("path", ""), old, new)
                     if moved is not None:
                         entry["path"] = moved
+                # Deferred deletes follow too. release() and releasedir()
+                # look for them under the handle's path, and one left under
+                # the old path would hide a file created there later, and
+                # delete it at its release().
+                self._pending_deletes = {
+                    _renamed_path(p, old, new) or p for p in self._pending_deletes
+                }
+                self._pending_dir_deletes = {
+                    _renamed_path(d, old, new) or d: {
+                        _renamed_path(c, old, new) or c for c in children
+                    }
+                    for d, children in self._pending_dir_deletes.items()
+                }
         return 0
 
     def flush(self, path, fh):

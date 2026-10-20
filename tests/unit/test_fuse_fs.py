@@ -6263,6 +6263,57 @@ class TestDeferredDeleteAfterRename:
         bridge.delete_dir_atomic.assert_called_with("/e")
         assert not fs._pending_deletes
 
+    def test_delete_deferred_before_a_directory_rename_follows_it(self, write_fs):
+        """The delete runs under the new path at the last release(), and a
+        file created later under the old path is left alone.
+        """
+        fs, bridge = write_fs
+        bridge.open_file.return_value = (0x4abbc, 0)
+        bridge.locate_path.return_value = (0x6855, 0, [])
+        bridge.rename_object.return_value = (-1, 0)
+        fh = fs.open("/d/x", os.O_RDWR)
+        bridge.delete_object.return_value = (0, 202)  # ERROR_OBJECT_IN_USE
+        assert fs.unlink("/d/x") == 0
+
+        fs.rename("/d", "/e")
+        assert fs._pending_deletes == {"/e/x"}
+        bridge.delete_object.return_value = (-1, 0)
+        fs.release("/d/x", fh)
+
+        assert bridge.delete_object.call_count == 2
+        bridge.locate_path.assert_called_with("/e")
+        assert not fs._pending_deletes
+        fh = fs.create("/d/x", 0o644)
+        fs.release("/d/x", fh)
+        assert bridge.delete_object.call_count == 2
+
+    def test_deferred_rmdir_follows_a_rename_of_its_parent(self, write_fs):
+        """An rmdir() deferred until its last child is deleted moves with
+        that child, so both deletes run under the new paths.
+        """
+        fs, bridge = write_fs
+        bridge.open_file.return_value = (0x4abbc, 0)
+        bridge.locate_path.return_value = (0x6855, 0, [])
+        bridge.rename_object.return_value = (-1, 0)
+        fh = fs.open("/p/d/x", os.O_RDWR)
+        bridge.delete_object.return_value = (0, 202)  # ERROR_OBJECT_IN_USE
+        assert fs.unlink("/p/d/x") == 0
+        bridge.delete_dir_atomic.return_value = (0, 216)  # ERROR_DIRECTORY_NOT_EMPTY
+        assert fs.rmdir("/p/d") == 0
+
+        fs.rename("/p", "/q")
+        assert fs._pending_deletes == {"/q/d", "/q/d/x"}
+        assert fs._pending_dir_deletes == {"/q/d": {"/q/d/x"}}
+        bridge.delete_object.return_value = (-1, 0)
+        bridge.locate_path.reset_mock()
+        bridge.delete_object.reset_mock()
+        fs.release("/p/d/x", fh)
+
+        assert [c.args[0] for c in bridge.locate_path.call_args_list] == ["/q/d", "/q"]
+        assert [c.args[1] for c in bridge.delete_object.call_args_list] == ["x", "d"]
+        assert not fs._pending_deletes
+        assert not fs._pending_dir_deletes
+
 
 class TestCacheLocking:
     """Verify _cache_lock protects cache dicts from concurrent access."""
