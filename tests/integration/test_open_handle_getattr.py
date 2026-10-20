@@ -69,6 +69,26 @@ def test_shared_handle_reports_handler_size_and_mode(ops):
         ops.release("/f.bin", fh)
 
 
+def test_exclusive_handle_reports_the_closed_mode(ops):
+    """While the handler cannot examine the file, its mode is the one it
+    reports once closed: a file the handler creates has protection 0.
+    """
+    fh = ops.create("/m.bin", 0o644)
+    try:
+        ops.write("/m.bin", b"m" * 1200, 0, fh)
+        open_mode = ops.getattr("/m.bin", fh)["st_mode"]
+    finally:
+        ops.release("/m.bin", fh)
+    closed = ops.getattr("/m.bin")
+    assert open_mode == closed["st_mode"]
+
+    fh = ops.open("/m.bin", os.O_WRONLY | os.O_TRUNC)
+    try:
+        assert ops.getattr("/m.bin", fh)["st_mode"] == closed["st_mode"]
+    finally:
+        ops.release("/m.bin", fh)
+
+
 @pytest.mark.parametrize("flags", [os.O_RDONLY, os.O_RDWR], ids=["O_RDONLY", "O_RDWR"])
 def test_renamed_file_leaves_no_entry_under_its_old_name(ops, flags):
     """A shared handle does not keep the name it was opened under alive."""
