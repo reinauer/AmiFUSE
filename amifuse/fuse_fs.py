@@ -10,6 +10,7 @@ import argparse
 import errno
 import itertools
 import math
+import operator
 import os
 import signal
 import subprocess
@@ -101,7 +102,8 @@ _NOT_FOUND_ERRORS = frozenset({ERROR_DIR_NOT_FOUND, ERROR_OBJECT_NOT_FOUND})
 # blocks it cannot read, so it does not prove the offset is past the end.
 ERROR_SEEK_ERROR = 219
 
-# ACTION_SEEK carries the offset in dp_Arg2, a signed LONG.
+# ACTION_SEEK and ACTION_SET_FILE_SIZE carry the offset in dp_Arg2, a
+# signed LONG.
 _LONG_MIN = -0x80000000
 _LONG_MAX = 0x7FFFFFFF
 
@@ -2145,6 +2147,28 @@ class HandlerBridge:
             return written, res2
 
     def set_handle_size(self, fh_addr: int, size: int, mode: int = OFFSET_BEGINNING) -> int:
+        """Make the file size bytes long, as AmigaDOS SetFileSize() does.
+
+        Returns the new size, or -1 when the handler fails the change or
+        does not reply. Only an integer size from 0 to 0x7FFFFFFF with mode
+        OFFSET_BEGINNING reaches the handler; anything else is -1 without a
+        packet. dp_Arg2 is a signed LONG, so a larger size would arrive
+        wrapped: 4 GiB + 4 would cut the file to 4 bytes. From
+        OFFSET_CURRENT or OFFSET_END the size resolves against a position
+        the bridge does not track, and FastFileSystem takes a result below
+        0 or above 0x7FFFFFFF as a grow.
+
+        A size in range is no safe grow either. FastFileSystem answers a
+        grow larger than the free space by growing the file until the
+        volume is full, then failing: 0x7FFFFFFF does this on any volume
+        with less than 2 GiB free.
+        """
+        try:
+            size, mode = operator.index(size), operator.index(mode)
+        except TypeError:
+            return -1
+        if mode != OFFSET_BEGINNING or not 0 <= size <= _LONG_MAX:
+            return -1
         with self._lock:
             self.launcher.send_set_file_size(self.state, fh_addr, size, mode)
             replies = self._run_until_replies()
