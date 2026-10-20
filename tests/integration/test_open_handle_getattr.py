@@ -69,6 +69,26 @@ def test_shared_handle_reports_handler_size_and_mode(ops):
         ops.release("/f.bin", fh)
 
 
+def test_shared_handle_reports_a_shrink_and_rewrite(ops):
+    """WinFsp replaces a file's data through an open handle: an ftruncate
+    to 0, then the new data.
+    """
+    _write_file(ops, "/r.bin", 3000)
+    closed = ops.getattr("/r.bin")
+    fh = ops.open("/r.bin", os.O_RDWR)
+    try:
+        ops.truncate("/r.bin", 0, fh)
+        for attrs in (ops.getattr("/r.bin"), ops.getattr("/r.bin", fh)):
+            assert attrs["st_size"] == 0
+        ops.write("/r.bin", b"n" * 1234, 0, fh)
+        for attrs in (ops.getattr("/r.bin"), ops.getattr("/r.bin", fh)):
+            assert attrs["st_size"] == 1234
+            assert attrs["st_mode"] == closed["st_mode"]
+    finally:
+        ops.release("/r.bin", fh)
+    assert ops.getattr("/r.bin")["st_size"] == 1234
+
+
 def test_exclusive_handle_reports_the_closed_mode(ops):
     """While the handler cannot examine the file, its mode is the one it
     reports once closed: a file the handler creates has protection 0.
