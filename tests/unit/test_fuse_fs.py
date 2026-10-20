@@ -1813,7 +1813,7 @@ class _FakeHandlerFile:
     """
 
     def __init__(self, data, capacity=1 << 20, seek_reply=None,
-                 set_size_reply=None, read_replies=None):
+                 set_size_reply=None, read_replies=None, write_replies=None):
         self.data = bytearray(data)
         self.pos = 0
         self.capacity = capacity
@@ -1821,9 +1821,10 @@ class _FakeHandlerFile:
         self.set_size_reply = set_size_reply
         self.writes = []  # length of every ACTION_WRITE
         self.set_sizes = []  # size of every ACTION_SET_FILE_SIZE
-        # The number of an ACTION_READ, counted from 0, mapped to the reply
-        # it gets instead, without moving the handle.
+        # The number of an ACTION_READ or ACTION_WRITE, counted from 0,
+        # mapped to the reply it gets instead, without moving the handle.
         self.read_replies = read_replies or {}
+        self.write_replies = write_replies or {}
         self.reads = []  # length of every ACTION_READ
         self.buf = b""
         self.reply = NO_REPLY
@@ -1858,6 +1859,10 @@ class _FakeHandlerFile:
         return PKT, 0
 
     def write(self, state, fh_addr, addr, size):
+        if len(self.writes) in self.write_replies:
+            self.reply = self.write_replies[len(self.writes)]
+            self.writes.append(size)
+            return PKT, 0
         self.writes.append(size)
         if self.pos + size > self.capacity:
             self.reply = _reply(-1, 221)
@@ -2043,6 +2048,151 @@ class TestHandlerBridgeReadChunks:
         assert exc_info.value.args[0] == errno.EIO
         # The handle moved by the chunk that arrived; the retry seeks back.
         assert fs.read("/big.bin", 3 * chunk, 0, handle) == content
+        assert fake.launcher.send_seek_handle.call_count == 2
+
+
+class TestHandlerBridgeWriteChunks:
+    """A write larger than IO_CHUNK goes out as one ACTION_WRITE per chunk.
+
+    A single packet for the whole write needed a buffer of that size in
+    emulated memory, which has 8 MiB, and on OFS, from about 640 KiB, kept
+    the handler working for 10 million cycles or more.
+    """
+
+    FH_ADDR = 0x3000
+    ORIGINAL = b"0123456789"
+
+    def test_large_write_is_split(self, fuse_mock):
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        chunk = fuse_fs_mod.IO_CHUNK
+        handler = _FakeHandlerFile(b"", capacity=4 * chunk)
+        bridge = _fake_write_bridge(fuse_fs_mod, handler)
+        data = _pattern(2 * chunk + 5)
+
+        assert bridge.write_handle_at(self.FH_ADDR, 0, data) == (len(data), 0)
+        assert handler.writes == [chunk, chunk, 5]
+        assert handler.data == data
+        # No buffer larger than one chunk, whatever the write.
+        sizes = [c.args[0] for c in bridge._alloc_read_buf.call_args_list]
+        assert max(sizes) == chunk
+
+    @pytest.mark.parametrize("reply, expected", [
+        (_reply(-1, 221), (-1, 221)),
+        (NO_REPLY, (-1, 0)),
+        ("too-many", (-1, 0)),
+    ], ids=["disk-full", "no-reply", "more-than-sent"])
+    def test_failed_chunk_fails_write(self, fuse_mock, reply, expected):
+        """A chunk that fails after another was written fails the whole write.
+
+        The chunks before it stay written. The handler can also have
+        written part of the chunk it failed, so no byte count would say
+        where the handle is.
+        """
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        chunk = fuse_fs_mod.IO_CHUNK
+        if reply == "too-many":
+            reply = _reply(chunk + 1)
+        handler = _FakeHandlerFile(b"", write_replies={1: reply})
+        bridge = _fake_write_bridge(fuse_fs_mod, handler)
+        data = _pattern(3 * chunk)
+
+        assert bridge.write_handle_reply(self.FH_ADDR, data) == expected
+        assert handler.writes == [chunk, chunk]
+        assert handler.data == data[:chunk]
+
+    def test_short_chunk_ends_write(self, fuse_mock):
+        """A chunk the handler writes short ends the write with the count so far."""
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        chunk = fuse_fs_mod.IO_CHUNK
+        handler = _FakeHandlerFile(b"", write_replies={1: _reply(10)})
+        bridge = _fake_write_bridge(fuse_fs_mod, handler)
+
+        assert bridge.write_handle_reply(self.FH_ADDR, _pattern(3 * chunk)) == (chunk + 10, 0)
+        assert handler.writes == [chunk, chunk]
+
+    def test_empty_write_sends_no_packet(self, fuse_mock):
+        """A write of no data returns (0, 0) without sending a packet."""
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        handler = _FakeHandlerFile(self.ORIGINAL)
+        bridge = _fake_write_bridge(fuse_fs_mod, handler)
+
+        assert bridge.write_handle_reply(self.FH_ADDR, b"") == (0, 0)
+        assert handler.writes == []
+        bridge._alloc_read_buf.assert_not_called()
+
+    def test_large_write_past_end_is_split(self, fuse_mock):
+        """The data after a zero fill goes out in chunks as well."""
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        chunk = fuse_fs_mod.IO_CHUNK
+        handler = _FakeHandlerFile(self.ORIGINAL)
+        bridge = _fake_write_bridge(fuse_fs_mod, handler)
+        offset = len(self.ORIGINAL) + 100
+        data = _pattern(2 * chunk + 5)
+
+        assert bridge.write_handle_at(self.FH_ADDR, offset, data) == (len(data), 0)
+        assert handler.writes == [100, chunk, chunk, 5]
+        assert handler.data == self.ORIGINAL + bytes(100) + data
+        sizes = [c.args[0] for c in bridge._alloc_read_buf.call_args_list]
+        assert max(sizes) == chunk
+
+    def test_data_past_end_that_fails_part_way_is_undone(self, fuse_mock):
+        """Data after a zero fill that runs out of space in its second
+        chunk shrinks the file back, like a fill that runs out."""
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        chunk = fuse_fs_mod.IO_CHUNK
+        offset = len(self.ORIGINAL) + 100
+        handler = _FakeHandlerFile(self.ORIGINAL, capacity=offset + chunk + 10)
+        bridge = _fake_write_bridge(fuse_fs_mod, handler)
+
+        assert bridge.write_handle_at(self.FH_ADDR, offset, _pattern(2 * chunk)) == (-1, 221)
+        assert handler.writes == [100, chunk, chunk]
+        assert handler.set_sizes == [len(self.ORIGINAL)]
+        assert handler.data == self.ORIGINAL
+
+    def _open(self, fuse_fs_mod, write_fs, handler):
+        """Open /big.bin through the FUSE layer on a bridge backed by the fake."""
+        fs, bridge = write_fs
+        fake = _fake_write_bridge(fuse_fs_mod, handler)
+        bridge.open_file.return_value = (self.FH_ADDR, 0)
+        bridge.write_handle_at = fake.write_handle_at
+        bridge.write_handle_reply = fake.write_handle_reply
+        return fs, fake, fs.open("/big.bin", os.O_RDWR)
+
+    def test_fuse_write_larger_than_memory(self, write_fs):
+        """One write() of 9 MiB lands whole, and the next follows it without a seek."""
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        handler = _FakeHandlerFile(b"", capacity=16 << 20)
+        fs, fake, handle = self._open(fuse_fs_mod, write_fs, handler)
+        data = _pattern(9 << 20)
+
+        assert fs.write("/big.bin", data, 0, handle) == len(data)
+        assert fs.write("/big.bin", b"tail", len(data), handle) == 4
+        assert handler.data == data + b"tail"
+        assert fake.launcher.send_seek_handle.call_count == 1
+        assert max(handler.writes) == fuse_fs_mod.IO_CHUNK
+
+    def test_fuse_write_that_fails_part_way(self, write_fs):
+        """A write that runs out of space part way fails with ENOSPC, and
+        the next write seeks."""
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        chunk = fuse_fs_mod.IO_CHUNK
+        handler = _FakeHandlerFile(b"", capacity=chunk + 100)
+        fs, fake, handle = self._open(fuse_fs_mod, write_fs, handler)
+        data = _pattern(3 * chunk)
+
+        with pytest.raises(fuse_fs_mod.FuseOSError) as exc_info:
+            fs.write("/big.bin", data, 0, handle)
+        assert exc_info.value.args[0] == errno.ENOSPC
+        assert handler.writes == [chunk, chunk]
+        assert fs.write("/big.bin", b"x", 0, handle) == 1
         assert fake.launcher.send_seek_handle.call_count == 2
 
 

@@ -127,9 +127,10 @@ class SeekResult(Enum):
 # so a large gap needs no more memory than an ordinary write.
 ZERO_FILL_CHUNK = 64 * 1024
 
-# The most bytes one ACTION_READ carries. Larger reads go out in packets of
-# this size, so that the buffer in emulated memory stays small and each
-# packet is a short piece of work for the handler.
+# The most bytes one ACTION_READ or ACTION_WRITE carries. Larger reads and
+# writes go out in packets of this size, so that the buffer in emulated
+# memory stays small and each packet is a short piece of work for the
+# handler.
 IO_CHUNK = 64 * 1024
 
 # AmigaDOS error codes from a failed ACTION_WRITE that have a closer errno
@@ -2083,21 +2084,37 @@ class HandlerBridge:
         return self.write_handle_reply(fh_addr, data)[0]
 
     def write_handle_reply(self, fh_addr: int, data: bytes) -> Tuple[int, int]:
-        """Send ACTION_WRITE and return (dp_Res1, dp_Res2).
+        """Write data at the handle's position and return (dp_Res1, dp_Res2).
 
-        dp_Res1 is the number of bytes written, or -1 when the handler fails
-        the write, and dp_Res2 then holds its AmigaDOS error code. A write
-        that gets no reply returns (-1, 0).
+        The data goes out as ACTION_WRITE packets of at most IO_CHUNK bytes,
+        one after another, and a short one ends the write. dp_Res1 is the
+        number of bytes written, or -1 when the handler fails any packet or
+        claims more bytes than it was sent, and dp_Res2 then holds its
+        AmigaDOS error code. A packet that gets no reply fails the write
+        with (-1, 0).
+
+        A failure part way leaves the packets before it written, and a
+        handler can write part of the packet it fails, so the handle's
+        position is then unknown.
         """
         with self._lock:
-            buf_mem = self._alloc_read_buf(len(data))
-            self.mem.w_block(buf_mem.addr, data)
-            pkt_addr, _ = self.launcher.send_write_handle(
-                self.state, fh_addr, buf_mem.addr, len(data))
-            reply = self._run_until_reply(pkt_addr, "write")
-            if reply is None:
-                return -1, 0
-            return reply
+            done, res2 = 0, 0
+            while done < len(data):
+                chunk = data[done:done + IO_CHUNK]
+                buf_mem = self._alloc_read_buf(len(chunk))
+                self.mem.w_block(buf_mem.addr, chunk)
+                pkt_addr, _ = self.launcher.send_write_handle(
+                    self.state, fh_addr, buf_mem.addr, len(chunk))
+                reply = self._run_until_reply(pkt_addr, "write")
+                if reply is None:
+                    return -1, 0
+                res1, res2 = reply
+                if res1 < 0 or res1 > len(chunk):
+                    return -1, res2
+                done += res1
+                if res1 < len(chunk):
+                    break
+            return done, res2
 
     def write_handle_at(self, fh_addr: int, offset: int, data: bytes) -> Tuple[int, int]:
         """Write data at offset and return (dp_Res1, dp_Res2) like write_handle_reply().
