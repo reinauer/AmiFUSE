@@ -17,7 +17,7 @@ import tempfile
 import types
 from types import SimpleNamespace
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 
 import pytest
 
@@ -515,7 +515,11 @@ class TestFormatVolume:
         mock_bridge.state.crashed = False
         mock_bridge.launcher = MagicMock()
         mock_bridge.launcher.alloc_bstr.return_value = (None, 0x1234)
-        mock_bridge._run_until_replies.return_value = [(0, 0, 1, 0)]
+        # (pkt, msg) of each packet sent, and the reply to each.
+        mock_bridge.launcher.send_inhibit.return_value = (0x100, 0xF0)
+        mock_bridge.launcher.send_format.return_value = (0x200, 0x1F0)
+        mock_bridge.launcher.send_flush.return_value = (0x300, 0x2F0)
+        mock_bridge._run_until_reply.return_value = (1, 0)
         monkeypatch.setattr(
             fuse_fs_mod, "HandlerBridge", MagicMock(return_value=mock_bridge)
         )
@@ -531,6 +535,13 @@ class TestFormatVolume:
         assert mock_bridge.launcher.send_inhibit.call_count == 1
         mock_bridge.launcher.send_inhibit.assert_called_once_with(mock_bridge.state, True)
         mock_bridge.launcher.send_flush.assert_called_once_with(mock_bridge.state)
+        # Each packet waits for its own reply, not for any reply.
+        assert mock_bridge._run_until_reply.call_args_list == [
+            call(0x100, "format inhibit"),
+            call(0x200, "format", max_iters=2000, cycles=2_000_000),
+            call(0x300, "format flush", max_iters=500, cycles=2_000_000),
+        ]
+        mock_bridge._run_until_replies.assert_not_called()
         mock_bridge.backend.sync.assert_called_once_with()
         mock_bridge.close.assert_called_once()
 

@@ -8,6 +8,7 @@ import pstats
 
 import argparse
 import errno
+import itertools
 import os
 import signal
 import subprocess
@@ -71,6 +72,7 @@ from .startup_runner import (
     OFFSET_END,
     _get_block_state,
     _clear_all_block_state,
+    _packet_type_name,
     _snapshot_block_state,
     _restore_block_state,
 )
@@ -257,6 +259,8 @@ class HandlerBridge:
         self.backend = None
         self.vh = None
         self._closed = False
+        # Set when a wait runs out of busy cycles; see _run_until_replies.
+        self._busy_ran_out = False
         try:
             self._initialize(image, driver, block_size, read_only, debug,
                              trace, partition, adf_info, iso_info)
@@ -657,11 +661,60 @@ class HandlerBridge:
             )
         return replies
 
+    # Emulated cycles a handler may work before the bridge gives up on a
+    # reply, so that a handler caught in a loop still fails the packet. The
+    # longest wait seen is pfs3aio freeing the blocks of a deleted 2 GiB
+    # file, about 2.8e9 cycles.
+    _MAX_BUSY_CYCLES = 10_000_000_000
+    # The busy limit once a wait has run out, until the handler replies,
+    # waits or exits: 50 bursts of 200,000 cycles, the whole of a default
+    # wait before the busy limit existed, so that no packet to a handler
+    # caught in a loop fails later than it did then.
+    _SHORT_BUSY_CYCLES = 10_000_000
+
     def _run_until_replies(self, max_iters: int = 50, cycles: int = 200_000, sleep_base: float = 0.0005, sleep_max: float = 0.01, drain_non_essential: bool = True):
-        """Run handler bursts until at least one reply is queued or iterations exhausted."""
+        """Run handler bursts until at least one reply is queued.
+
+        A burst that ends at its cycle limit, with neither done nor error
+        set, stopped the handler in the middle of its work. Such bursts run
+        again at once and count against a busy limit of _MAX_BUSY_CYCLES.
+        Every other burst, in which the handler waited or exited, counts
+        against max_iters. Returns [] when either limit runs out first, and
+        says so on stderr when it is _MAX_BUSY_CYCLES.
+
+        A handler whose wait ran out is still running, and the next packet
+        would resume it with the full busy limit again. Until it replies to
+        any packet, waits or exits, later waits get _SHORT_BUSY_CYCLES
+        instead. The limit is checked before every burst, so a handler that
+        waits or exits during such a wait gets the full limit for the rest
+        of it. A reply may belong to an earlier packet; callers that need
+        their own reply wait with _run_until_reply.
+
+        Busy also covers a handler waiting on timer.device: TR_ADDREQUEST
+        completes at once in vamos (TimerDevice.BeginIO leaves IOF_QUICK
+        set), so a handler never parks on a timer request. The limits count
+        cycles and bursts, not time: Delay() sleeps on the host and spends
+        no cycles, so the time a handler spends in it is bounded by neither,
+        as before.
+
+        Known limits: a parent that waits while a child process does the
+        packet's work still counts against max_iters, because
+        ProcessManager.run_all_ready_children drops whether the child is
+        still busy. And a packet whose wait ran out stays queued, or held by
+        the handler, until the handler answers it, but HandlerLauncher
+        builds packets in a ring of 8 buffers, so the 8th packet sent after
+        it reuses its buffer. If the first is still queued, the port then
+        holds the new packet twice and the first no more; either way, a late
+        reply to the first carries the new packet's address and passes for
+        its answer. A wait that ends at max_iters leaves its packet behind
+        the same way, as every wait of more than 50 bursts did before the
+        busy limit.
+        """
         from amitools.vamos.lib.ExecLibrary import ExecLibrary
         replies = []
         sleep_time = sleep_base
+        idle_iters = 0
+        busy_cycles = 0
 
         # Check if handler has crashed - if so, don't try to run it
         if self.state.crashed:
@@ -722,11 +775,34 @@ class HandlerBridge:
                         f"tc_SigRecvd@0x{proc_addr + sigrecvd_off:x}=0x{dos_signal:x}"
                     )
 
-        for i in range(max_iters):
+        for i in itertools.count():
+            busy_limit = (
+                self._SHORT_BUSY_CYCLES if self._busy_ran_out
+                else self._MAX_BUSY_CYCLES
+            )
+            if idle_iters >= max_iters or busy_cycles >= busy_limit:
+                break
             old_pc = self.state.pc
             self.launcher.run_burst(self.state, max_cycles=cycles, debug=self._debug)
             rs = self.state.run_state
             new_pc = self.state.pc
+            # A burst that ends at its cycle limit, with neither done nor
+            # error set, stopped the handler in the middle of its work.
+            busy = not getattr(rs, "error", None) and not getattr(rs, "done", False)
+            if busy:
+                busy_cycles += cycles
+            else:
+                # It waited or exited, so it is not caught in a loop.
+                self._busy_ran_out = False
+            # A wait can take 50,000 busy bursts, so --debug reports only
+            # every 1000th of them, with the busy cycles so far, and the
+            # poll of a busy burst only then or when a reply is queued.
+            show = self._debug and (not busy or busy_cycles % (1000 * cycles) == 0)
+            if show and busy:
+                print(
+                    f"[amifuse] _run_until_replies: busy for {busy_cycles:,} "
+                    f"cycles, pc=0x{new_pc:x}"
+                )
             # Log first few iterations to debug handler movement
             if self._debug and i < 3:
                 cycles_run = getattr(rs, 'cycles', 0) if rs else 0
@@ -737,8 +813,12 @@ class HandlerBridge:
                     print(f"[amifuse] _run_until_replies: handler crashed at iter {i}")
                 return []
             # Check for replies first - if we have them, we're done
+            debug_poll = show or (
+                self._debug
+                and self.vh.slm.exec_impl.port_mgr.has_msg(self.state.reply_port_addr)
+            )
             polled = self.launcher.poll_replies(
-                self.state.reply_port_addr, debug=self._debug
+                self.state.reply_port_addr, debug=debug_poll
             )
             if polled:
                 replies = polled
@@ -762,7 +842,7 @@ class HandlerBridge:
                     _restore_block_state(parent_block_state)
                 else:
                     _clear_all_block_state()
-                if num_children > 0 and self._debug:
+                if num_children > 0 and show:
                     print(f"[amifuse] Ran {num_children} child process(es)")
             else:
                 if self._debug and i < 5:
@@ -770,6 +850,7 @@ class HandlerBridge:
 
             # Check for error FIRST - errors take precedence over blocked state
             if getattr(rs, "error", None):
+                idle_iters += 1
                 # Error during run - might be WaitPort block or FindPort yield
                 # Check if we have replies first
                 polled = self.launcher.poll_replies(
@@ -791,17 +872,43 @@ class HandlerBridge:
                 else:
                     _clear_all_block_state()
                 continue
+            if busy:
+                # Run it again at once.
+                continue
             # If handler exited (done=True) without blocking, stop looping - it's not coming back
-            if getattr(rs, "done", False) and not self.state.initialized:
+            if not self.state.initialized:
                 # Handler exited during startup without entering main loop
                 # The startup packet results are in the packet struct - let caller check them
                 break
+            idle_iters += 1
             # Yield with exponential backoff to avoid tight polling loops.
             if sleep_base > 0:
                 time.sleep(sleep_time)
                 sleep_time = min(sleep_time * 2, sleep_max)
         if self._debug and not replies:
-            print(f"[amifuse] _run_until_replies: exhausted {max_iters} iters with no replies, pc=0x{self.state.pc:x}")
+            print(
+                f"[amifuse] _run_until_replies: no replies after {idle_iters} "
+                f"idle iters and {busy_cycles:,} of {busy_limit:,} busy cycles, "
+                f"pc=0x{self.state.pc:x}"
+            )
+        if replies:
+            # It answered a packet, so it is not caught in a loop, even if it
+            # went on to the next packet without waiting.
+            self._busy_ran_out = False
+        elif busy_cycles >= busy_limit:
+            if busy_limit == self._MAX_BUSY_CYCLES:
+                # Shown even without --debug, as in --interactive mounts and
+                # CLI commands. It is lost where stderr is discarded: at
+                # /dev/null by libfuse's daemonize, or at DEVNULL for a mount
+                # the Windows launcher starts.
+                pkt_type = self.launcher.last_pkt_type
+                to = "" if pkt_type is None else f" to {_packet_type_name(pkt_type)}"
+                print(
+                    f"[amifuse] WARNING: handler did not reply{to} within the "
+                    f"busy limit of {busy_limit:,} emulated cycles",
+                    file=sys.stderr,
+                )
+            self._busy_ran_out = True
 
         # Drain stale timer/IO messages that accumulated during packet
         # processing.  SendIO queues replies synchronously; without this
@@ -1118,16 +1225,20 @@ class HandlerBridge:
     # bounds the wait on a handler that never stops replying.
     _MAX_REPLY_ROUNDS = 8
 
-    def _run_until_reply(self, pkt_addr: int, label: str) -> Optional[Tuple[int, int]]:
+    def _run_until_reply(self, pkt_addr: int, label: str, **wait) -> Optional[Tuple[int, int]]:
         """Run the handler until it answers the packet at pkt_addr.
 
         Returns (res1, res2), or None when no answer arrives in time. A
         packet that timed out is still answered later, while the bridge
         waits for the next one. Such a reply is dropped: taken as this
         packet's answer, a READ byte count would pass for a seek position.
+
+        Each round is one _run_until_replies wait, which gets wait as its
+        keyword arguments and its own busy limit. A late reply ends the
+        short limit, so the rounds after it get the full one.
         """
         for _ in range(self._MAX_REPLY_ROUNDS):
-            replies = self._run_until_replies()
+            replies = self._run_until_replies(**wait)
             self._log_replies(label, replies)
             if not replies:
                 return None
@@ -1797,12 +1908,12 @@ class HandlerBridge:
                 raise OSError("handler crashed before volume flush")
             if self._debug:
                 print("[amifuse] Flushing volume buffers to disk...", flush=True)
-            self.launcher.send_flush(self.state)
-            replies = self._run_until_replies()
-            self._log_replies("flush_volume", replies)
+            pkt_addr, _ = self.launcher.send_flush(self.state)
+            # Only the flush's own reply says that the buffers are written.
+            reply = self._run_until_reply(pkt_addr, "flush_volume")
             # Sync the underlying file to disk
             self.backend.sync()
-            if self.state.crashed or not replies or replies[-1][2] == 0:
+            if self.state.crashed or reply is None or reply[0] == 0:
                 raise OSError("filesystem handler did not acknowledge ACTION_FLUSH")
             if self._debug:
                 print("[amifuse] Volume flush complete", flush=True)
@@ -3569,27 +3680,30 @@ def format_volume(
             raise SystemExit(f"Error: {exc}") from exc
         _raise_if_handler_crashed(bridge, "format startup")
 
-        # Inhibit the volume so the handler releases it for formatting
-        bridge.launcher.send_inhibit(bridge.state, True)
-        replies = bridge._run_until_replies()
+        # Inhibit the volume so the handler releases it for formatting.
+        # Each packet waits for its own reply, so that a late one cannot
+        # pass for the next packet's.
+        pkt_addr, _ = bridge.launcher.send_inhibit(bridge.state, True)
+        reply = bridge._run_until_reply(pkt_addr, "format inhibit")
         _raise_if_handler_crashed(bridge, "format inhibit")
-        if debug and replies:
-            _, _, r1, r2 = replies[-1]
-            print(f"[amifuse] INHIBIT reply: res1={r1} res2={r2}")
+        if debug and reply:
+            print(f"[amifuse] INHIBIT reply: res1={reply[0]} res2={reply[1]}")
 
         # Allocate volume name BSTR and send ACTION_FORMAT
         _, volname_bptr = bridge.launcher.alloc_bstr(volname, label="FormatVolName")
-        bridge.launcher.send_format(bridge.state, volname_bptr, dostype)
+        pkt_addr, _ = bridge.launcher.send_format(bridge.state, volname_bptr, dostype)
         # Format can take many cycles for large partitions — PFS3 must
         # initialize bitmap and root blocks proportional to partition size.
         # Use generous limits; the loop returns immediately once a reply arrives.
-        replies = bridge._run_until_replies(max_iters=2000, cycles=2_000_000)
+        reply = bridge._run_until_reply(
+            pkt_addr, "format", max_iters=2000, cycles=2_000_000
+        )
         _raise_if_handler_crashed(bridge, "format")
 
-        if not replies:
+        if reply is None:
             raise SystemExit("Format failed: no reply from handler.")
 
-        _, pkt_addr, res1, res2 = replies[-1]
+        res1, res2 = reply
         if res1 == 0:
             error_msgs = {
                 205: "Object in use",
@@ -3608,8 +3722,10 @@ def format_volume(
         # Reopening on the same bridge is redundant and has proven unstable for
         # SFS. Callers that want to verify the new volume should do so in a
         # fresh HandlerBridge.
-        bridge.launcher.send_flush(bridge.state)
-        bridge._run_until_replies(max_iters=500, cycles=2_000_000)
+        pkt_addr, _ = bridge.launcher.send_flush(bridge.state)
+        bridge._run_until_reply(
+            pkt_addr, "format flush", max_iters=500, cycles=2_000_000
+        )
         _raise_if_handler_crashed(bridge, "format flush")
         bridge.backend.sync()
 

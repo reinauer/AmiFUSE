@@ -83,6 +83,7 @@ def fuse_mock(monkeypatch):
         _get_block_state=lambda *args, **kwargs: None,
         _clear_all_block_state=lambda *args, **kwargs: None,
         _has_blocked_state=lambda *args, **kwargs: False,
+        _packet_type_name=lambda pkt_type: f"packet type {pkt_type}",
         _snapshot_block_state=lambda *args, **kwargs: None,
         _restore_block_state=lambda *args, **kwargs: None,
     )
