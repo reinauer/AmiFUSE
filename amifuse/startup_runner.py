@@ -266,6 +266,9 @@ def _unlink_msg_from_m68k_list(mem, msg_addr, debug=False):
 
 # Dos packet opcodes we care about
 ACTION_STARTUP = 0
+ACTION_LOCATE_OBJECT = 8
+ACTION_EXAMINE_OBJECT = 23
+ACTION_EXAMINE_NEXT = 24
 ACTION_DISK_INFO = 25
 ACTION_READ = ord("R")
 ACTION_WRITE = ord("W")
@@ -282,11 +285,40 @@ ACTION_CREATE_DIR = 22
 ACTION_FLUSH = 27
 ACTION_FORMAT = 1020
 ACTION_INHIBIT = 31
+# The names of the opcodes above, for messages.
+_PACKET_TYPE_NAMES = {
+    ACTION_STARTUP: "ACTION_STARTUP",
+    ACTION_LOCATE_OBJECT: "ACTION_LOCATE_OBJECT",
+    ACTION_EXAMINE_OBJECT: "ACTION_EXAMINE_OBJECT",
+    ACTION_EXAMINE_NEXT: "ACTION_EXAMINE_NEXT",
+    ACTION_DISK_INFO: "ACTION_DISK_INFO",
+    ACTION_READ: "ACTION_READ",
+    ACTION_WRITE: "ACTION_WRITE",
+    ACTION_SEEK: "ACTION_SEEK",
+    ACTION_END: "ACTION_END",
+    ACTION_SET_FILE_SIZE: "ACTION_SET_FILE_SIZE",
+    ACTION_FREE_LOCK: "ACTION_FREE_LOCK",
+    ACTION_FINDUPDATE: "ACTION_FINDUPDATE",
+    ACTION_FINDINPUT: "ACTION_FINDINPUT",
+    ACTION_FINDOUTPUT: "ACTION_FINDOUTPUT",
+    ACTION_DELETE_OBJECT: "ACTION_DELETE_OBJECT",
+    ACTION_RENAME_OBJECT: "ACTION_RENAME_OBJECT",
+    ACTION_CREATE_DIR: "ACTION_CREATE_DIR",
+    ACTION_FLUSH: "ACTION_FLUSH",
+    ACTION_FORMAT: "ACTION_FORMAT",
+    ACTION_INHIBIT: "ACTION_INHIBIT",
+}
 OFFSET_BEGINNING = -1
 OFFSET_CURRENT = 0
 OFFSET_END = 1
 SHARED_LOCK = -2
 EXCLUSIVE_LOCK = -1
+
+
+def _packet_type_name(pkt_type) -> str:
+    """Name a dp_Type for messages, as "ACTION_FLUSH (27)" or "packet type 99"."""
+    name = _PACKET_TYPE_NAMES.get(pkt_type)
+    return f"packet type {pkt_type}" if name is None else f"{name} ({pkt_type})"
 
 
 @dataclass
@@ -360,6 +392,8 @@ class HandlerLauncher:
         self._debug = False
         # Rate-limit warning for tc_SigRecvd read failures (once per instance)
         self._warned_tc_sigrecvd = False
+        # dp_Type of the last packet queued, for warnings about its reply
+        self.last_pkt_type = None
 
     def _compute_pending_signals(self, mask: int = 0xFFFFFFFF) -> int:
         """Compute pending signals from all message ports AND tc_SigRecvd, ANDed with mask.
@@ -601,6 +635,7 @@ class HandlerLauncher:
         self.mem.w32(pkt_addr + self._dp_link_offset, sp_addr & 0xFFFFFFFF)
         self.mem.w32(pkt_addr + self._dp_port_offset, reply_port_addr & 0xFFFFFFFF)
         self.mem.w32(pkt_addr + self._dp_type_offset, pkt_type & 0xFFFFFFFF)
+        self.last_pkt_type = pkt_type
         arg_addr = pkt_addr + self._dp_arg1_offset
         for val in args[:7]:
             self.mem.w32(arg_addr, val & 0xFFFFFFFF)
@@ -1066,15 +1101,15 @@ class HandlerLauncher:
         mode: int = SHARED_LOCK,
     ):
         """ACTION_LOCATE_OBJECT: returns a new lock BPTR in dp_Res1."""
-        return self.send_packet(state, 8, [lock_bptr, name_bptr, mode])
+        return self.send_packet(state, ACTION_LOCATE_OBJECT, [lock_bptr, name_bptr, mode])
 
     def send_examine(self, state: HandlerLaunchState, lock_bptr: int, fib_addr: int):
         """ACTION_EXAMINE_OBJECT"""
-        return self.send_packet(state, 23, [lock_bptr, fib_addr >> 2])
+        return self.send_packet(state, ACTION_EXAMINE_OBJECT, [lock_bptr, fib_addr >> 2])
 
     def send_examine_next(self, state: HandlerLaunchState, lock_bptr: int, fib_addr: int):
         """ACTION_EXAMINE_NEXT"""
-        return self.send_packet(state, 24, [lock_bptr, fib_addr >> 2])
+        return self.send_packet(state, ACTION_EXAMINE_NEXT, [lock_bptr, fib_addr >> 2])
 
     def send_free_lock(self, state: HandlerLaunchState, lock_bptr: int):
         """ACTION_FREE_LOCK: release a lock returned by LOCATE."""

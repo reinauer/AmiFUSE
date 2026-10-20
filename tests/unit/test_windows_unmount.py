@@ -223,6 +223,8 @@ def test_flush_requires_handler_acknowledgement(replies):
     bridge.state = SimpleNamespace(crashed=False)
     bridge._debug = False
     bridge.launcher = Mock()
+    # The flush packet's address, 0, is the one the replies carry.
+    bridge.launcher.send_flush.return_value = (0, 0)
     bridge.backend = Mock()
     bridge._run_until_replies = lambda: replies
     bridge._log_replies = Mock()
