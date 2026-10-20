@@ -315,7 +315,7 @@ class TestTruncateLengthLimit:
             bridge.close()
 
 
-# D. Truncate that grows a file -- 2 tests
+# D. Truncate that grows a file -- 3 tests
 
 
 class TestTruncateGrow:
@@ -387,3 +387,46 @@ class TestTruncateGrow:
             assert bridge.get_disk_info()["num_blocks_used"] == used
         finally:
             bridge.close()
+
+    def test_grow_to_free_space_limit_fits_or_is_undone(self, writable_volume):
+        """A grow by the most the free-space check lets through.
+
+        FFS, OFS and SFS need blocks of their own for a file that size, so
+        the fill runs out of space part way and the file is shrunk back;
+        on pfs3aio the grow fits.
+        """
+        image, driver, path = writable_volume
+        bridge = _bridge(image, driver, read_only=False)
+        try:
+            original = bridge.read_file(path, 1 << 20, 0)
+            info = bridge.get_disk_info()
+            bpb = info["bytes_per_block"]
+            free = info["num_blocks"] - info["num_blocks_used"]
+            # The free blocks, and the room left in the file's last block.
+            length = len(original) + free * bpb + (-len(original) % bpb)
+            ops = AmigaFuseFS(bridge)
+            try:
+                ops.truncate(path, length)
+                grown = True
+            except FuseOSError as exc:
+                assert exc.args[0] == errno.ENOSPC
+                grown = False
+            bridge.flush_volume()
+        finally:
+            bridge.close()
+
+        bridge = _bridge(image, driver)
+        try:
+            after = b"".join(bridge.read_file(path, 1 << 20, offset)
+                             for offset in range(0, length + 1, 1 << 20))
+            used = bridge.get_disk_info()["num_blocks_used"]
+        finally:
+            bridge.close()
+        # Pinned per handler, so that neither outcome can stand in for the
+        # other unnoticed.
+        assert grown == (driver.name == "pfs3aio")
+        if grown:
+            assert after == original + bytes(length - len(original))
+        else:
+            assert after == original
+            assert used == info["num_blocks_used"]
