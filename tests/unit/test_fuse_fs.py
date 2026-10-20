@@ -1974,6 +1974,67 @@ class TestHandlerBridgeWriteAt:
         assert bridge.write_handle(self.FH_ADDR, self.DATA) == expected[0]
 
 
+class TestHandlerBridgeSetSize:
+    """set_handle_size sends only an absolute size a file can have.
+
+    dp_Arg2 is a signed LONG, so the handler would see a larger size
+    wrapped: 4 GiB + 4 arrives as 4 and cuts the file to 4 bytes. A size
+    from OFFSET_CURRENT or OFFSET_END can resolve below 0 or above
+    0x7FFFFFFF, which FastFileSystem takes as a grow past the free space,
+    so only OFFSET_BEGINNING is sent.
+    """
+
+    FH_ADDR = 0x3000
+    ORIGINAL = b"0123456789"
+
+    # A mode given by name is the startup_runner constant; any other is sent
+    # as is.
+    @pytest.mark.parametrize("size, mode", [
+        ((1 << 32) + 4, "OFFSET_BEGINNING"),
+        (0x80000000, "OFFSET_BEGINNING"),
+        (-1, "OFFSET_BEGINNING"),
+        (-0x80000000, "OFFSET_BEGINNING"),
+        (4.0, "OFFSET_BEGINNING"),
+        (-0x80000000, "OFFSET_CURRENT"),
+        (0x7FFFFFFF, "OFFSET_CURRENT"),
+        (-1, "OFFSET_END"),
+        (-0x80000000, "OFFSET_END"),
+        (0x7FFFFFFF, "OFFSET_END"),
+        (4, 0xFFFFFFFF),
+        (4, 2),
+        (4, -1.0),
+    ], ids=["begin-4g+4", "begin-2g", "begin-minus-1", "begin-long-min",
+            "begin-float", "current-long-min", "current-long-max",
+            "end-minus-1", "end-long-min", "end-long-max",
+            "mode-unsigned-begin", "mode-2", "mode-float"])
+    def test_size_or_mode_is_refused(self, fuse_mock, size, mode):
+        """The call fails with -1 before any packet is sent."""
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        if isinstance(mode, str):
+            mode = getattr(fuse_fs_mod, mode)
+        handler = _FakeHandlerFile(self.ORIGINAL)
+        bridge = _fake_write_bridge(fuse_fs_mod, handler)
+
+        assert bridge.set_handle_size(self.FH_ADDR, size, mode) == -1
+        bridge.launcher.send_set_file_size.assert_not_called()
+        bridge._run_until_replies.assert_not_called()
+        assert handler.data == self.ORIGINAL
+
+    @pytest.mark.parametrize("size", [0, 0x7FFFFFFF],
+                             ids=["zero", "long-max"])
+    def test_size_in_range_reaches_handler(self, fuse_mock, size):
+        """The size is sent from OFFSET_BEGINNING, and the reply returned."""
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        handler = _FakeHandlerFile(self.ORIGINAL, set_size_reply=_reply(7))
+        bridge = _fake_write_bridge(fuse_fs_mod, handler)
+
+        assert bridge.set_handle_size(self.FH_ADDR, size) == 7
+        bridge.launcher.send_set_file_size.assert_called_once_with(
+            bridge.state, self.FH_ADDR, size, fuse_fs_mod.OFFSET_BEGINNING)
+
+
 class TestFuseWriteErrors:
     """AmigaFuseFS.write reports a failed write with the closest errno.
 
