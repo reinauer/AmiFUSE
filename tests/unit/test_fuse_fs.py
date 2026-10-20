@@ -1618,11 +1618,12 @@ class TestHandlerBridgeReadReplies:
         ([SEEK_OK, _reply(4)], b""),
         ([SEEK_OK, _reply(3)], b""),
         ([SEEK_OK, _reply(10)], None),
+        ([SEEK_OK, _reply(0x81000000 - (1 << 32))], None),
         ([SEEK_ERROR], None),
         ([NO_REPLY], None),
         ([SEEK_OK, SEEK_ERROR], None),
-    ], ids=["at-end", "past-end", "inside-file", "end-seek-error",
-            "end-seek-no-reply", "position-error"])
+    ], ids=["at-end", "past-end", "inside-file", "end-past-2gib",
+            "end-seek-error", "end-seek-no-reply", "position-error"])
     def test_seek_error_is_eof_only_past_the_end(self, fuse_mock, probe, expected):
         """ERROR_SEEK_ERROR reads as end of file only if the offset is past the end."""
         import amifuse.fuse_fs as fuse_fs_mod
@@ -1922,16 +1923,20 @@ class _FakeHandlerFile:
     writes at the handle's position and fails with ERROR_DISK_FULL when the
     file would grow past capacity. ACTION_SET_FILE_SIZE shrinks the file.
     seek_reply and set_size_reply, when set, answer every seek or size
-    change instead. Each send returns the packet address its reply carries.
+    change instead, and seek_mode_reply, a (mode, reply) pair, answers
+    every seek from that mode. Each send returns the packet address its
+    reply carries.
     """
 
     def __init__(self, data, capacity=1 << 20, seek_reply=None,
-                 set_size_reply=None, read_replies=None, write_replies=None):
+                 set_size_reply=None, seek_mode_reply=None,
+                 read_replies=None, write_replies=None):
         self.data = bytearray(data)
         self.pos = 0
         self.capacity = capacity
         self.seek_reply = seek_reply
         self.set_size_reply = set_size_reply
+        self.seek_mode_reply = seek_mode_reply
         self.writes = []  # length of every ACTION_WRITE
         self.set_sizes = []  # size of every ACTION_SET_FILE_SIZE
         # The number of an ACTION_READ or ACTION_WRITE, counted from 0,
@@ -1964,6 +1969,8 @@ class _FakeHandlerFile:
         base = {-1: 0, 0: self.pos, 1: len(self.data)}[mode]
         if self.seek_reply is not None:
             self.reply = self.seek_reply
+        elif self.seek_mode_reply and self.seek_mode_reply[0] == mode:
+            self.reply = self.seek_mode_reply[1]
         elif 0 <= base + offset <= len(self.data):
             self.reply = _reply(self.pos)
             self.pos = base + offset
@@ -2596,6 +2603,21 @@ class TestHandlerBridgeWriteAt:
         bridge = _fake_write_bridge(fuse_fs_mod, handler)
 
         assert bridge.write_handle_at(self.FH_ADDR, 4, self.DATA) == (-1, 0)
+        assert handler.writes == []
+        assert handler.data == self.ORIGINAL
+
+    def test_wrapped_end_fails_without_writing(self, fuse_mock):
+        """dp_Res1 is a signed LONG, so the end of a file of 2 GiB or more
+        arrives negative. Taken as an end, it would start a fill of about
+        2 GiB of zeros; the write fails instead."""
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        handler = _FakeHandlerFile(self.ORIGINAL, seek_mode_reply=(
+            fuse_fs_mod.OFFSET_CURRENT, _reply(0x81000000 - (1 << 32))))
+        # No disk info, so no free-space check stands before the fill.
+        bridge = _fake_write_bridge(fuse_fs_mod, handler, free_blocks=None)
+
+        assert bridge.write_handle_at(self.FH_ADDR, 100, self.DATA) == (-1, 0)
         assert handler.writes == []
         assert handler.data == self.ORIGINAL
 
