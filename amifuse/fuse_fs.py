@@ -123,15 +123,16 @@ class SeekResult(Enum):
     FAILED = "failed"  # any other refusal, no reply, or an offset out of range
 
 
-# A write past end of file fills the gap with zeros in chunks of this size,
-# so a large gap needs no more memory than an ordinary write.
-ZERO_FILL_CHUNK = 64 * 1024
-
 # The most bytes one ACTION_READ or ACTION_WRITE carries. Larger reads and
 # writes go out in packets of this size, so that the buffer in emulated
 # memory stays small and each packet is a short piece of work for the
 # handler.
 IO_CHUNK = 64 * 1024
+
+# The size of the host-side buffer of zeros that fills the gap before a
+# write past end of file, one packet's worth, so a large gap needs no more
+# memory than an ordinary write.
+ZERO_FILL_CHUNK = IO_CHUNK
 
 # AmigaDOS error codes from a failed ACTION_WRITE that have a closer errno
 # than EIO.
@@ -4931,7 +4932,7 @@ def cmd_hash(args):
 
         fh_addr, _dir_lock = fh_result
         try:
-            chunk_size = 65536
+            chunk_size = IO_CHUNK
             bytes_read = 0
             # Seek to start once, then use sequential read_handle() calls.
             # read_handle() reads from the current file position without
@@ -5122,7 +5123,7 @@ def cmd_read(args):
         # The lock is released when the bridge is destroyed.
         fh_addr, _dir_lock = fh_result
         try:
-            chunk_size = 65536
+            chunk_size = IO_CHUNK
             bytes_read = 0
             # Seek to start once, then use sequential read_handle() calls.
             bridge.seek_handle(fh_addr, 0)
@@ -5310,7 +5311,7 @@ def cmd_write(args):
             # - flush_volume() checks state.crashed and returns early (safe)
             # - close_file() sends a packet that gets no reply (harmless)
             # - write_handle() returning -1 triggers the error path below
-            chunk_size = 65536
+            chunk_size = IO_CHUNK
             bytes_written = 0
             with open(host_path, "rb") as f:
                 while True:
