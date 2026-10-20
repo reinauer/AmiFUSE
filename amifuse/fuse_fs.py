@@ -139,13 +139,16 @@ IO_CHUNK = 64 * 1024
 # memory than an ordinary write.
 ZERO_FILL_CHUNK = IO_CHUNK
 
-# AmigaDOS error codes from a failed ACTION_WRITE that have a closer errno
-# than EIO.
+# AmigaDOS error codes from a failed ACTION_WRITE or ACTION_SET_FILE_SIZE
+# that have a closer errno than EIO. ERROR_WRITE_PROTECTED is a file whose
+# protection bits forbid writing.
 ERROR_DISK_WRITE_PROTECTED = 214
 ERROR_DISK_FULL = 221
+ERROR_WRITE_PROTECTED = 223
 _WRITE_ERRNOS = {
     ERROR_DISK_WRITE_PROTECTED: errno.EROFS,
     ERROR_DISK_FULL: errno.ENOSPC,
+    ERROR_WRITE_PROTECTED: errno.EACCES,
 }
 
 # AmigaDOS error codes a handler can return when it refuses ACTION_DISK_INFO.
@@ -2318,9 +2321,9 @@ class HandlerBridge:
 
         Returns (new size, 0), or (-1, error) when the change fails: a
         failed grow carries ERROR_DISK_FULL when the volume cannot hold
-        it, or the error code of the write that failed. A failed shrink,
-        a length outside 0 to 0x7FFFFFFF, a failed seek or a missing
-        reply carries 0.
+        it, or the error code of the write that failed, and a failed
+        shrink carries the handler's error code. A length outside 0 to
+        0x7FFFFFFF, a failed seek or a missing reply carries 0.
 
         A grow writes zeros from the old end of file, as a write past it
         does, and fails before writing anything when the volume cannot
@@ -2359,19 +2362,30 @@ class HandlerBridge:
                 # cost little next to the zeros it then writes.
                 written, res2 = self._write_past_end(fh_addr, length, b"")
                 return (length, 0) if written >= 0 else (-1, res2)
-            return self.set_handle_size(fh_addr, length), 0
+            size, res2 = self.set_handle_size_reply(fh_addr, length)
+            return (size, 0) if size >= 0 else (-1, res2)
 
     def set_handle_size(self, fh_addr: int, size: int, mode: int = OFFSET_BEGINNING) -> int:
         """Make the file size bytes long, as AmigaDOS SetFileSize() does.
 
-        Returns the new size, or -1 when the handler fails the change or
-        does not reply. Only an integer size from 0 to 0x7FFFFFFF with mode
-        OFFSET_BEGINNING reaches the handler; anything else is -1 without a
-        packet. dp_Arg2 is a signed LONG, so a larger size would arrive
-        wrapped: 4 GiB + 4 would cut the file to 4 bytes. From
-        OFFSET_CURRENT or OFFSET_END the size resolves against a position
-        the bridge does not track, and FastFileSystem takes a result below
-        0 or above 0x7FFFFFFF as a grow.
+        Returns the new size, or -1 when the change fails. Callers that
+        need the handler's error code want set_handle_size_reply().
+        """
+        return self.set_handle_size_reply(fh_addr, size, mode)[0]
+
+    def set_handle_size_reply(self, fh_addr: int, size: int,
+                              mode: int = OFFSET_BEGINNING) -> Tuple[int, int]:
+        """Send ACTION_SET_FILE_SIZE and return (dp_Res1, dp_Res2).
+
+        dp_Res1 is the new size, or -1 when the handler fails the change,
+        and dp_Res2 then holds its AmigaDOS error code. A change that gets
+        no reply returns (-1, 0). Only an integer size from 0 to 0x7FFFFFFF
+        with mode OFFSET_BEGINNING reaches the handler; anything else is
+        (-1, 0) without a packet. dp_Arg2 is a signed LONG, so a larger
+        size would arrive wrapped: 4 GiB + 4 would cut the file to 4
+        bytes. From OFFSET_CURRENT or OFFSET_END the size resolves against
+        a position the bridge does not track, and FastFileSystem takes a
+        result below 0 or above 0x7FFFFFFF as a grow.
 
         A size in range is no safe grow either. FastFileSystem answers a
         grow larger than the free space by growing the file until the
@@ -2384,14 +2398,14 @@ class HandlerBridge:
         try:
             size, mode = operator.index(size), operator.index(mode)
         except TypeError:
-            return -1
+            return -1, 0
         if mode != OFFSET_BEGINNING or not 0 <= size <= _LONG_MAX:
-            return -1
+            return -1, 0
         with self._lock:
             pkt_addr, _ = self.launcher.send_set_file_size(
                 self.state, fh_addr, size, mode)
             reply = self._run_until_reply(pkt_addr, "setsize")
-        return -1 if reply is None else reply[0]
+        return (-1, 0) if reply is None else reply
 
     def delete_object(self, parent_lock_bptr: int, name: str) -> Tuple[int, int]:
         with self._lock:
