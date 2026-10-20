@@ -2242,14 +2242,13 @@ class HandlerBridge:
         with self._lock:
             _, src_bptr = self._alloc_bstr(src_name)
             _, dst_bptr = self._alloc_bstr(dst_name)
-            self.launcher.send_rename_object(
+            pkt_addr, _ = self.launcher.send_rename_object(
                 self.state, src_lock_bptr, src_bptr, dst_lock_bptr, dst_bptr
             )
-            replies = self._run_until_replies()
-            self._log_replies("rename", replies)
-            if not replies:
-                return 0, -1
-            return replies[-1][2], replies[-1][3]
+            # A late reply to a packet that timed out, a WRITE's byte count
+            # say, would otherwise pass for DOSTRUE.
+            reply = self._run_until_reply(pkt_addr, "rename")
+            return reply if reply is not None else (0, -1)
 
     def create_dir(self, parent_lock_bptr: int, name: str) -> Tuple[int, int]:
         with self._lock:
