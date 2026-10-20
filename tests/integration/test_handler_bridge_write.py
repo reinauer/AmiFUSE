@@ -313,3 +313,77 @@ class TestTruncateLengthLimit:
             assert bridge.read_file(path, 1 << 20, 0) == original
         finally:
             bridge.close()
+
+
+# D. Truncate that grows a file -- 2 tests
+
+
+class TestTruncateGrow:
+    """truncate() fills the range it adds with zeros, as on POSIX.
+
+    The handlers leave a range ACTION_SET_FILE_SIZE adds holding whatever
+    its blocks held before, so the mount writes zeros instead.
+    """
+
+    def test_grown_range_reads_as_zeros(self, writable_volume):
+        image, driver, path = writable_volume
+        # Blocks freed by a deleted file still hold its data. SFS moves a
+        # deleted file to .recycled, and reuses its blocks only once that
+        # copy is deleted too and the volume reopened.
+        bridge = _bridge(image, driver, read_only=False)
+        try:
+            ops = AmigaFuseFS(bridge)
+            handle = ops.create("/stale.bin", 0o644)
+            assert ops.write("/stale.bin", b"\xa5" * 32768, 0, handle) == 32768
+            ops.release("/stale.bin", handle)
+            ops.unlink("/stale.bin")
+            if driver.name == "SmartFilesystem":
+                ops.unlink("/.recycled/stale.bin")
+            bridge.flush_volume()
+        finally:
+            bridge.close()
+
+        bridge = _bridge(image, driver, read_only=False)
+        try:
+            original = bridge.read_file(path, 1 << 20, 0)
+            ops = AmigaFuseFS(bridge)
+            # ftruncate() on a file created in this session, whose size
+            # getattr serves from its cache until release.
+            handle = ops.create("/new.bin", 0o644)
+            assert ops.write("/new.bin", b"x", 0, handle) == 1
+            assert ops.truncate("/new.bin", 32768, handle) == 0
+            assert ops.getattr("/new.bin")["st_size"] == 32768
+            assert ops.read("/new.bin", 32768, 0, handle) == b"x" + bytes(32767)
+            # The grow moved the handle, so this write must seek.
+            assert ops.write("/new.bin", b"y", 1, handle) == 1
+            ops.release("/new.bin", handle)
+            # truncate() by path on an existing file.
+            assert ops.truncate(path, len(original) + 4096) == 0
+            bridge.flush_volume()
+        finally:
+            bridge.close()
+
+        bridge = _bridge(image, driver)
+        try:
+            new = bridge.read_file("/new.bin", 1 << 20, 0)
+            grown = bridge.read_file(path, 1 << 20, 0)
+        finally:
+            bridge.close()
+        assert new == b"xy" + bytes(32766)
+        assert grown == original + bytes(4096)
+
+    def test_grow_beyond_volume_fails_without_writing(self, writable_volume):
+        image, driver, path = writable_volume
+        bridge = _bridge(image, driver, read_only=False)
+        try:
+            original = bridge.read_file(path, 1 << 20, 0)
+            used = bridge.get_disk_info()["num_blocks_used"]
+            ops = AmigaFuseFS(bridge)
+            # Every test volume is far smaller than 100 MiB.
+            with pytest.raises(FuseOSError) as exc_info:
+                ops.truncate(path, 100 << 20)
+            assert exc_info.value.args[0] == errno.ENOSPC
+            assert bridge.read_file(path, 1 << 20, 0) == original
+            assert bridge.get_disk_info()["num_blocks_used"] == used
+        finally:
+            bridge.close()
