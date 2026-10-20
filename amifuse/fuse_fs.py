@@ -2266,7 +2266,8 @@ class HandlerBridge:
         """Fill the file with zeros from its end to offset, then write data.
 
         AmigaDOS cannot seek past end of file, so this writes the gap
-        instead. Returns (dp_Res1, dp_Res2) like write_handle_reply(). A
+        instead. Returns (dp_Res1, dp_Res2) like write_handle_reply(). With
+        no data, the file only grows to offset, as truncate() needs. A
         write that fails once the fill has begun shrinks the file back to
         its old end, so the zeros do not stay behind and fill the volume.
 
@@ -2274,8 +2275,8 @@ class HandlerBridge:
         serves one request at a time, so a large gap stalls the whole mount.
 
         ACTION_SET_FILE_SIZE would extend the file in one packet, but FFS,
-        OFS and pfs3aio leave the new range holding whatever its blocks held
-        before, such as a deleted file's data.
+        OFS, pfs3aio and SFS leave the new range holding whatever its blocks
+        held before, such as a deleted file's data.
         """
         with self._lock:
             end = self._handle_end(fh_addr)
@@ -2311,6 +2312,54 @@ class HandlerBridge:
                 # the zeros written so far stay.
                 self._shrink_back(fh_addr, end)
             return written, res2
+
+    def truncate_handle(self, fh_addr: int, length: int) -> Tuple[int, int]:
+        """Make the file length bytes long, as POSIX ftruncate() does.
+
+        Returns (new size, 0), or (-1, error) when the change fails: a
+        failed grow carries ERROR_DISK_FULL when the volume cannot hold
+        it, or the error code of the write that failed. A failed shrink,
+        a length outside 0 to 0x7FFFFFFF, a failed seek or a missing
+        reply carries 0.
+
+        A grow writes zeros from the old end of file, as a write past it
+        does, and fails before writing anything when the volume cannot
+        hold them. ACTION_SET_FILE_SIZE would add the range in one packet,
+        but AmigaDOS does not define its bytes, and FFS, OFS, pfs3aio and
+        SFS leave whatever the new blocks held before, such as a deleted
+        file's data. A shrink, or a truncate to the current size, is one
+        ACTION_SET_FILE_SIZE.
+
+        The end of file tells a grow from a shrink; a seek to the length
+        cannot. BFFS built with ALLOW_SPARSE_FILES accepts a seek past end
+        of file, and AROS afs refuses one inside a damaged file. Only when
+        the end cannot be measured does the seek decide, as it does in
+        write_handle_at: pfs3aio refuses the seek to the end of a file of
+        2 GiB or more, SFS answers it with an end dp_Res1 cannot carry,
+        and AROS afs can fail the seek to the end of a damaged file.
+        """
+        # A fill past 0x7FFFFFFF would leave a file no seek can reach the
+        # end of, and ACTION_SET_FILE_SIZE carries the size in a LONG.
+        if not 0 <= length <= _LONG_MAX:
+            return -1, 0
+        with self._lock:
+            # A truncate to 0 cannot grow the file, so it skips the seeks.
+            grow = False
+            if length:
+                end = self._handle_end(fh_addr)
+                if end is not None:
+                    grow = length > end
+                else:
+                    result, _ = self.seek_handle(fh_addr, length)
+                    if result is SeekResult.FAILED:
+                        return -1, 0
+                    grow = result is SeekResult.PAST_END
+            if grow:
+                # _write_past_end measures the end again. Two more seeks
+                # cost little next to the zeros it then writes.
+                written, res2 = self._write_past_end(fh_addr, length, b"")
+                return (length, 0) if written >= 0 else (-1, res2)
+            return self.set_handle_size(fh_addr, length), 0
 
     def set_handle_size(self, fh_addr: int, size: int, mode: int = OFFSET_BEGINNING) -> int:
         """Make the file size bytes long, as AmigaDOS SetFileSize() does.
@@ -3148,11 +3197,13 @@ class AmigaFuseFS(_FuseOperations):
             with entry["lock"]:
                 if entry.get("closed"):
                     raise FuseOSError(errno.EIO)
-                size = self.bridge.set_handle_size(fh_addr, length, OFFSET_BEGINNING)
+                size, res2 = self.bridge.truncate_handle(fh_addr, length)
+                # truncate_handle moves the handle, and handlers differ in
+                # where a size change leaves it, so the next read or write
+                # seeks.
+                entry["pos"] = None
                 if size < 0:
-                    raise FuseOSError(errno.EIO)
-                if entry["pos"] is not None:
-                    entry["pos"] = min(entry["pos"], length)
+                    raise FuseOSError(_WRITE_ERRNOS.get(res2, errno.EIO))
                 entry["dirty"] = True  # Truncate modifies the file
             # A pinned size is all getattr reports until release, and
             # write() only ever raises it. Left stale, it would place the
