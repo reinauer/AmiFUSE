@@ -2101,6 +2101,101 @@ class TestFuseWriteErrors:
         assert handler.writes == [100, 8, 8]
 
 
+class TestFuseTruncateLength:
+    """AmigaFuseFS.truncate refuses a length outside 0..0x7FFFFFFF.
+
+    ACTION_SET_FILE_SIZE takes the new size as a signed 32-bit argument, so
+    the handler would see only the low 32 bits of any other length:
+    4 GiB + 4 and -4 GiB + 4 as 4, and 2 GiB as a negative size.
+    """
+
+    FH_ADDR = 0x3000
+
+    @pytest.fixture
+    def writable(self, write_fs):
+        fs, bridge = write_fs
+        bridge.open_file.return_value = (self.FH_ADDR, 0)
+        bridge.set_handle_size.return_value = 0  # any size but -1 succeeds
+        return fs, bridge
+
+    @pytest.mark.parametrize("length", [0x80000000, 1 << 32, (1 << 32) + 4])
+    def test_path_truncate_past_long_raises_efbig(self, writable, length):
+        """truncate() fails with EFBIG and opens no handle."""
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        fs, bridge = writable
+        with pytest.raises(fuse_fs_mod.FuseOSError) as exc_info:
+            fs.truncate("/file", length)
+        assert exc_info.value.args[0] == errno.EFBIG
+        bridge.open_file.assert_not_called()
+        bridge.set_handle_size.assert_not_called()
+
+    @pytest.mark.parametrize("length", [0x80000000, 1 << 32, (1 << 32) + 4])
+    def test_handle_truncate_past_long_raises_efbig(self, writable, length):
+        """ftruncate() fails with EFBIG and leaves the handle open."""
+        import os
+
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        fs, bridge = writable
+        handle = fs.open("/file", os.O_WRONLY)
+        with pytest.raises(fuse_fs_mod.FuseOSError) as exc_info:
+            fs.truncate("/file", length, handle)
+        assert exc_info.value.args[0] == errno.EFBIG
+        bridge.set_handle_size.assert_not_called()
+        bridge.close_file.assert_not_called()
+
+    @pytest.mark.parametrize("length", [-1, -(1 << 32) + 4])
+    def test_path_truncate_negative_raises_einval(self, writable, length):
+        """truncate() fails with EINVAL and opens no handle."""
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        fs, bridge = writable
+        with pytest.raises(fuse_fs_mod.FuseOSError) as exc_info:
+            fs.truncate("/file", length)
+        assert exc_info.value.args[0] == errno.EINVAL
+        bridge.open_file.assert_not_called()
+        bridge.set_handle_size.assert_not_called()
+
+    @pytest.mark.parametrize("length", [-1, -(1 << 32) + 4])
+    def test_handle_truncate_negative_raises_einval(self, writable, length):
+        """ftruncate() fails with EINVAL and leaves the handle open."""
+        import os
+
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        fs, bridge = writable
+        handle = fs.open("/file", os.O_WRONLY)
+        with pytest.raises(fuse_fs_mod.FuseOSError) as exc_info:
+            fs.truncate("/file", length, handle)
+        assert exc_info.value.args[0] == errno.EINVAL
+        bridge.set_handle_size.assert_not_called()
+        bridge.close_file.assert_not_called()
+
+    @pytest.mark.parametrize("use_handle", [False, True])
+    def test_long_max_still_reaches_handler(self, writable, use_handle):
+        """A length of 0x7FFFFFFF is still sent to the handler."""
+        import os
+
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        fs, bridge = writable
+        handle = fs.open("/file", os.O_WRONLY) if use_handle else None
+        assert fs.truncate("/file", 0x7FFFFFFF, handle) == 0
+        bridge.set_handle_size.assert_called_once_with(
+            self.FH_ADDR, 0x7FFFFFFF, fuse_fs_mod.OFFSET_BEGINNING)
+
+    def test_read_only_mount_raises_erofs_first(self, fs_with_mock_bridge):
+        """A read-only mount reports EROFS whatever the length."""
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        fs, bridge = fs_with_mock_bridge
+        with pytest.raises(fuse_fs_mod.FuseOSError) as exc_info:
+            fs.truncate("/file", (1 << 32) + 4)
+        assert exc_info.value.args[0] == errno.EROFS
+        bridge.set_handle_size.assert_not_called()
+
+
 class TestHandlerBridgeBstrRing:
     """Verify bstr ring buffer frees old allocation on growth."""
 

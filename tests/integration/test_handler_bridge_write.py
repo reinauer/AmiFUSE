@@ -272,3 +272,42 @@ class TestWritePastEndOfFile:
             bridge.close()
         # The zeros written before the handler ran out are gone again.
         assert after["num_blocks_used"] == info["num_blocks_used"]
+
+
+# C. Truncate length limit -- 1 test
+
+
+class TestTruncateLengthLimit:
+    """truncate() refuses a length that ACTION_SET_FILE_SIZE cannot carry."""
+
+    def test_out_of_range_length_leaves_file_unchanged(self, writable_volume):
+        """Lengths outside 0..0x7FFFFFFF fail; the file is unchanged.
+
+        4 GiB + 4, 4 GiB and 2 GiB fail with EFBIG, and -1 and -4 GiB + 4
+        with EINVAL. ACTION_SET_FILE_SIZE takes a signed 32-bit size, so
+        without the checks 4 GiB + 4 and -4 GiB + 4 reached the handler as 4
+        and cut the file to 4 bytes.
+        """
+        image, driver, path = writable_volume
+        bridge = _bridge(image, driver, read_only=False)
+        try:
+            original = bridge.read_file(path, 1 << 20, 0)
+            assert len(original) > 4
+            ops = AmigaFuseFS(bridge)
+            for length, expected in (((1 << 32) + 4, errno.EFBIG),
+                                     (1 << 32, errno.EFBIG),
+                                     (0x80000000, errno.EFBIG),
+                                     (-(1 << 32) + 4, errno.EINVAL),
+                                     (-1, errno.EINVAL)):
+                with pytest.raises(FuseOSError) as exc_info:
+                    ops.truncate(path, length)
+                assert exc_info.value.args[0] == expected
+            bridge.flush_volume()
+        finally:
+            bridge.close()
+
+        bridge = _bridge(image, driver)
+        try:
+            assert bridge.read_file(path, 1 << 20, 0) == original
+        finally:
+            bridge.close()
