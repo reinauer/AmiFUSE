@@ -1,10 +1,11 @@
-"""Reads larger than one packet, on the real handlers.
+"""Reads and writes larger than one packet, on the real handlers.
 
-The bridge splits a read into ACTION_READ packets of at most IO_CHUNK
-bytes. Sent as one packet, a request larger than the free emulated memory
-(about 8 MiB) could not be allocated, and on OFS a read of about 1 MiB
-kept the handler working for 10 million cycles or more. Each test works
-on a copy of a volume through the FUSE callbacks a mounted volume receives.
+The bridge splits a read or write into ACTION_READ or ACTION_WRITE packets
+of at most IO_CHUNK bytes. Sent as one packet, a request larger than the
+free emulated memory (about 8 MiB) could not be allocated, and on OFS a
+read or write of about 1 MiB kept the handler working for 10 million
+cycles or more. Each test works on a copy of a volume through the FUSE
+callbacks a mounted volume receives.
 """
 
 import os
@@ -97,7 +98,8 @@ def _write(image, driver, partition, parts):
 
 
 class TestLargeTransfers:
-    """One read() returns every byte asked for, up to end of file."""
+    """One read() returns every byte asked for, up to end of file, and one
+    write() stores every byte it is given."""
 
     def test_read_larger_than_memory(self, large_volume):
         image, driver, partition, size = large_volume
@@ -127,3 +129,25 @@ class TestLargeTransfers:
             assert bridge.read_file(PATH, length, offset) == middle
         finally:
             bridge.close()
+
+    def test_write_whole_file_in_one_call(self, large_volume):
+        image, driver, partition, size = large_volume
+        content = _pattern(size)
+        # The second write follows the first and needs no seek.
+        _write(image, driver, partition, [content, b"tail"])
+
+        bridge = _bridge(image, driver, partition)
+        try:
+            ops = AmigaFuseFS(bridge)
+            handle = ops.open(PATH, os.O_RDONLY)
+            parts, offset = [], 0
+            while True:
+                part = ops.read(PATH, IO_CHUNK, offset, handle)
+                if not part:
+                    break
+                parts.append(part)
+                offset += len(part)
+            ops.release(PATH, handle)
+        finally:
+            bridge.close()
+        assert b"".join(parts) == content + b"tail"
