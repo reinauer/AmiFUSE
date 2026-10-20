@@ -1364,8 +1364,8 @@ class HandlerBridge:
     def free_lock(self, lock_bptr: int):
         with self._lock:
             if lock_bptr:
-                self.launcher.send_free_lock(self.state, lock_bptr)
-                self._run_until_replies()
+                pkt_addr, _ = self.launcher.send_free_lock(self.state, lock_bptr)
+                self._run_until_reply(pkt_addr, "free_lock")
 
     def locate_path(self, path: str) -> Tuple[int, int, List[int]]:
         """Return (lock BPTR, res2, locks_to_free) for the given absolute path.
@@ -1375,6 +1375,11 @@ class HandlerBridge:
         most the final lock. Ancestor locks must not accumulate in handler
         memory: they are never freed by callers, which only release the
         returned list.
+
+        Each LOCATE takes only its own reply. A late reply to a packet that
+        timed out, a WRITE's byte count say, would otherwise pass for the
+        lock and be examined and freed in its place. The real lock would
+        stay held, and the object in use, for the rest of the mount.
         """
         with self._lock:
             if path and path != "/" and self._is_neg_cached(path):
@@ -1386,11 +1391,10 @@ class HandlerBridge:
                 return lock, res2, []
             for comp in parts:
                 _, name_bptr = self._alloc_bstr(comp)
-                self.launcher.send_locate(self.state, lock, name_bptr)
-                replies = self._run_until_replies()
+                pkt_addr, _ = self.launcher.send_locate(self.state, lock, name_bptr)
+                reply = self._run_until_reply(pkt_addr, "locate")
                 parent = lock
-                lock = replies[-1][2] if replies else 0
-                res2 = replies[-1][3] if replies else -1
+                lock, res2 = reply if reply is not None else (0, -1)
                 if parent:
                     self.free_lock(parent)
                 if lock == 0:
@@ -1524,9 +1528,9 @@ class HandlerBridge:
             if path == "/":
                 return {"dir_type": 2, "size": 0, "name": "", "protection": 0}
             fib_mem = self._alloc_fib()
-            self.launcher.send_examine(self.state, lock, fib_mem.addr)
-            replies = self._run_until_replies()
-            if not replies or replies[-1][2] == 0:
+            pkt_addr, _ = self.launcher.send_examine(self.state, lock, fib_mem.addr)
+            reply = self._run_until_reply(pkt_addr, "examine")
+            if reply is None or reply[0] == 0:
                 for l in reversed(locks):
                     self.free_lock(l)
                 return None

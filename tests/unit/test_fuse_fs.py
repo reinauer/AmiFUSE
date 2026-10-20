@@ -1643,6 +1643,103 @@ class TestHandlerBridgeReadReplies:
         bridge.launcher.send_findinput.assert_not_called()
 
 
+STALE_WRITE = _reply(4096, pkt=STALE_PKT)  # late answer to a timed-out WRITE
+
+
+class TestHandlerBridgeLookupReplies:
+    """LOCATE, EXAMINE and FREE_LOCK take only their own replies.
+
+    A write that timed out is answered later, while the next lookup waits.
+    Its late byte count must not pass for a lock, which would be examined
+    and freed instead of the real one.
+    """
+
+    DIR_LOCK = 0x10
+    FILE_LOCK = 0x11
+
+    def _bridge(self, fuse_fs_mod, *replies):
+        """Build a bridge whose handler answers with the given reply lists in order."""
+        import threading
+
+        bridge = object.__new__(fuse_fs_mod.HandlerBridge)
+        bridge._lock = threading.RLock()
+        bridge._debug = False
+        bridge.state = MagicMock()
+        bridge.launcher = MagicMock()
+        for send in ("send_locate", "send_examine", "send_free_lock"):
+            getattr(bridge.launcher, send).return_value = (PKT, 0)
+        bridge._run_until_replies = MagicMock(side_effect=list(replies))
+        bridge._is_neg_cached = MagicMock(return_value=False)
+        bridge._set_neg_cached = MagicMock()
+        bridge._alloc_bstr = MagicMock(return_value=(0x4000, 0x1000))
+        bridge._alloc_fib = MagicMock(return_value=SimpleNamespace(addr=0x5000))
+        # A FileInfoBlock for a 3000-byte file named "file".
+        bridge.mem = MagicMock()
+        bridge.mem.r32s.return_value = -3
+        bridge.mem.r32.return_value = 3000
+        bridge.mem.r_block.return_value = b"\x04file" + bytes(103)
+        return bridge
+
+    def _freed(self, bridge):
+        return [c.args[1] for c in bridge.launcher.send_free_lock.call_args_list]
+
+    @pytest.mark.parametrize("replies", [
+        [STALE_WRITE, _reply(DIR_LOCK), _reply(FILE_LOCK), _reply(-1),
+         _reply(-1), _reply(-1)],
+        [_reply(DIR_LOCK), STALE_WRITE + _reply(FILE_LOCK), _reply(-1),
+         _reply(-1), _reply(-1)],
+        [_reply(DIR_LOCK), _reply(FILE_LOCK), _reply(-1), STALE_WRITE,
+         _reply(-1), _reply(-1)],
+    ], ids=["before-locate", "with-locate", "before-examine"])
+    def test_stat_path_uses_and_frees_the_real_locks(self, fuse_mock, replies):
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        bridge = self._bridge(fuse_fs_mod, *replies)
+
+        info = bridge.stat_path("/dir/file")
+
+        assert info is not None and info["size"] == 3000
+        locked = [c.args[1] for c in bridge.launcher.send_locate.call_args_list]
+        assert locked == [0, self.DIR_LOCK]
+        bridge.launcher.send_examine.assert_called_once_with(
+            bridge.state, self.FILE_LOCK, 0x5000)
+        assert self._freed(bridge) == [self.DIR_LOCK, self.FILE_LOCK]
+        assert bridge._run_until_replies.call_count == len(replies)
+
+    def test_examine_failure_is_not_hidden_by_a_late_reply(self, fuse_mock):
+        """A late nonzero res1 must not pass for EXAMINE's DOSTRUE."""
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        bridge = self._bridge(
+            fuse_fs_mod, _reply(self.FILE_LOCK), STALE_WRITE, _reply(0, 205), _reply(-1))
+
+        assert bridge.stat_path("/file") is None
+        assert self._freed(bridge) == [self.FILE_LOCK]
+
+    @pytest.mark.parametrize("replies, expected", [
+        ([STALE_WRITE, _reply(FILE_LOCK, 0)], (FILE_LOCK, 0, [FILE_LOCK])),
+        ([STALE_WRITE, _reply(0, 202)], (0, 202, [])),
+        ([STALE_WRITE, NO_REPLY], (0, -1, [])),
+    ], ids=["located", "in-use", "no-reply"])
+    def test_locate_path_reports_its_own_reply(self, fuse_mock, replies, expected):
+        """The lock and res2 come from the LOCATE reply, not a late one."""
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        bridge = self._bridge(fuse_fs_mod, *replies)
+
+        assert bridge.locate_path("/file") == expected
+
+    def test_free_lock_waits_for_its_own_reply(self, fuse_mock):
+        """Otherwise FREE_LOCK's reply would be left for the next packet."""
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        bridge = self._bridge(fuse_fs_mod, STALE_WRITE, _reply(-1))
+
+        bridge.free_lock(self.FILE_LOCK)
+
+        assert bridge._run_until_replies.call_count == 2
+
+
 class TestFuseReadErrors:
     """AmigaFuseFS.read turns a failed bridge read into EIO.
 
