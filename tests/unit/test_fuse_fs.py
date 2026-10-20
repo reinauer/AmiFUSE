@@ -5997,9 +5997,10 @@ class TestPinnedStatCache:
         assert "/Makefile" not in fs._pinned_stats
         assert "/Makefile" not in fs._stat_cache
 
-    def test_rename_discards_pins_on_both_paths(self, write_fs):
-        """rename() must clean both source and destination pin entries to
-        avoid stale stat being served under the new name.
+    def test_rename_moves_the_source_pin_over_the_destination(self, write_fs):
+        """rename() moves the source's pinned entry to the new name, where
+        getattr() needs it while the file is open, and drops the stale
+        destination entry rather than serve it under the new name.
         """
         fs, bridge = write_fs
         bridge.locate_path.return_value = (0x6855, 0, [])
@@ -6010,10 +6011,204 @@ class TestPinnedStatCache:
 
         fs.rename("/old", "/new")
 
-        assert "/old" not in fs._pinned_stats
-        assert "/new" not in fs._pinned_stats
+        assert fs._pinned_stats == {"/new"}
         assert "/old" not in fs._stat_cache
-        assert "/new" not in fs._stat_cache
+        assert fs._stat_cache["/new"][1]["st_size"] == 1
+
+
+class TestOpenHandleGetattr:
+    """getattr() while a file handle is open in write mode.
+
+    The stat cache TTL is 0 there. A file held on an exclusive FINDOUTPUT
+    lock, from create() or an O_TRUNC open(), has a pinned entry, which is
+    all getattr() reports until release(): the handler cannot examine the
+    file. For any other open file the handler is asked: FINDINPUT and
+    FINDUPDATE locks are shared, so it reports the current size and
+    protection.
+    """
+
+    INFO = {"dir_type": -3, "size": 3000, "num_blocks": 6, "protection": 0, "name": "f.bin"}
+
+    @pytest.fixture
+    def fs(self, write_fs):
+        fs, bridge = write_fs
+        bridge.open_file.return_value = (0x4abbc, 0)
+        return fs, bridge
+
+    @pytest.mark.parametrize("flags", [os.O_RDONLY, os.O_RDWR], ids=["O_RDONLY", "O_RDWR"])
+    def test_open_handle_reports_handler_size_and_mode(self, fs, flags):
+        fs, bridge = fs
+        bridge.stat_path.return_value = dict(self.INFO)
+        expected = fs._stat_from_fib(self.INFO, "/f.bin", 0)
+        fh = fs.open("/f.bin", flags)
+
+        for attrs in (fs.getattr("/f.bin"), fs.getattr("/f.bin", fh)):
+            assert attrs["st_size"] == 3000
+            assert attrs["st_mode"] == expected["st_mode"]
+            assert attrs["st_blocks"] == 6
+        assert bridge.stat_path.call_count == 2
+
+    @pytest.mark.parametrize("flags", [os.O_WRONLY | os.O_TRUNC, os.O_RDWR | os.O_TRUNC],
+                             ids=["O_WRONLY", "O_RDWR"])
+    def test_exclusive_open_answers_from_its_pin(self, fs, flags):
+        """open() with O_TRUNC takes an exclusive FINDOUTPUT lock, as
+        create() does. getattr() answers from a pinned entry that write()
+        and truncate() keep at the file's size, without asking the handler.
+        """
+        fs, bridge = fs
+        bridge.stat_path.side_effect = AssertionError("asked the handler")
+        bridge.write_handle_at.return_value = (1234, 0)
+        bridge.set_handle_size.return_value = 1000
+        bridge.truncate_handle.return_value = (1000, 0)  # either resize call
+        fh = fs.open("/f.bin", flags)
+
+        assert fs.getattr("/f.bin", fh)["st_size"] == 0
+        fs.write("/f.bin", b"z" * 1234, 0, fh)
+        assert fs.getattr("/f.bin", fh)["st_size"] == 1234
+        assert fs.getattr("/f.bin")["st_size"] == 1234
+        fs.truncate("/f.bin", 1000, fh)
+        assert fs.getattr("/f.bin", fh)["st_size"] == 1000
+
+        fs.release("/f.bin", fh)
+        assert "/f.bin" not in fs._pinned_stats
+
+    def test_read_only_truncating_open_is_not_pinned(self, fs):
+        """O_RDONLY | O_TRUNC opens with FINDINPUT, a shared lock."""
+        fs, bridge = fs
+        bridge.stat_path.return_value = dict(self.INFO)
+        fh = fs.open("/f.bin", os.O_RDONLY | os.O_TRUNC)
+
+        assert "/f.bin" not in fs._pinned_stats
+        assert fs.getattr("/f.bin", fh)["st_size"] == 3000
+
+    def test_prune_keeps_pinned_entries(self, fs, monkeypatch):
+        """In write mode each getattr() adds an entry that never serves
+        again, so the stat cache reaches its cap and drops its oldest half.
+        A pinned entry must stay: the handler cannot examine its file.
+        """
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        fs, bridge = fs
+        monkeypatch.setattr(fuse_fs_mod, "_CACHE_MAX_ENTRIES", 10)
+        bridge.write_handle_at.return_value = (2000, 0)
+        fh = fs.create("/new.bin", 0o644)
+        fs.write("/new.bin", b"w" * 2000, 0, fh)
+        bridge.stat_path.return_value = dict(self.INFO)
+        for i in range(30):
+            fs.getattr(f"/other{i}.bin")
+        bridge.stat_path.side_effect = AssertionError("asked the handler")
+
+        assert fs.getattr("/new.bin", fh)["st_size"] == 2000
+        assert fs.getattr("/new.bin")["st_size"] == 2000
+
+    def test_readdir_prune_keeps_pinned_entries(self, fs, monkeypatch):
+        """readdir() adds an entry for each file it lists and prunes the
+        stat cache as getattr() does. A pinned entry stays there too.
+        """
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        fs, bridge = fs
+        monkeypatch.setattr(fuse_fs_mod, "_CACHE_MAX_ENTRIES", 10)
+        bridge.write_handle_at.return_value = (2000, 0)
+        fh = fs.create("/new.bin", 0o644)
+        fs.write("/new.bin", b"w" * 2000, 0, fh)
+        bridge.list_dir_path.return_value = [
+            dict(self.INFO, name=f"other{i}.bin") for i in range(30)]
+        fs.readdir("/sub", None)
+        bridge.stat_path.side_effect = AssertionError("asked the handler")
+
+        assert fs.getattr("/new.bin", fh)["st_size"] == 2000
+        assert fs.getattr("/new.bin")["st_size"] == 2000
+
+    @pytest.mark.parametrize("flags", [os.O_RDONLY, os.O_RDWR], ids=["O_RDONLY", "O_RDWR"])
+    def test_shared_handle_does_not_keep_a_path_alive(self, fs, flags):
+        """A file renamed or deleted under a shared handle is gone from the
+        handler's view, and getattr() reports ENOENT for its old name, not
+        a made-up entry for the open handle.
+        """
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        fs, bridge = fs
+        bridge.stat_path.return_value = None
+        fs.open("/a.bin", flags)
+
+        with pytest.raises(fuse_fs_mod.FuseOSError) as exc_info:
+            fs.getattr("/a.bin")
+        assert exc_info.value.args[0] == errno.ENOENT
+
+    def test_renamed_directory_takes_its_open_files_along(self, fs):
+        """A file held exclusively below a renamed directory keeps its pin,
+        under the new path. WinFsp's later calls on the handle still pass
+        the old one.
+        """
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        fs, bridge = fs
+        bridge.locate_path.return_value = (0x6855, 0, [])
+        bridge.rename_object.return_value = (-1, 0)
+        bridge.write_handle_at.return_value = (2000, 0)
+        bridge.write_handle_reply.return_value = (500, 0)
+        bridge.set_handle_size.return_value = 100
+        bridge.truncate_handle.return_value = (100, 0)  # either resize call
+        bridge.stat_path.return_value = None
+        fh = fs.create("/dir/c.bin", 0o644)
+        fs.write("/dir/c.bin", b"c" * 2000, 0, fh)
+
+        fs.rename("/dir", "/dir2")
+
+        assert fs.getattr("/dir2/c.bin")["st_size"] == 2000
+        assert fs.getattr("/dir/c.bin", fh)["st_size"] == 2000
+        with pytest.raises(fuse_fs_mod.FuseOSError) as exc_info:
+            fs.getattr("/dir/c.bin")
+        assert exc_info.value.args[0] == errno.ENOENT
+        fs.write("/dir/c.bin", b"c" * 500, 2000, fh)
+        assert fs.getattr("/dir2/c.bin")["st_size"] == 2500
+        fs.truncate("/dir/c.bin", 100, fh)
+        assert fs.getattr("/dir2/c.bin")["st_size"] == 100
+        fs.release("/dir/c.bin", fh)
+        assert fs._pinned_stats == set()
+        assert "/dir2/c.bin" not in fs._stat_cache
+
+    def test_shared_handle_follows_a_rename(self, fs):
+        """getattr(path, fh) asks the handler about the file the handle
+        has open, under its new name, also when given the old one.
+        """
+        fs, bridge = fs
+        bridge.locate_path.return_value = (0x6855, 0, [])
+        bridge.rename_object.return_value = (-1, 0)
+        bridge.stat_path.return_value = dict(self.INFO)
+        fh = fs.open("/s.bin", os.O_RDWR)
+
+        fs.rename("/s.bin", "/t.bin")
+
+        assert fs.getattr("/s.bin", fh)["st_size"] == 3000
+        bridge.stat_path.assert_called_with("/t.bin")
+
+    def test_rename_moves_only_paths_below_the_renamed_one(self, fs):
+        fs, bridge = fs
+        bridge.locate_path.return_value = (0x6855, 0, [])
+        bridge.rename_object.return_value = (-1, 0)
+        paths = ("/a/f", "/a/d/f", "/ab/f", "/ab")
+        handles = {p: fs.open(p, os.O_RDWR) for p in paths}
+
+        fs.rename("/a", "/b")
+
+        assert [fs._fh_cache[handles[p]]["path"] for p in paths] == [
+            "/b/f", "/b/d/f", "/ab/f", "/ab"]
+
+    def test_path_unknown_to_handler_and_handles_is_enoent(self, fs):
+        """Handles on another file or on a directory do not make a path exist."""
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        fs, bridge = fs
+        bridge.stat_path.return_value = None
+        fs.open("/other.bin", os.O_RDWR)
+        fs.opendir("/gone")
+
+        for path in ("/missing.bin", "/gone"):
+            with pytest.raises(fuse_fs_mod.FuseOSError) as exc_info:
+                fs.getattr(path)
+            assert exc_info.value.args[0] == errno.ENOENT
 
 
 class TestCacheLocking:

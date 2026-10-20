@@ -189,15 +189,28 @@ class StartupDiskRejected(SystemExit):
 _CACHE_MAX_ENTRIES = 50_000
 
 
-def _prune_cache(cache: Dict) -> None:
+def _prune_cache(cache: Dict, keep: Set = frozenset()) -> None:
     """Drop the oldest half of a cache dict once it reaches the size cap.
 
-    The caller must hold the lock protecting the cache.
+    Keys in keep stay. The caller must hold the lock protecting the cache.
     """
     if len(cache) < _CACHE_MAX_ENTRIES:
         return
     for key in list(cache.keys())[: len(cache) // 2]:
-        del cache[key]
+        if key not in keep:
+            del cache[key]
+
+
+def _renamed_path(path: str, old: str, new: str) -> Optional[str]:
+    """Return what path becomes when old is renamed to new.
+
+    None when path is neither old nor below it.
+    """
+    if path == old:
+        return new
+    if path.startswith(old + "/"):
+        return new + path[len(old):]
+    return None
 
 
 def _require_fuse():
@@ -2084,8 +2097,8 @@ class AmigaFuseFS(_FuseOperations):
         # high-level API calls getattr immediately after create() to fill the
         # entry reply; if that probe hit PFS3 it would get ERROR_OBJECT_IN_USE
         # while the new file's handle is still open, and the kernel would
-        # return ENOENT to userspace. Populated by create(), cleared by
-        # release()/unlink().
+        # return ENOENT to userspace. Populated by create() and an O_TRUNC
+        # open(), cleared by release()/unlink().
         self._pinned_stats: Set[str] = set()
         if self.bridge._write_enabled:
             self._cache_ttl = 0.0
@@ -2197,7 +2210,7 @@ class AmigaFuseFS(_FuseOperations):
     def _set_cached_stat(self, path: str, result: Dict):
         """Cache a stat result."""
         with self._cache_lock:
-            _prune_cache(self._stat_cache)
+            _prune_cache(self._stat_cache, self._pinned_stats)
             self._stat_cache[path] = (time.time(), result)
 
     def _is_neg_cached(self, path: str) -> bool:
@@ -2299,6 +2312,11 @@ class AmigaFuseFS(_FuseOperations):
     # --- FUSE operations ---
     def getattr(self, path, fh=None):
         self._check_handler_alive()
+        if fh is not None:
+            # The handle names the file. rename() keeps its path current,
+            # while WinFsp goes on passing the name the file was opened under.
+            with self._fh_lock:
+                path = self._fh_cache.get(fh, {}).get("path") or path
         # Reject OS special files immediately without calling handler
         if self._is_platform_special(path):
             self._track_op("getattr", path, cached=True)
@@ -2339,26 +2357,13 @@ class AmigaFuseFS(_FuseOperations):
         if cached is not None:
             self._track_op("getattr", path, cached=True)
             return cached
-        # Active-handle fallback: if we have an open handle for this path,
-        # return synthetic attrs immediately. This prevents ENOENT races when
-        # WinFSP calls fgetattr right after create() -- the Amiga handler may
-        # not have committed the file yet, so bridge.stat_path() would fail.
-        if self.bridge._write_enabled:
-            with self._fh_lock:
-                for entry in self._fh_cache.values():
-                    if entry.get("path") == path and not entry.get("closed") and not entry.get("dir_handle"):
-                        now = int(time.time())
-                        self._track_op("getattr", path, cached=True)
-                        return {
-                            "st_mode": 0o100644,
-                            "st_nlink": 1,
-                            "st_size": 0,
-                            "st_ctime": now,
-                            "st_mtime": now,
-                            "st_atime": now,
-                            "st_uid": self._uid,
-                            "st_gid": self._gid,
-                        }
+        # A file held on an exclusive lock, from create() or an O_TRUNC
+        # open(), was answered from its pinned entry above: the handler
+        # cannot examine it until release(). Any other open file is shared,
+        # and the handler reports its current size and protection. This
+        # relies on write mounts running single-threaded (mount_fuse sets
+        # nothreads): no getattr() runs between the handler granting an
+        # exclusive lock and the pin being set.
         self._track_op("getattr", path, cached=False)
         info = self.bridge.stat_path(path)
         if not info:
@@ -2407,6 +2412,30 @@ class AmigaFuseFS(_FuseOperations):
         if self._icons_enabled and name.lower().endswith(".info"):
             result["st_flags"] = 0x8000  # UF_HIDDEN
         return result
+
+    def _pin_stat(self, path: str, size: int):
+        """Pin path's stat entry as a file of size bytes.
+
+        For a file held on an exclusive lock, from create() or an O_TRUNC
+        open(): the handler cannot examine it until release(), so this
+        entry is all getattr() reports.
+        """
+        now = time.time()
+        with self._cache_lock:
+            self._stat_cache[path] = (
+                now,
+                {
+                    "st_mode": 0o100644,
+                    "st_nlink": 1,
+                    "st_size": size,
+                    "st_ctime": int(now),
+                    "st_mtime": int(now),
+                    "st_atime": int(now),
+                    "st_uid": self._uid,
+                    "st_gid": self._gid,
+                },
+            )
+            self._pinned_stats.add(path)
 
     def _filter_pending_deletes(self, path: str, entries: List[str]) -> List[str]:
         """Drop directory entries whose full path has a pending (deferred) delete."""
@@ -2498,7 +2527,7 @@ class AmigaFuseFS(_FuseOperations):
             child_path = path.rstrip("/") + "/" + name if path != "/" else "/" + name
             stat_result = self._stat_from_fib(ent, name, int(now))
             with self._cache_lock:
-                _prune_cache(self._stat_cache)
+                _prune_cache(self._stat_cache, self._pinned_stats)
                 self._stat_cache[child_path] = (now, stat_result)
 
         # Add virtual icon files if this directory has a custom icon
@@ -2581,6 +2610,10 @@ class AmigaFuseFS(_FuseOperations):
                 "dirty": False,  # Track if file was written to
                 "path": path,
             }
+        # open_file() takes an exclusive ACTION_FINDOUTPUT lock for O_TRUNC
+        # without O_RDONLY, as create() does, and the file is empty now.
+        if flags & os.O_TRUNC and (flags & getattr(os, "O_ACCMODE", 3)) != os.O_RDONLY:
+            self._pin_stat(path, 0)
         return handle
 
     def read(self, path, size, offset, fh):
@@ -2664,7 +2697,9 @@ class AmigaFuseFS(_FuseOperations):
             entry["dirty"] = True  # Mark as needing flush on close
         # Keep pinned stat cache in sync so a mid-write getattr (e.g. cp -v
         # checking progress) sees the growing size rather than the size=0
-        # baseline written by create().
+        # baseline written by create(). The pin is under the handle's path,
+        # not the caller's (see getattr()).
+        path = entry["path"]
         if path in self._pinned_stats:
             with self._cache_lock:
                 cached = self._stat_cache.get(path)
@@ -2705,7 +2740,9 @@ class AmigaFuseFS(_FuseOperations):
                 entry["dirty"] = True  # Truncate modifies the file
             # A pinned size is all getattr reports until release, and
             # write() only ever raises it. Left stale, it would place the
-            # next O_APPEND write past the new end of file.
+            # next O_APPEND write past the new end of file. The pin is under
+            # the handle's path, not the caller's (see getattr()).
+            path = entry["path"]
             if path in self._pinned_stats:
                 with self._cache_lock:
                     cached = self._stat_cache.get(path)
@@ -2746,22 +2783,8 @@ class AmigaFuseFS(_FuseOperations):
             # Pin the entry: in write mode _cache_ttl is 0, so without pinning
             # libfuse2's post-create getattr probe would fall through to PFS3
             # and get ERROR_OBJECT_IN_USE on the still-open handle.
-            now = time.time()
+            self._pin_stat(path, 0)
             with self._cache_lock:
-                self._stat_cache[path] = (
-                    now,
-                    {
-                        "st_mode": 0o100644,
-                        "st_nlink": 1,
-                        "st_size": 0,
-                        "st_ctime": int(now),
-                        "st_mtime": int(now),
-                        "st_atime": int(now),
-                        "st_uid": self._uid,
-                        "st_gid": self._gid,
-                    },
-                )
-                self._pinned_stats.add(path)
                 parent_path, _ = self._split_path(path)
                 self._dir_cache.pop(parent_path, None)
             self._log_op("create", path, f"SUCCESS handle={handle} fh_addr=0x{fh_addr:x}")
@@ -2922,12 +2945,27 @@ class AmigaFuseFS(_FuseOperations):
             for l in reversed(dst_locks):
                 self.bridge.free_lock(l)
         with self._cache_lock:
-            self._stat_cache.pop(old, None)
             self._stat_cache.pop(new, None)
+            self._pinned_stats.discard(new)
+            # Handles follow the file to its new name, also below a renamed
+            # directory, and so does the pinned entry of a file held on an
+            # exclusive lock: getattr() has nothing else for it.
+            for pinned in list(self._pinned_stats):
+                moved = _renamed_path(pinned, old, new)
+                if moved is not None:
+                    self._pinned_stats.discard(pinned)
+                    cached = self._stat_cache.pop(pinned, None)
+                    if cached is not None:
+                        self._stat_cache[moved] = cached
+                        self._pinned_stats.add(moved)
+            self._stat_cache.pop(old, None)
             self._dir_cache.pop(src_dir, None)
             self._dir_cache.pop(dst_dir, None)
-        self._pinned_stats.discard(old)
-        self._pinned_stats.discard(new)
+            with self._fh_lock:
+                for entry in self._fh_cache.values():
+                    moved = _renamed_path(entry.get("path", ""), old, new)
+                    if moved is not None:
+                        entry["path"] = moved
         return 0
 
     def flush(self, path, fh):
@@ -3234,10 +3272,12 @@ class AmigaFuseFS(_FuseOperations):
             if parent_lock:
                 self.bridge.free_lock(parent_lock)
         # Unpin stat cache so future getattr re-queries PFS3 for current size.
-        self._pinned_stats.discard(path)
+        # The pin is under the handle's path, not the caller's (see getattr()).
+        pinned = entry.get("path", path)
+        self._pinned_stats.discard(pinned)
         if self._cache_ttl <= 0:
             with self._cache_lock:
-                self._stat_cache.pop(path, None)
+                self._stat_cache.pop(pinned, None)
         # Resolve path: use FUSE-provided path, fall back to cached path
         resolved_path = path if path else entry.get("path")
         # Check for deferred deletes (WinFSP unlink-before-release pattern)
