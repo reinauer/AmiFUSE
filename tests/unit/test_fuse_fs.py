@@ -6211,6 +6211,59 @@ class TestOpenHandleGetattr:
             assert exc_info.value.args[0] == errno.ENOENT
 
 
+class TestDeferredDeleteAfterRename:
+    """A delete deferred while a file is open runs at its last release(),
+    and one deferred while a directory is open at its last releasedir().
+
+    WinFsp passes these the name a handle was opened under, also after a
+    rename, while unlink() and rmdir() record the delete under the
+    current name.
+    """
+
+    def test_last_release_under_the_old_name_deletes(self, write_fs):
+        fs, bridge = write_fs
+        bridge.open_file.return_value = (0x4abbc, 0)
+        bridge.locate_path.return_value = (0x6855, 0, [])
+        bridge.rename_object.return_value = (-1, 0)
+        h1 = fs.open("/w.bin", os.O_RDWR)
+        fs.rename("/w.bin", "/v.bin")
+        h2 = fs.open("/v.bin", os.O_RDONLY)
+        bridge.delete_object.return_value = (0, 202)  # ERROR_OBJECT_IN_USE
+        assert fs.unlink("/v.bin") == 0
+        assert fs._pending_deletes == {"/v.bin"}
+
+        fs.release("/v.bin", h2)
+        assert bridge.delete_object.call_count == 1  # h1 still has it open
+        bridge.delete_object.return_value = (-1, 0)
+        fs.release("/w.bin", h1)
+
+        assert bridge.delete_object.call_count == 2
+        bridge.delete_object.assert_called_with(0x6855, "v.bin")
+        assert not fs._pending_deletes
+
+    def test_last_releasedir_under_the_old_name_removes(self, write_fs):
+        fs, bridge = write_fs
+        bridge.state = MagicMock(crashed=False)
+        bridge.locate_path.return_value = (0x6855, 0, [])
+        bridge.rename_object.return_value = (-1, 0)
+        h1 = fs.opendir("/d")
+        fs.rename("/d", "/e")
+        h2 = fs.opendir("/e")
+        bridge.delete_dir_atomic.return_value = (0, 202)  # ERROR_OBJECT_IN_USE
+        assert fs.rmdir("/e") == 0
+        assert fs._pending_deletes == {"/e"}
+        tries = bridge.delete_dir_atomic.call_count
+
+        fs.releasedir("/e", h2)
+        assert bridge.delete_dir_atomic.call_count == tries  # h1 still has it open
+        bridge.delete_dir_atomic.return_value = (-1, 0)
+        fs.releasedir("/d", h1)
+
+        assert bridge.delete_dir_atomic.call_count == tries + 1
+        bridge.delete_dir_atomic.assert_called_with("/e")
+        assert not fs._pending_deletes
+
+
 class TestCacheLocking:
     """Verify _cache_lock protects cache dicts from concurrent access."""
 

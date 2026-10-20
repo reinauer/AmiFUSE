@@ -213,6 +213,16 @@ def _renamed_path(path: str, old: str, new: str) -> Optional[str]:
     return None
 
 
+def _handle_path(entry: Optional[Dict], path: str) -> str:
+    """Return the path of the file or directory an open handle names.
+
+    rename() keeps a handle's path current, while WinFsp goes on passing
+    the name the file was opened under, so the handle's path wins over
+    the caller's. path is the answer for a handle that has none.
+    """
+    return (entry or {}).get("path") or path
+
+
 def _require_fuse():
     global FUSE
 
@@ -2313,10 +2323,8 @@ class AmigaFuseFS(_FuseOperations):
     def getattr(self, path, fh=None):
         self._check_handler_alive()
         if fh is not None:
-            # The handle names the file. rename() keeps its path current,
-            # while WinFsp goes on passing the name the file was opened under.
             with self._fh_lock:
-                path = self._fh_cache.get(fh, {}).get("path") or path
+                path = _handle_path(self._fh_cache.get(fh), path)
         # Reject OS special files immediately without calling handler
         if self._is_platform_special(path):
             self._track_op("getattr", path, cached=True)
@@ -2467,7 +2475,9 @@ class AmigaFuseFS(_FuseOperations):
             if not entry:
                 return 0
             del self._fh_cache[fh]
-        resolved_path = path if path else entry.get("path")
+        # A deferred rmdir() is looked for under the handle's path, as
+        # release() looks for a deferred unlink().
+        resolved_path = _handle_path(entry, path)
         if not resolved_path:
             return 0
         with self._fh_lock:
@@ -2697,9 +2707,8 @@ class AmigaFuseFS(_FuseOperations):
             entry["dirty"] = True  # Mark as needing flush on close
         # Keep pinned stat cache in sync so a mid-write getattr (e.g. cp -v
         # checking progress) sees the growing size rather than the size=0
-        # baseline written by create(). The pin is under the handle's path,
-        # not the caller's (see getattr()).
-        path = entry["path"]
+        # baseline written by create(). The pin is under the handle's path.
+        path = _handle_path(entry, path)
         if path in self._pinned_stats:
             with self._cache_lock:
                 cached = self._stat_cache.get(path)
@@ -2741,8 +2750,8 @@ class AmigaFuseFS(_FuseOperations):
             # A pinned size is all getattr reports until release, and
             # write() only ever raises it. Left stale, it would place the
             # next O_APPEND write past the new end of file. The pin is under
-            # the handle's path, not the caller's (see getattr()).
-            path = entry["path"]
+            # the handle's path.
+            path = _handle_path(entry, path)
             if path in self._pinned_stats:
                 with self._cache_lock:
                     cached = self._stat_cache.get(path)
@@ -3271,15 +3280,14 @@ class AmigaFuseFS(_FuseOperations):
             parent_lock = entry.get("parent_lock", 0)
             if parent_lock:
                 self.bridge.free_lock(parent_lock)
+        # The pin is under the handle's path, and so is a delete unlink()
+        # deferred, which it records only under a path a handle has.
+        resolved_path = _handle_path(entry, path)
         # Unpin stat cache so future getattr re-queries PFS3 for current size.
-        # The pin is under the handle's path, not the caller's (see getattr()).
-        pinned = entry.get("path", path)
-        self._pinned_stats.discard(pinned)
+        self._pinned_stats.discard(resolved_path)
         if self._cache_ttl <= 0:
             with self._cache_lock:
-                self._stat_cache.pop(pinned, None)
-        # Resolve path: use FUSE-provided path, fall back to cached path
-        resolved_path = path if path else entry.get("path")
+                self._stat_cache.pop(resolved_path, None)
         # Check for deferred deletes (WinFSP unlink-before-release pattern)
         if resolved_path:
             with self._fh_lock:
