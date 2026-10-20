@@ -2162,6 +2162,9 @@ class HandlerBridge:
         grow larger than the free space by growing the file until the
         volume is full, then failing: 0x7FFFFFFF does this on any volume
         with less than 2 GiB free.
+
+        A -1 for no reply does not mean the file is unchanged: on an OFS
+        volume such a grow can outlast the wait and still finish later.
         """
         try:
             size, mode = operator.index(size), operator.index(mode)
@@ -2170,12 +2173,10 @@ class HandlerBridge:
         if mode != OFFSET_BEGINNING or not 0 <= size <= _LONG_MAX:
             return -1
         with self._lock:
-            self.launcher.send_set_file_size(self.state, fh_addr, size, mode)
-            replies = self._run_until_replies()
-            self._log_replies("setsize", replies)
-            if not replies:
-                return -1
-            return replies[-1][2]
+            pkt_addr, _ = self.launcher.send_set_file_size(
+                self.state, fh_addr, size, mode)
+            reply = self._run_until_reply(pkt_addr, "setsize")
+        return -1 if reply is None else reply[0]
 
     def delete_object(self, parent_lock_bptr: int, name: str) -> Tuple[int, int]:
         with self._lock:

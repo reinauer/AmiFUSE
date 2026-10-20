@@ -1987,6 +1987,9 @@ class TestHandlerBridgeSetSize:
     FH_ADDR = 0x3000
     ORIGINAL = b"0123456789"
 
+    # A late answer to a timed-out 64 KiB ACTION_WRITE: dp_Res1 is its count.
+    LATE_WRITE = _reply(65536, pkt=STALE_PKT)
+
     # A mode given by name is the startup_runner constant; any other is sent
     # as is.
     @pytest.mark.parametrize("size, mode", [
@@ -2033,6 +2036,21 @@ class TestHandlerBridgeSetSize:
         assert bridge.set_handle_size(self.FH_ADDR, size) == 7
         bridge.launcher.send_set_file_size.assert_called_once_with(
             bridge.state, self.FH_ADDR, size, fuse_fs_mod.OFFSET_BEGINNING)
+
+    @pytest.mark.parametrize("rounds, expected", [
+        ([LATE_WRITE, _reply(4)], 4),
+        ([_reply(4) + LATE_WRITE], 4),
+        ([LATE_WRITE, NO_REPLY], -1),
+    ], ids=["before-answer", "with-answer", "then-timeout"])
+    def test_late_reply_is_not_the_answer(self, fuse_mock, rounds, expected):
+        """A reply to an earlier packet is dropped, not read as the new size."""
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        handler = _FakeHandlerFile(self.ORIGINAL)
+        bridge = _fake_write_bridge(fuse_fs_mod, handler)
+        bridge._run_until_replies = MagicMock(side_effect=rounds)
+
+        assert bridge.set_handle_size(self.FH_ADDR, 4) == expected
 
 
 class TestFuseWriteErrors:
