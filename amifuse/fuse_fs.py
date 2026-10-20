@@ -2426,23 +2426,17 @@ class AmigaFuseFS(_FuseOperations):
 
         For a file held on an exclusive lock, from create() or an O_TRUNC
         open(): the handler cannot examine it until release(), so this
-        entry is all getattr() reports.
+        entry is all getattr() reports. It is built as a closed file's
+        entry is, from protection 0, which a new file gets, so a new
+        file's mode does not change at release(). An existing file opened
+        with O_TRUNC can keep other protection bits. write() and
+        truncate() rebuild it at each new size.
         """
         now = time.time()
+        fib = {"dir_type": -3, "size": size, "protection": 0,  # ST_FILE
+               "num_blocks": (size + 511) // 512}
         with self._cache_lock:
-            self._stat_cache[path] = (
-                now,
-                {
-                    "st_mode": 0o100644,
-                    "st_nlink": 1,
-                    "st_size": size,
-                    "st_ctime": int(now),
-                    "st_mtime": int(now),
-                    "st_atime": int(now),
-                    "st_uid": self._uid,
-                    "st_gid": self._gid,
-                },
-            )
+            self._stat_cache[path] = (now, self._stat_from_fib(fib, path, int(now)))
             self._pinned_stats.add(path)
 
     def _filter_pending_deletes(self, path: str, entries: List[str]) -> List[str]:
@@ -2712,13 +2706,8 @@ class AmigaFuseFS(_FuseOperations):
         if path in self._pinned_stats:
             with self._cache_lock:
                 cached = self._stat_cache.get(path)
-                if cached is not None:
-                    ts, stat = cached
-                    new_size = max(stat["st_size"], offset + written)
-                    if new_size != stat["st_size"]:
-                        stat = dict(stat)
-                        stat["st_size"] = new_size
-                        self._stat_cache[path] = (ts, stat)
+                if cached is not None and offset + written > cached[1]["st_size"]:
+                    self._pin_stat(path, offset + written)
         return written
 
     def truncate(self, path, length, fh=None):
@@ -2754,10 +2743,8 @@ class AmigaFuseFS(_FuseOperations):
             path = _handle_path(entry, path)
             if path in self._pinned_stats:
                 with self._cache_lock:
-                    cached = self._stat_cache.get(path)
-                    if cached is not None:
-                        ts, stat = cached
-                        self._stat_cache[path] = (ts, dict(stat, st_size=length))
+                    if path in self._stat_cache:
+                        self._pin_stat(path, length)
         finally:
             if temp_handle:
                 self.release(path, fh)

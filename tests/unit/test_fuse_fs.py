@@ -5899,7 +5899,11 @@ class TestPinnedStatCache:
             "follow-up getattr; without pinning libfuse2 returns ENOENT "
             "to userspace and cp errors out."
         )
-        assert cached["st_mode"] == 0o100644
+        # The mode a new file reports once closed, so release() does not
+        # change it.
+        new_file = fs._stat_from_fib(
+            {"dir_type": -3, "size": 0, "protection": 0, "num_blocks": 0}, "/Makefile", 0)
+        assert cached["st_mode"] == new_file["st_mode"]
 
     def test_getattr_after_create_does_not_hit_handler(self, write_fs):
         """Whole-stack reproduction: getattr right after create() must be
@@ -5919,7 +5923,9 @@ class TestPinnedStatCache:
 
         attrs = fs.getattr("/Makefile")
 
-        assert attrs["st_mode"] == 0o100644
+        new_file = fs._stat_from_fib(
+            {"dir_type": -3, "size": 0, "protection": 0, "num_blocks": 0}, "/Makefile", 0)
+        assert attrs["st_mode"] == new_file["st_mode"]
         bridge.stat_path.assert_not_called()
 
     def test_release_unpins_path(self, write_fs):
@@ -6071,6 +6077,34 @@ class TestOpenHandleGetattr:
 
         fs.release("/f.bin", fh)
         assert "/f.bin" not in fs._pinned_stats
+
+    @pytest.mark.parametrize("platform, mode", [("linux", 0o100700), ("win32", 0o100755)],
+                             ids=["linux", "win32"])
+    def test_pinned_entry_is_built_like_a_closed_file(self, fs, monkeypatch, platform, mode):
+        """A pinned entry has the mode and block count a closed file of its
+        size reports, from protection 0, which a new file gets. On Windows
+        the owner's read and execute bits are mirrored to group and other,
+        so the ACL WinFsp builds from the mode does not change at release().
+        """
+        monkeypatch.setattr("sys.platform", platform)
+        fs, bridge = fs
+        bridge.write_handle_at.return_value = (1000, 0)
+        bridge.set_handle_size.return_value = 0
+        bridge.truncate_handle.return_value = (0, 0)  # either resize call
+
+        def attrs(path, fh):
+            st = fs.getattr(path, fh)
+            return st["st_mode"], st["st_size"], st["st_blocks"]
+
+        fh = fs.create("/new.bin", 0o644)
+        assert attrs("/new.bin", fh) == (mode, 0, 0)
+        fs.write("/new.bin", b"w" * 1000, 0, fh)
+        assert attrs("/new.bin", fh) == (mode, 1000, 2)
+        fs.truncate("/new.bin", 0, fh)
+        assert attrs("/new.bin", fh) == (mode, 0, 0)
+
+        fh = fs.open("/f.bin", os.O_WRONLY | os.O_TRUNC)
+        assert attrs("/f.bin", fh) == (mode, 0, 0)
 
     def test_read_only_truncating_open_is_not_pinned(self, fs):
         """O_RDONLY | O_TRUNC opens with FINDINPUT, a shared lock."""
