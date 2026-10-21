@@ -668,10 +668,11 @@ class HandlerBridge:
 
         Wait() returns the signals the handler waits for, which are cleared
         from the fallback signals and tc_SigRecvd as Wait() would. The
-        parent and then any ready children run until the parent parks
-        again, under the busy limits of _run_until_replies. Signals the
-        handler does not wait for stay pending. Nothing polls the reply
-        port here: a late reply belongs to the next packet's wait.
+        parent and then any ready children run until the parent parks with
+        nothing pending, under the busy limits of _run_until_replies and at
+        most max_iters parks. Signals the handler does not wait for stay
+        pending. Nothing polls the reply port here: a late reply belongs to
+        the next packet's wait.
         """
         from amitools.vamos.lib.lexec.signalfunc import SignalFunc
         from amitools.vamos.libstructs.exec_ import TaskStruct
@@ -723,8 +724,16 @@ class HandlerBridge:
             self._run_ready_children(cycles // 4)
             if busy:
                 continue
-            # A burst that ran nothing found it parked with nothing pending.
-            if getattr(rs, "done", False) or not getattr(rs, "cycles", 0):
+            if getattr(rs, "done", False):
+                return
+            # It parked. A burst that parks reports no cycles, so the parked
+            # state decides: with a wake already pending (a self-signal, a
+            # quick reply, a child's reply) run_burst left no block state,
+            # or the resume below finds the wake, and it runs again.
+            if (
+                _get_active_block_state(state.block_state) is not None
+                and not self.launcher.setup_resume_if_blocked(state, debug=self._debug)
+            ):
                 return
             idle_iters += 1
 
@@ -3554,27 +3563,40 @@ class AmigaFuseFS(_FuseOperations):
         bridge = self.bridge
         while True:
             with bridge._lock:
-                # Cleared before the deadline is read: a request armed
-                # after this point sets the event again.
-                timer.event.clear()
-                if self._timer_stop or _handler_has_crashed(bridge):
+                if self._timer_stop:
                     return
+                timeout = None
                 try:
-                    timeout = bridge.run_due_timers()
+                    if not _handler_has_crashed(bridge):
+                        timeout = bridge.run_due_timers()
                 except Exception:
                     # It goes on, as a mount does when a FUSE operation
                     # raises in the same bridge code: fusepy answers that
                     # with an error, and the next operation runs the handler
                     # from where the burst left it. A handler that crashed
-                    # stops the thread above.
+                    # stops the thread below.
                     if self._debug:
                         import traceback
                         print("[amifuse] timer: error delivering timers:", flush=True)
                         traceback.print_exc()
                     timeout = HandlerBridge._TIMER_RETRY
-            # Event.wait raises OverflowError above threading.TIMEOUT_MAX.
+                if _handler_has_crashed(bridge):
+                    # Shut the mount down, as a FUSE operation does when it
+                    # finds the handler crashed.
+                    self._schedule_crash_shutdown()
+                    return
+                # Cleared after run_due_timers, which reads the deadline
+                # last under the lock, so a request the handler armed while
+                # it ran is in the timeout. One armed after this point sets
+                # the event again.
+                timer.event.clear()
             if timeout is not None:
-                timeout = min(timeout, self._TIMER_MAX_SLEEP)
+                # At least one VBLANK tick, even when a request is due again
+                # at once, so that FUSE operations waiting for the lock get
+                # it: a resume that outlasts the handler's re-arm delay would
+                # otherwise retake it at once, again and again. Event.wait
+                # raises OverflowError above threading.TIMEOUT_MAX.
+                timeout = min(max(timeout, timer.MIN_DELAY), self._TIMER_MAX_SLEEP)
             timer.event.wait(timeout)
 
     def _stop_timer_thread(self):

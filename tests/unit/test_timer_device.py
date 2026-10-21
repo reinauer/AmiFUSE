@@ -28,15 +28,20 @@ _TC_SIGRECVD = 26      # struct Task's tc_SigRecvd
 
 
 class FakeMem:
-    """Big-endian memory that rejects out-of-range values, as machine68k does."""
+    """Big-endian memory that rejects out-of-range values and addresses, as machine68k does."""
 
     _BITS = {0: 8, 1: 16, 2: 32}
 
     def __init__(self, size=0x10000):
         self.data = bytearray(size)
 
+    def _check(self, addr, n):
+        if not 0 <= addr <= len(self.data) - n:
+            raise MemoryError(addr)
+
     def read(self, width, addr):
         n = self._BITS[width] // 8
+        self._check(addr, n)
         return int.from_bytes(self.data[addr:addr + n], "big")
 
     def reads(self, width, addr):
@@ -48,6 +53,7 @@ class FakeMem:
         bits = self._BITS[width]
         if not 0 <= val < (1 << bits):
             raise OverflowError(f"can't convert {val} to uint{bits}")
+        self._check(addr, bits // 8)
         self.data[addr:addr + bits // 8] = val.to_bytes(bits // 8, "big")
 
     def writes(self, width, addr, val):
@@ -315,28 +321,75 @@ class TestTimerDevice:
         assert timer.exec.port_mgr.ports[PORT].queue == [IO]
         assert _m68k_list(timer.mem) == [IO]
 
-    def test_child_parked_in_waitport_wakes_on_delivery(self, timer):
-        """A process parked in WaitPort() on the timer port resumes with the reply."""
+    def _waitport_frame(self, timer, waitpkt=False):
+        """The resume frame of a process parked in WaitPort() (or WaitPkt()) on PORT."""
         from amifuse.startup_runner import _build_resume_frame
 
         sp = 0x4000
         timer.mem.w32(sp, 0x5000)  # WaitPort's return address
         block = {"waitport_blocked_sp": sp, "waitport_blocked_port": PORT,
-                 "waitport_blocked_ret": 0x5000}
+                 "waitport_blocked_ret": 0x5000, "waitpkt_blocked": waitpkt}
+        return _build_resume_frame(
+            block, default_port_addr=PORT, mem=timer.mem,
+            port_mgr=timer.exec.port_mgr,
+            compute_pending_signals=lambda mask: 0,
+            clear_signals_from_task=lambda signals: None,
+            leave_queued=timer.device.delays)
 
-        def frame():
-            return _build_resume_frame(
-                block, default_port_addr=PORT, mem=timer.mem,
-                port_mgr=timer.exec.port_mgr,
-                compute_pending_signals=lambda mask: 0,
-                clear_signals_from_task=lambda signals: None)
+    def test_child_parked_in_waitport_wakes_on_delivery(self, timer):
+        """A process parked in WaitPort() on the timer port resumes with the reply.
 
+        As Exec's WaitPort() does, the resume leaves the reply queued, so
+        the GetMsg() that follows, as in while (!GetMsg(p)) WaitPort(p),
+        takes it.
+        """
         timer.send(micro=100_000)
-        assert frame() is None
+        assert self._waitport_frame(timer) is None
         timer.clock.now = 100.1
         timer.device.deliver()
-        assert frame() == {"pc": 0x5000, "sp": sp + 4, "d0": IO}
+        assert self._waitport_frame(timer) == {"pc": 0x5000, "sp": 0x4004, "d0": IO}
+        assert timer.exec.port_mgr.ports[PORT].queue == [IO]
+        assert _m68k_list(timer.mem) == [IO]
+
+    @pytest.mark.parametrize("case", ["waitpkt", "quick reply"])
+    def test_resume_still_takes_other_messages_off_the_port(self, timer, case):
+        """WaitPkt() and messages timer.device did not delay are taken off, as before."""
+        if case == "waitpkt":
+            timer.send(micro=100_000)
+            timer.clock.now = 100.1
+            timer.device.deliver()
+        else:
+            timer.send(cmd=TR_GETSYSTIME)  # replied at once by SendIO
+        assert timer.exec.port_mgr.ports[PORT].queue == [IO]
+        frame = self._waitport_frame(timer, waitpkt=case == "waitpkt")
+        assert frame["pc"] == 0x5000
+        assert timer.exec.port_mgr.ports[PORT].queue == []
         assert _m68k_list(timer.mem) == []
+
+    def test_bad_reply_port_is_replied_as_sendio_does(self, timer):
+        """A reply port outside memory gets no link and no signal, and raises nothing.
+
+        The other requests due with it are replied as usual.
+        """
+        bad = len(timer.mem.data) + 0x1000
+        timer.mem.w32(IO + 14, bad)
+        timer.send(IO, micro=100_000)
+        timer.send(IO2, micro=200_000)
+        timer.clock.now = 101.0
+        assert timer.device.deliver() == {TASK: 1 << SIGBIT}
+        assert timer.device.deliveries == 2
+        assert timer.exec.port_mgr.ports[bad].queue == [IO]
+        assert _m68k_list(timer.mem) == [IO2]
+
+    def test_unreadable_request_does_not_stop_the_others(self, timer):
+        """A request whose memory is gone is dropped; the rest are replied."""
+        timer.send(IO, micro=100_000)
+        timer.device._pending[len(timer.mem.data) + 0x1000] = (100.0, BASE)
+        timer.clock.now = 101.0
+        assert timer.device.deliver() == {TASK: 1 << SIGBIT}
+        assert timer.device.deliveries == 1
+        assert timer.device.next_deadline() == float("inf")
+        assert _m68k_list(timer.mem) == [IO]
 
     def test_fast_forward_delivers_every_pending_request(self, timer):
         """With fast_forward, requests whose time has not come are due too."""
@@ -426,6 +479,8 @@ class TestTimerDevice:
 
 class _Timer:
     """The bridge's view of AmiFuseTimerDevice."""
+
+    MIN_DELAY = 0.02
 
     def __init__(self, owned=(), signals=None, deadline=float("inf"), held=False):
         self.owned = set(owned)
@@ -661,26 +716,71 @@ class TestBridgeDelivery:
         assert timer.delivered == [False, True]
         assert bursts == [0, 1]
 
+    # The handler parked again in its main-loop Wait().
+    _PARKED = {"wait_blocked_sp": 0x6ffc, "wait_blocked_mask": 0x101,
+               "wait_blocked_ret": 0x4000}
+
+    def _parking_launcher(self, bursts, resumes, wakes=None):
+        """A launcher whose bursts all park, reporting 0 cycles as machine_run does.
+
+        wakes maps a burst number to where its wake comes from: "burst",
+        already pending when it parks, so run_burst leaves no block state;
+        or "child", a child's reply after it, which setup_resume_if_blocked
+        finds. resumes records what each setup_resume_if_blocked call found.
+        """
+        parked = self._PARKED
+        wakes = wakes or {}
+
+        class Launcher:
+            def run_burst(self, state, max_cycles=0, debug=False):
+                bursts.append((state.pc, state.regs[0]))
+                state.run_state = SimpleNamespace(done=False, error=True, cycles=0)
+                pending = wakes.get(len(bursts)) == "burst"
+                state.block_state = None if pending else dict(parked)
+
+            def setup_resume_if_blocked(self, state, debug=False):
+                found = wakes.get(len(bursts)) == "child"
+                resumes.append(found)
+                if found:
+                    state.block_state = None
+                return found
+
+        return Launcher()
+
     def test_run_due_timers_wakes_the_parked_handler(self, monkeypatch):
         """Due bits are returned by its main-loop Wait(), and it runs until it parks."""
         from amifuse import fuse_fs as fs
 
         timer = _Timer(signals={TASK: 0x1})
         bridge = self._bridge(timer)
-        bursts = []
-
-        class Launcher:
-            def run_burst(self, state, max_cycles=0, debug=False):
-                bursts.append((state.pc, state.regs[0]))
-                # It runs, then finds nothing pending and parks.
-                cycles = 500 if len(bursts) == 1 else 0
-                state.run_state = SimpleNamespace(done=False, error=True, cycles=cycles)
-
-        bridge.launcher = Launcher()
+        bursts, resumes = [], []
+        bridge.launcher = self._parking_launcher(bursts, resumes)
         monkeypatch.setattr(fs, "_clear_all_block_state", lambda: None)
         assert bridge.run_due_timers() is None
-        assert bursts == [(0x4000, 0x1), (0x4000, 0x1)]
+        # It parks with nothing pending: one burst.
+        assert bursts == [(0x4000, 0x1)]
+        assert resumes == [False]
         assert bridge._busy_ran_out is False
+
+    @pytest.mark.parametrize("wake", ["burst", "child"])
+    def test_resume_runs_a_handler_that_parks_with_a_wake_pending(self, monkeypatch, wake):
+        """A park with a wake pending runs again in the same resume.
+
+        Every burst that parks reports 0 cycles. Parked with a self-signal
+        or a quick reply already pending (burst), or with a child's reply
+        that came after it (child), the handler must not wait for the next
+        timer or FUSE operation.
+        """
+        from amifuse import fuse_fs as fs
+
+        timer = _Timer(signals={TASK: 0x1})
+        bridge = self._bridge(timer)
+        bursts, resumes = [], []
+        bridge.launcher = self._parking_launcher(bursts, resumes, wakes={1: wake})
+        monkeypatch.setattr(fs, "_clear_all_block_state", lambda: None)
+        assert bridge.run_due_timers() is None
+        assert len(bursts) == 2
+        assert resumes == ([False] if wake == "burst" else [True, False])
 
     def test_timer_resume_that_runs_out_sets_busy_ran_out(self, monkeypatch):
         """A resume that never parks again stops at the busy limit, as a packet does."""
@@ -747,13 +847,76 @@ class TestTimerThread:
         assert not thread.is_alive()
         assert fs._timer_thread is None
 
-    def test_thread_stops_when_the_handler_crashed(self):
+    @pytest.fixture
+    def shutdowns(self, monkeypatch):
+        """Set by a crash shutdown, which would otherwise send SIGTERM to pytest."""
+        from amifuse.fuse_fs import AmigaFuseFS
+
+        done = threading.Event()
+        monkeypatch.setattr(
+            AmigaFuseFS, "_terminate_mount_after_crash", lambda self: done.set())
+        return done
+
+    def test_thread_stops_when_the_handler_crashed(self, shutdowns):
         fs, calls = self._fs(_Timer(), crashed=True)
         fs.init("/")
         fs._timer_thread.join(2)
         assert not fs._timer_thread.is_alive()
         assert calls == []
+        assert shutdowns.wait(2)
         fs.destroy("/")
+
+    def test_crash_in_a_timer_burst_shuts_the_mount_down(self, shutdowns):
+        """A handler that crashes while idle shuts the mount down, as a FUSE operation does."""
+        timer = _Timer()
+        fs, calls = self._fs(timer)
+
+        def run_due_timers():
+            calls.append(time.monotonic())
+            fs.bridge.state.crashed = True
+            return None  # nothing pending: unchecked, the thread would wait forever
+
+        fs.bridge.run_due_timers = run_due_timers
+        fs.init("/")
+        fs._timer_thread.join(2)
+        assert not fs._timer_thread.is_alive()
+        assert len(calls) == 1
+        assert shutdowns.wait(2)
+        fs.destroy("/")
+
+    def test_thread_yields_the_lock_when_a_request_is_due_again_at_once(self):
+        """After each look it waits a tick, so FUSE operations get the lock.
+
+        Each call stands for a resume that outlasts the handler's re-arm
+        delay: it holds the lock, re-arms (which sets the event) and leaves
+        the request due again at once.
+        """
+        timer = _Timer()
+        fs, _ = self._fs(timer)
+        spans = []
+
+        def run_due_timers():
+            start = time.monotonic()
+            while time.monotonic() - start < 0.05:  # emulation holds the GIL
+                pass
+            timer.event.set()
+            spans.append((start, time.monotonic()))
+            return 0.0
+
+        fs.bridge.run_due_timers = run_due_timers
+        fs.init("/")
+        time.sleep(0.2)
+        waits = []
+        for _ in range(5):
+            start = time.monotonic()
+            if fs.bridge._lock.acquire(timeout=1.0):
+                fs.bridge._lock.release()
+            waits.append(time.monotonic() - start)
+        fs.destroy("/")
+        gaps = [nxt[0] - prev[1] for prev, nxt in zip(spans, spans[1:])]
+        assert len(gaps) >= 2
+        assert min(gaps) >= timer.MIN_DELAY / 2
+        assert max(waits) < 0.5
 
     def test_a_long_timeout_does_not_end_the_thread(self):
         """A deadline beyond threading.TIMEOUT_MAX is slept in bounded steps."""
