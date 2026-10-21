@@ -125,6 +125,21 @@ class TestFixedTextMatchesProvenance:
         for mention in mentions:
             assert _fixed_ranges(mention) == [_bundled_dos_types()], mention
 
+    def test_readme(self):
+        """Every DOS range in the README's lines about the bundled handler
+        is the covered set, the rest of DOS0-DOS7, or all of it."""
+        readme = Path(__file__).resolve().parents[2] / "README.md"
+        lines = readme.read_text(encoding="utf-8").splitlines()
+        start = lines.index("## Bundled FastFileSystem")
+        end = next(i for i in range(start + 1, len(lines)) if lines[i].startswith("## "))
+        about = lines[start:end] + [line for line in lines if "bundled" in line.lower()]
+        covered = _bundled_dos_types()
+        every = {f"DOS{n}" for n in range(8)}
+        ranges = _fixed_ranges("\n".join(about))
+        assert len(ranges) >= 8
+        for found in ranges:
+            assert found in (covered, every - covered, every), sorted(found)
+
 
 # ---------------------------------------------------------------------------
 # B. Folder lookup -- user, bundled, dev fallback
