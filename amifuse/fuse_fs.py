@@ -5326,6 +5326,8 @@ def _partition_driver(image: Path, block_size: Optional[int], name: str):
     if resolved.temporary:
         try:
             data = resolved.path.read_bytes()
+        except OSError as exc:
+            return None, f"cannot read the driver extracted from the RDB: {exc}"
         finally:
             try:
                 resolved.path.unlink()
