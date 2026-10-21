@@ -70,7 +70,12 @@ markers = [
 filterwarnings = ["ignore::DeprecationWarning:amitools"]
 
 [tool.setuptools.package-data]
-amifuse = ["drivers/*"]
+# By name, so that no other file placed in drivers/ ships.
+amifuse = [
+    "drivers/FastFileSystem.OS3",
+    "drivers/FastFileSystem.OS3.LICENSE",
+    "drivers/FastFileSystem.OS3.json",
+]
 
 [tool.setuptools.packages.find]
 include = ["amifuse*"]
