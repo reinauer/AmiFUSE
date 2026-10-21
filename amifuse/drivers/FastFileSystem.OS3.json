@@ -1,0 +1,15 @@
+{
+  "repo": "https://github.com/reinauer/FastFileSystem",
+  "tag": "alpha1",
+  "commit": "043b8030c1bac896e49385f8c328214b024c280d",
+  "asset": "FastFileSystem.OS3",
+  "size": 66724,
+  "sha256": "0a9ffd7c7b144a172273d8b0e7099b4ea9a92d90a517a604f6aaecc5f58f8826",
+  "license": "BSD-2-Clause",
+  "dos_types": ["DOS0", "DOS1", "DOS2", "DOS3", "DOS4", "DOS5"],
+  "build": {
+    "image": "stefanreinauer/amiga-gcc:gcc-v13.4",
+    "command": "make amigaos3",
+    "reproducible": true
+  }
+}
