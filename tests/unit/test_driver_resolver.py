@@ -1093,3 +1093,65 @@ class TestInspectParceiro:
         out = capsys.readouterr().out
         assert "  DH0: " in out
         assert "Note:" not in out
+
+
+def _two_partitions(tmp_path, second_drive, second_type):
+    """One RDB, no driver in it: DH0 of DOS type DOS3, then second_drive of
+    DOS type second_type."""
+    image = tmp_path / "pair.hdf"
+    proc = subprocess.run(
+        [sys.executable, "-m", "amitools.tools.rdbtool", str(image),
+         "create", "size=8Mi", "+", "init",
+         "+", "add", "size=3MiB", "name=DH0", "fs=DOS3",
+         "+", "add", "size=3MiB", f"name={second_drive}", f"fs={second_type}"],
+        cwd=AMITOOLS_ROOT if AMITOOLS_ROOT.is_dir() else None,
+        capture_output=True, text=True, check=False,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    return image
+
+
+class TestInspectSameRdbNames:
+    """mount --partition NAME takes the first partition of that name in an
+    RDB, so a later one of the same name gets no driver."""
+
+    NOTE = ("an earlier partition in this RDB is also named dh0, "
+            "and mount --partition dh0 uses that one")
+
+    def _partitions(self, image, capsys):
+        from amifuse.fuse_fs import main
+
+        main(["inspect", "--json", str(image)])
+        return json.loads(capsys.readouterr().out)["partitions"]
+
+    def test_json_shared_name(self, user_driver_dir, tmp_path, capsys):
+        """The second dh0 is DOS7, which the bundled driver mount would use
+        for DH0 does not serve."""
+        first, second = self._partitions(
+            _two_partitions(tmp_path, "dh0", "DOS7"), capsys)
+        assert first["driver"]["source"] == "bundled"
+        assert second["driver"] is None
+        assert second["driver_note"] == self.NOTE
+
+    def test_json_distinct_names(self, user_driver_dir, tmp_path, capsys):
+        for part in self._partitions(
+                _two_partitions(tmp_path, "DH1", "DOS3"), capsys):
+            assert part["driver"]["source"] == "bundled"
+            assert "driver_note" not in part
+
+    def test_text_shared_name(self, user_driver_dir, tmp_path, capsys):
+        from amifuse.fuse_fs import main
+
+        main(["inspect", str(_two_partitions(tmp_path, "dh0", "DOS7"))])
+        out = capsys.readouterr().out
+        assert "  DH0: FastFileSystem alpha1 (bundled, " in out
+        assert out.endswith(f"  dh0: {self.NOTE}\n")
+
+    def test_text_distinct_names(self, user_driver_dir, tmp_path, capsys):
+        from amifuse.fuse_fs import main
+
+        main(["inspect", str(_two_partitions(tmp_path, "DH1", "DOS3"))])
+        out = capsys.readouterr().out
+        assert "  DH0: FastFileSystem alpha1 (bundled, " in out
+        assert "  DH1: FastFileSystem alpha1 (bundled, " in out
+        assert "earlier partition" not in out

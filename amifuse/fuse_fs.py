@@ -5456,8 +5456,11 @@ def cmd_inspect(args):
             # A Parceiro disk's own RDB opens through every 0x76 entry, so
             # its copies here are one RDB, not a clash.
             parceiro = desc.get("mbr", {}).get("scheme") == "parceiro"
+            seen = set()
             for part in desc["partitions"]:
                 name = part["name"]
+                earlier = name.lower() in seen
+                seen.add(name.lower())
                 # mount --partition picks the first RDB holding the name, so
                 # a same-named partition in a later RDB cannot be mounted.
                 selected = None
@@ -5469,6 +5472,11 @@ def cmd_inspect(args):
                     part["driver_note"] = (
                         f"another RDB on this disk also has a partition named "
                         f"{name}, and mount --partition {name} uses that one")
+                    continue
+                # Within an RDB, mount --partition picks the first match too.
+                if earlier:
+                    part["driver"] = None
+                    part["driver_note"] = _earlier_name_note(name)
                     continue
                 part["driver"], text = _partition_driver(
                     args.image, args.block_size, name)
@@ -5489,10 +5497,23 @@ def cmd_inspect(args):
     print_inspect_report(args.image, args.block_size, args.full)
     print("\nFilesystem driver per partition (without --driver):")
     listed = list_partitions(args.image, args.block_size)
+    # Without a fallback, names repeat only within one RDB.
+    seen = set()
     for part in listed.partitions:
-        print(f"  {part.name}: {_partition_driver(args.image, args.block_size, part.name)[1]}")
+        if part.name.lower() in seen:
+            text = _earlier_name_note(part.name)
+        else:
+            text = _partition_driver(args.image, args.block_size, part.name)[1]
+        seen.add(part.name.lower())
+        print(f"  {part.name}: {text}")
     if listed.fallback_reason and not _is_parceiro(args.image, args.block_size):
         print(f"  Note: {listed.fallback_reason}")
+
+
+def _earlier_name_note(name: str) -> str:
+    """Why a partition named like an earlier one in its RDB has no driver."""
+    return (f"an earlier partition in this RDB is also named {name}, "
+            f"and mount --partition {name} uses that one")
 
 
 def _is_parceiro(image: Path, block_size: Optional[int]) -> bool:
