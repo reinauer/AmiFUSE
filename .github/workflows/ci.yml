@@ -29,6 +29,32 @@ jobs:
         run: |
           python -m amifuse --help
           python -c "from pathlib import Path; import tempfile; from amifuse.rdb_inspect import detect_adf; d=tempfile.TemporaryDirectory(); p=Path(d.name)/'test.adf'; p.write_bytes(b'DOS\0'+bytes(901116)); assert detect_adf(p) is not None"
+      - name: Check the bundled FastFileSystem in the installed package
+        working-directory: ${{ runner.temp }}
+        shell: python
+        run: |
+          import hashlib, json, subprocess, sys, tempfile
+          from pathlib import Path
+          from amifuse import driver_resolver as d
+
+          assert "site-packages" in str(d.BUNDLED_DRIVER), d.BUNDLED_DRIVER
+          info = json.loads(d.BUNDLED_PROVENANCE.read_text(encoding="utf-8"))
+          data = d.BUNDLED_DRIVER.read_bytes()
+          assert len(data) == info["size"], len(data)
+          assert hashlib.sha256(data).hexdigest() == info["sha256"]
+          assert "Stefan Reinauer" in d.BUNDLED_LICENSE.read_text(encoding="utf-8")
+
+          with tempfile.TemporaryDirectory() as tmp:
+              adf = Path(tmp) / "dos1.adf"
+              adf.write_bytes(b"DOS\x01" + bytes(901116))
+              out = subprocess.run(
+                  [sys.executable, "-m", "amifuse", "inspect", "--json", str(adf)],
+                  capture_output=True, text=True, check=True,
+              ).stdout
+          driver = json.loads(out)["driver"]
+          assert driver["source"] == "bundled", driver
+          assert driver["sha256"] == info["sha256"], driver
+          print("bundled FastFileSystem:", driver["path"])
 
   unit-tests:
     name: Unit Tests (Python ${{ matrix.python-version }}, ${{ matrix.os }})
