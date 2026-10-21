@@ -108,7 +108,8 @@ def user_driver_dir() -> Optional[Path]:
 
     try:
         return plat.get_primary_driver_dir()
-    except RuntimeError:  # Path.home() found no home folder
+    # Path.home() found no home folder; Python 3.9 raises KeyError for it.
+    except (RuntimeError, KeyError):
         return None
 
 

@@ -70,7 +70,8 @@ markers = [
 filterwarnings = ["ignore::DeprecationWarning:amitools"]
 
 [tool.setuptools.package-data]
-# By name, so that no other file placed in drivers/ ships.
+# By name, so that an untracked file in drivers/ stays out of the package.
+# A file committed there still ships: setuptools-scm adds tracked files.
 amifuse = [
     "drivers/FastFileSystem.OS3",
     "drivers/FastFileSystem.OS3.LICENSE",

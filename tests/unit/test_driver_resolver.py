@@ -403,6 +403,15 @@ class TestNoHomeFolder:
             f"{driver_resolver.BUNDLED_DRIVER}; DOS6-DOS7: none; place your own "
             "FastFileSystem in your drivers folder (no home folder found)")
 
+    def test_python39_key_error(self, no_home, monkeypatch):
+        """Python 3.9's Path.home() raises KeyError when the password
+        database has no entry for the user."""
+        def home(cls):
+            raise KeyError("getpwuid(): uid not found: 1000")
+
+        monkeypatch.setattr(Path, "home", classmethod(home))
+        assert driver_resolver.user_driver_dir() is None
+
     def test_inspect(self, no_home, tmp_path, capsys):
         from amifuse.fuse_fs import main
 
@@ -549,14 +558,17 @@ class TestResolveDriver:
 AMITOOLS_ROOT = Path(__file__).resolve().parents[2] / "amitools"
 
 
-def _rdb(tmp_path, part, fs=None, name="disk.hdf"):
+def _rdb(tmp_path, part, fs=(), name="disk.hdf"):
     """An rdbtool image with partition DH0 of DOS type part and, given fs,
-    the bundled FastFileSystem in its RDB under DOS type fs."""
+    the bundled FastFileSystem in its RDB under DOS type fs: one type, or a
+    tuple of types, each a further entry in the RDB's driver list."""
     image = tmp_path / name
-    args = ["create", "size=8Mi", "+", "init", "rdb_cyls=8",
+    fs = (fs,) if isinstance(fs, str) else fs
+    # 8 RDB cylinders hold one copy of the driver.
+    args = ["create", "size=8Mi", "+", "init", f"rdb_cyls={8 * max(1, len(fs))}",
             "+", "add", "size=6MiB", "name=DH0", f"fs={part}"]
-    if fs:
-        args += ["+", "fsadd", str(driver_resolver.BUNDLED_DRIVER), f"dostype={fs}"]
+    for dos_type in fs:
+        args += ["+", "fsadd", str(driver_resolver.BUNDLED_DRIVER), f"dostype={dos_type}"]
     proc = subprocess.run(
         [sys.executable, "-m", "amitools.tools.rdbtool", str(image), *args],
         cwd=AMITOOLS_ROOT if AMITOOLS_ROOT.is_dir() else None,
@@ -566,13 +578,16 @@ def _rdb(tmp_path, part, fs=None, name="disk.hdf"):
     return image
 
 
-def _flip_byte(image, tag: bytes):
-    """Flip one byte in the first block tagged tag, as a bad sector would."""
+def _flip_byte(image, tag: bytes, nth: int = 0):
+    """Flip one byte in the nth block tagged tag, as a bad sector would.
+    Returns the block's number."""
     data = image.read_bytes()
-    offset = next(o for o in range(0, len(data), 512) if data[o:o + 4] == tag) + 100
+    blocks = [o for o in range(0, len(data), 512) if data[o:o + 4] == tag]
+    offset = blocks[nth] + 100
     with open(image, "r+b") as f:
         f.seek(offset)
         f.write(bytes([data[offset] ^ 0xFF]))
+    return blocks[nth] // 512
 
 
 @pytest.fixture
@@ -608,16 +623,50 @@ class TestRdbImages:
 
     def test_unreadable_header_may_hide_the_driver(self, user_driver_dir, tmp_path, temp_dir):
         """A corrupt filesystem header hides its DOS type, so it stops the
-        lookup too."""
+        lookup too, even with your own copy present; --driver overrides it."""
         from amifuse.fuse_fs import resolve_driver
 
         image = _rdb(tmp_path, "DOS3", "DOS3")
-        _flip_byte(image, b"FSHD")
+        block = _flip_byte(image, b"FSHD")
+        _user_copy(user_driver_dir)
         with pytest.raises(DriverNotFound) as caught:
             resolve_driver(image, None, None, None)
-        assert str(caught.value).startswith(
+        assert str(caught.value) == (
             "Partition DH0 (DOS3) may have a damaged filesystem driver in its RDB: "
-            "Corrupt filesystem header at block ")
+            f"Corrupt filesystem header at block {block} "
+            "(remaining filesystem entries skipped).\n"
+            "AmiFUSE does not use another driver in its place; use --driver to choose one.")
+        given = driver_resolver.BUNDLED_DRIVER
+        assert resolve_driver(image, given, None, None).source == "explicit"
+
+    def test_damaged_driver_for_another_dos_type_is_ignored(
+            self, user_driver_dir, tmp_path, temp_dir):
+        """A damaged RDB driver for another DOS type does not stop the
+        lookup: the DOS1 partition gets the bundled handler."""
+        from amifuse.fuse_fs import resolve_driver
+
+        image = _rdb(tmp_path, "DOS1", "DOS3")
+        _flip_byte(image, b"LSEG")
+        assert resolve_driver(image, None, None, None).source == "bundled"
+        assert list(temp_dir.iterdir()) == []
+
+    def test_readable_driver_before_a_corrupt_header_is_used(
+            self, user_driver_dir, tmp_path, temp_dir):
+        """A corrupt header after the partition's readable driver hides
+        nothing it needs."""
+        from amifuse.fuse_fs import resolve_driver
+        from amifuse.rdb_inspect import open_rdisk
+
+        image = _rdb(tmp_path, "DOS3", ("DOS3", "DOS1"))
+        _flip_byte(image, b"FSHD", nth=1)
+        blkdev, rdisk, _ = open_rdisk(image)
+        try:
+            assert [fs.fshd.dos_type for fs in rdisk.fs] == [_dos(3)]
+            assert [dos_type for dos_type, _ in rdisk.damaged_fs] == [None]
+        finally:
+            rdisk.close()
+            blkdev.close()
+        assert resolve_driver(image, None, None, None).source == "rdb"
 
     def test_file_commands_report_driver_not_found(self, user_driver_dir, tmp_path, capsys):
         from amifuse.fuse_fs import main
@@ -910,6 +959,25 @@ class TestInspectRdb:
         assert part["driver"] is None
         assert part["driver_note"].startswith(
             "Partition DH0 (DOS3) has a damaged filesystem driver in its RDB: ")
+
+    def test_json_unreadable_extracted_driver(
+            self, user_driver_dir, tmp_path, temp_dir, monkeypatch, capsys):
+        """A failed read of the extracted RDB driver is reported, and the
+        extracted copy is still deleted."""
+        image = _rdb(tmp_path, "DOS3", "DOS3")
+        read_bytes = Path.read_bytes
+
+        def fake(self):
+            if self.parent == temp_dir:
+                raise PermissionError(13, "Permission denied", str(self))
+            return read_bytes(self)
+
+        monkeypatch.setattr(Path, "read_bytes", fake)
+        part = self._partition(image, capsys)
+        assert part["driver"] is None
+        assert part["driver_note"].startswith(
+            "cannot read the driver extracted from the RDB: [Errno 13] Permission denied: ")
+        assert list(temp_dir.iterdir()) == []
 
     def test_text_names_the_handler(self, user_driver_dir, tmp_path, capsys):
         from amifuse.fuse_fs import main
