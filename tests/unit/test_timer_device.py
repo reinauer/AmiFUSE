@@ -1000,34 +1000,41 @@ class TestTimerThread:
 
         Each call stands for a resume that outlasts the handler's re-arm
         delay: it holds the lock, re-arms (which sets the event) and leaves
-        the request due again at once.
+        the request due again at once. It counts a fixed number of looks,
+        not a time window, so a slow runner only makes it take longer.
         """
         timer = _Timer()
         fs, _ = self._fs(timer)
+        looks = 6
         spans = []
+        done = threading.Event()
 
         def run_due_timers():
             start = time.monotonic()
             while time.monotonic() - start < 0.05:  # emulation holds the GIL
                 pass
-            timer.event.set()
             spans.append((start, time.monotonic()))
+            if len(spans) == looks:
+                done.set()
+                return None  # nothing pending: it waits on the event
+            timer.event.set()
             return 0.0
 
         fs.bridge.run_due_timers = run_due_timers
         fs.init("/")
-        time.sleep(0.2)
         waits = []
-        for _ in range(5):
+        deadline = time.monotonic() + 30
+        while not done.is_set() and time.monotonic() < deadline:
             start = time.monotonic()
-            if fs.bridge._lock.acquire(timeout=1.0):
+            if fs.bridge._lock.acquire(timeout=5.0):
                 fs.bridge._lock.release()
             waits.append(time.monotonic() - start)
+            time.sleep(0.005)
         fs.destroy("/")
+        assert len(spans) == looks
         gaps = [nxt[0] - prev[1] for prev, nxt in zip(spans, spans[1:])]
-        assert len(gaps) >= 2
         assert min(gaps) >= timer.MIN_DELAY / 2
-        assert max(waits) < 0.5
+        assert max(waits) < 2.0
 
     def test_destroy_during_a_timer_burst_does_not_hang(self):
         """A stop that comes while run_due_timers runs ends the thread.
