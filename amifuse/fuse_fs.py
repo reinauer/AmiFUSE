@@ -5345,6 +5345,7 @@ def cmd_inspect(args):
     from .rdb_inspect import (
         open_rdisk, detect_adf, detect_iso, list_partitions,
         amiga_rdb_partitions, build_rdisk_desc, print_inspect_report,
+        find_partition_mbr_index,
     )
 
     use_json = getattr(args, "json", False)
@@ -5451,10 +5452,20 @@ def cmd_inspect(args):
                 blkdev.close()
 
         # Resolved with the image closed: a Windows disk admits one reader.
-        for desc in all_rdbs:
+        for rdb_idx, desc in enumerate(all_rdbs):
             for part in desc["partitions"]:
+                name = part["name"]
+                # mount --partition picks the first RDB holding the name, so
+                # a same-named partition in a later RDB cannot be mounted.
+                if multi_rdb and find_partition_mbr_index(
+                        args.image, args.block_size, name) != rdb_idx:
+                    part["driver"] = None
+                    part["driver_note"] = (
+                        f"another RDB on this disk also has a partition named "
+                        f"{name}, and mount --partition {name} uses that one")
+                    continue
                 part["driver"], text = _partition_driver(
-                    args.image, args.block_size, part["name"])
+                    args.image, args.block_size, name)
                 if part["driver"] is None:
                     part["driver_note"] = text
 
@@ -5471,8 +5482,11 @@ def cmd_inspect(args):
 
     print_inspect_report(args.image, args.block_size, args.full)
     print("\nFilesystem driver per partition (without --driver):")
-    for part in list_partitions(args.image, args.block_size).partitions:
+    listed = list_partitions(args.image, args.block_size)
+    for part in listed.partitions:
         print(f"  {part.name}: {_partition_driver(args.image, args.block_size, part.name)[1]}")
+    if listed.fallback_reason:
+        print(f"  Note: {listed.fallback_reason}")
 
 
 def cmd_mount(args):

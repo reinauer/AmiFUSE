@@ -558,15 +558,15 @@ class TestResolveDriver:
 AMITOOLS_ROOT = Path(__file__).resolve().parents[2] / "amitools"
 
 
-def _rdb(tmp_path, part, fs=(), name="disk.hdf"):
-    """An rdbtool image with partition DH0 of DOS type part and, given fs,
+def _rdb(tmp_path, part, fs=(), name="disk.hdf", drive="DH0"):
+    """An rdbtool image with partition drive of DOS type part and, given fs,
     the bundled FastFileSystem in its RDB under DOS type fs: one type, or a
     tuple of types, each a further entry in the RDB's driver list."""
     image = tmp_path / name
     fs = (fs,) if isinstance(fs, str) else fs
     # 8 RDB cylinders hold one copy of the driver.
     args = ["create", "size=8Mi", "+", "init", f"rdb_cyls={8 * max(1, len(fs))}",
-            "+", "add", "size=6MiB", "name=DH0", f"fs={part}"]
+            "+", "add", "size=6MiB", f"name={drive}", f"fs={part}"]
     for dos_type in fs:
         args += ["+", "fsadd", str(driver_resolver.BUNDLED_DRIVER), f"dostype={dos_type}"]
     proc = subprocess.run(
@@ -988,3 +988,53 @@ class TestInspectRdb:
             "Filesystem driver per partition (without --driver):\n"
             "  DH0: FastFileSystem alpha1 (bundled, sha256 0a9ffd7c7b14)"
         ) in out
+
+
+def _two_rdbs(tmp_path, second_drive):
+    """Two 0x76 MBR entries: DH0 with the bundled driver in its RDB, then
+    second_drive with no driver in its RDB, so the bundled file serves it."""
+    from tests.unit.test_mbr_rdb_block_size import _make_mbr
+
+    first = _rdb(tmp_path, "DOS3", "DOS3", name="first.hdf").read_bytes()
+    second = _rdb(tmp_path, "DOS3", name="second.hdf",
+                  drive=second_drive).read_bytes()
+    return _make_mbr(tmp_path, [(64, first), (64 + len(first) // 512, second)])
+
+
+class TestInspectMultiRdb:
+    """Each partition's driver comes from the RDB mount would open for it."""
+
+    def _partitions(self, image, capsys):
+        from amifuse.fuse_fs import main
+
+        main(["inspect", "--json", str(image)])
+        rdbs = json.loads(capsys.readouterr().out)["rdbs"]
+        return [part for rdb in rdbs for part in rdb["partitions"]]
+
+    def test_json_distinct_names(self, user_driver_dir, tmp_path, capsys):
+        first, second = self._partitions(_two_rdbs(tmp_path, "DH1"), capsys)
+        assert first["driver"]["source"] == "rdb"
+        assert second["driver"]["source"] == "bundled"
+
+    def test_json_shared_name_is_not_given_the_first_rdbs_driver(
+            self, user_driver_dir, tmp_path, capsys):
+        """mount --partition dh0 opens the first RDB, whose DH0 matches the
+        name, so the second RDB's dh0 has no driver mount would use."""
+        first, second = self._partitions(_two_rdbs(tmp_path, "dh0"), capsys)
+        assert first["driver"]["source"] == "rdb"
+        assert second["driver"] is None
+        assert second["driver_note"] == (
+            "another RDB on this disk also has a partition named dh0, "
+            "and mount --partition dh0 uses that one")
+
+    def test_text_says_why_partitions_are_missing(
+            self, user_driver_dir, tmp_path, capsys):
+        from amifuse.fuse_fs import main
+
+        main(["inspect", str(_two_rdbs(tmp_path, "DH0"))])
+        out = capsys.readouterr().out
+        assert out.endswith(
+            "Filesystem driver per partition (without --driver):\n"
+            "  DH0: DOS3/0x444f5303 (from RDB)\n"
+            "  Note: multiple RDBs with colliding partition names ('DH0'); "
+            "mounted first only\n")

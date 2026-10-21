@@ -4830,6 +4830,9 @@ class TestCmdInspectJson:
             make_rdisk_result(0),
             make_rdisk_result(1),
         ]
+        # mount --partition DHn would open RDB n.
+        fake_rdb.find_partition_mbr_index.side_effect = (
+            lambda image, block_size, name: int(name[2:]))
 
         fuse_fs_mod.cmd_inspect(inspect_args)
         output = capsys.readouterr().out
