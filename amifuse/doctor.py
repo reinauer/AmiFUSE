@@ -12,7 +12,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import Callable, List, Optional
+from typing import Callable, Dict, List, Optional
 
 
 @dataclasses.dataclass
@@ -106,28 +106,8 @@ def run_checks() -> List[CheckResult]:
             fixable=False, fix_description=fix_desc,
         ))
 
-    # 6. Driver availability
-    driver_found = False
-    driver_path = None
-    for search_dir in plat.get_driver_search_dirs():
-        candidate = search_dir / "FastFileSystem"
-        if candidate.is_file() and candidate.stat().st_size > 0:
-            driver_found = True
-            driver_path = candidate
-            break
-
-    if driver_found:
-        results.append(CheckResult(
-            "drivers", "ok", f"FastFileSystem found at {driver_path}",
-        ))
-    else:
-        primary_dir = plat.get_primary_driver_dir()
-        results.append(CheckResult(
-            "drivers", "warning",
-            "FastFileSystem not found",
-            fixable=False,
-            fix_description=f"Copy FastFileSystem to {primary_dir} for ADF floppy mounting",
-        ))
+    # 6. The FastFileSystem that FFS/OFS volumes without their own driver use
+    results.append(_drivers_check())
 
     # 7-8b. Windows shell integration: registration status plus, when
     # registered, tray dependencies and wscript availability. One import
@@ -250,6 +230,31 @@ def run_checks() -> List[CheckResult]:
             ))
 
     return results
+
+
+def _drivers_check() -> CheckResult:
+    """Check the bundled FastFileSystem and the user's copy, and name the
+    handler DOS0-DOS7 volumes would use, grouped by handler."""
+    from . import driver_resolver as dr
+
+    user_dir = dr.user_driver_dir()
+    serving: Dict[Optional[str], List[str]] = {}
+    for dos_type in range(dr.DOS_BASE, dr.DOS_BASE + 8):
+        try:
+            description = dr.find_folder_driver(dos_type, "", quiet=True).description
+        except dr.DriverNotFound:
+            description = None
+        serving.setdefault(description, []).append(dr.dos_tag(dos_type))
+
+    parts = [p for p in (dr.bundled_problem(), dr.user_copy_problem()) if p]
+    status = "warning" if parts else "ok"
+    for description, tags in serving.items():
+        served_by = description or f"none; place your own FastFileSystem in {user_dir}"
+        parts.append(f"{dr.dos_range(tags)}: {served_by}")
+    fix = None
+    if status == "warning":
+        fix = f"Reinstall AmiFUSE, or place a readable FastFileSystem in {user_dir}"
+    return CheckResult("drivers", status, "; ".join(parts), fix_description=fix)
 
 
 def _overall_status(checks: List[CheckResult]) -> str:

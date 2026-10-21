@@ -147,9 +147,10 @@ class TestMountFuseOptions:
         fake_rdb.detect_iso.return_value = None
         monkeypatch.setitem(sys.modules, "amifuse.rdb_inspect", fake_rdb)
 
-        # Patch get_partition_name and extract_embedded_driver
+        # Patch get_partition_info and extract_embedded_driver
         monkeypatch.setattr(
-            fuse_fs_mod, "get_partition_name", lambda *a, **kw: "DH0"
+            fuse_fs_mod, "get_partition_info",
+            lambda *a, **kw: {"name": "DH0", "dostype": 0x444F5303},
         )
         monkeypatch.setattr(
             fuse_fs_mod,
@@ -283,6 +284,27 @@ class TestMountFuseOptions:
         assert mock_mount_fuse_deps["mountpoint"] == expected
         assert mock_mount_fuse_deps["fuse_kwargs"]["uid"] == -1
         assert mock_mount_fuse_deps["fuse_kwargs"]["gid"] == -1
+
+    def test_adf_mounts_with_bundled_driver_and_keeps_it(
+        self, mock_mount_fuse_deps, user_driver_dir, capsys,
+    ):
+        """An ADF without --driver mounts with the bundled FastFileSystem.
+
+        The banner names it, and the cleanup that removes an RDB extraction
+        leaves the bundled file alone.
+        """
+        from amifuse import driver_resolver, fuse_fs
+
+        rdb = sys.modules["amifuse.rdb_inspect"]
+        rdb.detect_adf.return_value = SimpleNamespace(dos_type=0x444F5301, is_hd=False)
+        fuse_fs.mount_fuse(Path("test.adf"), None, None, block_size=None)
+
+        assert (
+            "Filesystem driver: FastFileSystem alpha1 (bundled, sha256 0a9ffd7c7b14) "
+            f"{driver_resolver.BUNDLED_DRIVER}\n"
+        ) in capsys.readouterr().out
+        assert fuse_fs.HandlerBridge.call_args.args[1] == driver_resolver.BUNDLED_DRIVER
+        assert driver_resolver.BUNDLED_DRIVER.exists()
 
     def test_subtype_included_on_linux(self, monkeypatch, mock_mount_fuse_deps):
         """On Linux, the 'subtype' kwarg is included and set to 'amifuse'."""
@@ -567,6 +589,39 @@ class TestFormatVolume:
         mock_bridge._run_until_replies.assert_not_called()
         mock_bridge.backend.sync.assert_called_once_with()
         mock_bridge.close.assert_called_once()
+
+    def test_format_dos_partition_without_rdb_driver_uses_bundled(
+            self, monkeypatch, tmp_path, user_driver_dir, capsys):
+        """A DOS3 partition whose RDB has no driver formats with the bundled
+        FastFileSystem, which format's cleanup leaves in place."""
+        import amifuse.fuse_fs as fuse_fs_mod
+        from amifuse import driver_resolver
+
+        image = tmp_path / "test.hdf"
+        image.write_bytes(b"")
+        monkeypatch.setattr(
+            fuse_fs_mod, "get_partition_info",
+            lambda image, block_size, partition: {"name": "DH0", "dostype": 0x444F5303},
+        )
+        monkeypatch.setattr(fuse_fs_mod, "extract_embedded_driver", lambda *a: None)
+        mock_bridge = MagicMock()
+        mock_bridge.state.crashed = False
+        mock_bridge.launcher.alloc_bstr.return_value = (None, 0x1234)
+        mock_bridge.launcher.send_inhibit.return_value = (0x100, 0xF0)
+        mock_bridge.launcher.send_format.return_value = (0x200, 0x1F0)
+        mock_bridge.launcher.send_flush.return_value = (0x300, 0x2F0)
+        mock_bridge._run_until_reply.return_value = (1, 0)
+        bridge_cls = MagicMock(return_value=mock_bridge)
+        monkeypatch.setattr(fuse_fs_mod, "HandlerBridge", bridge_cls)
+
+        fuse_fs_mod.format_volume(image, None, None, "DH0", volname="Fresh")
+
+        assert (
+            "Filesystem driver: FastFileSystem alpha1 (bundled, sha256 0a9ffd7c7b14) "
+            f"{driver_resolver.BUNDLED_DRIVER}\n"
+        ) in capsys.readouterr().out
+        assert bridge_cls.call_args.args[1] == driver_resolver.BUNDLED_DRIVER
+        assert driver_resolver.BUNDLED_DRIVER.exists()
 
     @pytest.mark.parametrize("make_error", [
         lambda mod: PermissionError(errno.EACCES, "Permission denied", "test.hdf"),
@@ -2418,8 +2473,14 @@ class TestCreateBridgeFromArgs:
         with pytest.raises(SystemExit, match="image file not found"):
             _create_bridge_from_args(args, "test")
 
-    def test_bridge_returns_tuple(self, fuse_mock, monkeypatch, tmp_path):
+    def test_bridge_returns_tuple(self, fuse_mock, monkeypatch, tmp_path, user_driver_dir):
+        """The RDB's driver wins over a user copy, and only the extraction
+        is returned for deletion, never the bundled or user file."""
         import amifuse.fuse_fs as fuse_fs_mod
+        from amifuse import driver_resolver
+
+        user_copy = user_driver_dir / "FastFileSystem"
+        user_copy.write_bytes(b"user")
 
         # Create a real image file so exists() passes
         image = tmp_path / "test.hdf"
@@ -2457,6 +2518,7 @@ class TestCreateBridgeFromArgs:
         bridge, td = result
         assert bridge is mock_bridge
         assert td == temp_driver
+        assert td not in (user_copy, driver_resolver.BUNDLED_DRIVER)
 
     def test_bridge_cleans_temp_driver_on_failure(self, fuse_mock, monkeypatch, tmp_path):
         import amifuse.fuse_fs as fuse_fs_mod
@@ -2533,24 +2595,23 @@ class TestCreateBridgeFromArgs:
             assert str(caught.value) == f"Error: {message}"
 
     def test_bridge_adf_no_driver_json_error(
-        self, fuse_mock, monkeypatch, tmp_path, capsys,
+        self, fuse_mock, monkeypatch, tmp_path, capsys, user_driver_dir,
     ):
-        """ADF without --driver: verify JSON body."""
+        """DOS7 ADF without --driver or a user copy: verify JSON body.
+
+        The bundled FastFileSystem covers DOS0-DOS5, so only a long-name
+        floppy is left without a driver.
+        """
         import amifuse.fuse_fs as fuse_fs_mod
 
         image = tmp_path / "test.adf"
         image.write_bytes(b"\x00" * 1024)
 
         fake_adf_info = MagicMock()
-        fake_adf_info.dos_type = 0x444F5300  # DOS0
+        fake_adf_info.dos_type = 0x444F5307  # DOS7
         fake_rdb = MagicMock()
         fake_rdb.detect_adf.return_value = fake_adf_info
         monkeypatch.setitem(sys.modules, "amifuse.rdb_inspect", fake_rdb)
-
-        # Ensure no driver is found on disk
-        monkeypatch.setattr(
-            "amifuse.platform.find_driver_for_dostype", lambda dt: None,
-        )
 
         args = argparse.Namespace(
             image=image,
@@ -2566,7 +2627,9 @@ class TestCreateBridgeFromArgs:
         data = json.loads(output)
         assert data["error"]["code"] == "DRIVER_NOT_FOUND"
         assert "ADF" in data["error"]["message"]
+        assert "DOS0-DOS5 only" in data["error"]["message"]
         assert "--driver" in data["error"]["message"]
+        assert "\n" not in data["error"]["message"]
 
     def test_bridge_iso_no_driver_json_error(
         self, fuse_mock, monkeypatch, tmp_path, capsys,
@@ -2601,7 +2664,11 @@ class TestCreateBridgeFromArgs:
     def test_bridge_rdb_no_embedded_driver_json_error(
         self, fuse_mock, monkeypatch, tmp_path, capsys,
     ):
-        """RDB image with no embedded driver should emit DRIVER_NOT_FOUND."""
+        """A non-DOS RDB partition with no embedded driver emits DRIVER_NOT_FOUND.
+
+        DOS0-DOS5 partitions fall back to the bundled FastFileSystem, so
+        this uses a PFS3 partition.
+        """
         import amifuse.fuse_fs as fuse_fs_mod
 
         image = tmp_path / "test.hdf"
@@ -2614,6 +2681,10 @@ class TestCreateBridgeFromArgs:
 
         monkeypatch.setattr(
             fuse_fs_mod, "extract_embedded_driver", lambda *a, **kw: None,
+        )
+        monkeypatch.setattr(
+            fuse_fs_mod, "get_partition_info",
+            lambda *a, **kw: {"name": "PDH0", "dostype": 0x50465303},
         )
 
         args = argparse.Namespace(
@@ -2637,17 +2708,16 @@ class TestCreateBridgeFromArgs:
 
 
 class TestAdfDriverAutoResolution:
-    """Tests for ADF auto-resolution of driver via find_driver_for_dostype."""
+    """Tests for ADF auto-resolution of the driver via fuse_fs.resolve_driver."""
 
-    def test_adf_auto_resolves_driver(self, monkeypatch, tmp_path):
-        """mount_fuse auto-resolves driver for ADF via find_driver_for_dostype."""
-        import types
+    def test_adf_auto_resolves_driver(self, monkeypatch, tmp_path, user_driver_dir):
+        """The file commands use the FastFileSystem in your drivers folder."""
         import amifuse.fuse_fs as fuse_fs_mod
 
         image = tmp_path / "test.adf"
         image.write_bytes(b"\x00" * 1024)
 
-        driver_file = tmp_path / "FastFileSystem"
+        driver_file = user_driver_dir / "FastFileSystem"
         driver_file.write_bytes(b"\x00")
 
         fake_adf_info = MagicMock()
@@ -2655,23 +2725,6 @@ class TestAdfDriverAutoResolution:
         fake_rdb = MagicMock()
         fake_rdb.detect_adf.return_value = fake_adf_info
         monkeypatch.setitem(sys.modules, "amifuse.rdb_inspect", fake_rdb)
-
-        # Mock DosType with proper module hierarchy
-        fake_dostype = types.ModuleType("amitools.fs.DosType")
-        fake_dostype.num_to_tag_str = lambda dt: "DOS0"
-        fake_amitools = types.ModuleType("amitools")
-        fake_amitools_fs = types.ModuleType("amitools.fs")
-        fake_amitools.fs = fake_amitools_fs
-        fake_amitools_fs.DosType = fake_dostype
-        monkeypatch.setitem(sys.modules, "amitools", fake_amitools)
-        monkeypatch.setitem(sys.modules, "amitools.fs", fake_amitools_fs)
-        monkeypatch.setitem(sys.modules, "amitools.fs.DosType", fake_dostype)
-
-        # find_driver_for_dostype returns the driver
-        monkeypatch.setattr(
-            "amifuse.platform.find_driver_for_dostype",
-            lambda dt: driver_file,
-        )
 
         # Mock HandlerBridge to capture the driver arg
         captured = {}
@@ -2691,37 +2744,23 @@ class TestAdfDriverAutoResolution:
             block_size=None,
             debug=False,
         )
-        bridge, info = fuse_fs_mod._create_bridge_from_args(args, "test")
+        bridge, temp_driver = fuse_fs_mod._create_bridge_from_args(args, "test")
         # The auto-resolved driver path should be the second positional arg
-        assert captured["args"][1] == str(driver_file)
+        assert captured["args"][1] == driver_file
+        assert temp_driver is None
 
-    def test_adf_no_driver_found_error(self, monkeypatch, tmp_path):
-        """mount_fuse raises SystemExit when no driver found for ADF."""
-        import types
+    def test_adf_no_driver_found_error(self, monkeypatch, tmp_path, user_driver_dir):
+        """A DOS7 ADF with no user copy fails, naming the drivers folder."""
         import amifuse.fuse_fs as fuse_fs_mod
 
         image = tmp_path / "test.adf"
         image.write_bytes(b"\x00" * 1024)
 
         fake_adf_info = MagicMock()
-        fake_adf_info.dos_type = 0x444F5300
+        fake_adf_info.dos_type = 0x444F5307
         fake_rdb = MagicMock()
         fake_rdb.detect_adf.return_value = fake_adf_info
         monkeypatch.setitem(sys.modules, "amifuse.rdb_inspect", fake_rdb)
-
-        fake_dostype = types.ModuleType("amitools.fs.DosType")
-        fake_dostype.num_to_tag_str = lambda dt: "DOS0"
-        fake_amitools = types.ModuleType("amitools")
-        fake_amitools_fs = types.ModuleType("amitools.fs")
-        fake_amitools.fs = fake_amitools_fs
-        fake_amitools_fs.DosType = fake_dostype
-        monkeypatch.setitem(sys.modules, "amitools", fake_amitools)
-        monkeypatch.setitem(sys.modules, "amitools.fs", fake_amitools_fs)
-        monkeypatch.setitem(sys.modules, "amitools.fs.DosType", fake_dostype)
-
-        monkeypatch.setattr(
-            "amifuse.platform.find_driver_for_dostype", lambda dt: None,
-        )
 
         args = argparse.Namespace(
             image=image,
@@ -2733,8 +2772,9 @@ class TestAdfDriverAutoResolution:
         )
         with pytest.raises(SystemExit) as exc_info:
             fuse_fs_mod._create_bridge_from_args(args, "test")
-        assert "DOS0" in str(exc_info.value)
+        assert "DOS7" in str(exc_info.value)
         assert "FastFileSystem" in str(exc_info.value)
+        assert str(user_driver_dir) in str(exc_info.value)
 
 
 # TestCmdLs -- ls command tests
@@ -5692,8 +5732,10 @@ class TestCreateBridgeReadOnlyParam:
             block_size=None,
             debug=False,
         )
-        fuse_fs_mod._create_bridge_from_args(args, "test")
+        _, td = fuse_fs_mod._create_bridge_from_args(args, "test")
         assert captured.get("read_only") is True
+        # Only the RDB extraction is handed back for deletion.
+        assert td == temp_driver
 
     def test_bridge_explicit_read_only_false(self, fuse_mock, monkeypatch, tmp_path):
         """Passing read_only=False creates a bridge with read_only=False."""
@@ -5736,8 +5778,10 @@ class TestCreateBridgeReadOnlyParam:
             block_size=None,
             debug=False,
         )
-        fuse_fs_mod._create_bridge_from_args(args, "test", read_only=False)
+        _, td = fuse_fs_mod._create_bridge_from_args(args, "test", read_only=False)
         assert captured.get("read_only") is False
+        # Only the RDB extraction is handed back for deletion.
+        assert td == temp_driver
 
 
 # ---------------------------------------------------------------------------
