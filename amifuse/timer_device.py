@@ -7,8 +7,12 @@ of times during startup, and the write-back it drives never sees time pass.
 
 AmiFuseTimerDevice holds each relative TR_ADDREQUEST until its deadline. The
 bridge calls deliver() between emulator bursts, and delivery replies the
-request the way SendIO's quick path does. Everything else (the clock
-functions, TR_GETSYSTIME, absolute units) is amitools' behaviour.
+request the way SendIO's quick path does. Absolute units and the clock
+arithmetic are amitools' behaviour.
+
+It also corrects the system time. amitools counts it from the Unix epoch,
+while AmigaOS, and dos.library's DateStamp in vamos, count from 1978-01-01,
+so a handler stamping files with GetSysTime dated them eight years ahead.
 
 The table is touched only while the bridge lock is held: the device runs
 inside emulator bursts, and the bridge and its timer thread take the lock.
@@ -30,7 +34,11 @@ import threading
 import time
 from typing import Callable, Dict, Optional, Tuple
 
-from amitools.vamos.lib.TimerDevice import TR_ADDREQUEST, TimerDevice  # type: ignore
+from amitools.vamos.lib.TimerDevice import (  # type: ignore
+    TR_ADDREQUEST,
+    TR_GETSYSTIME,
+    TimerDevice,
+)
 from amitools.vamos.libstructs.exec_ import (  # type: ignore
     IORequestStruct,
     MessageStruct,
@@ -81,6 +89,9 @@ class AmiFuseTimerDevice(TimerDevice):
     # One VBLANK tick. It bounds how often a handler that re-arms with no
     # delay can wake.
     MIN_DELAY = 0.02
+    # Seconds from the Unix epoch to the Amiga epoch, 1978-01-01: the 2922
+    # days that vamos' DateStamp subtracts (amitools.vamos.lib.dos.AmiTime).
+    AMIGA_EPOCH_OFFSET = 2922 * 24 * 60 * 60
 
     def __init__(self, exec_impl, clock: Callable[[], float] = time.monotonic):
         self._exec = exec_impl
@@ -97,6 +108,18 @@ class AmiFuseTimerDevice(TimerDevice):
         # Requests replied at their deadline, for tests and --debug.
         self.deliveries = 0
 
+    @classmethod
+    def get_sys_time(cls):
+        """The system time as (secs, micros) since the Amiga epoch, in UTC.
+
+        UTC, as vamos' DateStamp uses, so that both clocks agree. GetSysTime
+        and TR_GETSYSTIME both read it. Computed here rather than from
+        amitools' Unix-epoch value, so a fix there cannot apply twice.
+        """
+        now = time.time()
+        secs = int(now)
+        return secs - cls.AMIGA_EPOCH_OFFSET, int((now - secs) * cls.MICRO_HZ)
+
     # ---- library hooks ----
 
     def setup_lib(self, ctx, base_addr):
@@ -112,7 +135,16 @@ class AmiFuseTimerDevice(TimerDevice):
 
     def BeginIO(self, ctx, io_request):
         mem = ctx.mem
-        if mem.r16(io_request + _IO_COMMAND) != TR_ADDREQUEST:
+        cmd = mem.r16(io_request + _IO_COMMAND)
+        if cmd == TR_GETSYSTIME:
+            # In tr_time, where amitools' TimeRequestStruct does not put it:
+            # 16 bytes later it misses the answer and writes past the request.
+            secs, micros = self.get_sys_time()
+            mem.w8(io_request + _IO_ERROR, 0)
+            mem.w32(io_request + _TR_SECS, secs)
+            mem.w32(io_request + _TR_MICRO, micros)
+            return 0
+        if cmd != TR_ADDREQUEST:
             return super().BeginIO(ctx, io_request)
         unit = self._units.get(io_request)
         if unit not in _RELATIVE_UNITS:

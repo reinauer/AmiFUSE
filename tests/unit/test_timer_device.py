@@ -202,6 +202,36 @@ class TestTimerDevice:
         assert timer.exec.port_mgr.has_msg(PORT) is True
         assert timer.device.next_deadline() == float("inf")
 
+    def test_getsystime_answers_in_tr_time(self, timer):
+        """The time lands in tr_time, after the 32-byte IORequest, and nowhere else.
+
+        A struct timerequest is 40 bytes. amitools wrote the answer at +48,
+        past the end of the request.
+        """
+        timer.mem.w32(IO + 48, 0xDEADBEEF)
+        timer.mem.w32(IO + 52, 0xDEADBEEF)
+        timer.send(cmd=TR_GETSYSTIME)
+        secs, micros = timer.device.get_sys_time()
+        assert abs(timer.mem.r32(IO + 32) - secs) <= 1
+        assert timer.mem.r32(IO + 36) < 1_000_000
+        assert timer.mem.r32(IO + 48) == timer.mem.r32(IO + 52) == 0xDEADBEEF
+
+    def test_system_time_counts_from_the_amiga_epoch_like_datestamp(self):
+        """GetSysTime and dos.library's DateStamp tell the same time.
+
+        AmigaOS counts from 1978-01-01, 2922 days after the Unix epoch;
+        vamos' DateStamp subtracts them from UTC, and so must the timer.
+        """
+        from amitools.vamos.lib.dos.AmiTime import sys_to_ami_time
+        from amifuse.timer_device import AmiFuseTimerDevice
+
+        now = time.time()
+        stamp = sys_to_ami_time(now)
+        secs, micros = AmiFuseTimerDevice.get_sys_time()
+        assert 0 <= micros < 1_000_000
+        assert abs(secs - (stamp.tday * 86400 + stamp.tmin * 60 + stamp.tick // 50)) <= 2
+        assert AmiFuseTimerDevice.AMIGA_EPOCH_OFFSET == 252_460_800
+
     @pytest.mark.parametrize("unit", [UNIT_WAITUNTIL, None])
     def test_absolute_or_unknown_unit_stays_quick(self, timer, unit):
         """UNIT_WAITUNTIL, or a request never opened here, completes at once."""
