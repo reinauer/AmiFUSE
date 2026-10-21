@@ -246,6 +246,29 @@ class TestMountFuseOptions:
         assert not driver.exists()
         assert not icon.exists()
 
+    @pytest.mark.parametrize("created", [True, False])
+    def test_timer_thread_stops_before_the_bridge_closes(
+        self, monkeypatch, mock_mount_fuse_deps, created
+    ):
+        """The timer thread is stopped before bridge.close(), if the FS was built."""
+        from unittest.mock import call
+        from amifuse import fuse_fs
+
+        bridge = fuse_fs.HandlerBridge.return_value
+        operations = fuse_fs.AmigaFuseFS.return_value
+        order = MagicMock()
+        order.attach_mock(operations._stop_timer_thread, "stop")
+        order.attach_mock(bridge.close, "close")
+        if not created:
+            fuse_fs.AmigaFuseFS.side_effect = RuntimeError("no fs")
+        try:
+            fuse_fs.mount_fuse(Path("test.hdf"), Path("driver"), Path("/mnt/x"), None,
+                               foreground=True)
+        except RuntimeError:
+            assert not created
+        expected = [call.stop(), call.close()] if created else [call.close()]
+        assert order.mock_calls == expected
+
     @pytest.mark.parametrize("elevated, expected", [(True, "\\\\.\\R:"), (False, "R:")])
     def test_windows_drive_passed_to_fuse(self, monkeypatch, mock_mount_fuse_deps, elevated, expected):
         from amifuse import platform, fuse_fs

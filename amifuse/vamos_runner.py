@@ -85,6 +85,7 @@ class VamosHandlerRuntime:
         )
         self.scsi_backend = None
         self.scsi_debug = False
+        self.timer_device = None
 
     def setup(self, cpu: Optional[str] = None):
         _reset_runtime_state()
@@ -176,9 +177,13 @@ class VamosHandlerRuntime:
         # HandlerBridge after it has applied AmiFUSE's image detection.
         self.disk_session.install_devices(self.slm)
         from amifuse.null_device import NullDevice  # lazy import to avoid cycles
-        from amitools.vamos.lib.TimerDevice import TimerDevice
+        from amifuse.timer_device import AmiFuseTimerDevice
         self.slm.lib_mgr.add_impl_cls("keyboard.device", NullDevice)
-        self.slm.lib_mgr.add_impl_cls("timer.device", TimerDevice)
+        # One device for the runtime, so that pending requests survive the
+        # device being expunged and opened again, and the bridge can reach it.
+        timer_device = AmiFuseTimerDevice(self.slm.exec_impl)
+        self.timer_device = timer_device
+        self.slm.lib_mgr.add_impl_cls("timer.device", lambda: timer_device)
         self.slm.lib_mgr.add_impl_cls("console.device", NullDevice)
 
         # Add run() method to machine for backwards compatibility
@@ -311,6 +316,7 @@ class VamosHandlerRuntime:
             acknowledge_unsupported_commands=True,
         )
         self.scsi_backend = None
+        self.timer_device = None
         try:
             _reset_runtime_state()
         except BaseException as exc:
