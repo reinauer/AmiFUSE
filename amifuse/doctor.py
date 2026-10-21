@@ -237,7 +237,7 @@ def _drivers_check() -> CheckResult:
     handler DOS0-DOS7 volumes would use, grouped by handler."""
     from . import driver_resolver as dr
 
-    user_dir = dr.user_driver_dir()
+    user_dir = dr.user_driver_dir() or dr.NO_USER_DRIVER_DIR
     serving: Dict[Optional[str], List[str]] = {}
     for dos_type in range(dr.DOS_BASE, dr.DOS_BASE + 8):
         try:

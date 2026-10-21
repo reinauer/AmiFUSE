@@ -30,6 +30,8 @@ BUNDLED_LICENSE = BUNDLED_DIR / "FastFileSystem.OS3.LICENSE"
 
 # The name of the user's own copy, as in L:FastFileSystem on AmigaOS.
 USER_DRIVER_NAME = "FastFileSystem"
+# Names the drivers folder in messages when there is no home folder for it.
+NO_USER_DRIVER_DIR = "your drivers folder (no home folder found)"
 
 # Development checkouts and CI have AmiFUSE-testing beside AmiFUSE.
 DEV_FALLBACK_DRIVER = (
@@ -99,11 +101,20 @@ def dos_range(tags: Iterable[str]) -> str:
     )
 
 
-def user_driver_dir() -> Path:
-    """The drivers folder searched for the user's own FastFileSystem."""
+def user_driver_dir() -> Optional[Path]:
+    """The drivers folder searched for the user's own FastFileSystem, or
+    None when no home folder can be found to hold it."""
     from . import platform as plat
 
-    return plat.get_primary_driver_dir()
+    try:
+        return plat.get_primary_driver_dir()
+    except RuntimeError:  # Path.home() found no home folder
+        return None
+
+
+def _user_driver() -> Optional[Path]:
+    user_dir = user_driver_dir()
+    return None if user_dir is None else user_dir / USER_DRIVER_NAME
 
 
 def _usable(path: Path) -> bool:
@@ -174,8 +185,8 @@ def bundled_problem() -> Optional[str]:
 
 def user_copy_problem() -> Optional[str]:
     """Return why the user's FastFileSystem cannot be read, or None."""
-    user = user_driver_dir() / USER_DRIVER_NAME
-    if not _usable(user):
+    user = _user_driver()
+    if user is None or not _usable(user):
         return None
     try:
         user.read_bytes()
@@ -233,10 +244,10 @@ def find_folder_driver(dos_type: int, subject: str, quiet: bool = False) -> Reso
     Raises DriverNotFound, also when the chosen file cannot be read.
     """
     tag = dos_tag(dos_type)
-    user_dir = user_driver_dir()
+    user_dir = user_driver_dir() or NO_USER_DRIVER_DIR
     remedy = f"Reinstall AmiFUSE, place a FastFileSystem in {user_dir}, or use --driver."
-    user = user_dir / USER_DRIVER_NAME
-    if _usable(user):
+    user = _user_driver()
+    if user is not None and _usable(user):
         version, digest = _identity(
             user, "your FastFileSystem", subject,
             "Make it readable, remove it, or use --driver.")

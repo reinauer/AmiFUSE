@@ -4566,6 +4566,10 @@ class TestCmdInspectJson:
         fake_rdb_inspect.detect_iso.return_value = None
         fake_rdb_inspect.amiga_rdb_partitions.return_value = []
         monkeypatch.setitem(sys.modules, "amifuse.rdb_inspect", fake_rdb_inspect)
+        # The RDB path names each partition's driver; test_driver_resolver
+        # covers the lookup itself.
+        monkeypatch.setattr(fuse_fs_mod, "_partition_driver",
+                            lambda image, block_size, name: ({"for": name}, name))
 
         return fuse_fs_mod, fake_rdb_inspect
 
@@ -4712,7 +4716,8 @@ class TestCmdInspectJson:
         assert data["image_type"] == "rdb"
         assert data["image"] == str(inspect_args.image)
         # RDB data is merged into envelope (not nested under "rdbs")
-        assert data["partitions"] == [{"name": "DH0", "size_blocks": 100}]
+        assert data["partitions"] == [
+            {"name": "DH0", "size_blocks": 100, "driver": {"for": "DH0"}}]
         assert "rdbs" not in data
 
     # -- Gap 3: ISO human-readable output --
@@ -4838,8 +4843,8 @@ class TestCmdInspectJson:
         assert "rdbs" in data
         assert isinstance(data["rdbs"], list)
         assert len(data["rdbs"]) == 2
-        assert data["rdbs"][0]["partitions"] == [{"name": "DH0"}]
-        assert data["rdbs"][1]["partitions"] == [{"name": "DH1"}]
+        assert data["rdbs"][0]["partitions"] == [{"name": "DH0", "driver": {"for": "DH0"}}]
+        assert data["rdbs"][1]["partitions"] == [{"name": "DH1", "driver": {"for": "DH1"}}]
 
     # -- Gap 6: Verify image, version, status, command fields --
 
