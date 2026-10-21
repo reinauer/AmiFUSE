@@ -366,6 +366,117 @@ class TestTimerDevice:
         assert timer.exec.port_mgr.ports[PORT].queue == []
         assert _m68k_list(timer.mem) == []
 
+    # Each place that resumes a WaitPort() passes timer.device's delays, so
+    # a delayed reply stays queued for the GetMsg() that follows.
+
+    _DOS_PORT = 0x2800     # the handler's own pr_MsgPort
+    _DOS_MSG = 0x2900
+
+    @pytest.fixture
+    def parked(self, timer, monkeypatch):
+        """No live Exec/DOS block state; the resumes below clear it."""
+        from amitools.vamos.lib.DosLibrary import DosLibrary
+        from amitools.vamos.lib.ExecLibrary import ExecLibrary
+
+        for name in ("waitport_blocked_sp", "waitport_blocked_port",
+                     "waitport_blocked_ret", "wait_blocked_mask",
+                     "wait_blocked_sp", "wait_blocked_ret"):
+            monkeypatch.setattr(ExecLibrary, f"_{name}", None)
+        monkeypatch.setattr(DosLibrary, "_waitpkt_blocked", False)
+        timer.mem.w32(0x4000, 0x5000)  # WaitPort's return address
+        return {"waitport_blocked_sp": 0x4000, "waitport_blocked_port": PORT,
+                "waitport_blocked_ret": 0x5000, "waitpkt_blocked": False}
+
+    def _launcher(self, timer):
+        from amifuse.startup_runner import HandlerLauncher
+
+        launcher = HandlerLauncher.__new__(HandlerLauncher)
+        launcher.mem = timer.mem
+        launcher.exec_impl = timer.exec
+        launcher._debug = False
+        launcher._warned_tc_sigrecvd = False
+        cpu = SimpleNamespace(regs={})
+        cpu.w_reg = cpu.regs.__setitem__
+        launcher.vh = SimpleNamespace(
+            timer_device=timer.device, machine=SimpleNamespace(cpu=cpu),
+            alloc=SimpleNamespace(get_mem=lambda: timer.mem))
+        return launcher
+
+    def _state(self, block, port_addr=PORT):
+        return SimpleNamespace(
+            port_addr=port_addr, block_state=dict(block), pc=0x7000, sp=0x7800,
+            regs=[0] * 16, initialized=True, main_loop_pc=0x5000,
+            main_loop_sp=0x4004, wait_mask=0)
+
+    def _deliver(self, timer):
+        timer.send(micro=100_000)
+        timer.clock.now = 100.1
+        timer.device.deliver()
+        assert timer.exec.port_mgr.ports[PORT].queue == [IO]
+
+    def _assert_reply_left_queued(self, timer, pc, d0):
+        assert (pc, d0) == (0x5000, IO)
+        assert timer.exec.port_mgr.ports[PORT].queue == [IO]
+        assert _m68k_list(timer.mem) == [IO]
+
+    def test_setup_resume_leaves_a_delayed_reply_queued(self, timer, parked):
+        """setup_resume_if_blocked, for a reply that came after the burst."""
+        launcher = self._launcher(timer)
+        state = self._state(parked)
+        self._deliver(timer)
+        assert launcher.setup_resume_if_blocked(state)
+        self._assert_reply_left_queued(timer, state.pc, state.regs[0])
+
+    def test_burst_that_parks_leaves_a_delayed_reply_queued(self, timer, parked):
+        """_finalize_burst_blocked, for a reply already there when the burst parks."""
+        launcher = self._launcher(timer)
+        state = self._state(parked)
+        self._deliver(timer)
+        launcher._finalize_burst_blocked(
+            state, state.block_state, 0x4000, 0x5000, None, 0x4000, 0x10000)
+        self._assert_reply_left_queued(timer, state.pc, state.regs[0])
+
+    def test_child_resume_leaves_a_delayed_reply_queued(self, timer, parked):
+        """ProcessManager._resume_child_if_ready, for a child parked on its timer port."""
+        from amifuse.process_mgr import ProcessManager, ProcessState
+
+        pm = ProcessManager.__new__(ProcessManager)
+        pm.mem = timer.mem
+        pm.exec_impl = timer.exec
+        pm.vh = SimpleNamespace(timer_device=timer.device)
+        child = ProcessState(proc_addr=TASK, entry_pc=0x7000, sp=0x7800,
+                             port_addr=PORT, blocked=True, block_state=dict(parked))
+        self._deliver(timer)
+        assert pm._resume_child_if_ready(child)
+        self._assert_reply_left_queued(timer, child.entry_pc, child.regs[0])
+
+    @pytest.mark.parametrize("on", ["dos port", "timer port"])
+    def test_burst_parked_in_waitport_wakes_on_the_port_it_waits_on(
+            self, timer, parked, on):
+        """A WaitPort() park wakes for its own port, not for the DOS port.
+
+        A handler in WaitPort(timer_port) with a packet on its DOS port
+        stays parked: resumed, it would get D0 = 0, which no WaitPort()
+        returns. A reply on the timer port wakes it with an empty DOS port.
+        """
+        launcher = self._launcher(timer)
+        state = self._state(parked, port_addr=self._DOS_PORT)
+        timer.exec.port_mgr.register_port(self._DOS_PORT)
+        if on == "dos port":
+            timer.send(micro=100_000)  # pending: the timer port is empty
+            timer.exec.port_mgr.put_msg(self._DOS_PORT, self._DOS_MSG)
+        else:
+            self._deliver(timer)
+        launcher._finalize_burst_blocked(
+            state, state.block_state, 0x4000, 0x5000, None, 0x4000, 0x10000)
+        if on == "dos port":
+            # Still parked: the block state stays and D0 is not set.
+            assert state.block_state == parked
+            assert launcher.vh.machine.cpu.regs == {}
+            assert timer.exec.port_mgr.ports[self._DOS_PORT].queue == [self._DOS_MSG]
+        else:
+            self._assert_reply_left_queued(timer, state.pc, state.regs[0])
+
     def test_bad_reply_port_is_replied_as_sendio_does(self, timer):
         """A reply port outside memory gets no link and no signal, and raises nothing.
 
@@ -917,6 +1028,39 @@ class TestTimerThread:
         assert len(gaps) >= 2
         assert min(gaps) >= timer.MIN_DELAY / 2
         assert max(waits) < 0.5
+
+    def test_destroy_during_a_timer_burst_does_not_hang(self):
+        """A stop that comes while run_due_timers runs ends the thread.
+
+        The thread clears the event after run_due_timers, which would erase
+        the stop's wake; with nothing pending it would then wait for good,
+        and destroy() with it, before the final flush.
+        """
+        timer = _Timer()
+        fs, calls = self._fs(timer)
+        inside, release = threading.Event(), threading.Event()
+
+        def run_due_timers():
+            calls.append(time.monotonic())
+            inside.set()
+            release.wait(5)  # a resume in progress, holding the bridge lock
+            return None  # nothing pending afterwards
+
+        fs.bridge.run_due_timers = run_due_timers
+        fs.init("/")
+        thread = fs._timer_thread
+        assert inside.wait(5)
+        destroy = threading.Thread(target=fs.destroy, args=("/",), daemon=True)
+        destroy.start()
+        time.sleep(0.2)  # destroy has set the stop and the event, and joins
+        release.set()
+        destroy.join(3)
+        hung = destroy.is_alive()
+        timer.event.set()  # frees a hung thread, so it does not outlive the test
+        destroy.join(3)
+        assert not hung
+        assert not thread.is_alive()
+        assert len(calls) == 1
 
     def test_a_long_timeout_does_not_end_the_thread(self):
         """A deadline beyond threading.TIMEOUT_MAX is slept in bounded steps."""
