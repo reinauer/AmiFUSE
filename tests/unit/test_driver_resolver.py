@@ -1038,3 +1038,58 @@ class TestInspectMultiRdb:
             "  DH0: DOS3/0x444f5303 (from RDB)\n"
             "  Note: multiple RDBs with colliding partition names ('DH0'); "
             "mounted first only\n")
+
+    def test_json_failed_lookup_is_not_a_clash(
+            self, user_driver_dir, tmp_path, capsys, monkeypatch):
+        """A name mount's lookup cannot place gets the driver mount would
+        use, not a clash note."""
+        from amifuse import rdb_inspect
+
+        image = _two_rdbs(tmp_path, "dh0")
+        monkeypatch.setattr(rdb_inspect, "find_partition_mbr_index",
+                            lambda *a: None)
+        for part in self._partitions(image, capsys):
+            assert part["driver"]["source"] == "rdb"
+            assert "driver_note" not in part
+
+
+def _parceiro(tmp_path):
+    """A Parceiro disk: its own RDB, holding DH0, at block 2 beside an MBR
+    that also lists two empty 0x76 entries."""
+    from tests.unit.test_mbr_rdb_block_size import (
+        _make_mbr, _make_rdb, _with_partition_list)
+
+    rdb = _make_rdb(tmp_path, 512, "DH0")
+    image = _make_mbr(tmp_path, [(200, bytes(160 * 512)),
+                                 (400, bytes(160 * 512))])
+    data = bytearray(image.read_bytes())
+    data[2 * 512:3 * 512] = _with_partition_list(rdb, 512, 3)[:512]
+    data[3 * 512:4 * 512] = rdb[512:1024]
+    image.write_bytes(bytes(data))
+    return image
+
+
+class TestInspectParceiro:
+    """The 0x76 entries beside a Parceiro disk's own RDB all reach that one
+    RDB, so its names do not clash with themselves."""
+
+    def test_json_gives_every_partition_a_driver(
+            self, user_driver_dir, tmp_path, capsys):
+        from amifuse.fuse_fs import main
+
+        main(["inspect", "--json", str(_parceiro(tmp_path))])
+        env = json.loads(capsys.readouterr().out)
+        parts = [part for rdb in env.get("rdbs", [env])
+                 for part in rdb["partitions"]]
+        assert parts
+        for part in parts:
+            assert part["driver"] is not None
+            assert "driver_note" not in part
+
+    def test_text_prints_no_clash_note(self, user_driver_dir, tmp_path, capsys):
+        from amifuse.fuse_fs import main
+
+        main(["inspect", str(_parceiro(tmp_path))])
+        out = capsys.readouterr().out
+        assert "  DH0: " in out
+        assert "Note:" not in out
