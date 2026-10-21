@@ -650,35 +650,23 @@ class TestPlatformSpecificChecks:
 class TestDriversCheck:
     """Tests for the drivers availability check in run_checks()."""
 
-    def test_drivers_found(self, monkeypatch, tmp_path):
-        """Drivers check reports ok when FastFileSystem found."""
-        driver_dir = tmp_path / "drivers"
-        driver_dir.mkdir()
-        (driver_dir / "FastFileSystem").write_bytes(b"\x00")
-
-        monkeypatch.setattr(
-            "amifuse.platform.get_driver_search_dirs",
-            lambda: [driver_dir],
-        )
-
+    def test_drivers_found(self, user_driver_dir):
+        """Drivers check reports ok when the bundled FastFileSystem is there."""
         patches = _patch_all_checks()
         results = _run_with_patches(patches)
         c = _find_check(results, "drivers")
         assert c.status == "ok"
         assert "FastFileSystem" in c.message
 
-    def test_drivers_not_found(self, monkeypatch, tmp_path):
-        """Drivers check reports warning when no drivers found."""
-        empty_dir = tmp_path / "empty"
-        empty_dir.mkdir()
-
+    def test_drivers_not_found(self, monkeypatch, tmp_path, user_driver_dir):
+        """Drivers check reports warning when the bundled file is missing."""
         monkeypatch.setattr(
-            "amifuse.platform.get_driver_search_dirs",
-            lambda: [empty_dir],
+            "amifuse.driver_resolver.BUNDLED_DRIVER",
+            tmp_path / "missing" / "FastFileSystem.OS3",
         )
 
         patches = _patch_all_checks()
         results = _run_with_patches(patches)
         c = _find_check(results, "drivers")
         assert c.status == "warning"
-        assert "not found" in c.message
+        assert "missing" in c.message

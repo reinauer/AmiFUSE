@@ -63,6 +63,8 @@ class _FuseOperations:
     def symlink(self, target, source):
         raise FuseOSError(errno.EROFS)
 
+from . import driver_resolver
+from .driver_resolver import DriverNotFound, ResolvedDriver
 from .driver_runtime import BlockDeviceBackend, ImageInUseError
 from .vamos_runner import VamosHandlerRuntime
 from .bootstrap import BootstrapAllocator
@@ -3835,6 +3837,63 @@ def extract_embedded_driver(
         blkdev.close()
 
 
+def resolve_driver(
+    image: Path,
+    driver: Optional[Path],
+    block_size: Optional[int],
+    partition: Optional[str],
+    adf_info=None,
+    part_info: Optional[dict] = None,
+    iso_info=None,
+) -> ResolvedDriver:
+    """Pick the filesystem driver for an ADF, an ISO or an RDB partition.
+
+    Order: --driver; the RDB's driver for the partition's exact DOS type;
+    then, for DOS0-DOS7 volumes, driver_resolver.find_folder_driver() (your
+    drivers folder, the bundled FastFileSystem, the dev fallback). An ISO
+    needs --driver. part_info is get_partition_info()'s result when the
+    caller has it.
+
+    Raises DriverNotFound. Errors reading the RDB propagate. Only an RDB
+    extraction is temporary, so only that is the caller's to delete.
+    """
+    if driver is not None:
+        return ResolvedDriver(Path(driver), "explicit", str(driver))
+    if adf_info is not None:
+        floppy_type = "HD" if adf_info.is_hd else "DD"
+        dt_str = driver_resolver.dos_tag(adf_info.dos_type)
+        return driver_resolver.find_folder_driver(
+            adf_info.dos_type, f"ADF floppy image detected ({floppy_type}, {dt_str}).")
+    if iso_info is not None:
+        raise DriverNotFound(
+            f"ISO 9660 image detected (volume: {iso_info.volume_id}).\n"
+            "ISO images don't contain embedded filesystem drivers.\n"
+            "You need to specify a filesystem handler with --driver.\n"
+            "For ISO 9660, use CDFileSystem from an AmigaOS installation."
+        )
+
+    result = extract_embedded_driver(image, block_size, partition)
+    if result is not None:
+        temp_driver, dt_str, dostype = result
+        return ResolvedDriver(
+            temp_driver, "rdb", f"{dt_str}/0x{dostype:08x} (from RDB)", temporary=True)
+
+    if part_info is None:
+        part_info = get_partition_info(image, block_size, partition)
+    dostype = part_info.get("dostype")
+    if not driver_resolver.is_dos_type(dostype):
+        raise DriverNotFound(
+            "No embedded filesystem driver found for this partition.\n"
+            "You need to specify a filesystem handler with --driver"
+        )
+    name = part_info.get("name") or partition
+    return driver_resolver.find_folder_driver(
+        dostype,
+        f"Partition {name} ({driver_resolver.dos_tag(dostype)}) "
+        "has no filesystem driver in its RDB.",
+    )
+
+
 def mount_fuse(
     image: Path,
     driver: Optional[Path],
@@ -3849,7 +3908,6 @@ def mount_fuse(
     foreground: Optional[bool] = None,
 ):
     fuse_class = _require_fuse()
-    import amitools.fs.DosType as DosType
     from .rdb_inspect import detect_adf, detect_iso
     from . import platform as plat
 
@@ -3859,70 +3917,37 @@ def mount_fuse(
     # First, check if this is an ADF (floppy disk image)
     adf_info = detect_adf(image)
     iso_info = None
+    part_info = None
 
     if adf_info is not None:
         # ADF floppy detected - use DF0 as the partition name
-        dt_str = DosType.num_to_tag_str(adf_info.dos_type)
-        floppy_type = "HD" if adf_info.is_hd else "DD"
         part_name = "DF0"  # Will use actual volume name from handler later
-
-        # ADF files don't have embedded drivers - try auto-resolution
-        if driver is None:
-            resolved = plat.find_driver_for_dostype(dt_str)
-            if resolved:
-                driver = str(resolved)
-            else:
-                primary_dir = plat.get_primary_driver_dir()
-                raise SystemExit(
-                    f"ADF floppy image detected ({floppy_type}, {dt_str}).\n"
-                    "Floppy images don't contain embedded filesystem drivers.\n"
-                    f"No driver found for DOS type {dt_str}.\n"
-                    f"Place FastFileSystem in {primary_dir}\n"
-                    "or specify a filesystem handler with --driver"
-                )
-        driver_desc = str(driver)
-        temp_driver = None
     else:
         # Check for ISO 9660 image
         iso_info = detect_iso(image)
 
         if iso_info is not None:
             part_name = "CD0"
-
-            if driver is None:
-                raise SystemExit(
-                    f"ISO 9660 image detected (volume: {iso_info.volume_id}).\n"
-                    "ISO images don't contain embedded filesystem drivers.\n"
-                    "You need to specify a filesystem handler with --driver\n"
-                    "For ISO 9660, use CDFileSystem from an AmigaOS installation."
-                )
-            driver_desc = str(driver)
-            temp_driver = None
         else:
             # HDF/RDB image - get partition info
             try:
-                part_name = get_partition_name(image, block_size, partition)
+                part_info = get_partition_info(image, block_size, partition)
             except IOError as e:
                 raise SystemExit(f"Error: {e}")
+            part_name = part_info["name"]
 
-            # If no driver specified, try to extract from RDB
-            temp_driver = None
-            driver_desc = None
-            if driver is None:
-                try:
-                    result = extract_embedded_driver(image, block_size, partition)
-                except IOError as e:
-                    raise SystemExit(f"Error: {e}")
-                if result is None:
-                    raise SystemExit(
-                        "No embedded filesystem driver found for this partition.\n"
-                        "You need to specify a filesystem handler with --driver"
-                    )
-                temp_driver, dt_str, dostype = result
-                driver = temp_driver
-                driver_desc = f"{dt_str}/0x{dostype:08x} (from RDB)"
-            else:
-                driver_desc = str(driver)
+    try:
+        resolved = resolve_driver(
+            image, driver, block_size, partition,
+            adf_info=adf_info, part_info=part_info, iso_info=iso_info,
+        )
+    except IOError as e:
+        raise SystemExit(f"Error: {e}")
+    except DriverNotFound as e:
+        raise SystemExit(str(e)) from None
+    driver = resolved.path
+    driver_desc = resolved.description
+    temp_driver = resolved.path if resolved.temporary else None
 
     # Auto-create mountpoint on macOS/Windows if not specified
     if mountpoint is None:
@@ -4124,24 +4149,17 @@ def format_volume(
     dt_str = DosType.num_to_tag_str(dostype)
 
     # Resolve driver
-    temp_driver = None
-    if driver is None:
-        try:
-            result = extract_embedded_driver(image, block_size, partition)
-        except (OSError, ValueError) as exc:
-            if debug:
-                raise
-            raise SystemExit(f"Error: {exc}") from exc
-        if result is None:
-            raise SystemExit(
-                "No embedded filesystem driver found for this partition.\n"
-                "You need to specify a filesystem handler with --driver"
-            )
-        temp_driver, _, _ = result
-        driver = temp_driver
-        driver_desc = f"{dt_str}/0x{dostype:08x} (from RDB)"
-    else:
-        driver_desc = str(driver)
+    try:
+        resolved = resolve_driver(image, driver, block_size, partition, part_info=part_info)
+    except DriverNotFound as exc:
+        raise SystemExit(str(exc)) from None
+    except (OSError, ValueError) as exc:
+        if debug:
+            raise
+        raise SystemExit(f"Error: {exc}") from exc
+    driver = resolved.path
+    driver_desc = resolved.description
+    temp_driver = resolved.path if resolved.temporary else None
 
     try:
         # Inside the try, so that a failing print, such as a volume name
@@ -4371,9 +4389,7 @@ def _create_bridge_from_args(args, command: str, read_only: bool = True):
         SystemExit on error (with JSON error if args.json is True).
     """
     import json as _json
-    import amitools.fs.DosType as DosType
     from .rdb_inspect import detect_adf, detect_iso
-    from . import platform as plat
 
     use_json = getattr(args, "json", False)
     image = args.image
@@ -4395,52 +4411,26 @@ def _create_bridge_from_args(args, command: str, read_only: bool = True):
     debug = getattr(args, "debug", False)
     temp_driver = None
 
-    if adf_info is not None:
-        if driver is None:
-            dt_str = DosType.num_to_tag_str(adf_info.dos_type)
-            resolved = plat.find_driver_for_dostype(dt_str)
-            if resolved:
-                driver = str(resolved)
-            else:
-                primary_dir = plat.get_primary_driver_dir()
-                msg = (f"ADF floppy image detected ({dt_str}). "
-                       "Floppy images don't contain embedded filesystem drivers. "
-                       f"No driver found for DOS type {dt_str}. "
-                       f"Place FastFileSystem in {primary_dir} "
-                       "or use --driver to specify one.")
-                if use_json:
-                    print(_json.dumps(_json_error(command, "DRIVER_NOT_FOUND", msg)))
-                    sys.exit(1)
-                raise SystemExit(msg)
-    else:
+    if adf_info is None:
         iso_info = detect_iso(image)
-        if iso_info is not None:
-            if driver is None:
-                msg = ("ISO 9660 image detected. ISO images don't contain "
-                       "embedded filesystem drivers. Use --driver to specify one.")
-                if use_json:
-                    print(_json.dumps(_json_error(command, "DRIVER_NOT_FOUND", msg)))
-                    sys.exit(1)
-                raise SystemExit(msg)
-        else:
-            # RDB image -- extract embedded driver if not specified
-            if driver is None:
-                try:
-                    result = extract_embedded_driver(image, block_size, partition)
-                except IOError as e:
-                    if use_json:
-                        print(_json.dumps(_json_error(command, "IMAGE_INVALID", str(e))))
-                        sys.exit(1)
-                    raise SystemExit(f"Error: {e}")
-                if result is None:
-                    msg = ("No embedded filesystem driver found. "
-                           "Use --driver to specify one.")
-                    if use_json:
-                        print(_json.dumps(_json_error(command, "DRIVER_NOT_FOUND", msg)))
-                        sys.exit(1)
-                    raise SystemExit(msg)
-                temp_driver, _, _ = result
-                driver = temp_driver
+
+    try:
+        resolved = resolve_driver(
+            image, driver, block_size, partition, adf_info=adf_info, iso_info=iso_info)
+    except IOError as e:
+        if use_json:
+            print(_json.dumps(_json_error(command, "IMAGE_INVALID", str(e))))
+            sys.exit(1)
+        raise SystemExit(f"Error: {e}")
+    except DriverNotFound as e:
+        msg = " ".join(str(e).splitlines())
+        if use_json:
+            print(_json.dumps(_json_error(command, "DRIVER_NOT_FOUND", msg)))
+            sys.exit(1)
+        raise SystemExit(msg)
+    driver = resolved.path
+    if resolved.temporary:
+        temp_driver = resolved.path
 
     # Create the bridge
     try:
@@ -5324,9 +5314,19 @@ def cmd_inspect(args):
     # First check for ADF
     adf_info = detect_adf(args.image)
     if adf_info is not None:
+        # Name the handler a mount without --driver would use.
+        try:
+            resolved = resolve_driver(args.image, None, None, None, adf_info=adf_info)
+            driver_error = None
+        except DriverNotFound as exc:
+            resolved = None
+            driver_error = str(exc)
         if use_json:
             dt_str = DosType.num_to_tag_str(adf_info.dos_type)
             floppy_type = "HD" if adf_info.is_hd else "DD"
+            note = "ADF files don't contain embedded filesystem drivers."
+            if driver_error:
+                note += " " + " ".join(driver_error.splitlines()[1:])
             envelope = _json_result("inspect",
                 image=str(args.image),
                 image_type="adf",
@@ -5338,7 +5338,8 @@ def cmd_inspect(args):
                 total_blocks=adf_info.total_blocks,
                 dos_type=dt_str,
                 dos_type_raw=f"0x{adf_info.dos_type:08x}",
-                note="ADF files don't contain embedded filesystem drivers. Use --driver to specify a handler.",
+                driver=resolved.to_json() if resolved else None,
+                note=note,
             )
             print(_json.dumps(envelope, indent=2))
             return
@@ -5351,7 +5352,10 @@ def cmd_inspect(args):
         print(f"  Total blocks: {adf_info.total_blocks}")
         print(f"  DOS type: {dt_str} (0x{adf_info.dos_type:08x})")
         print("\nNote: ADF files don't contain embedded filesystem drivers.")
-        print("Use --driver to specify a filesystem handler when mounting.")
+        if resolved is not None:
+            print(f"Filesystem driver: {resolved.description}")
+        else:
+            print("\n".join(driver_error.splitlines()[1:]))
         return
 
     # Check for ISO 9660
@@ -5606,7 +5610,9 @@ commands:
     --json                    Output machine-readable JSON instead of text.
 
   mount <image>             Mount an Amiga filesystem image via FUSE.
-    --driver PATH             Filesystem binary (default: extract from RDB).
+    --driver PATH             Filesystem binary (default: RDB, your drivers
+                              folder, then the bundled FastFileSystem
+                              for DOS0-5).
     --mountpoint PATH         Mount location (default: /Volumes/<partition>).
     --partition NAME          Partition name (e.g. DH0) or index (defaults to first).
     --block-size N            Override block size (defaults to auto/512).
@@ -5634,14 +5640,18 @@ commands:
 
   format <image> <partition> [volname]
                               Format an Amiga partition.
-    --driver PATH             Filesystem binary (default: extract from RDB).
+    --driver PATH             Filesystem binary (default: RDB, your drivers
+                              folder, then the bundled FastFileSystem
+                              for DOS0-5).
     --block-size N            Override block size (defaults to auto/512).
     --debug                   Enable debug logging.
 
   ls <image> [path]         List files in an Amiga filesystem image.
     --path PATH               Directory path to list (default: /).
     --partition NAME          Partition name (e.g. DH0) or index.
-    --driver PATH             Filesystem binary (default: extract from RDB).
+    --driver PATH             Filesystem binary (default: RDB, your drivers
+                              folder, then the bundled FastFileSystem
+                              for DOS0-5).
     --block-size N            Override block size (defaults to auto/512).
     --recursive               List all entries recursively.
     --json                    Output results as JSON.
@@ -5651,7 +5661,9 @@ commands:
     --file PATH               Verify a specific file.
     --expect-size N           Expected file size in bytes (with --file).
     --partition NAME          Partition name (e.g. DH0) or index.
-    --driver PATH             Filesystem binary (default: extract from RDB).
+    --driver PATH             Filesystem binary (default: RDB, your drivers
+                              folder, then the bundled FastFileSystem
+                              for DOS0-5).
     --block-size N            Override block size (defaults to auto/512).
     --json                    Output results as JSON.
     --debug                   Enable debug logging.
@@ -5660,7 +5672,9 @@ commands:
     --file PATH               Path to file within the image (required).
     --algorithm ALG           Hash algorithm: md5, sha1, sha256 (default: sha256).
     --partition NAME          Partition name (e.g. DH0) or index.
-    --driver PATH             Filesystem binary (default: extract from RDB).
+    --driver PATH             Filesystem binary (default: RDB, your drivers
+                              folder, then the bundled FastFileSystem
+                              for DOS0-5).
     --block-size N            Override block size (defaults to auto/512).
     --json                    Output results as JSON.
     --debug                   Enable debug logging.
@@ -5670,7 +5684,9 @@ commands:
     --out PATH                Output path on host (default: filename, '-' for stdout).
                               Note: --out - cannot be combined with --json.
     --partition NAME          Partition name (e.g. DH0) or index.
-    --driver PATH             Filesystem binary (default: extract from RDB).
+    --driver PATH             Filesystem binary (default: RDB, your drivers
+                              folder, then the bundled FastFileSystem
+                              for DOS0-5).
     --block-size N            Override block size (defaults to auto/512).
     --json                    Output results as JSON.
     --debug                   Enable debug logging.
@@ -5679,7 +5695,9 @@ commands:
     --file PATH               Destination path within the image (required).
     --in PATH                 Source file on the host (required).
     --partition NAME          Partition name (e.g. DH0) or index.
-    --driver PATH             Filesystem binary (default: extract from RDB).
+    --driver PATH             Filesystem binary (default: RDB, your drivers
+                              folder, then the bundled FastFileSystem
+                              for DOS0-5).
     --block-size N            Override block size (defaults to auto/512).
     --json                    Output results as JSON.
     --debug                   Enable debug logging.
@@ -5713,7 +5731,7 @@ commands:
         "mount", help="Mount an Amiga filesystem image via FUSE."
     )
     mount_parser.add_argument("image", type=Path, help="Disk image file or physical disk device")
-    mount_parser.add_argument("--driver", type=Path, help="Filesystem binary (default: extract from RDB if available)")
+    mount_parser.add_argument("--driver", type=Path, help="Filesystem binary (default: RDB, your drivers folder, then the bundled FastFileSystem for DOS0-5)")
     mount_parser.add_argument("--mountpoint", type=Path, help="Mount location (default: /Volumes/<partition> on macOS, first free drive letter on Windows)")
     mount_parser.add_argument(
         "--partition", type=str, help="Partition name (e.g. DH0) or index (defaults to first)."
@@ -5809,7 +5827,7 @@ commands:
     format_parser.add_argument("image", type=Path, help="Disk image file")
     format_parser.add_argument("partition", type=str, help="Partition name (e.g. DH0) or index.")
     format_parser.add_argument("volname", nargs="?", default="Empty", help="Volume name (default: Empty)")
-    format_parser.add_argument("--driver", type=Path, help="Filesystem binary (default: extract from RDB if available)")
+    format_parser.add_argument("--driver", type=Path, help="Filesystem binary (default: RDB, your drivers folder, then the bundled FastFileSystem for DOS0-5)")
     format_parser.add_argument(
         "--block-size", type=int, help="Override block size (defaults to auto/512)."
     )
@@ -5833,7 +5851,8 @@ commands:
     )
     ls_parser.add_argument(
         "--driver", type=Path,
-        help="Filesystem binary (default: extract from RDB if available).",
+        help="Filesystem binary (default: RDB, your drivers folder, "
+             "then the bundled FastFileSystem for DOS0-5).",
     )
     ls_parser.add_argument(
         "--block-size", type=int,
@@ -5872,7 +5891,8 @@ commands:
     )
     verify_parser.add_argument(
         "--driver", type=Path,
-        help="Filesystem binary (default: extract from RDB if available).",
+        help="Filesystem binary (default: RDB, your drivers folder, "
+             "then the bundled FastFileSystem for DOS0-5).",
     )
     verify_parser.add_argument(
         "--block-size", type=int,
@@ -5908,7 +5928,8 @@ commands:
     )
     hash_parser.add_argument(
         "--driver", type=Path,
-        help="Filesystem binary (default: extract from RDB if available).",
+        help="Filesystem binary (default: RDB, your drivers folder, "
+             "then the bundled FastFileSystem for DOS0-5).",
     )
     hash_parser.add_argument(
         "--block-size", type=int,
@@ -5944,7 +5965,8 @@ commands:
     )
     read_parser.add_argument(
         "--driver", type=Path,
-        help="Filesystem binary (default: extract from RDB if available).",
+        help="Filesystem binary (default: RDB, your drivers folder, "
+             "then the bundled FastFileSystem for DOS0-5).",
     )
     read_parser.add_argument(
         "--block-size", type=int,
@@ -5979,7 +6001,8 @@ commands:
     )
     write_parser.add_argument(
         "--driver", type=Path,
-        help="Filesystem binary (default: extract from RDB if available).",
+        help="Filesystem binary (default: RDB, your drivers folder, "
+             "then the bundled FastFileSystem for DOS0-5).",
     )
     write_parser.add_argument(
         "--block-size", type=int,
