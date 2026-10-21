@@ -3754,6 +3754,11 @@ def extract_embedded_driver(
     driver, or None if the RDB has no filesystem entry matching the
     partition's dostype. The caller is responsible for deleting the temp
     file when done.
+
+    Raises DriverNotFound when no readable entry matches but the RDB has a
+    damaged one that may be the partition's: one of its DOS type, or a
+    corrupt header that hid the entries after it. Another driver is not
+    picked in its place.
     """
     import tempfile
     import amitools.fs.DosType as DosType
@@ -3798,6 +3803,20 @@ def extract_embedded_driver(
                     raise
                 return Path(temp_path), dt_str, target_dostype
 
+        # The lenient RDB parser drops damaged entries; None is a corrupt
+        # header, whose DOS type is unknown.
+        damaged = [(dos_type, warning)
+                   for dos_type, warning in getattr(rdisk, "damaged_fs", ())
+                   if dos_type in (target_dostype, None)]
+        if damaged:
+            known = any(dos_type == target_dostype for dos_type, _ in damaged)
+            raise DriverNotFound(
+                f"Partition {part.get_drive_name()} ({dt_str}) "
+                f"{'has' if known else 'may have'} a damaged filesystem driver "
+                f"in its RDB: {'; '.join(warning for _, warning in damaged)}.\n"
+                "AmiFUSE does not use another driver in its place; "
+                "use --driver to choose one."
+            )
         return None
     finally:
         rdisk.close()
@@ -3856,8 +3875,8 @@ def resolve_driver(
     name = part_info.get("name") or partition
     return driver_resolver.find_folder_driver(
         dostype,
-        f"Partition {name} ({driver_resolver.dos_tag(dostype)}) "
-        "has no filesystem driver in its RDB.",
+        f"Partition {name} has no filesystem driver for "
+        f"{driver_resolver.dos_tag(dostype)} in its RDB.",
     )
 
 
@@ -5257,12 +5276,39 @@ def cmd_write(args):
         _cleanup_bridge(bridge, temp_driver)
 
 
+def _partition_driver(image: Path, block_size: Optional[int], name: str):
+    """Name the driver `mount --partition name` would use without --driver.
+
+    Returns the driver's inspect --json object, or None, and a line of text:
+    its description, or why there is none. An RDB driver is extracted to
+    hash it, then deleted; its object has no path.
+    """
+    import hashlib
+
+    try:
+        resolved = resolve_driver(image, None, block_size, name)
+    except (DriverNotFound, OSError) as exc:
+        return None, " ".join(str(exc).splitlines())
+    info = resolved.to_json()
+    if resolved.temporary:
+        try:
+            data = resolved.path.read_bytes()
+        finally:
+            try:
+                resolved.path.unlink()
+            except OSError:
+                pass
+        info.update(path=None, version=driver_resolver.find_version(data),
+                    sha256=hashlib.sha256(data).hexdigest())
+    return info, resolved.description
+
+
 def cmd_inspect(args):
     """Handle the 'inspect' subcommand."""
     import json as _json
     import amitools.fs.DosType as DosType
     from .rdb_inspect import (
-        open_rdisk, detect_adf, detect_iso,
+        open_rdisk, detect_adf, detect_iso, list_partitions,
         amiga_rdb_partitions, build_rdisk_desc, print_inspect_report,
     )
 
@@ -5369,6 +5415,14 @@ def cmd_inspect(args):
                 rdisk.close()
                 blkdev.close()
 
+        # Resolved with the image closed: a Windows disk admits one reader.
+        for desc in all_rdbs:
+            for part in desc["partitions"]:
+                part["driver"], text = _partition_driver(
+                    args.image, args.block_size, part["name"])
+                if part["driver"] is None:
+                    part["driver_note"] = text
+
         envelope = _json_result("inspect",
             image=str(args.image),
             image_type="rdb",
@@ -5381,6 +5435,9 @@ def cmd_inspect(args):
         return
 
     print_inspect_report(args.image, args.block_size, args.full)
+    print("\nFilesystem driver per partition (without --driver):")
+    for part in list_partitions(args.image, args.block_size).partitions:
+        print(f"  {part.name}: {_partition_driver(args.image, args.block_size, part.name)[1]}")
 
 
 def cmd_mount(args):

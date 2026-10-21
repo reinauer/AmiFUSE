@@ -417,7 +417,10 @@ their own. It supports DOS0-DOS5; DOS6/DOS7 (long file names) need another FFS.
 
 Without `--driver`, AmiFUSE picks the driver in this order:
 
-1. The driver in the RDB for the partition's exact DOS type.
+1. The driver in the RDB for the partition's exact DOS type. If that driver is
+   damaged, AmiFUSE stops and asks for `--driver` instead of using another. A
+   driver the RDB holds for a different DOS type is not used, as on an Amiga,
+   where the FFS in ROM then serves the partition.
 2. `FastFileSystem` in your drivers folder (`%LOCALAPPDATA%\amifuse\drivers` on
    Windows, `~/.local/share/amifuse/drivers` elsewhere), for DOS0-DOS7. Place
    the one from AmigaOS 3.2 there to use it instead of the bundled one, or to
@@ -425,7 +428,8 @@ Without `--driver`, AmiFUSE picks the driver in this order:
 3. The bundled FastFileSystem, for DOS0-DOS5.
 4. In a development checkout, `../AmiFUSE-testing/drivers/FastFileSystem`.
 
-The mount banner, `amifuse doctor` and `amifuse inspect` name the driver in use.
+The mount banner, `amifuse doctor` and `amifuse inspect` name the driver in use;
+`inspect` names it for an ADF and for each partition of a hard disk image.
 
 The handler ships in `amifuse/drivers/` as the release asset
 `FastFileSystem.OS3`, unchanged, with its licence (`FastFileSystem.OS3.LICENSE`,

@@ -458,6 +458,8 @@ def _lenient_rdisk_open(rdisk) -> List[str]:
     accepted and the filesystem driver data is made available.
 
     Returns a list of warning strings (empty if everything parsed cleanly).
+    Each filesystem entry it drops is also recorded in rdisk.damaged_fs as
+    (DOS type, warning); the DOS type is None when the header is unreadable.
     """
     from amitools.fs.block.Block import Block
     from amitools.fs.block.rdb.PartitionBlock import PartitionBlock
@@ -473,6 +475,7 @@ def _lenient_rdisk_open(rdisk) -> List[str]:
     rdisk.block_bytes = rdb.block_size
     rdisk.used_blks = [rdb.blk_num]
     warnings = []
+    rdisk.damaged_fs = []
 
     # Read partitions (critical — fail on errors)
     part_blk = rdb.part_list
@@ -517,12 +520,14 @@ def _lenient_rdisk_open(rdisk) -> List[str]:
                         f"Filesystem #{fs.num} ({dt_str}/0x{dt:08x}): "
                         f"corrupt data block in LSEG chain (driver data unavailable)"
                     )
+                    rdisk.damaged_fs.append((dt, warnings[-1]))
                     fs_blk = fs.fshd.next
             else:
                 warnings.append(
                     f"Corrupt filesystem header at block {fs_blk} "
                     f"(remaining filesystem entries skipped)"
                 )
+                rdisk.damaged_fs.append((None, warnings[-1]))
                 break
             continue
         rdisk.fs.append(fs)
@@ -601,7 +606,7 @@ def open_rdisk(
 
     Tolerates corrupt filesystem driver (LSEG) blocks in the RDB — partition
     data is parsed strictly, but corrupt FS entries are skipped with warnings
-    stored in ``rdisk.rdb_warnings``.
+    stored in ``rdisk.rdb_warnings``, and recorded in ``rdisk.damaged_fs``.
 
     Args:
         image: Path to the disk image

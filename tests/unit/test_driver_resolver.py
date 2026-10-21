@@ -14,7 +14,9 @@ import argparse
 import hashlib
 import json
 import re
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -362,6 +364,56 @@ class TestDosRange:
         assert driver_resolver.find_version(driver_resolver.BUNDLED_DRIVER.read_bytes()) is None
 
 
+@pytest.fixture
+def no_home(monkeypatch, tmp_path):
+    """No home folder: Path.home() raises, as on Windows without these
+    variables, so there is no drivers folder; no dev fallback either."""
+    for name in ("LOCALAPPDATA", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "HOME"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(
+        driver_resolver, "DEV_FALLBACK_DRIVER", tmp_path / "no-dev" / "FastFileSystem")
+    try:
+        Path.home()
+    except RuntimeError:
+        return
+    # POSIX falls back to the password database; fail as Windows does.
+    def home(cls):
+        raise RuntimeError("Could not determine home directory.")
+
+    monkeypatch.setattr(Path, "home", classmethod(home))
+
+
+class TestNoHomeFolder:
+    """Without a home folder, the drivers folder counts as missing."""
+
+    def test_lookup_and_doctor(self, no_home):
+        from amifuse import doctor
+
+        assert driver_resolver.user_driver_dir() is None
+        assert driver_resolver.user_copy_problem() is None
+        assert driver_resolver.find_folder_driver(_dos(1), "s").source == "bundled"
+        with pytest.raises(DriverNotFound) as caught:
+            driver_resolver.find_folder_driver(_dos(7), "s")
+        assert str(caught.value).endswith(
+            "in your drivers folder (no home folder found), or use --driver.")
+        check = doctor._drivers_check()
+        assert check.status == "ok"
+        assert check.message == (
+            "DOS0-DOS5: FastFileSystem alpha1 (bundled, sha256 0a9ffd7c7b14) "
+            f"{driver_resolver.BUNDLED_DRIVER}; DOS6-DOS7: none; place your own "
+            "FastFileSystem in your drivers folder (no home folder found)")
+
+    def test_inspect(self, no_home, tmp_path, capsys):
+        from amifuse.fuse_fs import main
+
+        main(["inspect", "--json", str(_adf(tmp_path, 1))])
+        assert json.loads(capsys.readouterr().out)["driver"]["source"] == "bundled"
+        main(["inspect", "--json", str(_adf(tmp_path, 7, "dos7.adf"))])
+        data = json.loads(capsys.readouterr().out)
+        assert data["driver"] is None
+        assert "in your drivers folder (no home folder found)" in data["note"]
+
+
 # ---------------------------------------------------------------------------
 # C. fuse_fs.resolve_driver -- --driver and the RDB in front of the lookup
 # ---------------------------------------------------------------------------
@@ -437,7 +489,7 @@ class TestResolveDriver:
                 part_info={"name": "DH1", "dostype": _dos(7)})
         message = str(caught.value)
         assert message.startswith(
-            "Partition DH1 (DOS7) has no filesystem driver in its RDB.\n"
+            "Partition DH1 has no filesystem driver for DOS7 in its RDB.\n"
             "The bundled FastFileSystem supports DOS0-DOS5 only;")
 
     def test_non_dos_partition_keeps_todays_error(
@@ -492,6 +544,103 @@ class TestResolveDriver:
             tmp_path / "x.iso", given, None, None, iso_info=iso)
         assert (resolved.path, resolved.source) == (given, "explicit")
         extract.assert_not_called()
+
+
+AMITOOLS_ROOT = Path(__file__).resolve().parents[2] / "amitools"
+
+
+def _rdb(tmp_path, part, fs=None, name="disk.hdf"):
+    """An rdbtool image with partition DH0 of DOS type part and, given fs,
+    the bundled FastFileSystem in its RDB under DOS type fs."""
+    image = tmp_path / name
+    args = ["create", "size=8Mi", "+", "init", "rdb_cyls=8",
+            "+", "add", "size=6MiB", "name=DH0", f"fs={part}"]
+    if fs:
+        args += ["+", "fsadd", str(driver_resolver.BUNDLED_DRIVER), f"dostype={fs}"]
+    proc = subprocess.run(
+        [sys.executable, "-m", "amitools.tools.rdbtool", str(image), *args],
+        cwd=AMITOOLS_ROOT if AMITOOLS_ROOT.is_dir() else None,
+        capture_output=True, text=True, check=False,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    return image
+
+
+def _flip_byte(image, tag: bytes):
+    """Flip one byte in the first block tagged tag, as a bad sector would."""
+    data = image.read_bytes()
+    offset = next(o for o in range(0, len(data), 512) if data[o:o + 4] == tag) + 100
+    with open(image, "r+b") as f:
+        f.seek(offset)
+        f.write(bytes([data[offset] ^ 0xFF]))
+
+
+@pytest.fixture
+def temp_dir(monkeypatch, tmp_path):
+    """Where RDB drivers are extracted, to check that none is left."""
+    folder = tmp_path / "temp"
+    folder.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(folder))
+    return folder
+
+
+class TestRdbImages:
+    """resolve_driver() on rdbtool images."""
+
+    def test_damaged_driver_is_not_replaced(self, user_driver_dir, tmp_path, temp_dir):
+        """A damaged RDB driver for the partition's DOS type stops the
+        lookup, even with your own copy present; --driver overrides it."""
+        from amifuse.fuse_fs import resolve_driver
+
+        image = _rdb(tmp_path, "DOS3", "DOS3")
+        assert resolve_driver(image, None, None, None).source == "rdb"
+        _flip_byte(image, b"LSEG")
+        _user_copy(user_driver_dir)
+        with pytest.raises(DriverNotFound) as caught:
+            resolve_driver(image, None, None, None)
+        assert str(caught.value) == (
+            "Partition DH0 (DOS3) has a damaged filesystem driver in its RDB: "
+            "Filesystem #0 (DOS3/0x444f5303): corrupt data block in LSEG chain "
+            "(driver data unavailable).\n"
+            "AmiFUSE does not use another driver in its place; use --driver to choose one.")
+        given = driver_resolver.BUNDLED_DRIVER
+        assert resolve_driver(image, given, None, None).source == "explicit"
+
+    def test_unreadable_header_may_hide_the_driver(self, user_driver_dir, tmp_path, temp_dir):
+        """A corrupt filesystem header hides its DOS type, so it stops the
+        lookup too."""
+        from amifuse.fuse_fs import resolve_driver
+
+        image = _rdb(tmp_path, "DOS3", "DOS3")
+        _flip_byte(image, b"FSHD")
+        with pytest.raises(DriverNotFound) as caught:
+            resolve_driver(image, None, None, None)
+        assert str(caught.value).startswith(
+            "Partition DH0 (DOS3) may have a damaged filesystem driver in its RDB: "
+            "Corrupt filesystem header at block ")
+
+    def test_file_commands_report_driver_not_found(self, user_driver_dir, tmp_path, capsys):
+        from amifuse.fuse_fs import main
+
+        image = _rdb(tmp_path, "DOS3", "DOS3")
+        _flip_byte(image, b"LSEG")
+        with pytest.raises(SystemExit):
+            main(["ls", "--json", str(image)])
+        assert json.loads(capsys.readouterr().out)["error"]["code"] == "DRIVER_NOT_FOUND"
+
+    def test_driver_for_another_dos_type(self, user_driver_dir, tmp_path, temp_dir):
+        """An RDB driver serves only its own DOS type; a DOS1 partition
+        beside it gets the bundled handler, as it would get the FFS in ROM."""
+        from amifuse.fuse_fs import resolve_driver
+
+        image = _rdb(tmp_path, "DOS1", "DOS3")
+        assert resolve_driver(image, None, None, None).source == "bundled"
+        image7 = _rdb(tmp_path, "DOS7", "DOS3", "dos7.hdf")
+        with pytest.raises(DriverNotFound) as caught:
+            resolve_driver(image7, None, None, None)
+        assert str(caught.value).startswith(
+            "Partition DH0 has no filesystem driver for DOS7 in its RDB.\n")
+        assert list(temp_dir.iterdir()) == []
 
 
 # ---------------------------------------------------------------------------
@@ -721,3 +870,53 @@ class TestInspectAdf:
             "Filesystem driver: FastFileSystem alpha1 (bundled, sha256 0a9ffd7c7b14)"
             in out
         )
+
+
+class TestInspectRdb:
+    """inspect names the handler each RDB partition would mount with."""
+
+    def _partition(self, image, capsys):
+        from amifuse.fuse_fs import main
+
+        main(["inspect", "--json", str(image)])
+        [part] = json.loads(capsys.readouterr().out)["partitions"]
+        return part
+
+    def test_json_rdb_driver(self, user_driver_dir, tmp_path, temp_dir, capsys):
+        """The RDB's driver is hashed and its extracted copy deleted."""
+        part = self._partition(_rdb(tmp_path, "DOS3", "DOS3"), capsys)
+        assert part["driver"] == {
+            "source": "rdb", "path": None, "version": None, "tag": None,
+            "sha256": ALPHA1_SHA256,
+        }
+        assert "driver_note" not in part
+        assert list(temp_dir.iterdir()) == []
+
+    def test_json_bundled_driver(self, user_driver_dir, tmp_path, capsys):
+        """The same object as for an ADF."""
+        part = self._partition(_rdb(tmp_path, "DOS3"), capsys)
+        assert part["driver"] == {
+            "source": "bundled",
+            "path": str(driver_resolver.BUNDLED_DRIVER),
+            "version": None,
+            "tag": "alpha1",
+            "sha256": ALPHA1_SHA256,
+        }
+
+    def test_json_damaged_driver(self, user_driver_dir, tmp_path, capsys):
+        image = _rdb(tmp_path, "DOS3", "DOS3")
+        _flip_byte(image, b"LSEG")
+        part = self._partition(image, capsys)
+        assert part["driver"] is None
+        assert part["driver_note"].startswith(
+            "Partition DH0 (DOS3) has a damaged filesystem driver in its RDB: ")
+
+    def test_text_names_the_handler(self, user_driver_dir, tmp_path, capsys):
+        from amifuse.fuse_fs import main
+
+        main(["inspect", str(_rdb(tmp_path, "DOS3"))])
+        out = capsys.readouterr().out
+        assert (
+            "Filesystem driver per partition (without --driver):\n"
+            "  DH0: FastFileSystem alpha1 (bundled, sha256 0a9ffd7c7b14)"
+        ) in out
