@@ -92,15 +92,17 @@ def _mount_example_runner() -> Callable:
 
     module.FUSE = _fake_fuse
 
-    def run(name: str, command: str, check: Callable[[Dict[str, object], object], str], **kwargs) -> ExampleResult:
+    def run(name: str, command: str, check: Callable[[Dict[str, object], object], str],
+            context=None, **kwargs) -> ExampleResult:
         try:
-            with open(os.devnull, "w") as null_out, open(os.devnull, "w") as null_err:
-                with contextlib.redirect_stdout(null_out), contextlib.redirect_stderr(null_err):
-                    module.mount_fuse(**kwargs)
-            if not invocations:
-                raise RuntimeError("fake FUSE was not invoked")
-            info = invocations.pop(0)
-            details = check(info, module)
+            with context or contextlib.nullcontext():
+                with open(os.devnull, "w") as null_out, open(os.devnull, "w") as null_err:
+                    with contextlib.redirect_stdout(null_out), contextlib.redirect_stderr(null_err):
+                        module.mount_fuse(**kwargs)
+                if not invocations:
+                    raise RuntimeError("fake FUSE was not invoked")
+                info = invocations.pop(0)
+                details = check(info, module)
             return ExampleResult(name=name, mode="mount", status="ok", command=command, details=details, extra=info)
         except BaseException as exc:
             return ExampleResult(
@@ -285,11 +287,12 @@ def _mount_results() -> List[ExampleResult]:
             partition=None,
         ),
         run(
-            "mount_adf_explicit_driver",
-            "amifuse mount workbench.adf --driver L/FastFileSystem",
-            lambda info, module: "adf mount ok" if "OFS_README.txt" in info["root_names"] else (_raise("ADF mount root listing missing OFS_README.txt")),
+            "mount_adf_bundled_driver",
+            "amifuse mount workbench.adf",
+            lambda info, module: _expect_bundled_adf_mount(info, module, READONLY_DIR / "ofs.adf"),
+            context=_bundled_driver_only(),
             image=READONLY_DIR / "ofs.adf",
-            driver=DRIVERS_DIR / "FastFileSystem",
+            driver=None,
             mountpoint=tmp / "ofs-adf",
             block_size=None,
             partition=None,
@@ -320,6 +323,33 @@ def _mount_results() -> List[ExampleResult]:
     if write_image.exists():
         write_image.unlink()
     return results
+
+
+@contextlib.contextmanager
+def _bundled_driver_only():
+    """Point the user's drivers folder at an empty folder and drop the dev
+    fallback, so the bundled FastFileSystem serves the example."""
+    from amifuse import driver_resolver
+
+    saved = driver_resolver.user_driver_dir, driver_resolver.DEV_FALLBACK_DRIVER
+    with tempfile.TemporaryDirectory(prefix="amifuse_readme_drivers_") as empty:
+        driver_resolver.user_driver_dir = lambda: Path(empty)
+        driver_resolver.DEV_FALLBACK_DRIVER = Path(empty) / "no-dev" / "FastFileSystem"
+        try:
+            yield
+        finally:
+            driver_resolver.user_driver_dir, driver_resolver.DEV_FALLBACK_DRIVER = saved
+
+
+def _expect_bundled_adf_mount(info: Dict[str, object], module, image: Path) -> str:
+    if "OFS_README.txt" not in info["root_names"]:
+        raise RuntimeError("ADF mount root listing missing OFS_README.txt")
+    from amifuse.rdb_inspect import detect_adf
+
+    resolved = module.resolve_driver(image, None, None, None, adf_info=detect_adf(image))
+    if resolved.source != "bundled":
+        raise RuntimeError(f"ADF example used {resolved.description}, not the bundled handler")
+    return f"adf mount ok ({resolved.description})"
 
 
 def _expect_icons_mount(info: Dict[str, object]) -> str:

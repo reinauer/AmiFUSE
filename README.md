@@ -171,7 +171,7 @@ amifuse mount /path/to/disk.hdf
 | Argument | Required | Description |
 |----------|----------|-------------|
 | `image` | Yes | Path to the Amiga hard disk image file |
-| `--driver` | No | Path to filesystem handler binary (default: extract from RDB if available) |
+| `--driver` | No | Path to filesystem handler binary (default: RDB, your drivers folder, then the bundled FastFileSystem for DOS0-5; see [Bundled FastFileSystem](#bundled-fastfilesystem)) |
 | `--mountpoint` | macOS/Windows: No, Linux: Yes | Mount location (macOS: `/Volumes/<partition>`, Windows: first free drive letter) |
 | `--partition` | No | Partition name (e.g., `DH0`) or index (default: first partition) |
 | `--block-size` | No | Override block size (default: auto-detect or 512) |
@@ -312,8 +312,8 @@ amifuse mount multi-partition.hdf --partition 2
 mkdir -p ./mnt
 amifuse mount disk.hdf --mountpoint ./mnt
 
-# Mount an ADF floppy image (requires explicit driver)
-amifuse mount workbench.adf --driver L/FastFileSystem
+# Mount an ADF floppy image (uses the bundled FastFileSystem for DOS0-5)
+amifuse mount workbench.adf
 
 # Enable native icons (macOS only, converts Amiga .info files)
 amifuse mount disk.hdf --icons
@@ -392,14 +392,14 @@ driver-info --base 0x200000 pfs3aio
 
 ## Supported Image Formats
 
-- **HDF/RDB** - Hard disk images with Rigid Disk Block. Filesystem drivers can be embedded in the RDB or specified via `--driver`.
+- **HDF/RDB** - Hard disk images with Rigid Disk Block. Filesystem drivers can be embedded in the RDB or specified via `--driver`. An FFS/OFS partition whose RDB has no driver for its DOS type uses the [bundled FastFileSystem](#bundled-fastfilesystem).
 - **Emu68-style MBR images** - Disk images with MBR partition table containing an RDB partition, as used by Emu68 on Raspberry Pi.
-- **ADF** - Amiga Disk File floppy images (DD and HD). Requires `--driver` since ADFs don't contain embedded drivers.
+- **ADF** - Amiga Disk File floppy images (DD and HD). ADFs contain no driver, so DOS0-5 floppies use the [bundled FastFileSystem](#bundled-fastfilesystem); DOS6/7 floppies need your own FastFileSystem or `--driver`.
 
 ## Supported Filesystems
 
 Currently tested with:
-- **FFS/OFS** (Fast/Old File System) via `L:FastFileSystem` from Workbench (tested with 3.2)
+- **FFS/OFS** (Fast/Old File System) via the bundled [FastFileSystem](https://github.com/reinauer/FastFileSystem) for DOS0-5, or your own `L:FastFileSystem` from Workbench (tested with 3.2), which also serves DOS6/7 and wins when present
 - **CDFileSystem** via `L:CDFileSystem` from Workbench (tested with 3.2)
 - **PFS3** (Professional File System 3) via [pfs3aio](https://github.com/tonioni/pfs3aio) handler
 - **SFS** (Smart File System 1.279) via [SmartFileSystem](https://aminet.net/package/disk/misc/SFS) handler
@@ -408,6 +408,36 @@ Currently tested with:
 
 Other Amiga filesystem handlers may work but have not been tested. Reports are
 welcome.
+
+## Bundled FastFileSystem
+
+AmiFUSE ships Stefan Reinauer's [FastFileSystem](https://github.com/reinauer/FastFileSystem)
+(release `alpha1`, an early version) for FFS/OFS volumes that carry no driver of
+their own. It supports DOS0-DOS5; DOS6/DOS7 (long file names) need another FFS.
+
+Without `--driver`, AmiFUSE picks the driver in this order:
+
+1. The driver in the RDB for the partition's exact DOS type.
+2. `FastFileSystem` in your drivers folder (`%LOCALAPPDATA%\amifuse\drivers` on
+   Windows, `~/.local/share/amifuse/drivers` elsewhere), for DOS0-DOS7. Place
+   the one from AmigaOS 3.2 there to use it instead of the bundled one, or to
+   mount DOS6/DOS7 volumes.
+3. The bundled FastFileSystem, for DOS0-DOS5.
+4. In a development checkout, `../AmiFUSE-testing/drivers/FastFileSystem`.
+
+The mount banner, `amifuse doctor` and `amifuse inspect` name the driver in use.
+
+The handler ships in `amifuse/drivers/` as the release asset
+`FastFileSystem.OS3`, unchanged, with its licence (`FastFileSystem.OS3.LICENSE`,
+BSD-2-Clause) and provenance (`FastFileSystem.OS3.json`: repository, tag, commit,
+size, sha256, covered DOS types and the build). To move to a new release, replace
+the asset and the licence, and update the provenance file; the unit tests check
+that the three agree. Messages from `doctor`, `inspect` and failed mounts take the
+covered DOS types from the provenance file. If `dos_types` changes, also update
+the ranges written out in the `--driver` help in `amifuse/fuse_fs.py` and in this
+README (the `--driver` row, the ADF example, Supported Image Formats, Supported
+Filesystems and this section); the unit tests check them against the provenance
+file.
 
 ## Icon Support
 

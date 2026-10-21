@@ -404,6 +404,24 @@ scripts. Tests are organized into two layers:
 | Integration | `tests/integration/` | `integration` | machine68k + external fixtures |
 | Mount | `tests/integration/` | `fuse` | FUSE backend (WinFSP/FUSE-T/fuse3) + external fixtures |
 
+### Bundled FastFileSystem
+
+- `tests/unit/test_driver_resolver.py` checks the bundled handler against its
+  provenance file and licence, the driver order (`--driver`, RDB, your drivers
+  folder, bundled, dev fallback) and how the banner, `doctor` and `inspect`
+  report it, and that the DOS ranges written in the help text and the README
+  match the provenance file.
+- `tools/readme_smoke.py` runs the README's `amifuse mount workbench.adf`
+  example with an empty drivers folder, so the bundled handler serves it.
+- `tests/integration/test_bundled_ffs.py` runs the bundled handler with no
+  `--driver` on images it builds with amitools' `xdftool` and `rdbtool`: DOS0-5
+  floppies, a DOS3 HD floppy, an RDB partition without a driver and a sparse
+  image whose partition ends past 4 GiB. It needs machine68k but no external
+  fixtures, so it is not `integration`-marked. Its `fuse`-marked mount tests
+  run in the mount job, including the Windows launcher's command line.
+- The `package-smoke` CI job checks that the installed wheel carries the
+  handler, its licence and a matching sha256, and that `inspect` reports it.
+
 ### Quick Start
 
 ```sh
@@ -490,7 +508,8 @@ The following are still planned, not fully documented as standalone test
 entry points yet:
 
 - far-end file I/O coverage inside a filesystem that spans a partition
-  larger than `4GiB`
+  larger than `4GiB` (`test_bundled_ffs.py` covers a small FFS partition
+  that ends past 4 GiB)
 - fuller long-run generated benchmark recipes
 - ~~fixture-layout cleanup for `~/AmigaOS/AmiFuse/`~~ (resolved:
   `AMIFUSE_FIXTURE_ROOT` env var + fixture cascade in `tests/fixtures/paths.py`)
