@@ -2359,6 +2359,8 @@ class AmigaFuseFS(_FuseOperations):
         self._icon_existence_cache = None
         self._icon_handler = None
         self._crash_shutdown_started = False
+        # The timer thread and FUSE operations may both find the crash.
+        self._crash_shutdown_lock = threading.Lock()
         if icons:
             from .icon_parser import IconParser
             from .icon_cache import IconCache, IconExistenceCache
@@ -2511,9 +2513,10 @@ class AmigaFuseFS(_FuseOperations):
             raise FuseOSError(errno.EIO)
 
     def _schedule_crash_shutdown(self):
-        if self._crash_shutdown_started:
-            return
-        self._crash_shutdown_started = True
+        with self._crash_shutdown_lock:
+            if self._crash_shutdown_started:
+                return
+            self._crash_shutdown_started = True
         thread = threading.Thread(
             target=self._terminate_mount_after_crash,
             name="amifuse-crash-shutdown",
@@ -3590,6 +3593,10 @@ class AmigaFuseFS(_FuseOperations):
                 # it ran is in the timeout. One armed after this point sets
                 # the event again.
                 timer.event.clear()
+                # The clear may have erased the wake of a stop that came
+                # while run_due_timers ran.
+                if self._timer_stop:
+                    return
             if timeout is not None:
                 # At least one VBLANK tick, even when a request is due again
                 # at once, so that FUSE operations waiting for the lock get

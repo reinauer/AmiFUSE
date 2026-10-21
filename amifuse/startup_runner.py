@@ -854,8 +854,11 @@ class HandlerLauncher:
                 all_pending = self._compute_pending_signals(0xFFFFFFFF)
                 print(f"[run_burst] Wait block: ret=0x{ret_addr:x} mask=0x{wait_mask:x} pending_masked=0x{pending:x} pending_all=0x{all_pending:x} has_pending={has_pending}")
         else:
-            # WaitPort blocked - check for message on the port
-            has_pending = self.exec_impl.port_mgr.has_msg(state.port_addr)
+            # WaitPort blocked - check for a message on the port it waits on,
+            # as _build_resume_frame does; the DOS port if none was recorded.
+            has_pending = self.exec_impl.port_mgr.has_msg(
+                block_state.get("waitport_blocked_port") or state.port_addr
+            )
         if has_pending:
             # Resume from blocking call return address (saved on stack)
             if _pc_valid(ret_addr):
