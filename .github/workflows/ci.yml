@@ -22,7 +22,8 @@ jobs:
       - name: Build and install with the declared minimum amitools release
         run: |
           python -m pip install build "amitools-amifuse[vamos]==0.8.0.post10" fusepy
-          python -m build --wheel
+          # As the release does: the sdist, then the wheel built from it.
+          python -m build
           python -c "import glob, subprocess, sys; subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--no-deps', glob.glob('dist/*.whl')[0]])"
       - name: Exercise the installed package outside the checkout
         working-directory: ${{ runner.temp }}
