@@ -807,8 +807,8 @@ def find_partition_mbr_index(
 
     For MBR images with multiple 0x76 partitions, searches each RDB for the
     named partition.  Returns the 0-based index into the list of 0x76
-    partitions, or None if the image is not MBR, has only one 0x76 partition,
-    or the partition is found in the default (first) RDB.
+    partitions (0 when the first RDB holds it), or None if the image is not
+    MBR, has only one 0x76 partition, or no RDB that opens holds the name.
 
     Raises IOError if a forced block_size rules out an RDB that holds the
     partition at its own block size.
