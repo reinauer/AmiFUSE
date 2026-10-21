@@ -207,14 +207,20 @@ class AmiFuseTimerDevice(TimerDevice):
         signals: Dict[int, int] = {}
         for _, io, device in sorted(due):
             del self._pending[io]
-            # A request freed or reused since it was sent is not replied.
-            if (
-                mem.r32(io + _IO_DEVICE) != device
-                or mem.r8(io + _LN_TYPE) != NodeType.NT_MESSAGE
-            ):
+            # Each request on its own, so that one the handler broke cannot
+            # cost the others their replies.
+            try:
+                # A request freed or reused since it was sent is not replied.
+                if (
+                    mem.r32(io + _IO_DEVICE) != device
+                    or mem.r8(io + _LN_TYPE) != NodeType.NT_MESSAGE
+                ):
+                    continue
+                mem.w8(io + _IO_ERROR, 0)
+                task, bits = self._reply(mem, io)
+            except Exception as exc:
+                log_timer.warning("deliver: request 0x%06x not replied: %s", io, exc)
                 continue
-            mem.w8(io + _IO_ERROR, 0)
-            task, bits = self._reply(mem, io)
             self.deliveries += 1
             if bits:
                 signals[task] = signals.get(task, 0) | bits
@@ -244,7 +250,9 @@ class AmiFuseTimerDevice(TimerDevice):
 
         Registers the reply port with the port manager, so that WaitIO,
         which acts only on registered ports, removes the reply again.
-        Returns (task, signal bits) for the task it signalled.
+        Like SendIO, it skips the linking and the signal where the port
+        cannot be read or written. Returns (task, signal bits) for the task
+        it signalled.
         """
         mem.w8(io + _IO_FLAGS, mem.r8(io + _IO_FLAGS) | IOF_QUICK)
         mem.w8(io + _LN_TYPE, NodeType.NT_REPLYMSG)
@@ -253,14 +261,20 @@ class AmiFuseTimerDevice(TimerDevice):
             return 0, 0
         self._register_port(reply_port)
         self._exec.port_mgr.put_msg(reply_port, io)
-        list_addr = reply_port + _MP_MSGLIST
-        old_tailpred = mem.r32(list_addr + 8)
-        mem.w32(io + _LN_SUCC, list_addr + 4)
-        mem.w32(io + _LN_PRED, old_tailpred)
-        mem.w32(old_tailpred, io)
-        mem.w32(list_addr + 8, io)
-        sigbit = mem.r8(reply_port + _MP_SIGBIT)
-        task = mem.r32(reply_port + _MP_SIGTASK)
+        try:
+            list_addr = reply_port + _MP_MSGLIST
+            old_tailpred = mem.r32(list_addr + 8)
+            mem.w32(io + _LN_SUCC, list_addr + 4)
+            mem.w32(io + _LN_PRED, old_tailpred)
+            mem.w32(old_tailpred, io)
+            mem.w32(list_addr + 8, io)
+        except Exception:
+            pass
+        try:
+            sigbit = mem.r8(reply_port + _MP_SIGBIT)
+            task = mem.r32(reply_port + _MP_SIGTASK)
+        except Exception:
+            return 0, 0
         if not (0 <= sigbit < 32) or task == 0:
             return 0, 0
         self._exec.signal_func.signal(task, 1 << sigbit)

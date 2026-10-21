@@ -193,9 +193,13 @@ def _build_resume_frame(
     port_mgr,
     compute_pending_signals,
     clear_signals_from_task,
+    leave_queued=None,
     debug=False,
 ):
-    """Build the PC/SP/D0 frame needed to resume a blocked Wait()/WaitPort()."""
+    """Build the PC/SP/D0 frame needed to resume a blocked Wait()/WaitPort().
+
+    leave_queued is passed to _take_waitport_msg.
+    """
     if not _has_blocked_state(block_state):
         return None
 
@@ -221,9 +225,9 @@ def _build_resume_frame(
         waitport_port = block_state.get("waitport_blocked_port") or default_port_addr
         if not waitport_port or not port_mgr.has_msg(waitport_port):
             return None
-        msg_addr = port_mgr.get_msg(waitport_port)
-        if msg_addr:
-            _unlink_msg_from_m68k_list(mem, msg_addr, debug=debug)
+        msg_addr = _take_waitport_msg(
+            mem, port_mgr, waitport_port, waitpkt_blocked, leave_queued, debug=debug
+        )
         if waitpkt_blocked and msg_addr:
             msg = MessageStruct(mem, msg_addr)
             pkt_addr = msg.node.name.aptr
@@ -244,6 +248,32 @@ def _build_resume_frame(
         "sp": blocked_sp + 4,
         "d0": d0_val,
     }
+
+
+def _delayed_timer_reply(vh):
+    """leave_queued for _take_waitport_msg: the runtime timer.device's delays."""
+    timer = getattr(vh, "timer_device", None)
+    return None if timer is None else timer.delays
+
+
+def _take_waitport_msg(mem, port_mgr, port_addr, waitpkt, leave_queued, debug=False):
+    """The message a resumed WaitPort()/WaitPkt() returns, taken off the port.
+
+    WaitPkt() takes its packet off the port, as in DOS. WaitPort() leaves
+    the message queued in Exec, but the resume takes it off too, so that a
+    handler reading the DOS packet next does not process it twice. Only a
+    message for which leave_queued(msg_addr) holds stays queued for the
+    handler's GetMsg(): a reply timer.device delayed, which comes late
+    enough for a handler to park in WaitPort() for it.
+    """
+    if not waitpkt and leave_queued is not None:
+        msg_addr = port_mgr.peek_msg(port_addr)
+        if msg_addr and leave_queued(msg_addr):
+            return msg_addr
+    msg_addr = port_mgr.get_msg(port_addr)
+    if msg_addr:
+        _unlink_msg_from_m68k_list(mem, msg_addr, debug=debug)
+    return msg_addr
 
 
 def _unlink_msg_from_m68k_list(mem, msg_addr, debug=False):
@@ -767,6 +797,7 @@ class HandlerLauncher:
             port_mgr=self.exec_impl.port_mgr,
             compute_pending_signals=self._compute_pending_signals,
             clear_signals_from_task=self._clear_signals_from_task,
+            leave_queued=_delayed_timer_reply(self.vh),
             debug=debug,
         )
         if resume is None:
@@ -850,10 +881,11 @@ class HandlerLauncher:
                 # WaitPort()/WaitPkt() resume - set D0 appropriately
                 waitport_port = block_state.get("waitport_blocked_port")
                 if waitport_port is not None:
-                    # CRITICAL: use get_msg (not peek_msg) to dequeue.
-                    msg_addr = self.exec_impl.port_mgr.get_msg(waitport_port)
-                    if msg_addr:
-                        _unlink_msg_from_m68k_list(self.mem, msg_addr, debug=debug)
+                    msg_addr = _take_waitport_msg(
+                        self.mem, self.exec_impl.port_mgr, waitport_port,
+                        block_state.get("waitpkt_blocked", False),
+                        _delayed_timer_reply(self.vh), debug=debug,
+                    )
                     if block_state.get("waitpkt_blocked", False) and msg_addr:
                         # WaitPkt() resume - extract packet from message
                         msg = MessageStruct(self.mem, msg_addr)

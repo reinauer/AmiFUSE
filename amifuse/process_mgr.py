@@ -14,6 +14,7 @@ from amitools.vamos.machine.regs import REG_D0, REG_A6
 from .startup_runner import (
     _build_resume_frame,
     _clear_all_block_state,
+    _delayed_timer_reply,
     _has_blocked_state,
     _snapshot_block_state,
 )
@@ -252,6 +253,7 @@ class ProcessManager:
             port_mgr=self.exec_impl.port_mgr,
             compute_pending_signals=self._compute_pending_signals,
             clear_signals_from_task=self._clear_signals_from_task,
+            leave_queued=_delayed_timer_reply(self.vh),
         )
         if resume is None:
             return False
