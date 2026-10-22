@@ -3125,14 +3125,16 @@ class AmigaFuseFS(_FuseOperations):
                     self._dir_cache.pop(path, None)
                 return 0
             if res2 == 216:
-                # DIRECTORY_NOT_EMPTY — defer only if pending children exist
+                # DIRECTORY_NOT_EMPTY — defer only if pending children exist.
+                # Direct children only: _resolve_pending_dir_deletes strikes
+                # a deleted path off its parent's set and no other.
                 with self._fh_lock:
                     pending_children = {
                         p for p in self._pending_deletes
-                        if p.startswith(path + "/")
+                        if p.rsplit("/", 1)[0] == path
                     }
                     for d in self._pending_dir_deletes:
-                        if d.startswith(path + "/"):
+                        if d.rsplit("/", 1)[0] == path:
                             pending_children.add(d)
                     if pending_children:
                         self._pending_dir_deletes[path] = pending_children.copy()
