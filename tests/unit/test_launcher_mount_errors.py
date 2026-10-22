@@ -6,6 +6,7 @@ probes are mocked, and the launcher's logs go to ``tmp_path``.
 
 from __future__ import annotations
 
+import subprocess
 import sys
 from unittest.mock import MagicMock
 
@@ -64,6 +65,7 @@ def launcher(monkeypatch, tmp_path):
             returncode, text = queue.pop(0)
             if text:
                 kwargs["stderr"].write(text)
+                kwargs["stderr"].flush()  # a real child's writes reach the file
             proc = MagicMock()
             proc.poll.return_value = returncode
             proc.returncode = returncode
@@ -130,3 +132,52 @@ def test_running_and_mounted_children_are_not_reported(launcher):
     """A child that keeps running and whose drive appears shows no dialog."""
     run, _sleeps, _kwargs = launcher
     assert run([None], [(None, "")], present={"D:\\"}) is None
+
+
+def test_previous_log_for_the_letter_is_replaced(launcher, tmp_path):
+    run, _sleeps, _kwargs = launcher
+    (tmp_path / "mount-D.log").write_text("old error\n")
+    msg = run([None], [(1, NO_DRIVER)])
+
+    assert "old error" not in msg
+    assert (tmp_path / "mount-D.log").read_text() == NO_DRIVER
+
+
+def test_log_held_by_another_launch_is_left_alone(launcher, tmp_path):
+    """Two launches that picked the same letter never share its log: while
+    another mount holds mount-D.log, this one's stderr goes to DEVNULL and
+    its exit code is reported."""
+    run, _sleeps, popen_kwargs = launcher
+    held = open(str(tmp_path / "mount-D.log"), "w")
+    try:
+        held.write("other mount\n")
+        held.flush()
+        msg = run([None], [(1, "")])
+        assert popen_kwargs[0]["stderr"] == subprocess.DEVNULL
+        assert "exited with code 1" in msg
+        assert "other mount" not in msg
+        assert (tmp_path / "mount-D.log").read_text() == "other mount\n"
+    finally:
+        held.close()
+
+
+def test_log_is_held_until_its_error_is_read(launcher, monkeypatch):
+    """Another launch that picks D: after this mount exited, but before the
+    poll read its log, cannot replace the log: this launcher still holds it."""
+    from amifuse import launcher as mod
+
+    run, _sleeps, _kwargs = launcher
+    other = []
+
+    def other_launch(_seconds):
+        if not other:
+            other.append(mod._open_mount_log("D:"))
+
+    monkeypatch.setattr("time.sleep", other_launch)
+    try:
+        msg = run([None], [(1, NO_DRIVER)])
+        assert other[0] == (subprocess.DEVNULL, None)
+        assert "No driver found for DOS type DOS1." in msg
+    finally:
+        if other and other[0][1] is not None:
+            other[0][0].close()

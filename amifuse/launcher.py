@@ -63,12 +63,21 @@ _MOUNT_ERROR_LINES = 10
 def _open_mount_log(letter: str):
     """Open ``mount-<letter>.log`` next to launcher.log for a mount's stderr.
 
+    The mount writes to it for as long as it runs. The previous file for the
+    letter is removed first, and the new one is created exclusively: Windows
+    refuses the removal while a live mount or another launcher still holds
+    it, so launches that picked the same letter never share one file.
+
     Returns ``(file, path)``, or ``(subprocess.DEVNULL, None)`` when the file
     cannot be opened, so a log failure never stops the mount."""
     path = _LOG_DIR / f"mount-{letter[0]}.log"
     try:
         _LOG_DIR.mkdir(parents=True, exist_ok=True)
-        return open(str(path), "w"), path
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        return open(str(path), "x"), path
     except OSError as exc:
         _log(f"Could not open {path}: {exc}")
         return subprocess.DEVNULL, None
@@ -218,7 +227,8 @@ def _enumerate_mount_units(image: str) -> tuple[list[_MountUnit], Optional[str]]
     Any enumeration failure (non-RDB / unreadable image, IOError from
     ``open_rdisk``) degrades to a single no-``--partition`` unit -- exactly the
     legacy behavior: spawn one mount and let the mount process itself surface a
-    failure via the poll timeout. The launcher never crashes on enumeration.
+    failure, through its exit code and stderr or the poll timeout. The launcher
+    never crashes on enumeration.
     """
     try:
         from amifuse import rdb_inspect
@@ -342,6 +352,7 @@ def mount_image_all(image: str, *, write: bool, explorer: str) -> None:
     exited: list[tuple[_MountUnit, str, str]] = []  # (unit, letter, message)
     failed: list[tuple[_MountUnit, str]] = []
     procs: dict[str, tuple[subprocess.Popen, Optional[Path]]] = {}
+    held_logs = []  # mount logs this launcher holds open until the poll ends
     for unit, letter in pairs:
         cmd = [python_exe, "-m", "amifuse", "mount"]
         if unit.name is not None:
@@ -363,12 +374,15 @@ def mount_image_all(image: str, *, write: bool, explorer: str) -> None:
                 close_fds=True,
             )
         except Exception as exc:
+            if stderr_path is not None:
+                stderr.close()
             _log(f"Failed to launch mount for {letter}: {exc}")
             spawn_failed.append((unit, letter, str(exc)))
             continue
-        finally:
-            if stderr_path is not None:
-                stderr.close()
+        # Keep the handle until the poll ends, so that no other launch can
+        # replace the file between this mount exiting and its log being read.
+        if stderr_path is not None:
+            held_logs.append(stderr)
         pending[letter] = unit
         procs[letter] = (proc, stderr_path)
 
@@ -416,6 +430,8 @@ def mount_image_all(image: str, *, write: bool, explorer: str) -> None:
         if pending:
             _log(f"Mounts did not appear within {timeout:.0f}s: {list(pending)}")
             failed.extend((unit, letter) for letter, unit in pending.items())
+    for log in held_logs:
+        log.close()
 
     # Start the tray exactly ONCE after the poll (idempotent via the
     # Local\AmiFUSE_Tray_Mutex). A slow cold mount may still be initializing, so
