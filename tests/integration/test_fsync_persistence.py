@@ -1,41 +1,21 @@
 """fsync() on a real handler: the data is on the image while the file is open.
 
-A fresh bridge in another process (one emulator per process) reads a copy
-of the image taken after fsync() and before release().
+The test copies the image after fsync() and before release(), and reads the
+copy with a fresh bridge once the writing bridge has closed.
 """
 
 import os
 import shutil
-import subprocess
-import sys
 
 import pytest
 
 from amifuse.fuse_fs import AmigaFuseFS, HandlerBridge
 from amifuse.rdb_inspect import detect_adf
-from tests.fixtures.paths import FFS_DRIVER, REPO_ROOT
+from tests.fixtures.paths import FFS_DRIVER
 
 pytestmark = pytest.mark.integration
 
 DATA = b"fsync must reach the image\n" * 400
-
-_READER = """
-import os, sys
-from pathlib import Path
-from amifuse.fuse_fs import HandlerBridge
-from amifuse.rdb_inspect import detect_adf
-image, driver, size = Path(sys.argv[1]), Path(sys.argv[2]), int(sys.argv[3])
-bridge = HandlerBridge(image, driver, read_only=True, adf_info=detect_adf(image))
-try:
-    opened = bridge.open_file("/fsync.txt", os.O_RDONLY)
-    if opened is None:
-        sys.exit("fsync.txt is not on the image")
-    data = bridge.read_handle_at(opened[0], 0, size)
-    bridge.close_file(opened[0])
-    sys.stdout.write(data.hex())
-finally:
-    bridge.close()
-"""
 
 
 def _snapshot(image, copy):
@@ -55,14 +35,17 @@ def _snapshot(image, copy):
         os.close(fd)
 
 
-def _read_in_fresh_bridge(image, driver):
-    env = dict(os.environ, PYTHONPATH=str(REPO_ROOT))
-    result = subprocess.run(
-        [sys.executable, "-c", _READER, str(image), str(driver), str(len(DATA) + 16)],
-        capture_output=True, text=True, timeout=50, env=env, check=False,
-    )
-    assert result.returncode == 0, result.stderr[-2000:]
-    return bytes.fromhex(result.stdout.strip().splitlines()[-1])
+def _read_back(image, driver):
+    bridge = HandlerBridge(image, driver, read_only=True,
+                           adf_info=detect_adf(image))
+    try:
+        opened = bridge.open_file("/fsync.txt", os.O_RDONLY)
+        assert opened is not None, "fsync.txt is not on the image"
+        data = bridge.read_handle_at(opened[0], 0, len(DATA) + 16)
+        bridge.close_file(opened[0])
+        return data
+    finally:
+        bridge.close()
 
 
 @pytest.fixture(params=["pfs3", "ofs"])
@@ -82,6 +65,7 @@ def writable_image(request, tmp_path):
 
 def test_fsync_data_is_on_the_image_before_release(writable_image, tmp_path):
     image, driver = writable_image
+    snapshot = tmp_path / ("snapshot" + image.suffix)
     bridge = HandlerBridge(image, driver, read_only=False,
                            adf_info=detect_adf(image))
     try:
@@ -89,7 +73,6 @@ def test_fsync_data_is_on_the_image_before_release(writable_image, tmp_path):
         fh = ops.create("/fsync.txt", 0o644)
         assert ops.write("/fsync.txt", DATA, 0, fh) == len(DATA)
         assert ops.fsync("/fsync.txt", 0, fh) == 0
-        snapshot = tmp_path / ("snapshot" + image.suffix)
         _snapshot(image, snapshot)
         # The handle stays usable after the volume flush.
         assert ops.write("/fsync.txt", b"tail", len(DATA), fh) == 4
@@ -98,5 +81,5 @@ def test_fsync_data_is_on_the_image_before_release(writable_image, tmp_path):
     finally:
         bridge.close()
 
-    assert _read_in_fresh_bridge(snapshot, driver) == DATA
-    assert _read_in_fresh_bridge(image, driver) == DATA + b"tail"
+    assert _read_back(snapshot, driver) == DATA
+    assert _read_back(image, driver) == DATA + b"tail"
