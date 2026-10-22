@@ -44,16 +44,49 @@ def _log(msg: str) -> None:
         pass
 
 
-def _spawn_detached(cmd: list[str], **kwargs) -> None:
+def _spawn_detached(cmd: list[str], **kwargs) -> subprocess.Popen:
     """Spawn a fully detached process. Tries CREATE_BREAKAWAY_FROM_JOB first
     to escape Explorer's job object; falls back without it if the job
     doesn't allow breakaway."""
     flags = _DETACHED_FLAGS | CREATE_BREAKAWAY_FROM_JOB
     try:
-        subprocess.Popen(cmd, creationflags=flags, **kwargs)
+        return subprocess.Popen(cmd, creationflags=flags, **kwargs)
     except OSError:
         # Job doesn't allow breakaway -- retry without it
-        subprocess.Popen(cmd, creationflags=_DETACHED_FLAGS, **kwargs)
+        return subprocess.Popen(cmd, creationflags=_DETACHED_FLAGS, **kwargs)
+
+
+# How many of the last lines a failed mount wrote to stderr the dialog shows.
+_MOUNT_ERROR_LINES = 10
+
+
+def _open_mount_log(letter: str):
+    """Open ``mount-<letter>.log`` next to launcher.log for a mount's stderr.
+
+    Returns ``(file, path)``, or ``(subprocess.DEVNULL, None)`` when the file
+    cannot be opened, so a log failure never stops the mount."""
+    path = _LOG_DIR / f"mount-{letter[0]}.log"
+    try:
+        _LOG_DIR.mkdir(parents=True, exist_ok=True)
+        return open(str(path), "w"), path
+    except OSError as exc:
+        _log(f"Could not open {path}: {exc}")
+        return subprocess.DEVNULL, None
+
+
+def _mount_error(path: Optional[Path], returncode: int) -> str:
+    """Return the last lines an exited mount wrote to stderr, or, when it
+    wrote none, its exit code."""
+    lines = []
+    if path is not None:
+        try:
+            with open(str(path), errors="replace") as f:
+                lines = [line.rstrip() for line in f if line.strip()]
+        except OSError:
+            pass
+    if lines:
+        return "\n".join(lines[-_MOUNT_ERROR_LINES:])
+    return f"the mount exited with code {returncode}."
 
 
 def main(argv=None) -> None:
@@ -210,18 +243,22 @@ def _enumerate_mount_units(image: str) -> tuple[list[_MountUnit], Optional[str]]
     return units, result.fallback_reason
 
 
-def _report_summary(succeeded, skipped, spawn_failed, failed, fallback_reason) -> None:
+def _report_summary(succeeded, skipped, spawn_failed, exited, failed,
+                    fallback_reason) -> None:
     """Show at most ONE summary dialog for the whole fan-out.
 
     No dialog on a clean full success (Explorer opening the drive(s) is the
     confirmation) -- this preserves the pre-fan-out single-partition behavior.
     Otherwise a single ``_show_error`` names, in one composed body, the mounted
     drives, the skipped (no free letter) partitions, the ``spawn_failed`` ones
-    (the process never started -- DEFINITE wording), and the ``failed`` ones (the
-    process spawned but its drive never appeared -- SOFT wording, may be a slow
-    cold mount), plus any ``fallback_reason``. Never one dialog per partition.
+    (the process never started -- DEFINITE wording), the ``exited`` ones (the
+    process exited with an error before its drive appeared -- DEFINITE wording,
+    with the mount's own message), and the ``failed`` ones (the process spawned
+    but its drive never appeared -- SOFT wording, may be a slow cold mount), plus
+    any ``fallback_reason``. Never one dialog per partition.
     """
-    if not skipped and not spawn_failed and not failed and not fallback_reason:
+    if (not skipped and not spawn_failed and not exited and not failed
+            and not fallback_reason):
         return
 
     parts = []
@@ -238,6 +275,8 @@ def _report_summary(succeeded, skipped, spawn_failed, failed, fallback_reason) -
             parts.append(
                 f"Could not start mount for {u.label} ({letter}): {reason}"
             )
+    for u, letter, reason in exited:
+        parts.append(f"Could not mount {u.label} ({letter}):\n{reason}")
     if failed:
         names = ", ".join(f"{u.label} ({letter})" for u, letter in failed)
         # Soft wording: a timed-out drive may be a slow cold mount, not a
@@ -292,13 +331,17 @@ def mount_image_all(image: str, *, write: bool, explorer: str) -> None:
     # Spawn ALL mounts first (they are independent processes -- verified N=2
     # concurrent RW), then poll a single shared deadline below.
     pending: dict[str, _MountUnit] = {}   # letter -> unit awaiting arrival
-    # Two distinct failure buckets. spawn_failed: the process NEVER launched
-    # (_spawn_detached raised) -- a definite, hard failure. failed (below): the
-    # process spawned but its drive never appeared by the deadline -- a SOFT
-    # timeout that may still be a slow cold mount. Folding the two together would
-    # mislabel a never-started mount as "may still be starting".
+    # Three distinct failure buckets. spawn_failed: the process NEVER launched
+    # (_spawn_detached raised) -- a definite, hard failure. exited (below): the
+    # process exited with an error before its drive appeared -- definite, with
+    # its stderr. failed (below): the process spawned but its drive never
+    # appeared by the deadline -- a SOFT timeout that may still be a slow cold
+    # mount. Folding them together would mislabel a never-started or failed
+    # mount as "may still be starting".
     spawn_failed: list[tuple[_MountUnit, str, str]] = []  # (unit, letter, reason)
+    exited: list[tuple[_MountUnit, str, str]] = []  # (unit, letter, message)
     failed: list[tuple[_MountUnit, str]] = []
+    procs: dict[str, tuple[subprocess.Popen, Optional[Path]]] = {}
     for unit, letter in pairs:
         cmd = [python_exe, "-m", "amifuse", "mount"]
         if unit.name is not None:
@@ -308,19 +351,26 @@ def mount_image_all(image: str, *, write: bool, explorer: str) -> None:
         cmd += ["--mountpoint", letter, "--daemon", image]
 
         _log(f"Launching mount: {cmd}")
+        # The mount's stderr goes to a file, so an error it exits with can be
+        # shown instead of the soft timeout.
+        stderr, stderr_path = _open_mount_log(letter)
         try:
-            _spawn_detached(
+            proc = _spawn_detached(
                 cmd,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stderr=stderr,
                 close_fds=True,
             )
         except Exception as exc:
             _log(f"Failed to launch mount for {letter}: {exc}")
             spawn_failed.append((unit, letter, str(exc)))
             continue
+        finally:
+            if stderr_path is not None:
+                stderr.close()
         pending[letter] = unit
+        procs[letter] = (proc, stderr_path)
 
     # Single aggregate-deadline poll. os.path.exists("<letter>\\") is the CORRECT
     # "did my mount appear" probe (a live WinFSP mount has media) and is distinct
@@ -350,10 +400,19 @@ def mount_image_all(image: str, *, write: bool, explorer: str) -> None:
                             os.startfile(letter + "\\")
                         except OSError as exc:
                             _log(f"Could not open Explorer for {letter}: {exc}")
+                elif procs[letter][0].poll() not in (None, 0):
+                    # The mount exited with an error (e.g. no driver for the
+                    # DOS type), so its drive will never appear.
+                    unit = pending.pop(letter)
+                    proc, stderr_path = procs[letter]
+                    _log(f"Mount for {letter} exited with code {proc.returncode}")
+                    exited.append(
+                        (unit, letter, _mount_error(stderr_path, proc.returncode))
+                    )
 
         # Whatever is still pending timed out -- report softly (may be a slow
-        # cold mount, an unformatted/no-driver partition that SystemExited in its
-        # own process, or a TOCTOU-lost letter). The good drives are unaffected.
+        # cold mount, or a mount that is still running without its drive). The
+        # good drives are unaffected.
         if pending:
             _log(f"Mounts did not appear within {timeout:.0f}s: {list(pending)}")
             failed.extend((unit, letter) for letter, unit in pending.items())
@@ -363,7 +422,8 @@ def mount_image_all(image: str, *, write: bool, explorer: str) -> None:
     # start it even on a timeout; the tray auto-exits if no mounts are present.
     _ensure_tray_running()
 
-    _report_summary(succeeded, skipped, spawn_failed, failed, fallback_reason)
+    _report_summary(succeeded, skipped, spawn_failed, exited, failed,
+                    fallback_reason)
 
 
 def _do_mount(args) -> None:

@@ -27,10 +27,13 @@ def _msg_text(mock_windll) -> str:
 
 
 @pytest.fixture
-def mock_popen(monkeypatch):
-    """Mock subprocess.Popen and return the mock."""
+def mock_popen(monkeypatch, tmp_path):
+    """Mock subprocess.Popen and return the mock. Its child keeps running, as
+    a live mount does, and the launcher's logs go to ``tmp_path``."""
     mock = MagicMock()
+    mock.return_value.poll.return_value = None
     monkeypatch.setattr("amifuse.launcher.subprocess.Popen", mock)
+    monkeypatch.setattr("amifuse.launcher._LOG_DIR", tmp_path)
     return mock
 
 
