@@ -5465,8 +5465,13 @@ def cmd_inspect(args):
                 # a same-named partition in a later RDB cannot be mounted.
                 selected = None
                 if multi_rdb and not parceiro:
-                    selected = find_partition_mbr_index(
-                        args.image, args.block_size, name)
+                    try:
+                        selected = find_partition_mbr_index(
+                            args.image, args.block_size, name)
+                    except IOError:
+                        # A failed lookup: the driver lookup below meets
+                        # the same error and gives it as the note.
+                        pass
                 if selected is not None and selected != rdb_idx:
                     part["driver"] = None
                     part["driver_note"] = (
