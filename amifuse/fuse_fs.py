@@ -3219,6 +3219,15 @@ class AmigaFuseFS(_FuseOperations):
 
     def fsync(self, path, fdatasync, fh):
         self._log_op("fsync", path, f"fh={fh} fdatasync={fdatasync}")
+        self._check_handler_alive()
+        if not self.bridge._write_enabled:
+            return 0
+        # Handlers keep data and metadata in their buffers. ACTION_FLUSH has
+        # no per-file form, so write out the whole volume.
+        try:
+            self.bridge.flush_volume()
+        except OSError as exc:
+            raise FuseOSError(errno.EIO) from exc
         return 0
 
     def chmod(self, path, mode):
