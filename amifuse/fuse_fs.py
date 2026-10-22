@@ -881,7 +881,10 @@ class HandlerBridge:
             if getattr(rs, "done", False) and not replies:
                 break
 
-            if sleep_base > 0:
+            # A burst that ends at its cycle limit, with neither done nor
+            # error set, stopped the handler in the middle of its work, so
+            # the next burst follows at once.
+            if sleep_base > 0 and getattr(rs, "done", False):
                 time.sleep(sleep_time)
                 sleep_time = min(sleep_time * 2, sleep_max)
 
