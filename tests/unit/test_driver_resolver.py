@@ -1052,6 +1052,27 @@ class TestInspectMultiRdb:
             assert part["driver"]["source"] == "rdb"
             assert "driver_note" not in part
 
+    def test_json_lookup_error_is_the_drivers_note(
+            self, user_driver_dir, tmp_path, capsys, monkeypatch):
+        """The lookup's IOError, as for a name in an RDB that a forced block
+        size skips, leaves no driver and gives the error as the note."""
+        from amifuse import rdb_inspect
+
+        def refuse(image, block_size, name):
+            raise IOError(f"Partition {name} is in an RDB that does not "
+                          f"open with 1024-byte blocks")
+
+        image = _two_rdbs(tmp_path, "DH1")
+        monkeypatch.setattr(rdb_inspect, "find_partition_mbr_index", refuse)
+        parts = self._partitions(image, capsys)
+        assert [part["driver_note"] for part in parts] == [
+            "Partition DH0 is in an RDB that does not open with 1024-byte "
+            "blocks",
+            "Partition DH1 is in an RDB that does not open with 1024-byte "
+            "blocks",
+        ]
+        assert all(part["driver"] is None for part in parts)
+
 
 def _parceiro(tmp_path):
     """A Parceiro disk: its own RDB, holding DH0, at block 2 beside an MBR
