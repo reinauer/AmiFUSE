@@ -12,8 +12,8 @@ one under test; subprocesses inherit that environment.
 
 Writes stay within what works with every handler on main: whole files
 under 64 KiB, no truncate, no seek past the end, no os.replace, and no
-file rename, which the bundled v0.2 handler refuses for an open or
-locked object (ERROR_OBJECT_IN_USE).
+rename of an open or locked file, which the bundled v0.2 handler refuses
+(ERROR_OBJECT_IN_USE); Windows opens a file before renaming it.
 """
 
 import json
@@ -225,6 +225,7 @@ def test_long_names(tmp_path, no_user_driver, dos):
 
     session(lambda bridge, root: _write_file(bridge, "/" + name, NEW_DATA))
     assert _xdf_read(image, name, tmp_path) == NEW_DATA
+    assert _used_blocks(image) > used
 
     def rename(bridge, root):
         res1, res2 = bridge.rename_object(root, name, root, renamed)
