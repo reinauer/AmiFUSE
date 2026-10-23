@@ -412,7 +412,7 @@ welcome.
 ## Bundled FastFileSystem
 
 AmiFUSE ships Stefan Reinauer's [FastFileSystem](https://github.com/reinauer/FastFileSystem)
-(release `alpha1`, an early version) for FFS/OFS volumes that carry no driver of
+(release `v0.2`, an early version) for FFS/OFS volumes that carry no driver of
 their own. It supports DOS0-DOS5; DOS6/DOS7 (long file names) need another FFS.
 
 Without `--driver`, AmiFUSE picks the driver in this order:

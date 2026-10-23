@@ -12,7 +12,7 @@ one under test; subprocesses inherit that environment.
 
 Writes stay within what works with every handler on main: whole files
 under 64 KiB, no truncate, no seek past the end, no os.replace, and no
-file rename, which the bundled alpha1 handler refuses for an open or
+file rename, which the bundled v0.2 handler refuses for an open or
 locked object (ERROR_OBJECT_IN_USE).
 """
 
@@ -264,7 +264,7 @@ def test_format_rdb_partition_without_driver(tmp_path, no_user_driver):
     )
     result = _amifuse("format", str(image), "DH0", "Fresh")
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "Filesystem driver: FastFileSystem alpha1 (bundled" in result.stdout
+    assert "Filesystem driver: FastFileSystem 0.2 (21.10.2026) (bundled" in result.stdout
     listing = _xdftool(image, "open", "part=DH0", "+", "list")
     assert "Fresh" in listing and "DOS3" in listing
 
@@ -336,7 +336,7 @@ class TestMountWithoutDriver:
         assert (mp / "Sub" / "Multi.bin").read_bytes() == MULTI_DATA
         (mp / "Sub" / "Mount.bin").write_bytes(NEW_DATA)
         out = _unmount(mp, proc)
-        assert "Filesystem driver: FastFileSystem alpha1 (bundled," in out, out
+        assert "Filesystem driver: FastFileSystem 0.2 (21.10.2026) (bundled," in out, out
         assert _xdf_read(image, "Sub/Mount.bin", tmp_path) == NEW_DATA
 
     def test_write_survives_a_killed_mount(self, mount_image, tmp_path, no_user_driver):
@@ -354,7 +354,7 @@ class TestMountWithoutDriver:
         assert _xdf_read(image, "Kept.bin", tmp_path) == NEW_DATA
 
     @pytest.mark.skip(reason=(
-        "FastFileSystem alpha1 refuses to rename an open or locked object "
+        "FastFileSystem v0.2 refuses to rename an open or locked object "
         "(ERROR_OBJECT_IN_USE), and Windows opens a file before renaming it; "
         "remove this skip when the pinned release fixes it"
     ))

@@ -27,7 +27,7 @@ from amifuse import driver_resolver
 from amifuse.driver_resolver import DriverNotFound
 
 DOS0 = 0x444F5300
-ALPHA1_SHA256 = "0a9ffd7c7b144a172273d8b0e7099b4ea9a92d90a517a604f6aaecc5f58f8826"
+BUNDLED_SHA256 = "2c66aeaa747a0ba3b4e40281663d5de2b99c1345987d510d5ce4a3d1453d0b7a"
 HYPERION_VER = b"fs 47.4 (16.6.2020)"
 
 
@@ -66,10 +66,10 @@ class TestBundledFiles:
         info = json.loads(driver_resolver.BUNDLED_PROVENANCE.read_text(encoding="utf-8"))
         data = driver_resolver.BUNDLED_DRIVER.read_bytes()
         assert info["asset"] == driver_resolver.BUNDLED_DRIVER.name
-        assert info["size"] == len(data) == 66724
-        assert info["sha256"] == hashlib.sha256(data).hexdigest() == ALPHA1_SHA256
-        assert info["tag"] == "alpha1"
-        assert info["commit"] == "043b8030c1bac896e49385f8c328214b024c280d"
+        assert info["size"] == len(data) == 72044
+        assert info["sha256"] == hashlib.sha256(data).hexdigest() == BUNDLED_SHA256
+        assert info["tag"] == "v0.2"
+        assert info["commit"] == "6d1705041b77a3dc6d7846d49ff5155a44a1be01"
         assert info["license"] == "BSD-2-Clause"
         assert info["dos_types"] == ["DOS0", "DOS1", "DOS2", "DOS3", "DOS4", "DOS5"]
         assert info["build"] == {
@@ -159,7 +159,7 @@ class TestFolderLookup:
         assert resolved.path == driver_resolver.BUNDLED_DRIVER
         assert resolved.temporary is False
         assert resolved.description == (
-            f"FastFileSystem alpha1 (bundled, sha256 0a9ffd7c7b14) "
+            f"FastFileSystem 0.2 (21.10.2026) (bundled, sha256 2c66aeaa747a) "
             f"{driver_resolver.BUNDLED_DRIVER}"
         )
 
@@ -248,7 +248,7 @@ class TestFolderLookup:
         digest = hashlib.sha256(b"changed").hexdigest()
         assert f"sha256 {digest[:12]}" in resolved.description
         err = capsys.readouterr().err
-        assert "does not match the sha256" in err and ALPHA1_SHA256 in err
+        assert "does not match the sha256" in err and BUNDLED_SHA256 in err
 
     def test_quiet_skips_the_checksum_warning(
             self, user_driver_dir, monkeypatch, tmp_path, capsys):
@@ -275,7 +275,7 @@ class TestFolderLookup:
         assert f"{target} (Permission denied)" in lines[1]
         assert "--driver" in lines[2]
 
-    @pytest.mark.parametrize("content", [None, "{not json", '{"tag": "alpha1"}'])
+    @pytest.mark.parametrize("content", [None, "{not json", '{"tag": "v0.2"}'])
     def test_broken_provenance_names_the_json(
             self, user_driver_dir, monkeypatch, tmp_path, content):
         """A missing, invalid or incomplete provenance record is named as
@@ -359,9 +359,10 @@ class TestDosRange:
     def test_ranges(self, tags, text):
         assert driver_resolver.dos_range(tags) == text
 
-    def test_alpha1_has_none_yet(self):
-        """alpha1 has no $VER, so reports use its release tag."""
-        assert driver_resolver.find_version(driver_resolver.BUNDLED_DRIVER.read_bytes()) is None
+    def test_bundled_version(self):
+        """v0.2 carries a $VER, which reports use in place of its tag."""
+        assert driver_resolver.find_version(
+            driver_resolver.BUNDLED_DRIVER.read_bytes()) == "FastFileSystem 0.2 (21.10.2026)"
 
 
 @pytest.fixture
@@ -399,7 +400,7 @@ class TestNoHomeFolder:
         check = doctor._drivers_check()
         assert check.status == "ok"
         assert check.message == (
-            "DOS0-DOS5: FastFileSystem alpha1 (bundled, sha256 0a9ffd7c7b14) "
+            "DOS0-DOS5: FastFileSystem 0.2 (21.10.2026) (bundled, sha256 2c66aeaa747a) "
             f"{driver_resolver.BUNDLED_DRIVER}; DOS6-DOS7: none; place your own "
             "FastFileSystem in your drivers folder (no home folder found)")
 
@@ -752,7 +753,7 @@ class TestDoctorDriversCheck:
         check = _drivers_check()
         assert check.status == "ok"
         assert check.message == (
-            "DOS0-DOS5: FastFileSystem alpha1 (bundled, sha256 0a9ffd7c7b14) "
+            "DOS0-DOS5: FastFileSystem 0.2 (21.10.2026) (bundled, sha256 2c66aeaa747a) "
             f"{driver_resolver.BUNDLED_DRIVER}; "
             f"DOS6-DOS7: none; place your own FastFileSystem in {user_driver_dir}"
         )
@@ -803,7 +804,7 @@ class TestDoctorDriversCheck:
         assert check.status == "warning"
         assert check.message.startswith(
             "The bundled FastFileSystem does not match the sha256 recorded in "
-            f"FastFileSystem.OS3.json ({ALPHA1_SHA256}): {bundled}; DOS0-DOS5: ")
+            f"FastFileSystem.OS3.json ({BUNDLED_SHA256}): {bundled}; DOS0-DOS5: ")
         assert capsys.readouterr().err == ""
 
     def test_unreadable_user_copy_warns(self, user_driver_dir, monkeypatch):
@@ -824,7 +825,7 @@ class TestDoctorDriversCheck:
         monkeypatch.setattr(driver_resolver, "BUNDLED_PROVENANCE", record)
         check = _drivers_check()
         assert check.status == "ok"
-        assert check.message.startswith("DOS0-DOS7: FastFileSystem alpha1 (bundled")
+        assert check.message.startswith("DOS0-DOS7: FastFileSystem 0.2 (21.10.2026) (bundled")
         assert ";" not in check.message
 
     def test_doctor_json_reports_the_check(self, user_driver_dir, capsys):
@@ -835,7 +836,7 @@ class TestDoctorDriversCheck:
         checks = json.loads(capsys.readouterr().out)["checks"]
         drivers = next(c for c in checks if c["name"] == "drivers")
         assert drivers["status"] == "ok"
-        assert drivers["message"].startswith("DOS0-DOS5: FastFileSystem alpha1 (bundled")
+        assert drivers["message"].startswith("DOS0-DOS5: FastFileSystem 0.2 (21.10.2026) (bundled")
 
 
 def _adf(tmp_path, n, name="test.adf"):
@@ -855,9 +856,9 @@ class TestInspectAdf:
         assert data["driver"] == {
             "source": "bundled",
             "path": str(driver_resolver.BUNDLED_DRIVER),
-            "version": None,
-            "tag": "alpha1",
-            "sha256": ALPHA1_SHA256,
+            "version": "FastFileSystem 0.2 (21.10.2026)",
+            "tag": "v0.2",
+            "sha256": BUNDLED_SHA256,
         }
 
     def test_json_names_the_user_copy(self, user_driver_dir, tmp_path, capsys):
@@ -916,7 +917,7 @@ class TestInspectAdf:
         main(["inspect", str(_adf(tmp_path, 3))])
         out = capsys.readouterr().out
         assert (
-            "Filesystem driver: FastFileSystem alpha1 (bundled, sha256 0a9ffd7c7b14)"
+            "Filesystem driver: FastFileSystem 0.2 (21.10.2026) (bundled, sha256 2c66aeaa747a)"
             in out
         )
 
@@ -935,8 +936,8 @@ class TestInspectRdb:
         """The RDB's driver is hashed and its extracted copy deleted."""
         part = self._partition(_rdb(tmp_path, "DOS3", "DOS3"), capsys)
         assert part["driver"] == {
-            "source": "rdb", "path": None, "version": None, "tag": None,
-            "sha256": ALPHA1_SHA256,
+            "source": "rdb", "path": None, "version": "FastFileSystem 0.2 (21.10.2026)",
+            "tag": None, "sha256": BUNDLED_SHA256,
         }
         assert "driver_note" not in part
         assert list(temp_dir.iterdir()) == []
@@ -947,9 +948,9 @@ class TestInspectRdb:
         assert part["driver"] == {
             "source": "bundled",
             "path": str(driver_resolver.BUNDLED_DRIVER),
-            "version": None,
-            "tag": "alpha1",
-            "sha256": ALPHA1_SHA256,
+            "version": "FastFileSystem 0.2 (21.10.2026)",
+            "tag": "v0.2",
+            "sha256": BUNDLED_SHA256,
         }
 
     def test_json_damaged_driver(self, user_driver_dir, tmp_path, capsys):
@@ -986,7 +987,7 @@ class TestInspectRdb:
         out = capsys.readouterr().out
         assert (
             "Filesystem driver per partition (without --driver):\n"
-            "  DH0: FastFileSystem alpha1 (bundled, sha256 0a9ffd7c7b14)"
+            "  DH0: FastFileSystem 0.2 (21.10.2026) (bundled, sha256 2c66aeaa747a)"
         ) in out
 
 
@@ -1165,7 +1166,7 @@ class TestInspectSameRdbNames:
 
         main(["inspect", str(_two_partitions(tmp_path, "dh0", "DOS7"))])
         out = capsys.readouterr().out
-        assert "  DH0: FastFileSystem alpha1 (bundled, " in out
+        assert "  DH0: FastFileSystem 0.2 (21.10.2026) (bundled, " in out
         assert out.endswith(f"  dh0: {self.NOTE}\n")
 
     def test_text_distinct_names(self, user_driver_dir, tmp_path, capsys):
@@ -1173,6 +1174,6 @@ class TestInspectSameRdbNames:
 
         main(["inspect", str(_two_partitions(tmp_path, "DH1", "DOS3"))])
         out = capsys.readouterr().out
-        assert "  DH0: FastFileSystem alpha1 (bundled, " in out
-        assert "  DH1: FastFileSystem alpha1 (bundled, " in out
+        assert "  DH0: FastFileSystem 0.2 (21.10.2026) (bundled, " in out
+        assert "  DH1: FastFileSystem 0.2 (21.10.2026) (bundled, " in out
         assert "earlier partition" not in out
