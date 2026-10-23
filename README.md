@@ -413,7 +413,12 @@ welcome.
 
 AmiFUSE ships Stefan Reinauer's [FastFileSystem](https://github.com/reinauer/FastFileSystem)
 (release `v0.2`, an early version) for FFS/OFS volumes that carry no driver of
-their own. It supports DOS0-DOS7, long file names included.
+their own. It supports DOS0-DOS7, long file names included. Like the
+FastFileSystem of AmigaOS 3.2, it shortens a name longer than the volume takes
+(30 bytes, or 106 with long file names) whenever it creates, renames, opens or
+deletes a file. Two names that share their first 30 (or 106) bytes are
+therefore the same file: writing the second overwrites the first, and deleting
+either deletes it.
 
 Without `--driver`, AmiFUSE picks the driver in this order:
 
