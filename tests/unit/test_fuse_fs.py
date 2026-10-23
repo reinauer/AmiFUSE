@@ -300,7 +300,7 @@ class TestMountFuseOptions:
         fuse_fs.mount_fuse(Path("test.adf"), None, None, block_size=None)
 
         assert (
-            "Filesystem driver: FastFileSystem alpha1 (bundled, sha256 0a9ffd7c7b14) "
+            "Filesystem driver: FastFileSystem 0.2 (21.10.2026) (bundled, sha256 2c66aeaa747a) "
             f"{driver_resolver.BUNDLED_DRIVER}\n"
         ) in capsys.readouterr().out
         assert fuse_fs.HandlerBridge.call_args.args[1] == driver_resolver.BUNDLED_DRIVER
@@ -617,7 +617,7 @@ class TestFormatVolume:
         fuse_fs_mod.format_volume(image, None, None, "DH0", volname="Fresh")
 
         assert (
-            "Filesystem driver: FastFileSystem alpha1 (bundled, sha256 0a9ffd7c7b14) "
+            "Filesystem driver: FastFileSystem 0.2 (21.10.2026) (bundled, sha256 2c66aeaa747a) "
             f"{driver_resolver.BUNDLED_DRIVER}\n"
         ) in capsys.readouterr().out
         assert bridge_cls.call_args.args[1] == driver_resolver.BUNDLED_DRIVER

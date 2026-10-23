@@ -1,10 +1,10 @@
 {
   "repo": "https://github.com/reinauer/FastFileSystem",
-  "tag": "alpha1",
-  "commit": "043b8030c1bac896e49385f8c328214b024c280d",
+  "tag": "v0.2",
+  "commit": "6d1705041b77a3dc6d7846d49ff5155a44a1be01",
   "asset": "FastFileSystem.OS3",
-  "size": 66724,
-  "sha256": "0a9ffd7c7b144a172273d8b0e7099b4ea9a92d90a517a604f6aaecc5f58f8826",
+  "size": 72044,
+  "sha256": "2c66aeaa747a0ba3b4e40281663d5de2b99c1345987d510d5ce4a3d1453d0b7a",
   "license": "BSD-2-Clause",
   "dos_types": ["DOS0", "DOS1", "DOS2", "DOS3", "DOS4", "DOS5"],
   "build": {
