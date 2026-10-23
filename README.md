@@ -171,7 +171,7 @@ amifuse mount /path/to/disk.hdf
 | Argument | Required | Description |
 |----------|----------|-------------|
 | `image` | Yes | Path to the Amiga hard disk image file |
-| `--driver` | No | Path to filesystem handler binary (default: RDB, your drivers folder, then the bundled FastFileSystem for DOS0-5; see [Bundled FastFileSystem](#bundled-fastfilesystem)) |
+| `--driver` | No | Path to filesystem handler binary (default: RDB, your drivers folder, then the bundled FastFileSystem for DOS0-7; see [Bundled FastFileSystem](#bundled-fastfilesystem)) |
 | `--mountpoint` | macOS/Windows: No, Linux: Yes | Mount location (macOS: `/Volumes/<partition>`, Windows: first free drive letter) |
 | `--partition` | No | Partition name (e.g., `DH0`) or index (default: first partition) |
 | `--block-size` | No | Override block size (default: auto-detect or 512) |
@@ -312,7 +312,7 @@ amifuse mount multi-partition.hdf --partition 2
 mkdir -p ./mnt
 amifuse mount disk.hdf --mountpoint ./mnt
 
-# Mount an ADF floppy image (uses the bundled FastFileSystem for DOS0-5)
+# Mount an ADF floppy image (uses the bundled FastFileSystem for DOS0-7)
 amifuse mount workbench.adf
 
 # Enable native icons (macOS only, converts Amiga .info files)
@@ -394,12 +394,12 @@ driver-info --base 0x200000 pfs3aio
 
 - **HDF/RDB** - Hard disk images with Rigid Disk Block. Filesystem drivers can be embedded in the RDB or specified via `--driver`. An FFS/OFS partition whose RDB has no driver for its DOS type uses the [bundled FastFileSystem](#bundled-fastfilesystem).
 - **Emu68-style MBR images** - Disk images with MBR partition table containing an RDB partition, as used by Emu68 on Raspberry Pi.
-- **ADF** - Amiga Disk File floppy images (DD and HD). ADFs contain no driver, so DOS0-5 floppies use the [bundled FastFileSystem](#bundled-fastfilesystem); DOS6/7 floppies need your own FastFileSystem or `--driver`.
+- **ADF** - Amiga Disk File floppy images (DD and HD). ADFs contain no driver, so DOS0-7 floppies use the [bundled FastFileSystem](#bundled-fastfilesystem) unless your drivers folder holds your own.
 
 ## Supported Filesystems
 
 Currently tested with:
-- **FFS/OFS** (Fast/Old File System) via the bundled [FastFileSystem](https://github.com/reinauer/FastFileSystem) for DOS0-5, or your own `L:FastFileSystem` from Workbench (tested with 3.2), which also serves DOS6/7 and wins when present
+- **FFS/OFS** (Fast/Old File System) via the bundled [FastFileSystem](https://github.com/reinauer/FastFileSystem) for DOS0-7, or your own `L:FastFileSystem` from Workbench (tested with 3.2), which wins when present
 - **CDFileSystem** via `L:CDFileSystem` from Workbench (tested with 3.2)
 - **PFS3** (Professional File System 3) via [pfs3aio](https://github.com/tonioni/pfs3aio) handler
 - **SFS** (Smart File System 1.279) via [SmartFileSystem](https://aminet.net/package/disk/misc/SFS) handler
@@ -413,7 +413,7 @@ welcome.
 
 AmiFUSE ships Stefan Reinauer's [FastFileSystem](https://github.com/reinauer/FastFileSystem)
 (release `v0.2`, an early version) for FFS/OFS volumes that carry no driver of
-their own. It supports DOS0-DOS5; DOS6/DOS7 (long file names) need another FFS.
+their own. It supports DOS0-DOS7, long file names included.
 
 Without `--driver`, AmiFUSE picks the driver in this order:
 
@@ -424,9 +424,8 @@ Without `--driver`, AmiFUSE picks the driver in this order:
    not used, as on an Amiga, where the FFS in ROM then serves the partition.
 2. `FastFileSystem` in your drivers folder (`%LOCALAPPDATA%\amifuse\drivers` on
    Windows, `~/.local/share/amifuse/drivers` elsewhere), for DOS0-DOS7. Place
-   the one from AmigaOS 3.2 there to use it instead of the bundled one, or to
-   mount DOS6/DOS7 volumes.
-3. The bundled FastFileSystem, for DOS0-DOS5.
+   the one from AmigaOS 3.2 there to use it instead of the bundled one.
+3. The bundled FastFileSystem, for DOS0-DOS7.
 4. In a development checkout, `../AmiFUSE-testing/drivers/FastFileSystem`.
 
 The mount banner, `amifuse doctor` and `amifuse inspect` name the driver in use;

@@ -5998,7 +5998,7 @@ commands:
   mount <image>             Mount an Amiga filesystem image via FUSE.
     --driver PATH             Filesystem binary (default: RDB, your drivers
                               folder, then the bundled FastFileSystem
-                              for DOS0-5).
+                              for DOS0-7).
     --mountpoint PATH         Mount location (default: /Volumes/<partition>).
     --partition NAME          Partition name (e.g. DH0) or index (defaults to first).
     --block-size N            Override block size (defaults to auto/512).
@@ -6028,7 +6028,7 @@ commands:
                               Format an Amiga partition.
     --driver PATH             Filesystem binary (default: RDB, your drivers
                               folder, then the bundled FastFileSystem
-                              for DOS0-5).
+                              for DOS0-7).
     --block-size N            Override block size (defaults to auto/512).
     --debug                   Enable debug logging.
 
@@ -6037,7 +6037,7 @@ commands:
     --partition NAME          Partition name (e.g. DH0) or index.
     --driver PATH             Filesystem binary (default: RDB, your drivers
                               folder, then the bundled FastFileSystem
-                              for DOS0-5).
+                              for DOS0-7).
     --block-size N            Override block size (defaults to auto/512).
     --recursive               List all entries recursively.
     --json                    Output results as JSON.
@@ -6049,7 +6049,7 @@ commands:
     --partition NAME          Partition name (e.g. DH0) or index.
     --driver PATH             Filesystem binary (default: RDB, your drivers
                               folder, then the bundled FastFileSystem
-                              for DOS0-5).
+                              for DOS0-7).
     --block-size N            Override block size (defaults to auto/512).
     --json                    Output results as JSON.
     --debug                   Enable debug logging.
@@ -6060,7 +6060,7 @@ commands:
     --partition NAME          Partition name (e.g. DH0) or index.
     --driver PATH             Filesystem binary (default: RDB, your drivers
                               folder, then the bundled FastFileSystem
-                              for DOS0-5).
+                              for DOS0-7).
     --block-size N            Override block size (defaults to auto/512).
     --json                    Output results as JSON.
     --debug                   Enable debug logging.
@@ -6072,7 +6072,7 @@ commands:
     --partition NAME          Partition name (e.g. DH0) or index.
     --driver PATH             Filesystem binary (default: RDB, your drivers
                               folder, then the bundled FastFileSystem
-                              for DOS0-5).
+                              for DOS0-7).
     --block-size N            Override block size (defaults to auto/512).
     --json                    Output results as JSON.
     --debug                   Enable debug logging.
@@ -6083,7 +6083,7 @@ commands:
     --partition NAME          Partition name (e.g. DH0) or index.
     --driver PATH             Filesystem binary (default: RDB, your drivers
                               folder, then the bundled FastFileSystem
-                              for DOS0-5).
+                              for DOS0-7).
     --block-size N            Override block size (defaults to auto/512).
     --json                    Output results as JSON.
     --debug                   Enable debug logging.
@@ -6117,7 +6117,7 @@ commands:
         "mount", help="Mount an Amiga filesystem image via FUSE."
     )
     mount_parser.add_argument("image", type=Path, help="Disk image file or physical disk device")
-    mount_parser.add_argument("--driver", type=Path, help="Filesystem binary (default: RDB, your drivers folder, then the bundled FastFileSystem for DOS0-5)")
+    mount_parser.add_argument("--driver", type=Path, help="Filesystem binary (default: RDB, your drivers folder, then the bundled FastFileSystem for DOS0-7)")
     mount_parser.add_argument("--mountpoint", type=Path, help="Mount location (default: /Volumes/<partition> on macOS, first free drive letter on Windows)")
     mount_parser.add_argument(
         "--partition", type=str, help="Partition name (e.g. DH0) or index (defaults to first)."
@@ -6213,7 +6213,7 @@ commands:
     format_parser.add_argument("image", type=Path, help="Disk image file")
     format_parser.add_argument("partition", type=str, help="Partition name (e.g. DH0) or index.")
     format_parser.add_argument("volname", nargs="?", default="Empty", help="Volume name (default: Empty)")
-    format_parser.add_argument("--driver", type=Path, help="Filesystem binary (default: RDB, your drivers folder, then the bundled FastFileSystem for DOS0-5)")
+    format_parser.add_argument("--driver", type=Path, help="Filesystem binary (default: RDB, your drivers folder, then the bundled FastFileSystem for DOS0-7)")
     format_parser.add_argument(
         "--block-size", type=int, help="Override block size (defaults to auto/512)."
     )
@@ -6238,7 +6238,7 @@ commands:
     ls_parser.add_argument(
         "--driver", type=Path,
         help="Filesystem binary (default: RDB, your drivers folder, "
-             "then the bundled FastFileSystem for DOS0-5).",
+             "then the bundled FastFileSystem for DOS0-7).",
     )
     ls_parser.add_argument(
         "--block-size", type=int,
@@ -6278,7 +6278,7 @@ commands:
     verify_parser.add_argument(
         "--driver", type=Path,
         help="Filesystem binary (default: RDB, your drivers folder, "
-             "then the bundled FastFileSystem for DOS0-5).",
+             "then the bundled FastFileSystem for DOS0-7).",
     )
     verify_parser.add_argument(
         "--block-size", type=int,
@@ -6315,7 +6315,7 @@ commands:
     hash_parser.add_argument(
         "--driver", type=Path,
         help="Filesystem binary (default: RDB, your drivers folder, "
-             "then the bundled FastFileSystem for DOS0-5).",
+             "then the bundled FastFileSystem for DOS0-7).",
     )
     hash_parser.add_argument(
         "--block-size", type=int,
@@ -6352,7 +6352,7 @@ commands:
     read_parser.add_argument(
         "--driver", type=Path,
         help="Filesystem binary (default: RDB, your drivers folder, "
-             "then the bundled FastFileSystem for DOS0-5).",
+             "then the bundled FastFileSystem for DOS0-7).",
     )
     read_parser.add_argument(
         "--block-size", type=int,
@@ -6388,7 +6388,7 @@ commands:
     write_parser.add_argument(
         "--driver", type=Path,
         help="Filesystem binary (default: RDB, your drivers folder, "
-             "then the bundled FastFileSystem for DOS0-5).",
+             "then the bundled FastFileSystem for DOS0-7).",
     )
     write_parser.add_argument(
         "--block-size", type=int,

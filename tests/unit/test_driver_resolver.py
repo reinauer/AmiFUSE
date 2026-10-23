@@ -71,7 +71,7 @@ class TestBundledFiles:
         assert info["tag"] == "v0.2"
         assert info["commit"] == "6d1705041b77a3dc6d7846d49ff5155a44a1be01"
         assert info["license"] == "BSD-2-Clause"
-        assert info["dos_types"] == ["DOS0", "DOS1", "DOS2", "DOS3", "DOS4", "DOS5"]
+        assert info["dos_types"] == [f"DOS{n}" for n in range(8)]
         assert info["build"] == {
             "image": "stefanreinauer/amiga-gcc:gcc-v13.4",
             "command": "make amigaos3",
@@ -151,9 +151,9 @@ class TestFixedTextMatchesProvenance:
 class TestFolderLookup:
     """driver_resolver.find_folder_driver() for DOS0-DOS7 volumes."""
 
-    @pytest.mark.parametrize("n", range(6))
-    def test_bundled_serves_dos0_to_dos5(self, user_driver_dir, n):
-        """With an empty drivers folder, DOS0-DOS5 get the bundled handler."""
+    @pytest.mark.parametrize("n", range(8))
+    def test_bundled_serves_dos0_to_dos7(self, user_driver_dir, n):
+        """With an empty drivers folder, DOS0-DOS7 get the bundled handler."""
         resolved = driver_resolver.find_folder_driver(_dos(n), "subject")
         assert resolved.source == "bundled"
         assert resolved.path == driver_resolver.BUNDLED_DRIVER
@@ -188,8 +188,8 @@ class TestFolderLookup:
         user = _user_copy(user_driver_dir)
         assert driver_resolver.find_folder_driver(_dos(n), "subject").path == user
 
-    def test_dos7_without_user_copy_explains(self, user_driver_dir):
-        """The bundled build covers DOS0-DOS5; DOS7 says what to do."""
+    def test_dos7_without_user_copy_explains(self, user_driver_dir, bundled_dos0_to_dos5):
+        """A bundled build that covers DOS0-DOS5 says what DOS7 needs."""
         with pytest.raises(DriverNotFound) as caught:
             driver_resolver.find_folder_driver(
                 _dos(7), "ADF floppy image detected (DD, DOS7).")
@@ -206,7 +206,8 @@ class TestFolderLookup:
         (user_driver_dir / "FastFileSystem").write_bytes(b"")
         assert driver_resolver.find_folder_driver(_dos(1), "s").source == "bundled"
 
-    def test_dev_fallback_comes_last(self, user_driver_dir, monkeypatch, tmp_path):
+    def test_dev_fallback_comes_last(
+            self, user_driver_dir, monkeypatch, tmp_path, bundled_dos0_to_dos5):
         """The dev fallback serves only what nothing before it serves."""
         dev = tmp_path / "AmiFUSE-testing" / "drivers" / "FastFileSystem"
         dev.parent.mkdir(parents=True)
@@ -387,7 +388,7 @@ def no_home(monkeypatch, tmp_path):
 class TestNoHomeFolder:
     """Without a home folder, the drivers folder counts as missing."""
 
-    def test_lookup_and_doctor(self, no_home):
+    def test_lookup_and_doctor(self, no_home, bundled_dos0_to_dos5):
         from amifuse import doctor
 
         assert driver_resolver.user_driver_dir() is None
@@ -413,7 +414,7 @@ class TestNoHomeFolder:
         monkeypatch.setattr(Path, "home", classmethod(home))
         assert driver_resolver.user_driver_dir() is None
 
-    def test_inspect(self, no_home, tmp_path, capsys):
+    def test_inspect(self, no_home, tmp_path, capsys, bundled_dos0_to_dos5):
         from amifuse.fuse_fs import main
 
         main(["inspect", "--json", str(_adf(tmp_path, 1))])
@@ -460,10 +461,10 @@ class TestResolveDriver:
         assert resolved.path == temp
         assert resolved.description == "DOS3/0x444f5303 (from RDB)"
 
-    @pytest.mark.parametrize("n", range(6))
+    @pytest.mark.parametrize("n", range(8))
     def test_rdb_dos_partition_without_entry_gets_bundled(
             self, fuse_mock, user_driver_dir, monkeypatch, tmp_path, n):
-        """A DOS0-DOS5 partition with no RDB driver falls back to bundled."""
+        """A DOS0-DOS7 partition with no RDB driver falls back to bundled."""
         import amifuse.fuse_fs as fuse_fs_mod
 
         monkeypatch.setattr(fuse_fs_mod, "extract_embedded_driver", lambda *a: None)
@@ -488,7 +489,7 @@ class TestResolveDriver:
         reader.assert_not_called()
 
     def test_rdb_dos7_partition_without_entry_explains(
-            self, fuse_mock, user_driver_dir, monkeypatch, tmp_path):
+            self, fuse_mock, user_driver_dir, monkeypatch, tmp_path, bundled_dos0_to_dos5):
         """A DOS7 partition with no RDB driver and no user copy is refused."""
         import amifuse.fuse_fs as fuse_fs_mod
 
@@ -518,7 +519,8 @@ class TestResolveDriver:
             "You need to specify a filesystem handler with --driver"
         )
 
-    def test_adf_uses_the_folder_lookup(self, fuse_mock, user_driver_dir, monkeypatch, tmp_path):
+    def test_adf_uses_the_folder_lookup(
+            self, fuse_mock, user_driver_dir, monkeypatch, tmp_path, bundled_dos0_to_dos5):
         """An ADF never reads an RDB; its error names the floppy."""
         import amifuse.fuse_fs as fuse_fs_mod
 
@@ -678,7 +680,8 @@ class TestRdbImages:
             main(["ls", "--json", str(image)])
         assert json.loads(capsys.readouterr().out)["error"]["code"] == "DRIVER_NOT_FOUND"
 
-    def test_driver_for_another_dos_type(self, user_driver_dir, tmp_path, temp_dir):
+    def test_driver_for_another_dos_type(
+            self, user_driver_dir, tmp_path, temp_dir, bundled_dos0_to_dos5):
         """An RDB driver serves only its own DOS type; a DOS1 partition
         beside it gets the bundled handler, as it would get the FFS in ROM."""
         from amifuse.fuse_fs import resolve_driver
@@ -753,6 +756,13 @@ class TestDoctorDriversCheck:
         check = _drivers_check()
         assert check.status == "ok"
         assert check.message == (
+            "DOS0-DOS7: FastFileSystem 0.2 (21.10.2026) (bundled, sha256 2c66aeaa747a) "
+            f"{driver_resolver.BUNDLED_DRIVER}")
+
+    def test_bundled_dos0_to_dos5_only(self, user_driver_dir, bundled_dos0_to_dos5):
+        check = _drivers_check()
+        assert check.status == "ok"
+        assert check.message == (
             "DOS0-DOS5: FastFileSystem 0.2 (21.10.2026) (bundled, sha256 2c66aeaa747a) "
             f"{driver_resolver.BUNDLED_DRIVER}; "
             f"DOS6-DOS7: none; place your own FastFileSystem in {user_driver_dir}"
@@ -804,7 +814,7 @@ class TestDoctorDriversCheck:
         assert check.status == "warning"
         assert check.message.startswith(
             "The bundled FastFileSystem does not match the sha256 recorded in "
-            f"FastFileSystem.OS3.json ({BUNDLED_SHA256}): {bundled}; DOS0-DOS5: ")
+            f"FastFileSystem.OS3.json ({BUNDLED_SHA256}): {bundled}; DOS0-DOS7: ")
         assert capsys.readouterr().err == ""
 
     def test_unreadable_user_copy_warns(self, user_driver_dir, monkeypatch):
@@ -836,7 +846,7 @@ class TestDoctorDriversCheck:
         checks = json.loads(capsys.readouterr().out)["checks"]
         drivers = next(c for c in checks if c["name"] == "drivers")
         assert drivers["status"] == "ok"
-        assert drivers["message"].startswith("DOS0-DOS5: FastFileSystem 0.2 (21.10.2026) (bundled")
+        assert drivers["message"].startswith("DOS0-DOS7: FastFileSystem 0.2 (21.10.2026) (bundled")
 
 
 def _adf(tmp_path, n, name="test.adf"):
@@ -877,7 +887,7 @@ class TestInspectAdf:
         }
 
     def test_json_dev_fallback_reports_what_it_can(
-            self, user_driver_dir, monkeypatch, tmp_path, capsys):
+            self, user_driver_dir, monkeypatch, tmp_path, capsys, bundled_dos0_to_dos5):
         from amifuse.fuse_fs import main
 
         dev = tmp_path / "AmiFUSE-testing" / "drivers" / "FastFileSystem"
@@ -903,7 +913,8 @@ class TestInspectAdf:
         assert data["driver"] is None
         assert f"Cannot read your FastFileSystem: {user}" in data["note"]
 
-    def test_json_driver_is_null_for_dos7_without_user_copy(self, user_driver_dir, tmp_path, capsys):
+    def test_json_driver_is_null_for_dos7_without_user_copy(
+            self, user_driver_dir, tmp_path, capsys, bundled_dos0_to_dos5):
         from amifuse.fuse_fs import main
 
         main(["inspect", "--json", str(_adf(tmp_path, 7))])
@@ -1146,7 +1157,7 @@ class TestInspectSameRdbNames:
         main(["inspect", "--json", str(image)])
         return json.loads(capsys.readouterr().out)["partitions"]
 
-    def test_json_shared_name(self, user_driver_dir, tmp_path, capsys):
+    def test_json_shared_name(self, user_driver_dir, tmp_path, capsys, bundled_dos0_to_dos5):
         """The second dh0 is DOS7, which the bundled driver mount would use
         for DH0 does not serve."""
         first, second = self._partitions(
@@ -1161,7 +1172,7 @@ class TestInspectSameRdbNames:
             assert part["driver"]["source"] == "bundled"
             assert "driver_note" not in part
 
-    def test_text_shared_name(self, user_driver_dir, tmp_path, capsys):
+    def test_text_shared_name(self, user_driver_dir, tmp_path, capsys, bundled_dos0_to_dos5):
         from amifuse.fuse_fs import main
 
         main(["inspect", str(_two_partitions(tmp_path, "dh0", "DOS7"))])

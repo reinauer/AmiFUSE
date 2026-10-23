@@ -6,7 +6,7 @@
   "size": 72044,
   "sha256": "2c66aeaa747a0ba3b4e40281663d5de2b99c1345987d510d5ce4a3d1453d0b7a",
   "license": "BSD-2-Clause",
-  "dos_types": ["DOS0", "DOS1", "DOS2", "DOS3", "DOS4", "DOS5"],
+  "dos_types": ["DOS0", "DOS1", "DOS2", "DOS3", "DOS4", "DOS5", "DOS6", "DOS7"],
   "build": {
     "image": "stefanreinauer/amiga-gcc:gcc-v13.4",
     "command": "make amigaos3",
