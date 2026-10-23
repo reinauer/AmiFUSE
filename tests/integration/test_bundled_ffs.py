@@ -190,23 +190,58 @@ def test_bridge_reads_and_writes_without_driver(tmp_path, no_user_driver, dos, h
     assert _xdf_read(image, "Sub/Multi.bin", tmp_path) == MULTI_DATA
 
 
-def test_long_name_on_dos7(tmp_path, no_user_driver):
-    """A DOS7 volume keeps a name longer than the 30 bytes DOS0-DOS5 allow;
-    xdftool lists the file and reads it back."""
-    image = _seed_adf(tmp_path, "DOS7")
+def _used_blocks(image: Path) -> int:
+    """The used block count xdftool reads from the volume's bitmap."""
+    line = next(line for line in _xdftool(image, "info").splitlines()
+                if line.startswith("used:"))
+    return int(line.split()[1])
+
+
+@pytest.mark.parametrize("dos", ["DOS6", "DOS7"])
+def test_long_names(tmp_path, no_user_driver, dos):
+    """A long-name volume keeps a name longer than the 30 bytes DOS0-DOS5
+    allow, also when renamed to another one; xdftool reads the file back
+    under each name, and deleting it frees every block it used."""
+    image = _seed_adf(tmp_path, dos)
+    used = _used_blocks(image)
     adf_info = detect_adf(image)
     resolved = resolve_driver(image, None, None, None, adf_info=adf_info)
     assert resolved.source == "bundled"
     name = "A name longer than the 30 bytes of DOS0-DOS5.bin"
-    bridge = HandlerBridge(image, resolved.path, read_only=False, adf_info=adf_info)
-    try:
-        _write_file(bridge, "/" + name, NEW_DATA)
-        assert name in {e["name"] for e in bridge.list_dir_path("/")}
-        bridge.flush_volume()
-    finally:
-        bridge.close()
-    assert name in _xdftool(image, "list")
+    renamed = "Renamed to another name longer than 30 bytes.bin"
+
+    def session(step):
+        bridge = HandlerBridge(image, resolved.path, read_only=False, adf_info=adf_info)
+        try:
+            root_lock, res2 = bridge.locate(0, "")
+            assert root_lock, f"locate root failed: {res2}"
+            try:
+                step(bridge, root_lock)
+            finally:
+                bridge.free_lock(root_lock)
+            bridge.flush_volume()
+        finally:
+            bridge.close()
+
+    session(lambda bridge, root: _write_file(bridge, "/" + name, NEW_DATA))
     assert _xdf_read(image, name, tmp_path) == NEW_DATA
+
+    def rename(bridge, root):
+        res1, res2 = bridge.rename_object(root, name, root, renamed)
+        assert res1, f"rename failed: {res2}"
+
+    session(rename)
+    listing = _xdftool(image, "list")
+    assert renamed in listing and name not in listing
+    assert _xdf_read(image, renamed, tmp_path) == NEW_DATA
+
+    def delete(bridge, root):
+        res1, res2 = bridge.delete_object(root, renamed)
+        assert res1, f"delete failed: {res2}"
+
+    session(delete)
+    assert renamed not in _xdftool(image, "list")
+    assert _used_blocks(image) == used
 
 
 def test_bridge_starts_quickly(tmp_path, no_user_driver):

@@ -415,7 +415,8 @@ scripts. Tests are organized into two layers:
   example with an empty drivers folder, so the bundled handler serves it.
 - `tests/integration/test_bundled_ffs.py` runs the bundled handler with no
   `--driver` on images it builds with amitools' `xdftool` and `rdbtool`: DOS0-7
-  floppies, a DOS3 HD floppy, an RDB partition without a driver and a sparse
+  floppies (on DOS6/DOS7 also a long name, renamed and deleted), a DOS3 HD
+  floppy, an RDB partition without a driver and a sparse
   image whose partition ends past 4 GiB. It needs machine68k but no external
   fixtures, so it is not `integration`-marked. Its `fuse`-marked mount tests
   run in the mount job, including the Windows launcher's command line.
