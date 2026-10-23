@@ -4181,11 +4181,12 @@ class TestCreateBridgeFromArgs:
 
     def test_bridge_adf_no_driver_json_error(
         self, fuse_mock, monkeypatch, tmp_path, capsys, user_driver_dir,
+        bundled_dos0_to_dos5,
     ):
         """DOS7 ADF without --driver or a user copy: verify JSON body.
 
-        The bundled FastFileSystem covers DOS0-DOS5, so only a long-name
-        floppy is left without a driver.
+        With a bundled build that covers DOS0-DOS5, a long-name floppy
+        is left without a driver.
         """
         import amifuse.fuse_fs as fuse_fs_mod
 
@@ -4251,7 +4252,7 @@ class TestCreateBridgeFromArgs:
     ):
         """A non-DOS RDB partition with no embedded driver emits DRIVER_NOT_FOUND.
 
-        DOS0-DOS5 partitions fall back to the bundled FastFileSystem, so
+        DOS0-DOS7 partitions fall back to the bundled FastFileSystem, so
         this uses a PFS3 partition.
         """
         import amifuse.fuse_fs as fuse_fs_mod
@@ -4334,7 +4335,8 @@ class TestAdfDriverAutoResolution:
         assert captured["args"][1] == driver_file
         assert temp_driver is None
 
-    def test_adf_no_driver_found_error(self, monkeypatch, tmp_path, user_driver_dir):
+    def test_adf_no_driver_found_error(
+            self, monkeypatch, tmp_path, user_driver_dir, bundled_dos0_to_dos5):
         """A DOS7 ADF with no user copy fails, naming the drivers folder."""
         import amifuse.fuse_fs as fuse_fs_mod
 

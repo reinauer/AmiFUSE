@@ -55,7 +55,7 @@ def no_user_driver(monkeypatch, tmp_path):
     """An empty user drivers folder and no dev fallback.
 
     The dev fallback is CI's AmiFUSE-testing clone. A subprocess still sees
-    it, but it comes after the bundled handler, which serves DOS0-DOS5.
+    it, but it comes after the bundled handler, which serves DOS0-DOS7.
     """
     home = tmp_path / "home"
     home.mkdir()
@@ -151,8 +151,8 @@ def _big_partition_image(tmp_path: Path) -> Path:
 @pytest.mark.parametrize("dos, hd", [
     ("DOS0", False), ("DOS1", False), ("DOS2", False),
     ("DOS3", False), ("DOS4", False), ("DOS5", False),
-    ("DOS3", True),
-], ids=["DOS0", "DOS1", "DOS2", "DOS3", "DOS4", "DOS5", "DOS3-HD"])
+    ("DOS6", False), ("DOS7", False), ("DOS3", True),
+], ids=["DOS0", "DOS1", "DOS2", "DOS3", "DOS4", "DOS5", "DOS6", "DOS7", "DOS3-HD"])
 def test_bridge_reads_and_writes_without_driver(tmp_path, no_user_driver, dos, hd):
     """List and read xdftool's files, then create, mkdir, delete and flush;
     xdftool reads the result back."""
@@ -188,6 +188,25 @@ def test_bridge_reads_and_writes_without_driver(tmp_path, no_user_driver, dos, h
     assert "Root.txt" not in listing
     assert _xdf_read(image, "Sub/New.bin", tmp_path) == NEW_DATA
     assert _xdf_read(image, "Sub/Multi.bin", tmp_path) == MULTI_DATA
+
+
+def test_long_name_on_dos7(tmp_path, no_user_driver):
+    """A DOS7 volume keeps a name longer than the 30 bytes DOS0-DOS5 allow;
+    xdftool lists the file and reads it back."""
+    image = _seed_adf(tmp_path, "DOS7")
+    adf_info = detect_adf(image)
+    resolved = resolve_driver(image, None, None, None, adf_info=adf_info)
+    assert resolved.source == "bundled"
+    name = "A name longer than the 30 bytes of DOS0-DOS5.bin"
+    bridge = HandlerBridge(image, resolved.path, read_only=False, adf_info=adf_info)
+    try:
+        _write_file(bridge, "/" + name, NEW_DATA)
+        assert name in {e["name"] for e in bridge.list_dir_path("/")}
+        bridge.flush_volume()
+    finally:
+        bridge.close()
+    assert name in _xdftool(image, "list")
+    assert _xdf_read(image, name, tmp_path) == NEW_DATA
 
 
 def test_bridge_starts_quickly(tmp_path, no_user_driver):
