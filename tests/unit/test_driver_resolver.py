@@ -1157,9 +1157,9 @@ class TestInspectSameRdbNames:
         main(["inspect", "--json", str(image)])
         return json.loads(capsys.readouterr().out)["partitions"]
 
-    def test_json_shared_name(self, user_driver_dir, tmp_path, capsys, bundled_dos0_to_dos5):
-        """The second dh0 is DOS7, which the bundled driver mount would use
-        for DH0 does not serve."""
+    def test_json_shared_name(self, user_driver_dir, tmp_path, capsys):
+        """The second dh0 gets no driver, although the bundled handler would
+        serve its DOS type, because mount --partition dh0 reaches DH0."""
         first, second = self._partitions(
             _two_partitions(tmp_path, "dh0", "DOS7"), capsys)
         assert first["driver"]["source"] == "bundled"
@@ -1172,7 +1172,7 @@ class TestInspectSameRdbNames:
             assert part["driver"]["source"] == "bundled"
             assert "driver_note" not in part
 
-    def test_text_shared_name(self, user_driver_dir, tmp_path, capsys, bundled_dos0_to_dos5):
+    def test_text_shared_name(self, user_driver_dir, tmp_path, capsys):
         from amifuse.fuse_fs import main
 
         main(["inspect", str(_two_partitions(tmp_path, "dh0", "DOS7"))])

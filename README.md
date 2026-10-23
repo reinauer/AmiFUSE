@@ -440,8 +440,8 @@ that the three agree. Messages from `doctor`, `inspect` and failed mounts take t
 covered DOS types from the provenance file. If `dos_types` changes, also update
 the ranges written out in the `--driver` help in `amifuse/fuse_fs.py` and in this
 README (the `--driver` row, the ADF example, Supported Image Formats, Supported
-Filesystems and this section); the unit tests check them against the provenance
-file.
+Filesystems and this section), and in `TESTING.md`; the unit tests check the help
+and the README against the provenance file.
 
 ## Icon Support
 
