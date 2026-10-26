@@ -82,6 +82,7 @@ class BlockDeviceBackend:
         self.partition_scope = partition_scope and adf_info is None and iso_info is None
         self.partition = partition
         self._block_range = None
+        self._fsync_error = None
         # Physical disks keep their existing whole-device exclusion policy.
         if (self.partition_scope and _range_locks_supported()
                 and not is_windows_disk(image)
@@ -299,8 +300,19 @@ class BlockDeviceBackend:
         # An MBR partition's OffsetBlockDevice wraps the image's device.
         img_file = getattr(self.blkdev, "base", self.blkdev).img_file
         # Windows can't fsync a read-only descriptor.
-        if not img_file.read_only:
+        if img_file.read_only:
+            return
+        # The host reports a failed writeback to one fsync only and may drop
+        # the pages, so a later fsync would succeed with the data lost.
+        if self._fsync_error is not None:
+            raise OSError(self._fsync_error.errno,
+                          f"an earlier fsync of the image failed: "
+                          f"{self._fsync_error.strerror}")
+        try:
             os.fsync(img_file.fobj.fileno())
+        except OSError as exc:
+            self._fsync_error = exc
+            raise
 
     def describe(self) -> str:
         if self.adf_info is not None:

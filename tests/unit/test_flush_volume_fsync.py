@@ -5,6 +5,7 @@ only moves it into the host's cache, which a power loss or an OS crash
 still loses.
 """
 
+import errno
 import os
 import threading
 from types import SimpleNamespace
@@ -96,6 +97,37 @@ def test_read_only_mount_never_fsyncs(adf, events):
         assert events == ["reply", "sync"]
     finally:
         backend.close()
+
+
+def test_failed_fsync_fails_every_later_flush(adf, events, monkeypatch):
+    # Linux reports a writeback error to the next fsync only, and may drop
+    # the failed pages: a retried fsync() or the unmount's flush would
+    # then succeed with the data lost.
+    calls = []
+
+    def fsync(fd):
+        calls.append(fd)
+        if len(calls) == 1:
+            raise OSError(errno.EIO, "Input/output error")
+
+    monkeypatch.setattr(os, "fsync", fsync)
+    backend = _backend(adf, read_only=False)
+    try:
+        bridge = _bridge(backend, events)
+        for _ in range(2):
+            with pytest.raises(OSError) as caught:
+                bridge.flush_volume()
+            assert caught.value.errno == errno.EIO
+        assert len(calls) == 1
+    finally:
+        backend.close()
+
+
+def test_closed_backend_never_fsyncs(adf, events):
+    backend = _backend(adf, read_only=False)
+    backend.close()
+    backend.fsync()
+    assert events == []
 
 
 def test_unacknowledged_flush_does_not_fsync(adf, events):
