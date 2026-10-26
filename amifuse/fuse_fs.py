@@ -6435,11 +6435,16 @@ def cmd_inspect(args):
             finally:
                 rdisk.close()
                 blkdev.close()
+            if mbr_ctx is not None and mbr_ctx.mbr_partition is None:
+                # Parceiro-style: open_rdisk found the disk's own RDB, which
+                # it does whichever 0x76 partition is selected. Describe it
+                # once, as for a single RDB.
+                break
 
         # Resolved with the image closed: a Windows disk admits one reader.
         for rdb_idx, desc in enumerate(all_rdbs):
-            # A Parceiro disk's own RDB opens through every 0x76 entry, so
-            # its copies here are one RDB, not a clash.
+            # A Parceiro disk's own RDB is the only one mount opens, so no
+            # other RDB can take its names.
             parceiro = desc.get("mbr", {}).get("scheme") == "parceiro"
             seen = set()
             for part in desc["partitions"]:
@@ -6496,7 +6501,7 @@ def cmd_inspect(args):
             text = _partition_driver(args.image, args.block_size, part.name)[1]
         seen.add(part.name.lower())
         print(f"  {part.name}: {text}")
-    if listed.fallback_reason and not _is_parceiro(args.image, args.block_size):
+    if listed.fallback_reason:
         print(f"  Note: {listed.fallback_reason}")
 
 
@@ -6504,23 +6509,6 @@ def _earlier_name_note(name: str) -> str:
     """Why a partition named like an earlier one in its RDB has no driver."""
     return (f"an earlier partition in this RDB is also named {name}, "
             f"and mount --partition {name} uses that one")
-
-
-def _is_parceiro(image: Path, block_size: Optional[int]) -> bool:
-    """Whether the image's RDB is a Parceiro disk's own, beside its MBR.
-
-    list_partitions finds that one RDB through every 0x76 entry, so its
-    names repeat without clashing.
-    """
-    from .rdb_inspect import open_rdisk
-
-    try:
-        blkdev, rdisk, mbr_ctx = open_rdisk(image, block_size=block_size)
-    except IOError:
-        return False
-    rdisk.close()
-    blkdev.close()
-    return mbr_ctx is not None and mbr_ctx.scheme == "parceiro"
 
 
 def cmd_mount(args):
