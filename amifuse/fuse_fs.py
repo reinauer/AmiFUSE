@@ -2332,9 +2332,9 @@ class HandlerBridge:
         shrink carries the handler's error code. A shrink whose reply
         carries an error code fails even when dp_Res1 is a size: BFFS
         refuses every ACTION_SET_FILE_SIZE with DOSFALSE, which reads as a
-        size of 0. A refused truncate to 0 of a file already empty still
-        returns (0, 0). A length outside 0 to 0x7FFFFFFF, a failed seek or
-        a missing reply carries 0.
+        size of 0. A truncate to 0 that BFFS refuses with DOSFALSE still
+        returns (0, 0) when the file is already empty. A length outside 0
+        to 0x7FFFFFFF, a failed seek or a missing reply carries 0.
 
         A grow writes zeros from the old end of file, as a write past it
         does, and fails before writing anything when the volume cannot
@@ -2406,10 +2406,14 @@ class HandlerBridge:
                 return size, 0
             # A truncate to 0 skipped the end check, and BFFS refuses even
             # one that changes nothing, so its refusal of an empty file is
-            # no failure. Other refusals send nothing more: with no reply,
-            # or after a retry seek that failed, the handler may still hold
-            # a packet.
-            if (not length and size == 0 and res2
+            # no failure. Only BFFS's own reply can be such a refusal: with
+            # no reply the handler may still hold the packet, and a handler
+            # that refuses every packet with DOSFALSE, such as one with no
+            # disk, answers the seeks the same way, so they would read as
+            # an end of 0.
+            if (not length and size == 0
+                    and res2 in (ERROR_OBJECT_NOT_FOUND,
+                                 ERROR_DISK_WRITE_PROTECTED)
                     and self._handle_end(fh_addr) == 0):
                 return 0, 0
             return -1, res2
