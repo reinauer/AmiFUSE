@@ -2324,8 +2324,12 @@ class HandlerBridge:
         Returns (new size, 0), or (-1, error) when the change fails: a
         failed grow carries ERROR_DISK_FULL when the volume cannot hold
         it, or the error code of the write that failed, and a failed
-        shrink carries the handler's error code. A length outside 0 to
-        0x7FFFFFFF, a failed seek or a missing reply carries 0.
+        shrink carries the handler's error code. A shrink whose reply
+        carries an error code fails even when dp_Res1 is a size: BFFS
+        refuses every ACTION_SET_FILE_SIZE with DOSFALSE, which reads as a
+        size of 0. A refused truncate to 0 of a file already empty still
+        returns (0, 0). A length outside 0 to 0x7FFFFFFF, a failed seek or
+        a missing reply carries 0.
 
         A grow writes zeros from the old end of file, as a write past it
         does, and fails before writing anything when the volume cannot
@@ -2393,7 +2397,17 @@ class HandlerBridge:
                 if all(self.seek_handle(other, 0)[0] is SeekResult.OK
                        for other in others):
                     size, res2 = self.set_handle_size_reply(fh_addr, length)
-            return (size, 0) if size >= 0 else (-1, res2)
+            if size >= 0 and not res2:
+                return size, 0
+            # A truncate to 0 skipped the end check, and BFFS refuses even
+            # one that changes nothing, so its refusal of an empty file is
+            # no failure. Other refusals send nothing more: with no reply,
+            # or after a retry seek that failed, the handler may still hold
+            # a packet.
+            if (not length and size == 0 and res2
+                    and self._handle_end(fh_addr) == 0):
+                return 0, 0
+            return -1, res2
 
     def set_handle_size(self, fh_addr: int, size: int, mode: int = OFFSET_BEGINNING) -> int:
         """Make the file size bytes long, as AmigaDOS SetFileSize() does.
@@ -3272,8 +3286,9 @@ class AmigaFuseFS(_FuseOperations):
             # write() only ever raises it. Left stale, it would place the
             # next O_APPEND write past the new end of file. The pin is under
             # the handle's path. A shrink that stopped short left the file at
-            # size. A smaller size means the handler changed nothing: BFFS
-            # replies 0 to every ACTION_SET_FILE_SIZE.
+            # size. A smaller size with no error code, which no handler is
+            # known to reply, is not a size the file is known to have, so
+            # the pin stays.
             path = _handle_path(entry, path)
             if path in self._pinned_stats and size >= length:
                 with self._cache_lock:
