@@ -3302,6 +3302,7 @@ class AmigaFuseFS(_FuseOperations):
                 self._log_op("create", path, "FAILED: open_file returned None")
                 raise FuseOSError(errno.EIO)
             fh_addr, parent_lock = opened
+            self._forget_pending_delete(path)
             with self._fh_lock:
                 handle = self._next_fh
                 self._next_fh += 1
@@ -3393,26 +3394,33 @@ class AmigaFuseFS(_FuseOperations):
         self._log_op("rmdir", path, f"delete_dir_atomic res1={res1} res2={res2}")
         if res1 == 0:
             if res2 == 202:
-                # OBJECT_IN_USE — defer unconditionally; releasedir will retry
+                # OBJECT_IN_USE: pfs3aio refuses while a file inside is open,
+                # even an unlinked one. Defer only where a retry will come:
+                # release() of the last pending child, or releasedir() of a
+                # FUSE directory handle open on this path.
                 with self._fh_lock:
-                    self._pending_deletes.add(path)
+                    pending_children = self._pending_children(path)
+                    dir_open = any(
+                        v.get("dir_handle") and v.get("path") == path
+                        for v in self._fh_cache.values()
+                    )
+                    if pending_children:
+                        self._pending_dir_deletes[path] = pending_children
+                    if pending_children or dir_open:
+                        self._pending_deletes.add(path)
+                if not (pending_children or dir_open):
+                    self._log_op("rmdir", path, "in use, nothing would retry: EBUSY")
+                    raise FuseOSError(errno.EBUSY)
                 with self._cache_lock:
                     self._stat_cache.pop(path, None)
                     self._dir_cache.pop(dir_path, None)
                     self._dir_cache.pop(path, None)
+                self._log_op("rmdir", path, "deferred (object in use)")
                 return 0
             if res2 == 216:
                 # DIRECTORY_NOT_EMPTY — defer only if pending children exist.
-                # Direct children only: _resolve_pending_dir_deletes strikes
-                # a deleted path off its parent's set and no other.
                 with self._fh_lock:
-                    pending_children = {
-                        p for p in self._pending_deletes
-                        if p.rsplit("/", 1)[0] == path
-                    }
-                    for d in self._pending_dir_deletes:
-                        if d.rsplit("/", 1)[0] == path:
-                            pending_children.add(d)
+                    pending_children = self._pending_children(path)
                     if pending_children:
                         self._pending_dir_deletes[path] = pending_children.copy()
                         self._pending_deletes.add(path)
@@ -3428,11 +3436,28 @@ class AmigaFuseFS(_FuseOperations):
             # Unrecognized error
             raise FuseOSError(errno.EIO)
         # Immediate success
+        self._forget_pending_delete(path)
         with self._cache_lock:
             self._stat_cache.pop(path, None)
             self._dir_cache.pop(dir_path, None)
             self._dir_cache.pop(path, None)
         return 0
+
+    def _pending_children(self, path: str) -> set:
+        """Direct children of path with a pending delete. Caller holds _fh_lock.
+
+        Direct children only: _resolve_pending_dir_deletes strikes a deleted
+        path off its parent's set and no other.
+        """
+        children = {p for p in self._pending_deletes if p.rsplit("/", 1)[0] == path}
+        children.update(d for d in self._pending_dir_deletes if d.rsplit("/", 1)[0] == path)
+        return children
+
+    def _forget_pending_delete(self, path: str):
+        """Stop hiding path once its delete is done or a new object holds the name."""
+        with self._fh_lock:
+            self._pending_deletes.discard(path)
+            self._pending_dir_deletes.pop(path, None)
 
     def mkdir(self, path, mode):
         self._check_handler_alive()
@@ -3452,6 +3477,7 @@ class AmigaFuseFS(_FuseOperations):
         finally:
             for l in reversed(locks):
                 self.bridge.free_lock(l)
+        self._forget_pending_delete(path)
         with self._cache_lock:
             self._dir_cache.pop(dir_path, None)
         return 0
