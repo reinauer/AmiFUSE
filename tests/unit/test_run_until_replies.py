@@ -75,7 +75,7 @@ def _bridge(launcher):
     bridge._busy_ran_out = False
     bridge._lock = threading.RLock()
     bridge.launcher = launcher
-    bridge.backend = SimpleNamespace(sync=lambda: None)
+    bridge.backend = SimpleNamespace(sync=lambda: None, fsync=lambda: None)
     bridge.state = SimpleNamespace(crashed=False, pc=0x4000, main_loop_pc=0,
                                    initialized=True, reply_port_addr=0x3000,
                                    run_state=None)

@@ -5,6 +5,7 @@ MBR, ADF, or ISO) onto host file I/O for the filesystem handler runtime.
 
 import ctypes
 import errno
+import os
 import sys
 import stat
 from pathlib import Path
@@ -286,6 +287,20 @@ class BlockDeviceBackend:
         """Flush any buffered writes to the underlying file."""
         if self.blkdev:
             self.blkdev.flush()
+
+    def fsync(self):
+        """Ask the host OS to write the image file to stable storage.
+
+        sync() leaves the written blocks in the host's cache. A Windows
+        physical disk needs no more: its flush() calls FlushFileBuffers.
+        """
+        if not self.blkdev or is_windows_disk(self.image):
+            return
+        # An MBR partition's OffsetBlockDevice wraps the image's device.
+        img_file = getattr(self.blkdev, "base", self.blkdev).img_file
+        # Windows can't fsync a read-only descriptor.
+        if not img_file.read_only:
+            os.fsync(img_file.fobj.fileno())
 
     def describe(self) -> str:
         if self.adf_info is not None:
