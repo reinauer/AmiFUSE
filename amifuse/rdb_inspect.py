@@ -910,13 +910,15 @@ def list_partitions(
     pattern; ``RDisk.close()`` only nulls its state, so the block device must be
     closed separately or the image handle leaks).
 
-    For multi-RDB images (Emu68/Parceiro disks with more than one ``0x76`` MBR
+    For multi-RDB images (Emu68-style disks with more than one ``0x76`` MBR
     partition, each carrying its own RDB) it enumerates across ALL ``0x76`` RDBs,
     mirroring the multi-RDB loop in ``rdb_inspect.main`` / ``fuse_fs.cmd_inspect``.
     Names -- not indices -- are the fan-out key, because ``Partition.num``
     restarts at 0 in each RDB and so collides across RDBs; every emitted name
     re-resolves through the existing, tested ``find_partition_mbr_index`` name
-    path when the caller spawns ``--partition <name>``.
+    path when the caller spawns ``--partition <name>``. A Parceiro disk's own
+    RDB, beside its MBR, opens through every ``0x76`` entry and is enumerated
+    once, as the disk's one RDB.
 
     RDB-ONLY: the caller performs the non-RDB short-circuit (``detect_adf`` /
     ``detect_iso``) BEFORE calling this. ``list_partitions`` does not probe for
@@ -960,7 +962,7 @@ def list_partitions(
     first_part: Optional[PartInfo] = None
     for rdb_idx in range(len(amiga_parts)):
         try:
-            blkdev, rdisk, _mbr_ctx = open_rdisk(
+            blkdev, rdisk, mbr_ctx = open_rdisk(
                 image, block_size=block_size, mbr_partition_index=rdb_idx
             )
         except IOError:
@@ -987,6 +989,11 @@ def list_partitions(
         for info in rdb_parts:
             seen_names[info.name.lower()] = info
             all_parts.append(info)
+
+        if mbr_ctx is not None and mbr_ctx.mbr_partition is None:
+            # Parceiro-style: open_rdisk found the disk's own RDB, which it
+            # does whichever 0x76 partition is selected. List it once.
+            break
 
     return PartitionList(partitions=all_parts)
 
