@@ -4,6 +4,12 @@ The registry is real, but it is not the user's: for this module the process's
 HKEY_CURRENT_USER is mapped onto a scratch key, and the AmiFUSE folder under
 APPDATA is moved into tmp_path. register() and unregister() then leave the
 Explorer registration, icons and launch.vbs of an installed AmiFUSE alone.
+
+The mapping holds only inside this process: a test here that registers
+through a child process (``python -m amifuse ...``, ``reg.exe``) would write
+the real HKCU. A run killed before teardown (by pytest-timeout's
+``os._exit``, for one) leaves its scratch key, HKCU\\Software\\AmiFUSE-test-<hex>,
+behind; the registration itself is never touched.
 """
 
 import ctypes
@@ -62,9 +68,22 @@ def hkcu_sandbox():
         finally:
             restored = override(hkcu, None)
     finally:
-        winreg.CloseKey(scratch)
-        _delete_key_recursive(hkcu, scratch_path)
-    assert restored == 0, f"RegOverridePredefKey restore failed: {ctypes.FormatError(restored)}"
+        # While the mapping is still in place, deleting through
+        # HKEY_CURRENT_USER would act inside the scratch key, not on the hive.
+        if restored == 0:
+            winreg.CloseKey(scratch)
+            _delete_key_recursive(hkcu, scratch_path)
+            try:
+                winreg.CloseKey(winreg.OpenKey(hkcu, scratch_path))
+            except FileNotFoundError:
+                pass
+            else:
+                pytest.fail(f"Scratch key HKCU\\{scratch_path} was not deleted")
+        else:
+            pytest.fail(
+                f"RegOverridePredefKey restore failed: {ctypes.FormatError(restored)}; "
+                f"HKEY_CURRENT_USER stays mapped onto HKCU\\{scratch_path} in this process"
+            )
 
 
 @pytest.fixture
@@ -193,9 +212,9 @@ class TestWindowsShellRegistration:
         assert not (ICON_DIR / "diskimage.ico").exists()
         assert not (ICON_DIR / "floppyimage.ico").exists()
 
-    def test_register_stays_in_sandbox(self, hkcu_sandbox, tmp_path):
+    def test_register_stays_in_sandbox(self, hkcu_sandbox, appdata_sandbox):
         """register() writes into the scratch key, and its verbs run the
-        launch.vbs below tmp_path."""
+        sandboxed launch.vbs."""
         import winreg
         from amifuse.windows_shell import register
 
@@ -211,5 +230,6 @@ class TestWindowsShellRegistration:
             command, _ = winreg.QueryValueEx(key, "")
         finally:
             winreg.CloseKey(key)
-        assert f'"{tmp_path / "AmiFUSE" / "launch.vbs"}"' in command
-        assert (tmp_path / "AmiFUSE" / "launch.vbs").exists()
+        launch_vbs = appdata_sandbox / "launch.vbs"
+        assert f'"{launch_vbs}"' in command
+        assert launch_vbs.exists()
