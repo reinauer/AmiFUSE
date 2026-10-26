@@ -138,7 +138,7 @@ class TestMountCommand:
         mock_windll.kernel32.OpenMutexW.return_value = 1
 
         # First Popen raises (breakaway denied), second succeeds
-        mock_popen.side_effect = [OSError("breakaway denied"), MagicMock()]
+        mock_popen.side_effect = [OSError("breakaway denied"), mock_popen.return_value]
 
         from amifuse.launcher import (
             main, DETACHED_PROCESS, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW,
@@ -752,11 +752,11 @@ class TestMountImageAllFanOut:
 
         # WB_2.x (E:) never launches: raise a NON-OSError so _spawn_detached
         # propagates immediately (its retry only catches OSError). The other two
-        # spawns succeed.
+        # spawns succeed and keep running, as a live mount does.
         def _side(cmd, *a, **kw):
             if "--partition" in cmd and cmd[cmd.index("--partition") + 1] == "WB_2.x":
                 raise RuntimeError("CreateProcess failed")
-            return MagicMock()
+            return mock_popen.return_value
         mock_popen.side_effect = _side
 
         from amifuse.launcher import main
