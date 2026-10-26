@@ -3535,6 +3535,19 @@ class AmigaFuseFS(_FuseOperations):
             raise FuseOSError(errno.EIO) from exc
         return 0
 
+    def fsyncdir(self, path, datasync, fh):
+        self._log_op("fsyncdir", path, f"fh={fh} datasync={datasync}")
+        self._check_handler_alive()
+        if not self.bridge._write_enabled:
+            return 0
+        # A create, rename, delete or mkdir in the directory can still be in
+        # the handler's buffers, and ACTION_FLUSH writes out the whole volume.
+        try:
+            self.bridge.flush_volume()
+        except OSError as exc:
+            raise FuseOSError(errno.EIO) from exc
+        return 0
+
     def chmod(self, path, mode):
         if not self.bridge._write_enabled:
             raise FuseOSError(errno.EROFS)
