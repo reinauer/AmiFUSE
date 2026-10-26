@@ -386,8 +386,9 @@ def mount_image_all(image: str, *, write: bool, explorer: str) -> None:
         pending[letter] = unit
         procs[letter] = (proc, stderr_path)
 
-    # Single aggregate-deadline poll. os.path.exists("<letter>\\") is the CORRECT
-    # "did my mount appear" probe (a live WinFSP mount has media) and is distinct
+    # Single aggregate-deadline poll. Once the mount's process is known not to
+    # have failed, os.path.exists("<letter>\\") is the "did my mount appear"
+    # probe (a live WinFSP mount has media). It is distinct
     # from the GetLogicalDrives allocation bitmask used to SELECT letters -- do
     # not merge the two probes. This blocks up to the aggregate deadline before
     # main() reaches os._exit(0); safe because both shell verbs launch hidden and
@@ -403,7 +404,19 @@ def mount_image_all(image: str, *, write: bool, explorer: str) -> None:
             time.sleep(poll_interval)
             elapsed += poll_interval
             for letter in list(pending):
-                if os.path.exists(letter + "\\"):
+                # Check the process before the drive: a drive at this letter
+                # may be another launch's mount that took the same letter, so
+                # a mount that exited with an error (e.g. no driver for the
+                # DOS type, or the letter already allocated) is a failure even
+                # when the drive is present.
+                if procs[letter][0].poll() not in (None, 0):
+                    unit = pending.pop(letter)
+                    proc, stderr_path = procs[letter]
+                    _log(f"Mount for {letter} exited with code {proc.returncode}")
+                    exited.append(
+                        (unit, letter, _mount_error(stderr_path, proc.returncode))
+                    )
+                elif os.path.exists(letter + "\\"):
                     unit = pending.pop(letter)
                     succeeded.append((unit, letter))
                     _log(f"Mount ready at {letter} after {elapsed:.1f}s")
@@ -414,15 +427,6 @@ def mount_image_all(image: str, *, write: bool, explorer: str) -> None:
                             os.startfile(letter + "\\")
                         except OSError as exc:
                             _log(f"Could not open Explorer for {letter}: {exc}")
-                elif procs[letter][0].poll() not in (None, 0):
-                    # The mount exited with an error (e.g. no driver for the
-                    # DOS type), so its drive will never appear.
-                    unit = pending.pop(letter)
-                    proc, stderr_path = procs[letter]
-                    _log(f"Mount for {letter} exited with code {proc.returncode}")
-                    exited.append(
-                        (unit, letter, _mount_error(stderr_path, proc.returncode))
-                    )
 
         # Whatever is still pending timed out -- report softly (may be a slow
         # cold mount, or a mount that is still running without its drive). The
