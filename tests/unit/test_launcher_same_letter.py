@@ -11,6 +11,7 @@ launcher's logs go to ``tmp_path``.
 
 from __future__ import annotations
 
+import subprocess
 import sys
 from unittest.mock import MagicMock
 
@@ -59,7 +60,7 @@ def launcher(monkeypatch, tmp_path):
 
     def run(verb, returncode, stderr_text):
         def fake_popen(cmd, **kwargs):
-            if stderr_text:
+            if stderr_text and kwargs["stderr"] != subprocess.DEVNULL:
                 kwargs["stderr"].write(stderr_text)
                 kwargs["stderr"].flush()  # a real child's writes reach the file
             proc = MagicMock()
@@ -91,6 +92,27 @@ def test_exited_mount_is_reported_although_its_letter_is_present(
     log = (tmp_path / "launcher.log").read_text()
     assert "Mount for D: exited with code 1" in log
     assert "Mount ready at D:" not in log
+
+
+@pytest.mark.parametrize("verb", ["open", "mount"])
+def test_exited_mount_is_reported_when_the_other_launch_holds_its_log(
+    launcher, tmp_path, verb
+):
+    """The other ordering of the race: the winning launch opened mount-D.log
+    first and still holds it, so this mount's stderr goes to DEVNULL. The
+    launch still reports the failure, with its exit code."""
+    run, opened = launcher
+    held = open(str(tmp_path / "mount-D.log"), "w")
+    try:
+        msg = run(verb, 1, ALLOCATED)
+    finally:
+        held.close()
+
+    assert msg is not None
+    assert "Could not mount floppy disk (D:):" in msg
+    assert "exited with code 1" in msg
+    assert opened == []
+    assert "Mount ready at D:" not in (tmp_path / "launcher.log").read_text()
 
 
 def test_running_mount_whose_drive_appears_opens_explorer(launcher, tmp_path):
