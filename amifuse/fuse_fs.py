@@ -960,8 +960,8 @@ class HandlerBridge:
         any packet, waits or exits, later waits get _SHORT_BUSY_CYCLES
         instead. The limit is checked before every burst, so a handler that
         waits or exits during such a wait gets the full limit for the rest
-        of it. A reply may belong to an earlier packet; callers that need
-        their own reply wait with _run_until_reply.
+        of it. A reply may belong to an earlier packet, so every packet
+        wait must go through _run_until_reply, which drops such a reply.
 
         A handler waiting on timer.device parks like any other. Timer
         requests that are due when the wait starts are replied first, so
