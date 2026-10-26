@@ -76,6 +76,35 @@ def fake_pil(monkeypatch):
     return image_mod
 
 
+@pytest.fixture(autouse=True)
+def no_real_mounts(monkeypatch):
+    """Keep every test away from the machine's real mounts and shell.
+
+    TrayApp.run() starts the poll thread, which lists the live mounts, and
+    then unmounts whatever it found. Discovery here reports no mounts, and
+    shell notifications and the error dialog do nothing. Tests that need
+    mounts or a stop patch them in themselves, so any PID that reaches this
+    stop_mount_processes is one the test did not set up. The tray catches
+    errors from a stop, so the call is recorded and fails the test at
+    teardown.
+    """
+    unexpected_stops = []
+
+    def stop_mount_processes(pids, *args, **kwargs):
+        unexpected_stops.append(list(pids))
+        return []
+
+    monkeypatch.setattr("amifuse.platform.find_amifuse_mounts", lambda: [])
+    monkeypatch.setattr("amifuse.platform.stop_mount_processes", stop_mount_processes)
+    monkeypatch.setattr("amifuse.platform.notify_shell_drive_change", MagicMock())
+    if sys.platform == "win32":
+        import ctypes
+        monkeypatch.setattr(ctypes.windll.user32, "MessageBoxW", MagicMock())
+    yield
+    if unexpected_stops:
+        pytest.fail(f"stop_mount_processes got PIDs the test did not set up: {unexpected_stops}")
+
+
 @pytest.fixture
 def tray_app(fake_pystray, fake_pil, monkeypatch):
     """Create a TrayApp instance with mocked dependencies."""
