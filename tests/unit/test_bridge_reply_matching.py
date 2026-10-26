@@ -3,7 +3,8 @@
 A packet the bridge stopped waiting for is still answered later, while
 another call waits. A scripted launcher queues such a late reply ahead of
 (or behind) every packet's own reply, and each call must still return
-its own result and leave none of its own replies queued.
+its own result and leave none of its own replies queued. When only the
+late reply comes, the call fails as if it had no reply.
 """
 
 import os
@@ -13,6 +14,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from amifuse import fuse_fs
+
 ACTION_LOCATE_OBJECT = 8
 ACTION_FREE_LOCK = 15
 ACTION_DELETE_OBJECT = 16
@@ -21,7 +24,9 @@ ACTION_EXAMINE_NEXT = 24
 ACTION_INHIBIT = 31
 ACTION_CREATE_DIR = 22
 ACTION_END = 1007
+ACTION_FINDUPDATE = 1004
 ACTION_FINDINPUT = 1005
+ACTION_FINDOUTPUT = 1006
 
 ERROR_OBJECT_IN_USE = 202
 ERROR_OBJECT_NOT_FOUND = 205
@@ -48,7 +53,7 @@ class ScriptedLauncher:
     (res1, res2, fib), where fib is what the reply fills into the
     FileInfoBlock. mode "alone": the late reply comes in a burst of its
     own, ahead of the packet's own. mode "behind": both come in one burst,
-    the late one last.
+    the late one last. mode "silent": only the late reply comes.
     """
 
     def __init__(self, table, mode, names):
@@ -75,8 +80,10 @@ class ScriptedLauncher:
         stale = (0, late, *LATE_RES, None)
         if self._mode == "alone":
             self.bursts += [[stale], [own]]
-        else:
+        elif self._mode == "behind":
             self.bursts.append([own, stale])
+        else:
+            self.bursts.append([stale])
         return pkt, 0
 
     def run_until_replies(self, **_wait):
@@ -112,6 +119,14 @@ class ScriptedLauncher:
 
     def send_findinput(self, state, name_bptr, lock, fh_addr):
         pkt, msg = self._send(ACTION_FINDINPUT, name_bptr, lock)
+        return fh_addr, pkt, msg
+
+    def send_findupdate(self, state, name_bptr, lock, fh_addr):
+        pkt, msg = self._send(ACTION_FINDUPDATE, name_bptr, lock)
+        return fh_addr, pkt, msg
+
+    def send_findoutput(self, state, name_bptr, lock, fh_addr):
+        pkt, msg = self._send(ACTION_FINDOUTPUT, name_bptr, lock)
         return fh_addr, pkt, msg
 
     def send_delete_object(self, state, lock, name_bptr):
@@ -184,19 +199,26 @@ def _locate(args, names):
     return (0, ERROR_OBJECT_NOT_FOUND)
 
 
-def _opened(bridge):
-    """(name, directory lock) of each FINDINPUT sent."""
+def _opened(bridge, action):
+    """(name, directory lock) of each open packet of this action sent."""
     return [(bridge.names[bptr], lock)
-            for bptr, lock in bridge.launcher.sent_of(ACTION_FINDINPUT)]
+            for bptr, lock in bridge.launcher.sent_of(action)]
 
 
 MODES = ["alone", "behind"]
 
+# open() flags and the packet open_file sends for them.
+OPENS = [
+    (os.O_RDONLY, ACTION_FINDINPUT),
+    (os.O_RDWR, ACTION_FINDUPDATE),
+    (os.O_WRONLY | os.O_TRUNC, ACTION_FINDOUTPUT),
+]
+OPEN_IDS = ["findinput", "findupdate", "findoutput"]
+
 
 @pytest.fixture
-def fuse_fs_mod(fuse_mock):
-    import amifuse.fuse_fs as mod
-    return mod
+def fuse_fs_mod():
+    return fuse_fs
 
 
 @pytest.mark.parametrize("mode", MODES)
@@ -208,31 +230,33 @@ def test_locate(fuse_fs_mod, monkeypatch, mode):
     assert launcher.own_replies_queued() == []
 
 
+@pytest.mark.parametrize("flags, action", OPENS, ids=OPEN_IDS)
 @pytest.mark.parametrize("mode", MODES)
-def test_open_file_refused(fuse_fs_mod, monkeypatch, mode):
-    """A refused FINDINPUT fails the open; the late DOSTRUE does not open it."""
+def test_open_file_refused(fuse_fs_mod, monkeypatch, mode, flags, action):
+    """A refused open fails; the late DOSTRUE does not open the file."""
     bridge, launcher = _run(fuse_fs_mod, monkeypatch, mode, {
         ACTION_LOCATE_OBJECT: _locate,
-        ACTION_FINDINPUT: lambda args, names: (0, ERROR_OBJECT_NOT_FOUND),
+        action: lambda args, names: (0, ERROR_OBJECT_NOT_FOUND),
         ACTION_FREE_LOCK: _ok,
     })
 
-    assert bridge.open_file("/f", os.O_RDONLY) is None
-    assert _opened(bridge) == [("f", ROOT_LOCK)]
+    assert bridge.open_file("/f", flags) is None
+    assert _opened(bridge, action) == [("f", ROOT_LOCK)]
     assert launcher.sent_of(ACTION_FREE_LOCK) == [(ROOT_LOCK,)]
     bridge._free_fh.assert_called_once_with(FH_ADDR)
     assert launcher.own_replies_queued() == []
 
 
+@pytest.mark.parametrize("flags, action", OPENS, ids=OPEN_IDS)
 @pytest.mark.parametrize("mode", MODES)
-def test_open_file_opened(fuse_fs_mod, monkeypatch, mode):
+def test_open_file_opened(fuse_fs_mod, monkeypatch, mode, flags, action):
     bridge, launcher = _run(fuse_fs_mod, monkeypatch, mode, {
         ACTION_LOCATE_OBJECT: _locate,
-        ACTION_FINDINPUT: _ok,
+        action: _ok,
     })
 
-    assert bridge.open_file("/f", os.O_RDONLY) == (FH_ADDR, ROOT_LOCK)
-    assert _opened(bridge) == [("f", ROOT_LOCK)]
+    assert bridge.open_file("/f", flags) == (FH_ADDR, ROOT_LOCK)
+    assert _opened(bridge, action) == [("f", ROOT_LOCK)]
     assert launcher.own_replies_queued() == []
 
 
@@ -263,15 +287,24 @@ def test_list_dir(fuse_fs_mod, monkeypatch, mode):
     assert launcher.own_replies_queued() == []
 
 
+@pytest.mark.parametrize("lock, examined, freed", [
+    (DIR_LOCK, DIR_LOCK, []),
+    (0, ROOT_LOCK, [(ROOT_LOCK,)]),
+], ids=["dir", "root"])
 @pytest.mark.parametrize("mode", MODES)
-def test_list_dir_examine_refused(fuse_fs_mod, monkeypatch, mode):
+def test_list_dir_examine_refused(fuse_fs_mod, monkeypatch, mode, lock, examined, freed):
+    """A refused EXAMINE lists nothing and frees the root lock list_dir took."""
     bridge, launcher = _run(fuse_fs_mod, monkeypatch, mode, {
+        ACTION_LOCATE_OBJECT: _locate,
         ACTION_EXAMINE_OBJECT: lambda args, names: (0, 211),
         ACTION_EXAMINE_NEXT: _examine_next(["a"]),
+        ACTION_FREE_LOCK: _ok,
     })
 
-    assert bridge.list_dir(DIR_LOCK) == []
+    assert bridge.list_dir(lock) == []
+    assert launcher.sent_of(ACTION_EXAMINE_OBJECT) == [(examined,)]
     assert launcher.sent_of(ACTION_EXAMINE_NEXT) == []
+    assert launcher.sent_of(ACTION_FREE_LOCK) == freed
     assert launcher.own_replies_queued() == []
 
 
@@ -339,6 +372,29 @@ def test_close_file_waits_for_its_end_reply(fuse_fs_mod, monkeypatch):
 
     assert launcher.own_replies_queued() == []
     bridge._free_fh.assert_called_once_with(FH_ADDR)
+
+
+@pytest.mark.parametrize("call, expected, sent", [
+    (lambda b: b.locate(0, ""), (0, -1), [ACTION_LOCATE_OBJECT]),
+    (lambda b: b.open_file("/f", os.O_RDONLY), None,
+     [ACTION_LOCATE_OBJECT, ACTION_FINDINPUT]),
+    (lambda b: b.list_dir(DIR_LOCK), [], [ACTION_EXAMINE_OBJECT]),
+    (lambda b: b.delete_object(ROOT_LOCK, "f"), (0, -1), [ACTION_DELETE_OBJECT]),
+    (lambda b: b.delete_dir_atomic("/e"), (0, -1),
+     [ACTION_LOCATE_OBJECT, ACTION_DELETE_OBJECT]),
+    (lambda b: b.create_dir(ROOT_LOCK, "n"), (0, -1), [ACTION_CREATE_DIR]),
+], ids=["locate", "open_file", "list_dir", "delete_object",
+        "delete_dir_atomic", "create_dir"])
+def test_only_a_late_reply_is_no_reply(fuse_fs_mod, monkeypatch, call, expected, sent):
+    """With no reply of its own, a call fails and sends nothing further."""
+    actions = (ACTION_LOCATE_OBJECT, ACTION_FINDINPUT, ACTION_EXAMINE_OBJECT,
+               ACTION_EXAMINE_NEXT, ACTION_DELETE_OBJECT, ACTION_CREATE_DIR,
+               ACTION_FREE_LOCK)
+    bridge, launcher = _run(fuse_fs_mod, monkeypatch, "silent",
+                            {action: _ok for action in actions})
+
+    assert call(bridge) == expected
+    assert [action for action, _, _ in launcher.sent] == sent
 
 
 def test_inhibit_cycle_uninhibits_after_the_inhibit_reply(fuse_fs_mod, monkeypatch):

@@ -5,6 +5,11 @@ handler answers it later, while the next call waits. The test takes a real
 ACTION_DISK_INFO reply and hands it back, alone, in the next wait, as such
 a late reply would arrive. It then unlinks an open file through the FUSE
 callback, on a copy of the fixture image. No host FUSE driver is needed.
+
+The reply is handed back rather than left queued on the handler's port:
+SmartFilesystem never answers the second of two packets queued together
+(#188), so a real queued packet would leave the unlink's lookup without
+any reply.
 """
 
 import os
