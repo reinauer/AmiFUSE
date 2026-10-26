@@ -14,6 +14,11 @@ import pytest
 
 from amifuse import fuse_fs as fs
 
+# The named fields among the ten that list(stat_result) returns; items 7-9
+# are unnamed integer times.
+_STAT_SEQ = ("st_mode", "st_ino", "st_dev", "st_nlink", "st_uid", "st_gid",
+             "st_size")
+
 
 @pytest.fixture
 def write_context(monkeypatch, tmp_path):
@@ -44,7 +49,11 @@ def write_context(monkeypatch, tmp_path):
                 return st
             fields = list(st)
             fields[6] = size  # st_size
-            return os.stat_result(fields)
+            # Carry over the fields list(st) leaves out (float and ns times,
+            # st_file_attributes, ...).
+            extra = {name: getattr(st, name) for name in dir(st)
+                     if name.startswith("st_") and name not in _STAT_SEQ}
+            return os.stat_result(fields, extra)
 
         monkeypatch.setattr(Path, "stat", fake_stat)
 
@@ -103,7 +112,7 @@ def test_source_growing_to_limit_still_written(write_context, monkeypatch,
 @pytest.mark.parametrize("use_json", [True, False])
 def test_source_growing_past_limit_stops(write_context, monkeypatch, capsys,
                                          use_json):
-    """A source that grows while it is read stops below the limit."""
+    """A source that grows while it is read, or a stream, stops below the limit."""
     args, bridge, created, source, report_size = write_context
     args.json = use_json
     source.write_bytes(b"x" * 20)
@@ -117,9 +126,11 @@ def test_source_growing_past_limit_stops(write_context, monkeypatch, capsys,
         error = json.loads(capsys.readouterr().out)["error"]
         assert error["code"] == "FILE_TOO_LARGE"
         assert error["details"]["bytes_written"] == 8
-        assert error["details"]["expected"] == 4
+        assert error["details"]["size"] == 4
+        assert "keeps the first 8 bytes" in error["message"]
     else:
-        assert "grew past 12 bytes" in str(caught.value)
+        assert "holds more than 12 bytes" in str(caught.value)
+        assert "keeps the first 8 bytes" in str(caught.value)
     assert [c.args[1] for c in bridge.write_handle.call_args_list] == [b"x" * 8]
     bridge.close_file.assert_called_once_with(0x1000)
     bridge.flush_volume.assert_called()

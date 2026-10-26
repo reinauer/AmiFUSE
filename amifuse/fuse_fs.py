@@ -5555,19 +5555,21 @@ def cmd_write(args):
                     if not data:
                         break
                     if bytes_written + len(data) > _MAX_FILE_SIZE:
-                        # The source grew past the limit while it was read
+                        # The source holds more than its stat() size: it grew
+                        # while it was read, or it is a stream that reports 0
                         if use_json:
                             print(json.dumps(_json_error("write", "FILE_TOO_LARGE",
-                                f"Source file grew past {_MAX_FILE_SIZE} bytes, "
-                                f"the largest AmigaDOS file, while it was written",
-                                {**mount_details, "bytes_written": bytes_written,
-                                 "expected": host_size,
+                                f"Source holds more than {_MAX_FILE_SIZE} bytes, "
+                                f"the largest AmigaDOS file; the destination "
+                                f"keeps the first {bytes_written} bytes",
+                                {**mount_details, "size": host_size,
+                                 "bytes_written": bytes_written,
                                  "max_size": _MAX_FILE_SIZE})))
                             sys.exit(1)
                         raise SystemExit(
-                            f"Error: source file grew past {_MAX_FILE_SIZE} "
-                            f"bytes, the largest AmigaDOS file, while it was "
-                            f"written ({bytes_written} bytes written)")
+                            f"Error: source holds more than {_MAX_FILE_SIZE} "
+                            f"bytes, the largest AmigaDOS file; the destination "
+                            f"keeps the first {bytes_written} bytes")
                     n = bridge.write_handle(fh_addr, data)
                     # Distinguish write failure modes:
                     # n < 0:  No reply from handler (crashed or unresponsive)
