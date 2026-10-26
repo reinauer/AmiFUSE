@@ -5495,6 +5495,19 @@ def cmd_write(args):
 
     host_size = host_path.stat().st_size
 
+    # Refuse before the bridge exists: opening the destination with O_TRUNC
+    # (ACTION_FINDOUTPUT) would already empty an existing file.
+    if host_size > _MAX_FILE_SIZE:
+        if use_json:
+            print(json.dumps(_json_error("write", "FILE_TOO_LARGE",
+                f"Source file is larger than {_MAX_FILE_SIZE} bytes, the "
+                f"largest AmigaDOS file: {host_path} ({host_size} bytes)",
+                {"size": host_size, "max_size": _MAX_FILE_SIZE})))
+            sys.exit(1)
+        raise SystemExit(
+            f"Error: source file is larger than {_MAX_FILE_SIZE} bytes, the "
+            f"largest AmigaDOS file: {host_path} ({host_size} bytes)")
+
     # Safety warning (stderr so it doesn't interfere with JSON output)
     print(f"WARNING: This will modify the disk image: {args.image}", file=sys.stderr)
     print(f"  Source: {host_path} ({host_size:,} bytes)", file=sys.stderr)
@@ -5541,6 +5554,20 @@ def cmd_write(args):
                     data = f.read(chunk_size)
                     if not data:
                         break
+                    if bytes_written + len(data) > _MAX_FILE_SIZE:
+                        # The source grew past the limit while it was read
+                        if use_json:
+                            print(json.dumps(_json_error("write", "FILE_TOO_LARGE",
+                                f"Source file grew past {_MAX_FILE_SIZE} bytes, "
+                                f"the largest AmigaDOS file, while it was written",
+                                {**mount_details, "bytes_written": bytes_written,
+                                 "expected": host_size,
+                                 "max_size": _MAX_FILE_SIZE})))
+                            sys.exit(1)
+                        raise SystemExit(
+                            f"Error: source file grew past {_MAX_FILE_SIZE} "
+                            f"bytes, the largest AmigaDOS file, while it was "
+                            f"written ({bytes_written} bytes written)")
                     n = bridge.write_handle(fh_addr, data)
                     # Distinguish write failure modes:
                     # n < 0:  No reply from handler (crashed or unresponsive)
