@@ -328,6 +328,7 @@ class TestInstallIcons:
         """Icon files written to ICON_DIR."""
         icon_dir = tmp_path / "icons"
         monkeypatch.setattr("amifuse.windows_shell.ICON_DIR", icon_dir)
+        monkeypatch.setattr("amifuse.windows_shell._LAUNCH_VBS", tmp_path / "launch.vbs")
 
         from amifuse.windows_shell import _install_icons
         _install_icons()
@@ -342,6 +343,7 @@ class TestInstallIcons:
         """_install_icons creates tray.ico."""
         icon_dir = tmp_path / "icons"
         monkeypatch.setattr("amifuse.windows_shell.ICON_DIR", icon_dir)
+        monkeypatch.setattr("amifuse.windows_shell._LAUNCH_VBS", tmp_path / "launch.vbs")
 
         from amifuse.windows_shell import _install_icons
         _install_icons()

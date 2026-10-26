@@ -1,6 +1,15 @@
-"""Integration tests for Windows shell registration (real registry)."""
+"""Integration tests for Windows shell registration (real registry).
 
+The registry is real, but it is not the user's: for this module the process's
+HKEY_CURRENT_USER is mapped onto a scratch key, and the AmiFUSE folder under
+APPDATA is moved into tmp_path. register() and unregister() then leave the
+Explorer registration, icons and launch.vbs of an installed AmiFUSE alone.
+"""
+
+import ctypes
 import sys
+import uuid
+
 import pytest
 
 pytestmark = [
@@ -9,50 +18,74 @@ pytestmark = [
 ]
 
 
-@pytest.fixture(scope="session")
-def registry_snapshot():
-    """Snapshot relevant HKCU keys before tests, restore after all tests."""
+@pytest.fixture(scope="module")
+def hkcu_sandbox():
+    """Map this process's HKEY_CURRENT_USER onto a scratch key.
+
+    RegOverridePredefKey redirects every use of HKEY_CURRENT_USER in this
+    process (not in child processes) to HKCU\\Software\\AmiFUSE-test-<hex>.
+    A probe written through HKEY_CURRENT_USER must land in the scratch key
+    before any test runs. Afterwards the mapping is removed and the scratch
+    key deleted. Yields an open handle to the scratch key.
+    """
     import winreg
+    from ctypes import wintypes
 
-    KEY_PATHS = [
-        r"Software\Classes\.hdf",
-        r"Software\Classes\.adf",
-        r"Software\Classes\AmiFUSE.DiskImage",
-        r"Software\Classes\AmiFUSE.FloppyImage",
-    ]
+    from amifuse.windows_shell import _delete_key_recursive
 
-    def _snapshot_key(path):
-        """Return (exists, {values}, [subkeys]) or (False, {}, [])."""
+    override = ctypes.WinDLL("advapi32").RegOverridePredefKey
+    override.argtypes = [wintypes.HKEY, wintypes.HKEY]
+    override.restype = wintypes.LONG
+
+    hkcu = winreg.HKEY_CURRENT_USER
+    name = f"AmiFUSE-test-{uuid.uuid4().hex}"
+    scratch_path = rf"Software\{name}"
+    scratch = winreg.CreateKey(hkcu, scratch_path)
+    restored = 0
+    try:
+        rc = override(hkcu, scratch.handle)
+        if rc != 0:
+            pytest.fail(f"RegOverridePredefKey failed: {ctypes.FormatError(rc)}")
         try:
-            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, path, 0, winreg.KEY_READ)
-        except OSError:
-            return (False, {}, [])
-        values = {}
-        try:
-            i = 0
-            while True:
+            winreg.CloseKey(winreg.CreateKey(hkcu, name))
+            try:
+                winreg.CloseKey(winreg.OpenKey(scratch, name))
+            except OSError:
+                pytest.fail("HKEY_CURRENT_USER is not redirected to the scratch key")
+            finally:
+                # Removes the probe wherever it landed.
                 try:
-                    name, data, typ = winreg.EnumValue(key, i)
-                    values[name] = (data, typ)
-                    i += 1
+                    winreg.DeleteKey(hkcu, name)
                 except OSError:
-                    break
+                    pass
+            yield scratch
         finally:
-            winreg.CloseKey(key)
-        return (True, values, [])
+            restored = override(hkcu, None)
+    finally:
+        winreg.CloseKey(scratch)
+        _delete_key_recursive(hkcu, scratch_path)
+    assert restored == 0, f"RegOverridePredefKey restore failed: {ctypes.FormatError(restored)}"
 
-    snapshots = {p: _snapshot_key(p) for p in KEY_PATHS}
-    yield
-    # Restore: delete any keys we created, leave pre-existing ones alone
-    for path, (existed, _values, _subkeys) in snapshots.items():
-        if not existed:
-            # Key didn't exist before -- remove it if it exists now
-            from amifuse.windows_shell import _delete_key_recursive
-            _delete_key_recursive(winreg.HKEY_CURRENT_USER, path)
+
+@pytest.fixture
+def appdata_sandbox(monkeypatch, tmp_path):
+    """Point APPDATA and the AmiFUSE folder, icons and launch.vbs into tmp_path.
+
+    windows_shell works these paths out from APPDATA at import, so the
+    module attributes are patched as well as the variable.
+    """
+    from amifuse import windows_shell
+
+    amifuse_dir = tmp_path / "AmiFUSE"
+    monkeypatch.setenv("APPDATA", str(tmp_path))
+    monkeypatch.setattr(windows_shell, "_AMIFUSE_DIR", amifuse_dir)
+    monkeypatch.setattr(windows_shell, "ICON_DIR", amifuse_dir / "icons")
+    monkeypatch.setattr(windows_shell, "_LAUNCH_VBS", amifuse_dir / "launch.vbs")
+    return amifuse_dir
 
 
 @pytest.fixture(autouse=True)
-def clean_registration(registry_snapshot):
+def clean_registration(hkcu_sandbox, appdata_sandbox):
     """Ensure clean state before/after each test."""
     from amifuse.windows_shell import unregister
     try:
@@ -159,3 +192,24 @@ class TestWindowsShellRegistration:
         # Icons should be removed
         assert not (ICON_DIR / "diskimage.ico").exists()
         assert not (ICON_DIR / "floppyimage.ico").exists()
+
+    def test_register_stays_in_sandbox(self, hkcu_sandbox, tmp_path):
+        """register() writes into the scratch key, and its verbs run the
+        launch.vbs below tmp_path."""
+        import winreg
+        from amifuse.windows_shell import register
+
+        register()
+
+        key = winreg.OpenKey(
+            hkcu_sandbox,
+            r"Software\Classes\AmiFUSE.DiskImage\shell\open\command",
+            0,
+            winreg.KEY_READ,
+        )
+        try:
+            command, _ = winreg.QueryValueEx(key, "")
+        finally:
+            winreg.CloseKey(key)
+        assert f'"{tmp_path / "AmiFUSE" / "launch.vbs"}"' in command
+        assert (tmp_path / "AmiFUSE" / "launch.vbs").exists()

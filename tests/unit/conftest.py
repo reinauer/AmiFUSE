@@ -1,8 +1,37 @@
 """Shared fixtures for the unit tests."""
 
 import json
+import os
+import site
+import sys
 
 import pytest
+
+
+@pytest.fixture(autouse=True)
+def appdata_sandbox(monkeypatch, tmp_path):
+    """Point APPDATA, and the AmiFUSE folder worked out from it, into tmp_path.
+
+    windows_shell and launcher read APPDATA once, when they are imported, so
+    setting the variable alone does not move their paths. Without this, tests
+    that reach register(), unregister() or launcher._log() write, and delete,
+    launch.vbs and launcher.log in the real %APPDATA%\\AmiFUSE. APPDATA itself
+    is set too: tray reads it at call time, and child processes inherit it.
+    """
+    if sys.platform == "win32" and "PYTHONUSERBASE" not in os.environ:
+        # A child Python works out its user site-packages from APPDATA too.
+        monkeypatch.setenv("PYTHONUSERBASE", site.getuserbase())
+    appdata = tmp_path / "appdata"
+    monkeypatch.setenv("APPDATA", str(appdata))
+
+    from amifuse import launcher, windows_shell
+
+    amifuse_dir = appdata / "AmiFUSE"
+    monkeypatch.setattr(windows_shell, "_AMIFUSE_DIR", amifuse_dir)
+    monkeypatch.setattr(windows_shell, "ICON_DIR", amifuse_dir / "icons")
+    monkeypatch.setattr(windows_shell, "_LAUNCH_VBS", amifuse_dir / "launch.vbs")
+    monkeypatch.setattr(launcher, "_LOG_DIR", amifuse_dir)
+    return amifuse_dir
 
 
 @pytest.fixture
