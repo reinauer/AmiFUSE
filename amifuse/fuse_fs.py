@@ -2533,6 +2533,8 @@ class HandlerBridge:
             self.backend.sync()
             if self.state.crashed or reply is None or reply[0] == 0:
                 raise OSError("filesystem handler did not acknowledge ACTION_FLUSH")
+            # fsync() and a clean unmount promise data on stable storage.
+            self.backend.fsync()
             if self._debug:
                 print("[amifuse] Volume flush complete", flush=True)
 
