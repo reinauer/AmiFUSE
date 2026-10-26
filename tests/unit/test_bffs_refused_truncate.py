@@ -61,8 +61,8 @@ def test_truncate_raises_on_refusal(fuse_mock, use_handle, length, res2,
 @pytest.mark.parametrize("use_handle", [False, True], ids=["path", "handle"])
 def test_refused_truncate_of_empty_file_succeeds(fuse_mock, use_handle):
     """A truncate to 0 sends ACTION_SET_FILE_SIZE without measuring the end
-    first, as an open with O_TRUNC does, and BFFS refuses it even when the
-    file is already empty. The file then has the length asked for."""
+    first, and BFFS refuses it even when the file is already empty, as one
+    that create() made is. The file then has the length asked for."""
     handler = _FakeHandlerFile(b"", set_size_reply=_reply(0, 205))
     fs = _fake_write_fs(fuse_fs, handler)
     handle = fs.open("/file", os.O_RDWR) if use_handle else None
@@ -70,6 +70,47 @@ def test_refused_truncate_of_empty_file_succeeds(fuse_mock, use_handle):
     assert fs.truncate("/file", 0, handle) == 0
     assert handler.set_sizes == [0]
     assert handler.data == b""
+
+
+@pytest.mark.parametrize("data, expected", [
+    (ORIGINAL, (-1, 205)),
+    (b"", (0, 0)),
+], ids=["full", "empty"])
+def test_refusal_with_other_handles_is_not_sent_again(fuse_mock, data,
+                                                      expected):
+    """BFFS's refusal is not about other handles, so they stay where they
+    are and the truncate is sent once."""
+    other = 0x4000
+    handler = _FakeHandlerFile(data, set_size_reply=_reply(0, 205))
+    handler.others = {other: len(data)}
+    bridge = _fake_write_bridge(fuse_fs, handler)
+
+    assert bridge.truncate_handle(FH_ADDR, 0, [other]) == expected
+    assert handler.set_sizes == [0]
+    assert all(seek[0] != other for seek in handler.seeks)
+
+
+def test_handler_refusing_every_packet_is_not_empty(fuse_mock):
+    """A handler with no disk refuses the seeks with DOSFALSE too, which
+    reads as an end of 0, so only BFFS's refusal measures the end."""
+    handler = _FakeHandlerFile(ORIGINAL, set_size_reply=_reply(0, 226),
+                               seek_reply=_reply(0, 226))
+    bridge = _fake_write_bridge(fuse_fs, handler)
+
+    assert bridge.truncate_handle(FH_ADDR, 0) == (-1, 226)
+    assert handler.seeks == []
+    assert handler.data == ORIGINAL
+
+
+def test_refusal_when_end_cannot_be_measured_fails(fuse_mock):
+    """Only a file measured as empty turns BFFS's refusal into success."""
+    handler = _FakeHandlerFile(b"", set_size_reply=_reply(0, 205),
+                               seek_mode_reply=(fuse_fs.OFFSET_END,
+                                                _reply(-1, 225)))
+    bridge = _fake_write_bridge(fuse_fs, handler)
+
+    assert bridge.truncate_handle(FH_ADDR, 0) == (-1, 205)
+    assert handler.set_sizes == [0]
 
 
 @pytest.mark.parametrize("refusal, expected", [
