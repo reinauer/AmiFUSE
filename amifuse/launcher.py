@@ -262,10 +262,10 @@ def _report_summary(succeeded, skipped, spawn_failed, exited, failed,
     Otherwise a single ``_show_error`` names, in one composed body, the mounted
     drives, the skipped (no free letter) partitions, the ``spawn_failed`` ones
     (the process never started -- DEFINITE wording), the ``exited`` ones (the
-    process exited with an error before its drive appeared -- DEFINITE wording,
-    with the mount's own message), and the ``failed`` ones (the process spawned
-    but its drive never appeared -- SOFT wording, may be a slow cold mount), plus
-    any ``fallback_reason``. Never one dialog per partition.
+    process exited with an error, even with a drive at its letter -- DEFINITE
+    wording, with the mount's own message), and the ``failed`` ones (the
+    process spawned but its drive never appeared -- SOFT wording, may be a slow
+    cold mount), plus any ``fallback_reason``. Never one dialog per partition.
     """
     if (not skipped and not spawn_failed and not exited and not failed
             and not fallback_reason):
@@ -343,11 +343,12 @@ def mount_image_all(image: str, *, write: bool, explorer: str) -> None:
     pending: dict[str, _MountUnit] = {}   # letter -> unit awaiting arrival
     # Three distinct failure buckets. spawn_failed: the process NEVER launched
     # (_spawn_detached raised) -- a definite, hard failure. exited (below): the
-    # process exited with an error before its drive appeared -- definite, with
-    # its stderr. failed (below): the process spawned but its drive never
-    # appeared by the deadline -- a SOFT timeout that may still be a slow cold
-    # mount. Folding them together would mislabel a never-started or failed
-    # mount as "may still be starting".
+    # process exited with an error, even if a drive (perhaps another launch's)
+    # is present at its letter -- definite, with its stderr. failed (below):
+    # the process spawned but its drive never appeared by the deadline -- a
+    # SOFT timeout that may still be a slow cold mount. Folding them together
+    # would mislabel a never-started or failed mount as "may still be
+    # starting".
     spawn_failed: list[tuple[_MountUnit, str, str]] = []  # (unit, letter, reason)
     exited: list[tuple[_MountUnit, str, str]] = []  # (unit, letter, message)
     failed: list[tuple[_MountUnit, str]] = []
