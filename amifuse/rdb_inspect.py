@@ -808,9 +808,10 @@ def find_partition_mbr_index(
     For MBR images with multiple 0x76 partitions, searches each RDB for the
     named partition.  Returns the 0-based index into the list of 0x76
     partitions (0 when the first RDB holds it), or None if the image is not
-    MBR, has only one 0x76 partition, or no RDB that opens holds the name.
-    A number selects a partition by its number only when no RDB holds a
-    partition of that name.
+    MBR, has only one 0x76 partition, or no RDB that opens holds the name
+    or, when the name is a number, a partition of that number. A number
+    selects a partition by its number only when no RDB holds a partition
+    of that name.
 
     Raises IOError if a forced block_size rules out an RDB that holds the
     partition at its own block size.
@@ -822,16 +823,22 @@ def find_partition_mbr_index(
     if len(amiga_parts) <= 1:
         return None
 
-    def holds_partition(idx, size, by_name):
+    name = str(partition_name)
+
+    def holds_partition(idx, size, number):
         # True or False if 0x76 partition idx opens at size, None if not.
+        # Looks for the name when number is None, else for that number.
         try:
             blkdev, rdisk, _ = open_rdisk(image, block_size=size, mbr_partition_index=idx)
             try:
-                if by_name:
-                    found = rdisk.find_partition_by_drive_name(str(partition_name))
-                else:
-                    found = rdisk.find_partition_by_string(str(partition_name))
-                return found is not None
+                if number is not None:
+                    return rdisk.get_partition(number) is not None
+                # find_partition_by_drive_name, but a damaged name (None)
+                # does not match rather than raise.
+                return any(
+                    p.get_drive_name() is not None
+                    and p.get_drive_name().get_unicode().lower() == name.lower()
+                    for p in rdisk.parts)
             finally:
                 rdisk.close()
                 blkdev.close()
@@ -840,16 +847,21 @@ def find_partition_mbr_index(
 
     # find_partition_by_string falls back to a number within one RDB, so
     # every RDB is asked for the name before any is asked for the number.
-    for by_name in (True, False):
+    lookups = [None]
+    try:
+        lookups.append(int(name))
+    except ValueError:
+        pass
+    for number in lookups:
         for idx in range(len(amiga_parts)):
-            found = holds_partition(idx, block_size, by_name)
+            found = holds_partition(idx, block_size, number)
             if found:
                 return idx
             if (found is None and block_size is not None
-                    and holds_partition(idx, None, by_name)):
-                # The forced size skips an RDB holding the name, so a later
-                # match, or none, would differ from what auto-detection
-                # resolves.
+                    and holds_partition(idx, None, number)):
+                # The forced size skips an RDB holding the partition, so a
+                # later match, or none, would differ from what
+                # auto-detection resolves.
                 raise IOError(
                     f"Partition {partition_name} is in an RDB that does not open "
                     f"with {block_size}-byte blocks"
