@@ -65,18 +65,26 @@ The fixture directory should contain:
 
 ## How CI Works
 
-The workflow (`.github/workflows/ci.yml`) has three layers:
+The workflow (`.github/workflows/ci.yml`) has five jobs, each run on
+Linux, macOS, and Windows:
 
-- **Unit tests** -- All platforms (Linux, macOS, Windows) x Python
-  3.11--3.13. No external dependencies.
-- **Integration tests** -- Linux + macOS only. Clones AmiFUSE-testing
-  for fixtures. Exercises the full m68k emulation stack.
-- **Tools smoke** -- Linux + macOS only. Same fixtures. Runs
+- **Installed wheel** -- Python 3.13. Builds the sdist, then the wheel
+  from it, and installs the wheel with the declared minimum amitools
+  release. Checks the installed package from outside the checkout,
+  including the bundled FastFileSystem.
+- **Unit tests** -- Python 3.11--3.13. No external dependencies.
+- **Integration tests** -- Python 3.13. Clones AmiFUSE-testing for
+  fixtures. Exercises the full m68k emulation stack.
+- **Tools smoke** -- Python 3.13. Same fixtures. Runs
   `amifuse_matrix.py` and `image_format_smoke.py` as CI-visible smoke
   checks.
+- **Mount tests** -- Python 3.13. Same fixtures. Installs a FUSE
+  backend (fuse3, FUSE-T, or WinFSP) and runs the `fuse`-marked
+  integration tests.
 
-Windows is excluded from integration and smoke jobs pending upstream
-machine68k fixes
+Integration tests, tools smoke, and mount tests start once the unit
+tests pass. On Windows they install the `machine68k-amifuse` fork,
+which carries Windows fixes that upstream machine68k lacks
 ([cnvogelg/machine68k#8](https://github.com/cnvogelg/machine68k/issues/8),
 [cnvogelg/machine68k#9](https://github.com/cnvogelg/machine68k/issues/9)).
 
