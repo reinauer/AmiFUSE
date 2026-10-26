@@ -1637,14 +1637,15 @@ class HandlerBridge:
     def locate(self, lock_bptr: int, name: str):
         with self._lock:
             _, name_bptr = self._alloc_bstr(name)
-            self.launcher.send_locate(self.state, lock_bptr, name_bptr)
-            replies = self._run_until_replies()
+            pkt_addr, _ = self.launcher.send_locate(self.state, lock_bptr, name_bptr)
+            # A late reply to a packet that timed out would pass for the lock.
+            reply = self._run_until_reply(pkt_addr, "locate")
             if self._debug:
-                if replies:
-                    print(f"[amifuse] locate(lock=0x{lock_bptr:x}, name='{name}'): res1=0x{replies[-1][2]:x} res2={replies[-1][3]}")
+                if reply is not None:
+                    print(f"[amifuse] locate(lock=0x{lock_bptr:x}, name='{name}'): res1=0x{reply[0]:x} res2={reply[1]}")
                 else:
                     print(f"[amifuse] locate(lock=0x{lock_bptr:x}, name='{name}'): NO REPLIES")
-            return replies[-1][2] if replies else 0, replies[-1][3] if replies else -1
+            return reply if reply is not None else (0, -1)
 
     def free_lock(self, lock_bptr: int):
         with self._lock:
@@ -1711,7 +1712,8 @@ class HandlerBridge:
             mode = flags & getattr(os, 'O_ACCMODE', 3)
             if mode == os.O_RDONLY:
                 fh_addr = self._alloc_fh()
-                self.launcher.send_findinput(self.state, name_bptr, dir_lock, fh_addr)
+                _, pkt_addr, _ = self.launcher.send_findinput(
+                    self.state, name_bptr, dir_lock, fh_addr)
             else:
                 if not self._write_enabled:
                     return None
@@ -1719,18 +1721,20 @@ class HandlerBridge:
                     fh_addr = self._alloc_fh()
                     if self._debug:
                         print(f"[amifuse][open_file] FINDOUTPUT name={name!r} dir_lock=0x{dir_lock:x} fh_addr=0x{fh_addr:x}", flush=True)
-                    self.launcher.send_findoutput(self.state, name_bptr, dir_lock, fh_addr)
+                    _, pkt_addr, _ = self.launcher.send_findoutput(
+                        self.state, name_bptr, dir_lock, fh_addr)
                 else:
                     fh_addr = self._alloc_fh()
                     if self._debug:
                         print(f"[amifuse][open_file] FINDUPDATE name={name!r} dir_lock=0x{dir_lock:x} fh_addr=0x{fh_addr:x}", flush=True)
-                    self.launcher.send_findupdate(self.state, name_bptr, dir_lock, fh_addr)
-            replies = self._run_until_replies()
-            self._log_replies("find", replies)
-            if not replies or replies[-1][2] == 0:
-                res2 = replies[-1][3] if replies else -1
+                    _, pkt_addr, _ = self.launcher.send_findupdate(
+                        self.state, name_bptr, dir_lock, fh_addr)
+            # A late nonzero res1 would pass for DOSTRUE on a failed open.
+            reply = self._run_until_reply(pkt_addr, "find")
+            if reply is None or reply[0] == 0:
+                res2 = reply[1] if reply else -1
                 if self._debug:
-                    print(f"[amifuse][open_file] FAILED: replies={bool(replies)} res1={replies[-1][2] if replies else 'none'} res2={res2}", flush=True)
+                    print(f"[amifuse][open_file] FAILED: replies={reply is not None} res1={reply[0] if reply else 'none'} res2={res2}", flush=True)
                 if path and path != "/" and res2 in _NOT_FOUND_ERRORS:
                     self._set_neg_cached(path)
                 self._free_fh(fh_addr)
@@ -1755,12 +1759,12 @@ class HandlerBridge:
                     print(f"[amifuse] list_dir: obtained root_lock=0x{root_lock:x}")
             fib_mem = self._alloc_fib()
             # First Examine returns info about the directory itself, not contents
-            self.launcher.send_examine(self.state, lock_bptr, fib_mem.addr)
-            replies = self._run_until_replies()
+            pkt_addr, _ = self.launcher.send_examine(self.state, lock_bptr, fib_mem.addr)
+            reply = self._run_until_reply(pkt_addr, "examine")
             entries: List[Dict] = []
-            if not replies or replies[-1][2] == 0:
+            if reply is None or reply[0] == 0:
                 if self._debug:
-                    res2 = replies[-1][3] if replies else -1
+                    res2 = reply[1] if reply else -1
                     print(f"[amifuse] list_dir: Examine FAILED lock=0x{lock_bptr:x} res2={res2}")
                 if root_lock:
                     self.free_lock(root_lock)
@@ -1775,11 +1779,12 @@ class HandlerBridge:
             # 65536 is generous; ExamineNext will return ERROR_NO_MORE_ENTRIES
             # (res1=0) when the directory is exhausted, which breaks the loop.
             for iter_num in range(65536):
-                self.launcher.send_examine_next(self.state, lock_bptr, fib_mem.addr)
-                replies = self._run_until_replies()
-                if not replies or replies[-1][2] == 0:
+                pkt_addr, _ = self.launcher.send_examine_next(
+                    self.state, lock_bptr, fib_mem.addr)
+                reply = self._run_until_reply(pkt_addr, "examine_next")
+                if reply is None or reply[0] == 0:
                     if self._debug:
-                        res2 = replies[-1][3] if replies else -1
+                        res2 = reply[1] if reply else -1
                         print(f"[amifuse] list_dir: ExamineNext #{iter_num} ended res2={res2}")
                     break
                 entry = _parse_fib(self.mem, fib_mem.addr)
@@ -1945,9 +1950,9 @@ class HandlerBridge:
                 fib_mem = self._alloc_fib()
                 # lock_bptr=0 -> current volume root
                 root_lock, _ = self.locate(0, "")
-                self.launcher.send_examine(self.state, root_lock, fib_mem.addr)
-                replies = self._run_until_replies()
-                if replies and replies[-1][2]:
+                pkt_addr, _ = self.launcher.send_examine(self.state, root_lock, fib_mem.addr)
+                reply = self._run_until_reply(pkt_addr, "examine")
+                if reply is not None and reply[0]:
                     info = _parse_fib(self.mem, fib_mem.addr)
                     if info.get("name"):
                         self._volname = info["name"]
@@ -2440,12 +2445,10 @@ class HandlerBridge:
     def delete_object(self, parent_lock_bptr: int, name: str) -> Tuple[int, int]:
         with self._lock:
             _, name_bptr = self._alloc_bstr(name)
-            self.launcher.send_delete_object(self.state, parent_lock_bptr, name_bptr)
-            replies = self._run_until_replies()
-            self._log_replies("delete", replies)
-            if not replies:
-                return 0, -1
-            return replies[-1][2], replies[-1][3]
+            pkt_addr, _ = self.launcher.send_delete_object(
+                self.state, parent_lock_bptr, name_bptr)
+            reply = self._run_until_reply(pkt_addr, "delete")
+            return reply if reply is not None else (0, -1)
 
     def delete_dir_atomic(self, path: str) -> Tuple[int, int]:
         """Atomically locate parent and delete directory, preventing concurrent
@@ -2458,10 +2461,10 @@ class HandlerBridge:
             lock = 0
             for comp in parts:
                 _, name_bptr = self._alloc_bstr(comp)
-                self.launcher.send_locate(self.state, lock, name_bptr)
-                replies = self._run_until_replies()
+                pkt_addr, _ = self.launcher.send_locate(self.state, lock, name_bptr)
+                reply = self._run_until_reply(pkt_addr, "locate")
                 parent = lock
-                lock = replies[-1][2] if replies else 0
+                lock = reply[0] if reply is not None else 0
                 if parent:
                     # Free intermediate locks while descending (see locate_path).
                     self.free_lock(parent)
@@ -2477,14 +2480,11 @@ class HandlerBridge:
                     self.free_lock(l)
                 return 0, -1
             _, name_bptr = self._alloc_bstr(name)
-            self.launcher.send_delete_object(self.state, lock, name_bptr)
-            replies = self._run_until_replies()
-            self._log_replies("delete_dir_atomic", replies)
+            pkt_addr, _ = self.launcher.send_delete_object(self.state, lock, name_bptr)
+            reply = self._run_until_reply(pkt_addr, "delete_dir_atomic")
             for l in reversed(locks):
                 self.free_lock(l)
-            if not replies:
-                return 0, -1
-            return replies[-1][2], replies[-1][3]
+            return reply if reply is not None else (0, -1)
 
     def rename_object(
         self, src_lock_bptr: int, src_name: str, dst_lock_bptr: int, dst_name: str
@@ -2503,18 +2503,15 @@ class HandlerBridge:
     def create_dir(self, parent_lock_bptr: int, name: str) -> Tuple[int, int]:
         with self._lock:
             _, name_bptr = self._alloc_bstr(name)
-            self.launcher.send_create_dir(self.state, parent_lock_bptr, name_bptr)
-            replies = self._run_until_replies()
-            self._log_replies("mkdir", replies)
-            if not replies:
-                return 0, -1
-            return replies[-1][2], replies[-1][3]
+            pkt_addr, _ = self.launcher.send_create_dir(
+                self.state, parent_lock_bptr, name_bptr)
+            reply = self._run_until_reply(pkt_addr, "mkdir")
+            return reply if reply is not None else (0, -1)
 
     def close_file(self, fh_addr: int):
         with self._lock:
-            self.launcher.send_end_handle(self.state, fh_addr)
-            replies = self._run_until_replies()
-            self._log_replies("end", replies)
+            pkt_addr, _ = self.launcher.send_end_handle(self.state, fh_addr)
+            self._run_until_reply(pkt_addr, "end")
             # Note: ACTION_FLUSH is for flushing volume buffers, not file-specific.
             # We call flush_volume() on unmount instead of after every file close.
             self._free_fh(fh_addr)
@@ -2541,14 +2538,16 @@ class HandlerBridge:
         with self._lock:
             if self.state.crashed:
                 return
-            self.launcher.send_inhibit(self.state, True)
-            self._run_until_replies()
-            self.launcher.send_inhibit(self.state, False)
-            replies = self._run_until_replies()
+            # Each wait takes its own packet's reply: a late reply to another
+            # packet would end the inhibit's wait before the handler inhibits.
+            pkt_addr, _ = self.launcher.send_inhibit(self.state, True)
+            self._run_until_reply(pkt_addr, "inhibit")
+            pkt_addr, _ = self.launcher.send_inhibit(self.state, False)
+            reply = self._run_until_reply(pkt_addr, "uninhibit")
             # Sync the underlying file to disk
             self.backend.sync()
             if self._debug:
-                if replies and replies[-1][2] != 0:
+                if reply is not None and reply[0] != 0:
                     print("[amifuse] Volume flush complete", flush=True)
                 else:
                     print("[amifuse] Volume flush may have failed", flush=True)
