@@ -3429,8 +3429,11 @@ class AmigaFuseFS(_FuseOperations):
                     if pending_children or dir_open:
                         self._pending_deletes.add(path)
                 if not (pending_children or dir_open):
-                    self._log_op("rmdir", path, "in use, nothing would retry: EBUSY")
-                    raise FuseOSError(errno.EBUSY)
+                    # Nothing would retry. pfs3aio answers 202 before 216, so
+                    # a directory that still lists entries is not empty.
+                    err = errno.ENOTEMPTY if self.bridge.list_dir_path(path) else errno.EBUSY
+                    self._log_op("rmdir", path, f"in use, nothing would retry: {errno.errorcode[err]}")
+                    raise FuseOSError(err)
                 with self._cache_lock:
                     self._stat_cache.pop(path, None)
                     self._dir_cache.pop(dir_path, None)
@@ -3840,7 +3843,13 @@ class AmigaFuseFS(_FuseOperations):
                     if lock_bptr:
                         locks.append(lock_bptr)
                 if lock_bptr != 0:
-                    self.bridge.inhibit_cycle()
+                    # pfs3aio stops answering after an inhibit cycle with a
+                    # file open deeper in the tree, and SmartFilesystem drops
+                    # every open handle (#129). Cycle only with no file open.
+                    with self._fh_lock:
+                        files_open = any("fh_addr" in v for v in self._fh_cache.values())
+                    if not files_open:
+                        self.bridge.inhibit_cycle()
                     res1, res2 = self.bridge.delete_object(lock_bptr, name)
                     self._log_op("release", parent_dir, f"deferred rmdir res1={res1} res2={res2}")
                     if res1 == 0:

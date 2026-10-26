@@ -42,6 +42,7 @@ class _InUseVolume:
         self.open_files = {}  # fh_addr -> path
         self.deletes = []  # every path a delete was sent for
         self.deleted = []  # paths a delete removed
+        self.inhibit_cycles = []  # paths open at each inhibit cycle
         self._lock_paths = {}
         self._next_fh_addr = 0x1000
 
@@ -71,7 +72,7 @@ class _InUseVolume:
         pass
 
     def inhibit_cycle(self):
-        pass
+        self.inhibit_cycles.append(sorted(self.open_files.values()))
 
     def flush_volume(self):
         pass
@@ -82,6 +83,13 @@ class _InUseVolume:
             return 0, ERROR_OBJECT_EXISTS
         self.dirs.add(path)
         return self.locate_path(path)[0], 0
+
+    def list_dir_path(self, path):
+        return [
+            {"name": p.rsplit("/", 1)[1]}
+            for p in sorted(self.dirs | self.files)
+            if p != "/" and _parent(p) == path
+        ]
 
     def stat_path(self, path):
         if path in self.dirs:
@@ -199,15 +207,50 @@ def test_in_use_rmdir_under_a_deferred_parent_resolves_upwards(make_fs):
     assert fs._pending_deletes == set()
 
 
-def test_in_use_rmdir_with_no_retry_to_come_is_busy(make_fs):
+def test_deferred_rmdir_at_release_skips_the_inhibit_cycle_while_a_file_is_open(make_fs):
+    # pfs3aio stops answering after an inhibit cycle with a file open
+    # deeper in the tree, so the retry at release sends none then.
+    fs, volume = make_fs(dirs={"/", "/d", "/a", "/a/b"}, files={"/d/x", "/a/b/y"})
+    hx = _defer_d_behind_open_unlinked_x(fs, volume)
+    _hold(fs, volume, "/a/b/y")
+    cycles = len(volume.inhibit_cycles)
+
+    fs.release("/d/x", hx)
+
+    assert volume.inhibit_cycles[cycles:] == []
+    assert volume.deleted == ["/d/x", "/d"]
+    assert fs._pending_deletes == set()
+
+
+def test_deferred_rmdir_at_release_cycles_with_no_file_open(make_fs):
+    fs, volume = make_fs(dirs={"/", "/d"}, files={"/d/x"})
+    hx = _defer_d_behind_open_unlinked_x(fs, volume)
+    cycles = len(volume.inhibit_cycles)
+
+    fs.release("/d/x", hx)
+
+    assert volume.inhibit_cycles[cycles:] == [[]]
+    assert volume.deleted == ["/d/x", "/d"]
+
+
+def test_in_use_rmdir_of_a_directory_with_entries_and_no_retry_is_not_empty(make_fs):
     # /d/x is open but not unlinked: nothing would ever resend the delete,
     # so deferring it would only hide a directory that stays on disk.
     fs, volume = make_fs(dirs={"/", "/d"}, files={"/d/x"})
     _hold(fs, volume, "/d/x")
 
-    assert _errno_of(fs.rmdir, "/d") == errno.EBUSY
+    assert _errno_of(fs.rmdir, "/d") == errno.ENOTEMPTY
     assert fs._pending_deletes == set()
     assert fs._pending_dir_deletes == {}
+    assert _visible(fs, "/d")
+
+
+def test_in_use_rmdir_of_an_empty_directory_with_no_retry_is_busy(make_fs):
+    fs, volume = make_fs(dirs={"/", "/d"}, files=set())
+    volume.busy.add("/d")
+
+    assert _errno_of(fs.rmdir, "/d") == errno.EBUSY
+    assert fs._pending_deletes == set()
     assert _visible(fs, "/d")
 
 
