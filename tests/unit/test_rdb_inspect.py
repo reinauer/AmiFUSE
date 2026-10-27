@@ -471,6 +471,7 @@ class _FakeRDisk:
 
     def __init__(self, parts):
         self.parts = parts
+        self.rdb = types.SimpleNamespace(blk_num=0)  # RDSK block
         self.closed = False
 
     def close(self):
@@ -481,10 +482,20 @@ class _FakeBlkDev:
     """Records close() so tests can assert the block device is released."""
 
     def __init__(self):
+        self.block_bytes = 512
         self.closed = False
 
     def close(self):
         self.closed = True
+
+
+def _entry_ctx(mbr, i):
+    """The MBRContext open_rdisk gives for 0x76 entry i's own RDB."""
+    from amifuse.rdb_inspect import MBRContext
+
+    part = mbr.partitions[i]
+    return MBRContext(mbr_info=mbr, mbr_partition=part,
+                      offset_blocks=part.start_lba)
 
 
 def _patch_dostype(monkeypatch, rdb_inspect):
@@ -645,10 +656,12 @@ def test_list_partitions_multi_rdb_distinct_names(
     )
     rdb1 = _FakeRDisk([_FakePartition(0, "DH2", _FFS_DOS1)])
     blk0, blk1 = _FakeBlkDev(), _FakeBlkDev()
-    rets = {0: (blk0, rdb0, None), 1: (blk1, rdb1, None)}
+    rets = {i: (blk, rdb, _entry_ctx(mbr, i))
+            for i, (blk, rdb) in enumerate([(blk0, rdb0), (blk1, rdb1)])}
 
     def fake_open_rdisk(image, block_size=None, mbr_partition_index=None):
-        return rets[mbr_partition_index]
+        # No RDB beside the MBR, so the default opens the first entry's.
+        return rets[mbr_partition_index or 0]
 
     monkeypatch.setattr(rdb_inspect, "open_rdisk", fake_open_rdisk)
 
@@ -699,10 +712,12 @@ def test_list_partitions_duplicate_name_fallback(amitools_mock, monkeypatch, tmp
     )
     rdb1 = _FakeRDisk([_FakePartition(0, "DH0", _FFS_DOS1)])  # collides with rdb0
     blk0, blk1 = _FakeBlkDev(), _FakeBlkDev()
-    rets = {0: (blk0, rdb0, None), 1: (blk1, rdb1, None)}
+    rets = {i: (blk, rdb, _entry_ctx(mbr, i))
+            for i, (blk, rdb) in enumerate([(blk0, rdb0), (blk1, rdb1)])}
 
     def fake_open_rdisk(image, block_size=None, mbr_partition_index=None):
-        return rets[mbr_partition_index]
+        # No RDB beside the MBR, so the default opens the first entry's.
+        return rets[mbr_partition_index or 0]
 
     monkeypatch.setattr(rdb_inspect, "open_rdisk", fake_open_rdisk)
 

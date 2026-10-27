@@ -6008,6 +6008,19 @@ class TestCmdInspectJson:
         fake_rdb_inspect.detect_adf.return_value = mock_adf_info
         fake_rdb_inspect.detect_iso.return_value = None
         fake_rdb_inspect.amiga_rdb_partitions.return_value = []
+
+        def open_each_rdb(image, block_size, count):
+            # One open_rdisk per 0x76 entry, as on a disk with no RDB
+            # beside its MBR, or the default open with fewer than two.
+            for idx in range(count) if count > 1 else [None]:
+                try:
+                    opened = fake_rdb_inspect.open_rdisk(
+                        image, block_size=block_size, mbr_partition_index=idx)
+                except IOError as e:
+                    opened = e
+                yield idx, opened
+
+        fake_rdb_inspect.open_each_rdb.side_effect = open_each_rdb
         monkeypatch.setitem(sys.modules, "amifuse.rdb_inspect", fake_rdb_inspect)
         # The RDB path names each partition's driver; test_driver_resolver
         # covers the lookup itself.
