@@ -7,6 +7,7 @@ earlier RDB's partition number 1 win over a later RDB's partition named 1.
 
 from contextlib import ExitStack
 import json
+import struct
 
 import pytest
 
@@ -20,7 +21,7 @@ from amitools.fs.rdb.RDisk import RDisk
 
 from amifuse.fuse_fs import get_partition_info, main
 from amifuse.rdb_inspect import find_partition_mbr_index
-from tests.unit.test_mbr_rdb_block_size import _make_mbr
+from tests.unit.test_mbr_rdb_block_size import _make_mbr, _make_parceiro
 
 # The first RDB's partition number 1 is DH1.
 FIRST = [("DH0", DOS3), ("DH1", DOS7)]
@@ -78,6 +79,22 @@ def test_name_in_later_rdb_wins_over_number_in_earlier(tmp_path):
     # mount --partition 1 opens the partition named 1, not DH1.
     assert get_partition_info(image, None, "1") == {"name": "1",
                                                     "dostype": DOS3}
+
+
+def test_name_in_the_rdb_beside_the_mbr_is_found_first(tmp_path):
+    # A Parceiro disk's own RDB, beside the MBR, holds DH0, and so does the
+    # RDB of its second 0x76 entry. None selects the disk's own RDB, which
+    # the default open returns.
+    image = _make_parceiro(tmp_path, _make_rdb_parts(tmp_path, 512, [("DH0", DOS3)]))
+    data = bytearray(image.read_bytes())
+    for slot, name in ((1, "PI0"), (2, "DH0")):
+        rdb = _make_rdb_parts(tmp_path, 512, [(name, DOS3)])
+        entry = 446 + 16 * slot
+        data[entry + 4] = 0x76
+        struct.pack_into("<II", data, entry + 8, len(data) // 512, len(rdb) // 512)
+        data += rdb
+    image.write_bytes(bytes(data))
+    assert find_partition_mbr_index(image, None, "DH0") is None
 
 
 def test_inspect_json_gives_the_named_partition_a_driver(

@@ -811,7 +811,8 @@ def find_partition_mbr_index(
     MBR, has only one 0x76 partition, or no RDB that opens holds the name
     or, when the name is a number, a partition of that number. A number
     selects a partition by its number only when no RDB holds a partition
-    of that name.
+    of that name. The disk's own RDB beside the MBR is searched first,
+    and None selects it, as open_rdisk opens it by default.
 
     Raises IOError if a forced block_size rules out an RDB that holds the
     partition at its own block size.
@@ -826,11 +827,13 @@ def find_partition_mbr_index(
     name = str(partition_name)
 
     def holds_partition(idx, size, number):
-        # True or False if 0x76 partition idx opens at size, None if not.
+        # True or False if RDB idx opens at size, None if not.
         # Looks for the name when number is None, else for that number.
         try:
-            blkdev, rdisk, _ = open_rdisk(image, block_size=size, mbr_partition_index=idx)
+            blkdev, rdisk, mbr_ctx = open_rdisk(image, block_size=size, mbr_partition_index=idx)
             try:
+                if idx is None and mbr_ctx is not None and mbr_ctx.mbr_partition is not None:
+                    return None  # No RDB beside the MBR.
                 if number is not None:
                     return rdisk.get_partition(number) is not None
                 # find_partition_by_drive_name, but a damaged name (None)
@@ -853,7 +856,7 @@ def find_partition_mbr_index(
     except ValueError:
         pass
     for number in lookups:
-        for idx in range(len(amiga_parts)):
+        for idx in [None, *range(len(amiga_parts))]:
             found = holds_partition(idx, block_size, number)
             if found:
                 return idx
