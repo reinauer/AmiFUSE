@@ -6328,7 +6328,7 @@ def cmd_inspect(args):
     import json as _json
     import amitools.fs.DosType as DosType
     from .rdb_inspect import (
-        open_rdisk, detect_adf, detect_iso, list_partitions,
+        open_each_rdb, detect_adf, detect_iso, list_partitions,
         amiga_rdb_partitions, build_rdisk_desc, print_inspect_report,
         find_partition_mbr_index,
     )
@@ -6418,34 +6418,24 @@ def cmd_inspect(args):
         amiga_parts = amiga_rdb_partitions(args.image)
         multi_rdb = len(amiga_parts) > 1
         all_rdbs = []
-        for rdb_idx in range(len(amiga_parts) if multi_rdb else 1):
-            mbr_partition_index = rdb_idx if multi_rdb else None
-            try:
-                blkdev, rdisk, mbr_ctx = open_rdisk(
-                    args.image, block_size=args.block_size,
-                    mbr_partition_index=mbr_partition_index,
-                )
-            except IOError as e:
-                envelope = _json_error("inspect", "OPEN_FAILED", str(e))
+        rdb_indices = []
+        for rdb_idx, opened in open_each_rdb(
+                args.image, args.block_size, len(amiga_parts)):
+            if isinstance(opened, IOError):
+                envelope = _json_error("inspect", "OPEN_FAILED", str(opened))
                 envelope["image"] = str(args.image)
                 print(_json.dumps(envelope, indent=2))
                 sys.exit(1)
+            blkdev, rdisk, mbr_ctx = opened
             try:
                 all_rdbs.append(build_rdisk_desc(rdisk, mbr_ctx))
+                rdb_indices.append(rdb_idx)
             finally:
                 rdisk.close()
                 blkdev.close()
-            if mbr_ctx is not None and mbr_ctx.mbr_partition is None:
-                # Parceiro-style: open_rdisk found the disk's own RDB, which
-                # it does whichever 0x76 partition is selected. Describe it
-                # once, as for a single RDB.
-                break
 
         # Resolved with the image closed: a Windows disk admits one reader.
-        for rdb_idx, desc in enumerate(all_rdbs):
-            # A Parceiro disk's own RDB is the only one mount opens, so no
-            # other RDB can take its names.
-            parceiro = desc.get("mbr", {}).get("scheme") == "parceiro"
+        for rdb_idx, desc in zip(rdb_indices, all_rdbs):
             seen = set()
             for part in desc["partitions"]:
                 name = part["name"]
@@ -6453,8 +6443,9 @@ def cmd_inspect(args):
                 seen.add(name.lower())
                 # mount --partition picks the first RDB holding the name, so
                 # a same-named partition in a later RDB cannot be mounted.
-                selected = None
-                if multi_rdb and not parceiro:
+                # The disk's own RDB (index None) is searched first.
+                selected = rdb_idx
+                if multi_rdb and rdb_idx is not None:
                     try:
                         selected = find_partition_mbr_index(
                             args.image, args.block_size, name)
@@ -6462,7 +6453,10 @@ def cmd_inspect(args):
                         # A failed lookup: the driver lookup below meets
                         # the same error and gives it as the note.
                         pass
-                if selected is not None and selected != rdb_idx:
+                    if selected is None and rdb_indices[0] is not None:
+                        # No RDB beside the MBR, and none found the name.
+                        selected = rdb_idx
+                if selected != rdb_idx:
                     part["driver"] = None
                     part["driver_note"] = (
                         f"another RDB on this disk also has a partition named "
