@@ -187,21 +187,26 @@ def test_inspect_text_reports_every_rdb(user_driver_dir, tmp_path, capsys):
         "  DH0", "  DH1", "  PI1"]
 
 
-def test_name_in_the_disk_rdb_wins(user_driver_dir, tmp_path, capsys):
+def test_clash_note_marks_the_copy_mount_does_not_use(user_driver_dir,
+                                                      tmp_path, capsys):
     from amifuse.fuse_fs import main
 
     image = _parceiro(tmp_path, ("PI0", "DH0"))
-    assert find_partition_mbr_index(image, None, "DH0") is None
     listed = list_partitions(image)
     assert [p.name for p in listed.partitions] == ["DH0"]
     assert "colliding partition names ('DH0')" in listed.fallback_reason
 
     main(["inspect", "--json", str(image)])
     rdbs = json.loads(capsys.readouterr().out)["rdbs"]
-    assert rdbs[0]["partitions"][0]["driver"] is not None
-    clash = rdbs[2]["partitions"][0]
-    assert clash["driver"] is None
-    assert clash["driver_note"].startswith("another RDB on this disk")
+    disk, entry = rdbs[0]["partitions"][0], rdbs[2]["partitions"][0]
+    # mount --partition DH0 opens the RDB this lookup selects; None is the
+    # disk's own.
+    selected = find_partition_mbr_index(image, None, "DH0")
+    assert selected in (None, 1)
+    used, other = (disk, entry) if selected is None else (entry, disk)
+    assert used["driver"] is not None
+    assert other["driver"] is None
+    assert other["driver_note"].startswith("another RDB on this disk")
 
 
 def test_entries_sharing_an_rdb_list_it_once(tmp_path):

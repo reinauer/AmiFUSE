@@ -6443,9 +6443,9 @@ def cmd_inspect(args):
                 seen.add(name.lower())
                 # mount --partition picks the first RDB holding the name, so
                 # a same-named partition in a later RDB cannot be mounted.
-                # The disk's own RDB (index None) is searched first.
+                # None stands for the disk's own RDB beside the MBR.
                 selected = rdb_idx
-                if multi_rdb and rdb_idx is not None:
+                if multi_rdb:
                     try:
                         selected = find_partition_mbr_index(
                             args.image, args.block_size, name)
