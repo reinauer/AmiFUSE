@@ -6307,6 +6307,10 @@ def _partition_driver(image: Path, block_size: Optional[int], name: str):
         resolved = resolve_driver(image, None, block_size, name)
     except (DriverNotFound, OSError) as exc:
         return None, " ".join(str(exc).splitlines())
+    except AttributeError as exc:
+        # amitools raises it on a damaged drive name in an RDB the partition
+        # lookup reads (#192).
+        return None, f"a damaged drive name stops the partition lookup: {exc}"
     info = resolved.to_json()
     if resolved.temporary:
         try:
@@ -6416,7 +6420,6 @@ def cmd_inspect(args):
         # rdb-inspect tool (which skips unreadable RDBs), any open failure
         # is fatal here so scripts get a definitive error envelope.
         amiga_parts = amiga_rdb_partitions(args.image)
-        multi_rdb = len(amiga_parts) > 1
         all_rdbs = []
         rdb_indices = []
         for rdb_idx, opened in open_each_rdb(
@@ -6435,6 +6438,9 @@ def cmd_inspect(args):
                 blkdev.close()
 
         # Resolved with the image closed: a Windows disk admits one reader.
+        multi_rdb = len(all_rdbs) > 1
+        disk_names = ({p["name"].lower() for p in all_rdbs[0]["partitions"]}
+                      if rdb_indices and rdb_indices[0] is None else set())
         for rdb_idx, desc in zip(rdb_indices, all_rdbs):
             seen = set()
             for part in desc["partitions"]:
@@ -6449,12 +6455,14 @@ def cmd_inspect(args):
                     try:
                         selected = find_partition_mbr_index(
                             args.image, args.block_size, name)
-                    except IOError:
-                        # A failed lookup: the driver lookup below meets
-                        # the same error and gives it as the note.
+                    except (IOError, AttributeError):
+                        # A failed lookup, or a damaged drive name (#192):
+                        # the driver lookup below meets the same error and
+                        # gives it as the note.
                         pass
-                    if selected is None and rdb_indices[0] is not None:
-                        # No RDB beside the MBR, and none found the name.
+                    if selected is None and name.lower() not in disk_names:
+                        # Unless the disk's own RDB holds the name, None
+                        # means no RDB was found holding it.
                         selected = rdb_idx
                 if selected != rdb_idx:
                     part["driver"] = None

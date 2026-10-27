@@ -603,7 +603,7 @@ def test_list_partitions_single_amiga_mbr_uses_plain_path(
 
     def fake_open_rdisk(image, block_size=None, mbr_partition_index=None):
         calls.append((block_size, mbr_partition_index))
-        return blkdev, rdisk, None
+        return blkdev, rdisk, _entry_ctx(mbr, 0)
 
     monkeypatch.setattr(rdb_inspect, "open_rdisk", fake_open_rdisk)
 
@@ -655,13 +655,16 @@ def test_list_partitions_multi_rdb_distinct_names(
         [_FakePartition(0, "DH0", _FFS_DOS1), _FakePartition(1, "DH1", _FFS_DOS1)]
     )
     rdb1 = _FakeRDisk([_FakePartition(0, "DH2", _FFS_DOS1)])
-    blk0, blk1 = _FakeBlkDev(), _FakeBlkDev()
-    rets = {i: (blk, rdb, _entry_ctx(mbr, i))
-            for i, (blk, rdb) in enumerate([(blk0, rdb0), (blk1, rdb1)])}
+    opened = []
 
     def fake_open_rdisk(image, block_size=None, mbr_partition_index=None):
-        # No RDB beside the MBR, so the default opens the first entry's.
-        return rets[mbr_partition_index or 0]
+        # Fresh handles per open. No RDB beside the MBR, so the default
+        # opens the first entry's.
+        i = mbr_partition_index or 0
+        handles = (_FakeBlkDev(), _FakeRDisk([rdb0, rdb1][i].parts),
+                   _entry_ctx(mbr, i))
+        opened.append(handles)
+        return handles
 
     monkeypatch.setattr(rdb_inspect, "open_rdisk", fake_open_rdisk)
 
@@ -670,8 +673,9 @@ def test_list_partitions_multi_rdb_distinct_names(
     assert result.fallback_reason is None
     assert [p.name for p in result.partitions] == ["DH0", "DH1", "DH2"]
     assert [p.index for p in result.partitions] == [0, 1, 0]  # .num collides; name keys
-    assert rdb0.closed and blk0.closed
-    assert rdb1.closed and blk1.closed
+    # The default open's handles and each RDB's are all released.
+    assert len(opened) == 3
+    assert all(blk.closed and rdisk.closed for blk, rdisk, _ in opened)
 
 
 def test_list_partitions_duplicate_name_fallback(amitools_mock, monkeypatch, tmp_path):
@@ -711,13 +715,16 @@ def test_list_partitions_duplicate_name_fallback(amitools_mock, monkeypatch, tmp
         [_FakePartition(0, "DH0", _FFS_DOS1), _FakePartition(1, "DH1", _FFS_DOS1)]
     )
     rdb1 = _FakeRDisk([_FakePartition(0, "DH0", _FFS_DOS1)])  # collides with rdb0
-    blk0, blk1 = _FakeBlkDev(), _FakeBlkDev()
-    rets = {i: (blk, rdb, _entry_ctx(mbr, i))
-            for i, (blk, rdb) in enumerate([(blk0, rdb0), (blk1, rdb1)])}
+    opened = []
 
     def fake_open_rdisk(image, block_size=None, mbr_partition_index=None):
-        # No RDB beside the MBR, so the default opens the first entry's.
-        return rets[mbr_partition_index or 0]
+        # Fresh handles per open. No RDB beside the MBR, so the default
+        # opens the first entry's.
+        i = mbr_partition_index or 0
+        handles = (_FakeBlkDev(), _FakeRDisk([rdb0, rdb1][i].parts),
+                   _entry_ctx(mbr, i))
+        opened.append(handles)
+        return handles
 
     monkeypatch.setattr(rdb_inspect, "open_rdisk", fake_open_rdisk)
 
@@ -731,5 +738,6 @@ def test_list_partitions_duplicate_name_fallback(amitools_mock, monkeypatch, tmp
     assert result.partitions[0].name == "DH0"
     assert result.partitions[0].index == 0
     # No leaked handles, including the collision-triggering RDB.
-    assert rdb0.closed and blk0.closed
-    assert rdb1.closed and blk1.closed
+    # The default open's handles and each RDB's are all released.
+    assert len(opened) == 3
+    assert all(blk.closed and rdisk.closed for blk, rdisk, _ in opened)
