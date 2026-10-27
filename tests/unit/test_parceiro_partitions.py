@@ -108,6 +108,15 @@ def test_inspect_text_gives_every_partition_a_driver(user_driver_dir,
         "  DH0", "  DH1"]
 
 
+def test_rdb_inspect_json_describes_the_rdb_once(tmp_path, capsys):
+    from amifuse.rdb_inspect import main
+
+    main(["--json", str(_parceiro(tmp_path))])
+    desc = json.loads(capsys.readouterr().out)
+    assert desc["mbr"]["scheme"] == "parceiro"
+    assert [p["name"] for p in desc["partitions"]] == ["DH0", "DH1"]
+
+
 def _names(image, **kwargs):
     blkdev, rdisk, mbr_ctx = open_rdisk(image, **kwargs)
     try:
