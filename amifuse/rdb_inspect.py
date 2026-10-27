@@ -4,7 +4,7 @@ import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Tuple, Union
+from typing import Iterator, List, Optional, Tuple, Union
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 AMITOOLS_PATH = REPO_ROOT / "amitools"
@@ -950,24 +950,17 @@ def list_partitions(
     """
     amiga_parts = amiga_rdb_partitions(image)
 
-    # Plain RDB (or a single 0x76 RDB): open once, enumerate, close both handles.
-    if len(amiga_parts) <= 1:
-        blkdev, rdisk, _mbr_ctx = open_rdisk(image, block_size=block_size)
-        try:
-            parts = [_part_info(p) for p in rdisk.parts]
-        finally:
-            rdisk.close()
-            blkdev.close()
-        return PartitionList(partitions=parts)
-
-    # Multi-RDB: enumerate across every 0x76 RDB, keyed by name. Each iteration
-    # opens its own (blkdev, rdisk) and MUST close both inside the loop or N
-    # block-device handles leak.
+    # Enumerate across every RDB, keyed by name. Each iteration opens its own
+    # (blkdev, rdisk) and MUST close both inside the loop or N block-device
+    # handles leak.
     all_parts: List[PartInfo] = []
     seen_names: dict = {}   # lower-cased names from previously-processed RDBs
     first_part: Optional[PartInfo] = None
-    for _rdb_idx, opened in open_each_rdb(image, block_size, len(amiga_parts)):
+    for rdb_idx, opened in open_each_rdb(image, block_size, len(amiga_parts)):
         if isinstance(opened, IOError):
+            if rdb_idx is None:
+                # A plain or single-0x76 image whose one RDB does not open.
+                raise opened
             continue
         blkdev, rdisk, _mbr_ctx = opened
         try:
@@ -1029,7 +1022,11 @@ def _is_entry_rdb(mbr_ctx: Optional[MBRContext]) -> bool:
     return mbr_ctx is not None and mbr_ctx.mbr_partition is not None
 
 
-def open_each_rdb(image: Path, block_size: Optional[int], count: int):
+def open_each_rdb(
+    image: Path, block_size: Optional[int], count: int,
+) -> Iterator[Tuple[Optional[int], Union[
+        Tuple[Union[RawBlockDevice, OffsetBlockDevice], RDisk, Optional[MBRContext]],
+        OSError]]]:
     """Open each RDB of an MBR disk with `count` 0x76 entries, once.
 
     Yields (mbr_partition_index, opened). The disk's own RDB beside the
@@ -1038,7 +1035,8 @@ def open_each_rdb(image: Path, block_size: Optional[int], count: int):
     caller closes, or the IOError the entry failed with. With an RDB beside
     the MBR, entries that do not open are skipped instead. An RDB already
     yielded, as by two entries starting at the same sector, is skipped too.
-    With fewer than two entries, yields the default open, or its error, once.
+    With fewer than two entries, yields the default open, or its error,
+    with index None, then beside the disk's own RDB a single entry's own.
     """
     if count <= 1:
         try:
@@ -1046,6 +1044,14 @@ def open_each_rdb(image: Path, block_size: Optional[int], count: int):
         except IOError as e:
             opened = e
         yield None, opened
+        if count == 0 or isinstance(opened, IOError) or _is_entry_rdb(opened[2]):
+            return
+        try:
+            opened = open_rdisk(image, block_size=block_size,
+                                mbr_partition_index=0)
+        except IOError:
+            return  # The entry holds no RDB of its own.
+        yield 0, opened
         return
     seen = set()
     disk_rdb = False
@@ -1153,8 +1159,7 @@ def print_inspect_report(image: Path, block_size: Optional[int], full: bool) -> 
                     # Report it as for a single RDB.
                     lines = [""]
                 else:
-                    lines = [f"\n=== Amiga RDB in MBR partition [{mbr_ctx.mbr_partition.index}]"
-                             f" (offset: {mbr_ctx.offset_blocks} sectors) ===\n"]
+                    lines = [_entry_heading(mbr_ctx)]
                 lines += format_rdisk_report(rdisk, full=full)
             finally:
                 rdisk.close()
@@ -1180,25 +1185,30 @@ def print_inspect_report(image: Path, block_size: Optional[int], full: bool) -> 
             )
         return
 
-    # Single RDB (plain or Parceiro-style)
-    blkdev = None
-    rdisk = None
-    try:
+    # Single RDB (plain or Parceiro-style), then beside a Parceiro disk's own
+    # RDB its single 0x76 entry's own RDB, if it holds one.
+    for rdb_idx, opened in open_each_rdb(image, block_size, len(amiga_parts)):
+        if isinstance(opened, IOError):
+            raise SystemExit(f"Error: {opened}")
+        blkdev, rdisk, mbr_ctx = opened
         try:
-            blkdev, rdisk, mbr_ctx = open_rdisk(image, block_size=block_size)
-        except IOError as e:
-            raise SystemExit(f"Error: {e}")
-        if mbr_ctx is not None:
-            for line in format_mbr_info(mbr_ctx):
+            if rdb_idx is not None:
+                print(_entry_heading(mbr_ctx))
+            elif mbr_ctx is not None:
+                for line in format_mbr_info(mbr_ctx):
+                    print(line)
+                print()
+            for line in format_rdisk_report(rdisk, full=full):
                 print(line)
-            print()
-        for line in format_rdisk_report(rdisk, full=full):
-            print(line)
-    finally:
-        if rdisk is not None:
+        finally:
             rdisk.close()
-        if blkdev is not None:
             blkdev.close()
+
+
+def _entry_heading(mbr_ctx: MBRContext) -> str:
+    """The report heading of an RDB inside a 0x76 entry."""
+    return (f"\n=== Amiga RDB in MBR partition [{mbr_ctx.mbr_partition.index}]"
+            f" (offset: {mbr_ctx.offset_blocks} sectors) ===\n")
 
 
 _MBR_TYPE_NAMES = {

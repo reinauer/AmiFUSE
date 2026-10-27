@@ -12,6 +12,8 @@ from contextlib import ExitStack
 from amitools.fs.FSString import FSString
 from amitools.fs.blkdev.DiskGeometry import DiskGeometry
 from amitools.fs.blkdev.RawBlockDevice import RawBlockDevice
+from amitools.fs.block.rdb.PartitionBlock import PartitionBlock
+from amitools.fs.block.rdb.RDBlock import RDBlock
 from amitools.fs.rdb.RDisk import RDisk
 
 from amifuse.driver_runtime import BlockDeviceBackend
@@ -215,3 +217,66 @@ def test_entries_sharing_an_rdb_list_it_once(tmp_path):
     listed = list_partitions(image)
     assert [p.name for p in listed.partitions] == ["PI0"]
     assert listed.fallback_reason is None
+
+
+def test_single_entry_rdb_is_listed_beside_the_disk_rdb(user_driver_dir,
+                                                        tmp_path, capsys):
+    from amifuse.fuse_fs import main
+
+    image = _parceiro(tmp_path, ("PI0",))  # one 0x76 entry, at LBA 200
+    listed = list_partitions(image)
+    assert [p.name for p in listed.partitions] == ["DH0", "DH1", "PI0"]
+    assert listed.fallback_reason is None
+
+    main(["inspect", "--json", str(image)])
+    rdbs = json.loads(capsys.readouterr().out)["rdbs"]
+    assert [(r["mbr"]["scheme"], r["mbr"].get("partition_index"),
+             [p["name"] for p in r["partitions"]]) for r in rdbs] == [
+        ("parceiro", None, ["DH0", "DH1"]), ("emu68", 0, ["PI0"])]
+    assert all(p["driver"] is not None for p in rdbs[0]["partitions"])
+
+    main(["inspect", str(image)])
+    out = capsys.readouterr().out
+    assert "=== Amiga RDB in MBR partition [0] (offset: 200 sectors) ===" in out
+    section = out.split("Filesystem driver per partition (without --driver):\n")[1]
+    assert [line.split(":")[0] for line in section.splitlines()] == [
+        "  DH0", "  DH1", "  PI0"]
+
+
+def _damage_first_name(image, lba):
+    """Make the first partition of the RDB at lba hold a 40-byte drive name
+    length, past the 31 bytes a partition block holds, with the checksum
+    redone. amitools reads the name as None and raises on it in a lookup."""
+    raw = RawBlockDevice(str(image), read_only=False, block_bytes=512)
+    raw.open()
+    try:
+        rdb_blk = RDBlock(raw, lba)
+        assert rdb_blk.read()
+        part_blk = PartitionBlock(raw, lba + rdb_blk.part_list)
+        assert part_blk.read()
+        part_blk.data[36] = 40  # drive name length, long 9
+        part_blk._put_chksum()
+        part_blk._write_data()
+        raw.flush()
+    finally:
+        raw.close()
+
+
+def test_damaged_name_in_an_entry_rdb_does_not_end_inspect(user_driver_dir,
+                                                           tmp_path, capsys):
+    # On main the entries' RDBs were never read beside the disk's own, so
+    # the damaged name could not stop inspect.
+    from amifuse.fuse_fs import main
+
+    image = _parceiro(tmp_path, ("PI0", "PI1"))
+    _damage_first_name(image, 400)
+
+    main(["inspect", "--json", str(image)])
+    env = json.loads(capsys.readouterr().out)
+    assert env["status"] == "ok"
+    for rdb in env["rdbs"]:
+        for part in rdb["partitions"]:
+            assert part["driver"] is not None or part["driver_note"]
+
+    main(["inspect", str(image)])
+    assert "Filesystem driver per partition" in capsys.readouterr().out
