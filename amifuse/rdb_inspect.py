@@ -808,11 +808,12 @@ def find_partition_mbr_index(
     For MBR images with multiple 0x76 partitions, searches each RDB for the
     named partition.  Returns the 0-based index into the list of 0x76
     partitions (0 when the first RDB holds it), or None if the image is not
-    MBR, has only one 0x76 partition, or no RDB that opens holds the name
-    or, when the name is a number, a partition of that number. A number
-    selects a partition by its number only when no RDB holds a partition
-    of that name. The disk's own RDB beside the MBR is searched first,
-    and None selects it, as open_rdisk opens it by default.
+    MBR, has only one 0x76 partition and no RDB beside the MBR, or no RDB
+    that opens holds the name or, when the name is a number, a partition of
+    that number. A number selects a partition by its number only when no
+    RDB holds a partition of that name. The disk's own RDB beside the MBR
+    is searched first, and None selects it, as open_rdisk opens it by
+    default.
 
     Raises IOError if a forced block_size rules out an RDB that holds the
     partition at its own block size.
@@ -821,8 +822,17 @@ def find_partition_mbr_index(
     if mbr_info is None or not mbr_info.has_amiga_partitions:
         return None
     amiga_parts = [p for p in mbr_info.partitions if p.partition_type == MBR_TYPE_AMIGA_RDB]
-    if len(amiga_parts) <= 1:
-        return None
+    if len(amiga_parts) == 1:
+        # One 0x76 entry adds an RDB to search only beside the disk's own,
+        # which the default open returns; otherwise that open is the one RDB.
+        try:
+            blkdev, rdisk, mbr_ctx = open_rdisk(image)
+        except IOError:
+            return None
+        rdisk.close()
+        blkdev.close()
+        if mbr_ctx is not None and mbr_ctx.mbr_partition is not None:
+            return None
 
     name = str(partition_name)
 

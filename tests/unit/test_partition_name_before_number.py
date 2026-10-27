@@ -8,6 +8,7 @@ earlier RDB's partition number 1 win over a later RDB's partition named 1.
 from contextlib import ExitStack
 import json
 import struct
+import types
 
 import pytest
 
@@ -19,8 +20,10 @@ from amitools.fs.block.rdb.PartitionBlock import PartitionBlock
 from amitools.fs.block.rdb.RDBlock import RDBlock
 from amitools.fs.rdb.RDisk import RDisk
 
+from amifuse import rdb_inspect
 from amifuse.fuse_fs import get_partition_info, main
-from amifuse.rdb_inspect import find_partition_mbr_index
+from amifuse.rdb_inspect import (MBRContext, MBRInfo, MBRPartition,
+                                 find_partition_mbr_index)
 from tests.unit.test_mbr_rdb_block_size import _make_mbr, _make_parceiro
 
 # The first RDB's partition number 1 is DH1.
@@ -95,6 +98,47 @@ def test_name_in_the_rdb_beside_the_mbr_is_found_first(tmp_path):
         data += rdb
     image.write_bytes(bytes(data))
     assert find_partition_mbr_index(image, None, "DH0") is None
+
+
+class _FakeRDisk:
+    """The parts of an RDisk the lookup reads: drive names and numbers."""
+
+    def __init__(self, names):
+        self.parts = [types.SimpleNamespace(get_drive_name=lambda n=n: FSString(n))
+                      for n in names]
+
+    def get_partition(self, num):
+        return self.parts[num] if 0 <= num < len(self.parts) else None
+
+    def close(self):
+        pass
+
+
+@pytest.mark.parametrize("beside_mbr,expected", [
+    # The default open gives the disk's own RDB (DH0); index 0 gives the
+    # entry's own RDB (PI0), as it does once an entry index opens it.
+    (True, [None, 0, None]),
+    # No RDB beside the MBR: the default open gives the entry's RDB, the
+    # disk's one RDB, and the lookup leaves it to that open.
+    (False, [None, None, None]),
+])
+def test_single_entry_beside_the_disk_rdb_is_searched(monkeypatch,
+                                                      beside_mbr, expected):
+    entry = MBRPartition(index=1, bootable=False, partition_type=0x76,
+                         start_lba=200, num_sectors=160)
+    mbr = MBRInfo(partitions=[entry], has_amiga_partitions=True)
+
+    def fake_open_rdisk(image, block_size=None, mbr_partition_index=None):
+        if mbr_partition_index is None and beside_mbr:
+            names, ctx = ["DH0"], MBRContext(mbr, None, 0, "parceiro")
+        else:
+            names, ctx = ["PI0"], MBRContext(mbr, entry, 200)
+        return types.SimpleNamespace(close=lambda: None), _FakeRDisk(names), ctx
+
+    monkeypatch.setattr(rdb_inspect, "detect_mbr", lambda image: mbr)
+    monkeypatch.setattr(rdb_inspect, "open_rdisk", fake_open_rdisk)
+    assert [find_partition_mbr_index("disk.hdf", None, name)
+            for name in ("DH0", "PI0", "XX")] == expected
 
 
 def test_inspect_json_gives_the_named_partition_a_driver(
