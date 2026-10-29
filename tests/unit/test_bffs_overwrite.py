@@ -154,7 +154,7 @@ def _bffs_bridge(volume):
     bridge._write_enabled = True
     bridge._neg_cache = {}
     bridge._neg_cache_ttl = 0
-    bridge.locate_path = MagicMock(return_value=(0, 0, []))
+    bridge.locate_path = MagicMock(side_effect=lambda path: (0, 0, []))
     bridge.locate = MagicMock(return_value=(ROOT_LOCK, 0))
     bridge.free_lock = MagicMock()
     bridge._alloc_bstr = lambda name: (0, name)
@@ -231,7 +231,8 @@ def test_parent_lock_is_swapped(fuse_mock):
 
 def test_refused_reopen_keeps_a_handle(fuse_mock):
     """BFFS refuses the ACTION_FINDOUTPUT while another handle holds the
-    file. The file is opened again as before and keeps its data."""
+    file, and truncate() says the file is busy. The file is opened again
+    as before and keeps its data."""
     volume = _FakeBFFS({"file": ORIGINAL})
     fs = _bffs_fs(volume)
     reader = fs.open("/file", os.O_RDONLY)
@@ -239,7 +240,7 @@ def test_refused_reopen_keeps_a_handle(fuse_mock):
 
     with pytest.raises(fuse_fs.FuseOSError) as exc_info:
         fs.truncate("/file", 0, fh)
-    assert exc_info.value.args[0] == errno.EIO
+    assert exc_info.value.args[0] == errno.EBUSY
     assert [action for action, _ in volume.opens] == [
         FINDINPUT, FINDUPDATE, FINDOUTPUT, FINDUPDATE]
     assert fs.write("/file", b"X", 0, fh) == 1
@@ -249,18 +250,22 @@ def test_refused_reopen_keeps_a_handle(fuse_mock):
 
     assert volume.files["file"] == b"X" + ORIGINAL[1:]
     assert volume.handles == {}
+    # The refused open's lock, the old handle's, then at release the
+    # handle's and the reader's.
+    assert fs.bridge.free_lock.call_count == 4
 
 
-@pytest.mark.parametrize("replies, opens", [
+@pytest.mark.parametrize("replies, opens, expected, freed", [
     ({1: _reply(0, fuse_fs.ERROR_OBJECT_IN_USE),
       2: _reply(0, fuse_fs.ERROR_OBJECT_IN_USE)},
-     [FINDUPDATE, FINDOUTPUT, FINDUPDATE]),
-    ({1: NO_REPLY}, [FINDUPDATE, FINDOUTPUT]),
+     [FINDUPDATE, FINDOUTPUT, FINDUPDATE], errno.EBUSY, 3),
+    ({1: NO_REPLY}, [FINDUPDATE, FINDOUTPUT], errno.EIO, 2),
 ], ids=["refused-twice", "no-reply"])
-def test_entry_with_no_handle_left_is_closed(fuse_mock, replies, opens):
+def test_entry_with_no_handle_left_is_closed(fuse_mock, replies, opens,
+                                             expected, freed):
     """With no handle left, every later call fails with EIO, and release()
-    sends no ACTION_END for the handle that ended. After an open that got
-    no reply, no other open is sent."""
+    sends no ACTION_END for the handle that ended and frees no lock. After
+    an open that got no reply, no other open is sent."""
     volume = _FakeBFFS({"file": ORIGINAL})
     fs = _bffs_fs(volume)
     fh = fs.open("/file", os.O_RDWR)
@@ -268,7 +273,7 @@ def test_entry_with_no_handle_left_is_closed(fuse_mock, replies, opens):
 
     with pytest.raises(fuse_fs.FuseOSError) as exc_info:
         fs.truncate("/file", 0, fh)
-    assert exc_info.value.args[0] == errno.EIO
+    assert exc_info.value.args[0] == expected
     assert [action for action, _ in volume.opens] == opens
     ended = volume.ends[:]
     assert len(ended) == 1 and volume.handles == {}
@@ -282,6 +287,73 @@ def test_entry_with_no_handle_left_is_closed(fuse_mock, replies, opens):
 
     assert volume.ends == ended
     assert volume.files["file"] == ORIGINAL
+    assert fs.bridge.free_lock.call_count == freed
+
+
+def test_refused_zero_length_write_fails_the_truncate(fuse_mock):
+    """BFFS refuses the write mode when it cannot extend the file's last
+    block on a full volume. The truncate then fails with ENOSPC, the new
+    handle ends without cutting the file, and the file is opened again as
+    before, so a later write cannot cut it either."""
+    volume = _FakeBFFS({"file": ORIGINAL})
+    volume.write_replies = {0: _reply(-1, fuse_fs.ERROR_DISK_FULL)}
+    fs = _bffs_fs(volume)
+    fh = fs.open("/file", os.O_RDWR)
+
+    with pytest.raises(fuse_fs.FuseOSError) as exc_info:
+        fs.truncate("/file", 0, fh)
+    assert exc_info.value.args[0] == errno.ENOSPC
+    assert [action for action, _ in volume.opens] == [
+        FINDUPDATE, FINDOUTPUT, FINDUPDATE]
+    assert fs.getattr("/file", fh)["st_size"] == len(ORIGINAL)
+    assert fs.write("/file", b"X", 0, fh) == 1
+    fs.release("/file", fh)
+
+    assert volume.writes == [0, 1]
+    assert volume.files["file"] == b"X" + ORIGINAL[1:]
+    assert volume.handles == {}
+
+
+def test_unanswered_zero_length_write_keeps_the_new_handle(fuse_mock):
+    """The handler may still carry out the write, so no other packet goes
+    out for it: no open, no second zero-length write. The entry keeps the
+    new handle, which release() ends."""
+    volume = _FakeBFFS({"file": ORIGINAL})
+    volume.write_replies = {0: NO_REPLY}
+    fs = _bffs_fs(volume)
+    fh = fs.open("/file", os.O_RDWR)
+
+    with pytest.raises(fuse_fs.FuseOSError) as exc_info:
+        fs.truncate("/file", 0, fh)
+    assert exc_info.value.args[0] == errno.EIO
+    assert [action for action, _ in volume.opens] == [FINDUPDATE, FINDOUTPUT]
+    fs.release("/file", fh)
+
+    assert volume.writes == [0]
+    assert len(volume.ends) == 2 and volume.handles == {}
+
+
+@pytest.mark.parametrize("truncate", [True, False],
+                         ids=["reopen", "O_TRUNC-open"])
+def test_read_stops_at_what_the_handle_wrote(fuse_mock, truncate):
+    """BFFS still holds the old data until the handle ends, and a read of
+    it would move the point BFFS cuts the file at. A read past what the
+    handle wrote returns nothing and sends no packet."""
+    volume = _FakeBFFS({"file": ORIGINAL})
+    fs = _bffs_fs(volume)
+    if truncate:
+        fh = fs.open("/file", os.O_RDWR)
+        fs.truncate("/file", 0, fh)
+    else:
+        fh = fs.open("/file", os.O_RDWR | os.O_TRUNC)
+
+    assert fs.read("/file", 4096, 0, fh) == b""
+    fs.write("/file", NEW, 0, fh)
+    assert fs.read("/file", 4096, 0, fh) == NEW
+    assert fs.read("/file", 10, len(NEW) - 4, fh) == NEW[-4:]
+    fs.release("/file", fh)
+
+    assert volume.files["file"] == NEW
 
 
 def test_truncate_to_nonzero_length_is_not_reopened(fuse_mock):
@@ -346,8 +418,10 @@ def test_reused_file_handle_carries_no_mark(fuse_mock):
 
 
 def test_failed_first_write_still_gets_zero_length_write(fuse_mock):
-    """BFFS can fail a write before the handle switches to write mode, as
-    when the volume is full, so only a write that succeeds counts."""
+    """BFFS can fail a write before the handle switches to write mode,
+    when it cannot extend the file's last block, so a failed write leaves
+    the mark. Here the zero-length write at the end succeeds, as when the
+    first write failed after the switch or space came free since."""
     volume = _FakeBFFS({"file": ORIGINAL})
     volume.write_replies = {0: _reply(-1, fuse_fs.ERROR_DISK_FULL)}
     fs = _bffs_fs(volume)
