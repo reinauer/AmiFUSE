@@ -1,10 +1,12 @@
 """A launch whose mount exits with an error reports it, even when a drive is
 present at its letter.
 
-Two launches that run at once can pick the same free letter. The losing
-mount exits 1, but the winner's drive is present, so a poll that probes the
-drive before the process would report the loser as mounted and open Explorer
-on the other image. Windows-only, like ``test_launcher.py``: Popen,
+Something other than this launch can take a letter after the launch
+selected it (another program, or a launch whose claim on the letter has
+ended; test_launcher_letter_claims.py covers the claims). The losing mount
+exits 1, but the other drive is present, so a poll that probes the drive
+before the process would report the loser as mounted and open Explorer on
+the other image. Windows-only, like ``test_launcher.py``: Popen,
 ctypes.windll, os.startfile and the drive probe are mocked, and the
 launcher's logs go to ``tmp_path``.
 """

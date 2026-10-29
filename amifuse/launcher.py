@@ -173,6 +173,67 @@ def _select_drive_letter() -> Optional[str]:
     return chosen[0] if chosen else None
 
 
+_ERROR_ALREADY_EXISTS = 183
+_kernel32 = None
+
+
+def _claim_drive_letter(letter: str):
+    """Claim ``letter`` for this launch; return the claim's handle, or ``None``
+    when a launch (this one or another) already holds it. A claim that
+    cannot be created, e.g. one an elevated launch holds, counts as held.
+
+    A letter stays unallocated until its mount is up, seconds after it was
+    selected, so launches that run at once would otherwise pick the same one.
+    The claim is the named mutex ``Local\\AmiFUSE-drive-<letter>``, which
+    exists for as long as a handle to it is open: closing the handle, or the
+    launcher exiting, releases the letter."""
+    global _kernel32
+    if _kernel32 is None:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateMutexW.restype = ctypes.c_void_p
+        kernel32.CreateMutexW.argtypes = [
+            ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p,
+        ]
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        _kernel32 = kernel32
+    ctypes.set_last_error(0)
+    handle = _kernel32.CreateMutexW(
+        None, False, f"Local\\AmiFUSE-drive-{letter[0]}"
+    )
+    if not handle:
+        return None
+    if ctypes.get_last_error() == _ERROR_ALREADY_EXISTS:
+        _kernel32.CloseHandle(handle)
+        return None
+    return handle
+
+
+def _claim_drive_letters(n: int) -> tuple[list[str], list]:
+    """Return up to ``n`` free letters that this launch has claimed, as
+    ``"X:"`` strings, and their claim handles.
+
+    A letter is free when :func:`_select_drive_letters` reports it, no launch
+    holds its claim (:func:`_claim_drive_letter`), and it is still
+    unallocated once this launch holds the claim."""
+    free, _ = _select_drive_letters(len(_DRIVE_LETTER_ALPHABET))
+    chosen, claims = [], []
+    for letter in free:
+        if len(chosen) == n:
+            break
+        handle = _claim_drive_letter(letter)
+        if handle is None:
+            continue
+        # A launch keeps its claim until its poll ends, which is after its
+        # drive is up unless the mount timed out, so a letter claimed just
+        # after another launch's drive arrived shows as allocated here.
+        if letter[0] in platform._windows_allocated_drive_letters():
+            _kernel32.CloseHandle(handle)
+            continue
+        chosen.append(letter)
+        claims.append(handle)
+    return chosen, claims
+
+
 @dataclass
 class _MountUnit:
     """One drive to mount in a fan-out.
@@ -311,9 +372,11 @@ def mount_image_all(image: str, *, write: bool, explorer: str) -> None:
     ``platform.notify_shell_drive_change`` at fuse_fs.py:2715-2719, so the
     launcher adds no refresh code).
 
-    Steps: enumerate units; allocate up to N free letters (best-effort partial
-    on exhaustion); spawn all mounts FIRST; poll a single aggregate deadline for
-    every drive to appear; start the tray once; show at most one summary dialog.
+    Steps: enumerate units; claim up to N free letters (best-effort partial
+    on exhaustion), held until the poll ends so that a launch running at the
+    same time picks others; spawn all mounts FIRST; poll a single aggregate
+    deadline for every drive to appear; start the tray once; show at most one
+    summary dialog.
 
     N=1 is the identity case -- a single unit reproduces the pre-fan-out path
     exactly: one spawn (no ``--partition``), a 15s poll, one Explorer window on
@@ -325,8 +388,8 @@ def mount_image_all(image: str, *, write: bool, explorer: str) -> None:
     if fallback_reason:
         _log(fallback_reason)
 
-    chosen, total_free = _select_drive_letters(len(units))
-    if total_free == 0:
+    chosen, claims = _claim_drive_letters(len(units))
+    if not chosen:
         _log("No available drive letter found")
         _show_error("AmiFUSE", "No available drive letter found. Cannot mount.")
         return
@@ -343,7 +406,7 @@ def mount_image_all(image: str, *, write: bool, explorer: str) -> None:
     pending: dict[str, _MountUnit] = {}   # letter -> unit awaiting arrival
     # Three distinct failure buckets. spawn_failed: the process NEVER launched
     # (_spawn_detached raised) -- a definite, hard failure. exited (below): the
-    # process exited with an error, even if a drive (perhaps another launch's)
+    # process exited with an error, even if a drive (perhaps another mount's)
     # is present at its letter -- definite, with its stderr. failed (below):
     # the process spawned but its drive never appeared by the deadline -- a
     # SOFT timeout that may still be a slow cold mount. Folding them together
@@ -406,7 +469,7 @@ def mount_image_all(image: str, *, write: bool, explorer: str) -> None:
             elapsed += poll_interval
             for letter in list(pending):
                 # Check the process before the drive: a drive at this letter
-                # may be another launch's mount that took the same letter, so
+                # may be another mount's that took the same letter, so
                 # a mount that exited with an error (e.g. no driver for the
                 # DOS type, or the letter already allocated) is a failure even
                 # when the drive is present.
@@ -437,6 +500,11 @@ def mount_image_all(image: str, *, write: bool, explorer: str) -> None:
             failed.extend((unit, letter) for letter, unit in pending.items())
     for log in held_logs:
         log.close()
+    # A drive that has arrived now holds its letter itself. A mount still
+    # starting after the deadline loses its claim, so another launch may
+    # select its letter.
+    for handle in claims:
+        _kernel32.CloseHandle(handle)
 
     # Start the tray exactly ONCE after the poll (idempotent via the
     # Local\AmiFUSE_Tray_Mutex). A slow cold mount may still be initializing, so
