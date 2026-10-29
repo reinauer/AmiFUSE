@@ -6,7 +6,6 @@ so a longer file cannot be seeked to its end.
 
 import json
 import os
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -41,11 +40,13 @@ def write_context(monkeypatch, tmp_path):
     monkeypatch.setattr(fs, "_ensure_parent_dirs", lambda *a, **kw: None)
 
     def report_size(size):
-        real_stat = Path.stat
+        # cmd_write takes the size from fstat() on the source it opened.
+        real_fstat = os.fstat
+        source_stat = os.stat(source)
 
-        def fake_stat(self, *a, **kw):
-            st = real_stat(self, *a, **kw)
-            if os.path.normcase(str(self)) != os.path.normcase(str(source)):
+        def fake_fstat(fd, *a, **kw):
+            st = real_fstat(fd, *a, **kw)
+            if not os.path.samestat(st, source_stat):
                 return st
             fields = list(st)
             fields[6] = size  # st_size
@@ -55,7 +56,7 @@ def write_context(monkeypatch, tmp_path):
                      if name.startswith("st_") and name not in _STAT_SEQ}
             return os.stat_result(fields, extra)
 
-        monkeypatch.setattr(Path, "stat", fake_stat)
+        monkeypatch.setattr(os, "fstat", fake_fstat)
 
     return args, bridge, created, source, report_size
 
