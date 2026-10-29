@@ -81,6 +81,7 @@ def fuse_mock(monkeypatch):
         OFFSET_CURRENT=0,
         OFFSET_END=1,
         _get_block_state=lambda *args, **kwargs: None,
+        _get_active_block_state=lambda *args, **kwargs: None,
         _clear_all_block_state=lambda *args, **kwargs: None,
         _has_blocked_state=lambda *args, **kwargs: False,
         _packet_type_name=lambda pkt_type: f"packet type {pkt_type}",
