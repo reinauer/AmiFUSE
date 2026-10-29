@@ -18,7 +18,7 @@ IO = 0x1000            # a struct timerequest
 IO2 = 0x1100
 PORT = 0x2000          # the handler's timer reply port
 TASK = 0x3000          # the task the port signals
-UNITS = 0x6000         # the Units OpenDevice allocates
+UNITS = 0xA000         # the Units OpenDevice allocates
 SIGBIT = 4
 
 TR_ADDREQUEST = 9

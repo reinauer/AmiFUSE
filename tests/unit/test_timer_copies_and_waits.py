@@ -119,11 +119,11 @@ class TestCopiedRequest:
         assert timer.exec.port_mgr.has_msg(PORT) is False
         assert timer.device.delays(COPY)
 
-    @pytest.mark.parametrize("unit", [0, 0x4000, 0x6080])
+    @pytest.mark.parametrize("unit", [0, 0x4000, 0xA080])
     def test_request_never_opened_completes_at_once(self, timer, unit):
         """A request with this device's io_Device but no Unit of its own is not held.
 
-        0x6080 is where the next Unit would go: not allocated yet.
+        0xA080 is where the next Unit would go: not allocated yet.
         """
         timer.mem.w32(COPY + 14, PORT)
         timer.mem.w32(COPY + 20, BASE)
@@ -223,8 +223,12 @@ class TestDoIOAndWaitIO:
         t = exec_timer
         t.send(secs=1)
         t.mem.w8(IO + 8, NT_REPLYMSG)  # a new request at the same address
-        assert t.exec.WaitIO(t.ctx, IO) == 0
+        t.mem.w8s(IO + 31, -1)
+        flags = t.mem.r8(IO + 30)
+        assert t.exec.WaitIO(t.ctx, IO) == -1
+        assert (t.mem.r8(IO + 30), t.mem.r8s(IO + 31)) == (flags, -1)
         assert t.exec.port_mgr.has_msg(PORT) is False
+        assert _m68k_list(t.mem) == []
         assert t.device.next_deadline() == float("inf")
         assert t.device.completed_early == {}
 
