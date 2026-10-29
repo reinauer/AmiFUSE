@@ -4643,13 +4643,17 @@ def format_volume(
             pkt_addr, "format flush", max_iters=500, cycles=2_000_000
         )
         _raise_if_handler_crashed(bridge, "format flush")
-        # A handler that does not implement ACTION_FLUSH answers
-        # ERROR_ACTION_NOT_KNOWN (SmartFilesystem does after a format); what
-        # it wrote is then already on the image, and the fsync below makes
-        # it durable. Any other refusal, or no reply, fails the format.
+        # The volume is still inhibited, and a handler may refuse the flush
+        # as it refuses other packets then, saying there is no volume:
+        # SmartFilesystem answers ERROR_ACTION_NOT_KNOWN. In the handlers
+        # tested the flush writes nothing here, since ACTION_FORMAT's own
+        # writes are already on the image; the fsync below makes them
+        # durable. No reply, or a refusal for another reason, fails.
         if reply is None:
             raise SystemExit("Format failed: no reply to ACTION_FLUSH from handler.")
-        if reply[0] == 0 and reply[1] != ERROR_ACTION_NOT_KNOWN:
+        if reply[0] == 0 and reply[1] not in (
+                ERROR_ACTION_NOT_KNOWN, ERROR_DEVICE_NOT_MOUNTED,
+                ERROR_NOT_A_DOS_DISK, ERROR_NO_DISK):
             raise SystemExit(
                 f"Format failed: handler refused ACTION_FLUSH (error code {reply[1]})")
         # "Format complete" promises the new volume is on stable storage.
@@ -5565,40 +5569,47 @@ def _open_write_source(host_path: Path, use_json: bool):
 
     Returns the open file and its size. Both come from the one handle the
     write loop reads, so a path that is replaced afterwards is not copied
-    in its place. Only a regular file is accepted; O_NONBLOCK keeps a FIFO
-    from blocking the open, and has no effect on a regular file. O_NOCTTY
+    in its place. Only a regular file is accepted. O_NONBLOCK keeps a FIFO
+    from blocking the open, and is cleared again for the reads. O_NOCTTY
     keeps a terminal opened as the source from becoming this process's
     controlling terminal before it is refused.
     """
     import json
     import stat
 
-    flags = os.O_RDONLY
-    for name in ("O_BINARY", "O_NONBLOCK", "O_NOCTTY"):
+    def refuse(code, message):
+        if use_json:
+            print(json.dumps(_json_error("write", code, message)))
+            sys.exit(1)
+        raise SystemExit(f"Error: {message[0].lower()}{message[1:]}")
+
+    def unreadable(exc):
+        refuse("INVALID_ARGUMENT",
+               f"Cannot read source file: {host_path}: {exc.strerror or exc}")
+
+    nonblock = getattr(os, "O_NONBLOCK", 0)
+    flags = os.O_RDONLY | nonblock
+    for name in ("O_BINARY", "O_NOCTTY"):
         flags |= getattr(os, name, 0)
     try:
         fd = os.open(host_path, flags)
     except FileNotFoundError:
-        if use_json:
-            print(json.dumps(_json_error("write", "SOURCE_NOT_FOUND",
-                f"Source file not found: {host_path}")))
-            sys.exit(1)
-        raise SystemExit(f"Error: source file not found: {host_path}")
+        refuse("SOURCE_NOT_FOUND", f"Source file not found: {host_path}")
     except OSError as exc:
-        if use_json:
-            print(json.dumps(_json_error("write", "INVALID_ARGUMENT",
-                f"Cannot read source file: {host_path}: {exc.strerror or exc}")))
-            sys.exit(1)
-        raise SystemExit(
-            f"Error: cannot read source file: {host_path}: {exc.strerror or exc}")
+        unreadable(exc)
     try:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode):
-            if use_json:
-                print(json.dumps(_json_error("write", "INVALID_ARGUMENT",
-                    f"Source is not a regular file: {host_path}")))
-                sys.exit(1)
-            raise SystemExit(f"Error: source is not a regular file: {host_path}")
+            refuse("INVALID_ARGUMENT", f"Source is not a regular file: {host_path}")
+        if nonblock:
+            os.set_blocking(fd, True)
+        # Read a byte too: a source another program has locked at its start,
+        # or one whose data cannot be read, opens but fails on its first read.
+        try:
+            os.read(fd, 1)
+            os.lseek(fd, 0, os.SEEK_SET)
+        except OSError as exc:
+            unreadable(exc)
         return os.fdopen(fd, "rb"), st.st_size
     except BaseException:
         os.close(fd)
@@ -5787,7 +5798,6 @@ def cmd_write(args):
             sys.exit(1)
         raise SystemExit(f"Error during write: {e}")
     finally:
-        source.close()
         # On error paths, we still want to flush what was written to
         # avoid losing partially-written data. But if flush_volume() already
         # succeeded on the success path, skip the redundant flush.
@@ -5797,6 +5807,7 @@ def cmd_write(args):
             except Exception:
                 pass
         _cleanup_bridge(bridge, temp_driver)
+        source.close()
 
 
 def _partition_driver(image: Path, block_size: Optional[int], name: str):
