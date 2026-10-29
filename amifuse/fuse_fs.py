@@ -628,6 +628,14 @@ class HandlerBridge:
                 elif mem is not None:
                     # Off the port's mp_MsgList too, as GetMsg() takes it.
                     _unlink_msg_from_m68k_list(mem, msg_addr, debug=self._debug)
+                    # The handler may still WaitIO() on the request, and
+                    # WaitIO() unlinks it again. Linked to itself, the node
+                    # takes no later message with it.
+                    try:
+                        mem.w32(msg_addr, msg_addr)  # ln_Succ
+                        mem.w32(msg_addr + 4, msg_addr)  # ln_Pred
+                    except Exception:
+                        pass
             for msg_addr in kept:
                 pmgr.put_msg(port_addr, msg_addr)
 
