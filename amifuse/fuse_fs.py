@@ -3112,7 +3112,11 @@ class AmigaFuseFS(_FuseOperations):
             stat_result = self._stat_from_fib(ent, name, int(now))
             with self._cache_lock:
                 _prune_cache(self._stat_cache, self._pinned_stats)
-                self._stat_cache[child_path] = (now, stat_result)
+                # A pinned entry stands until release (_pin_stat), and
+                # read() stops at its size: BFFS lists a file it holds for
+                # ACTION_FINDOUTPUT at its old size.
+                if child_path not in self._pinned_stats:
+                    self._stat_cache[child_path] = (now, stat_result)
 
         # Add virtual icon files if this directory has a custom icon
         if self._icon_handler and self._has_valid_icon(path):
