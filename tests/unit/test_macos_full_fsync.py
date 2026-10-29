@@ -108,6 +108,22 @@ def test_macos_full_fsync_write_error_fails_every_later_fsync(
     assert calls == [("fcntl", _fd(backend), F_FULLFSYNC)]
 
 
+def test_macos_failed_fallback_fsync_fails_every_later_fsync(
+        backend, calls, monkeypatch):
+    def fsync(fd):
+        calls.append(("fsync", fd))
+        raise OSError(errno.EIO, os.strerror(errno.EIO))
+
+    monkeypatch.setattr(os, "fsync", fsync)
+    fake = _fake_fcntl(calls, fcntl_error=errno.ENOTSUP)
+    for _ in range(2):
+        with pytest.raises(OSError) as caught:
+            _fsync_on(backend, monkeypatch, "darwin", fake)
+        assert caught.value.errno == errno.EIO
+    fd = _fd(backend)
+    assert calls == [("fcntl", fd, F_FULLFSYNC), ("fsync", fd)]
+
+
 @pytest.mark.parametrize("st_mode", [stat.S_IFCHR | 0o640, stat.S_IFBLK | 0o640],
                          ids=["rdisk", "disk"])
 def test_macos_disk_device_flushes_the_drive_cache(backend, calls, monkeypatch,
