@@ -131,6 +131,31 @@ class TestDrainUnlinksWhatItDrops:
         lst = _msg_list(IO_PORT)
         assert (mem.r32(lst), mem.r32(lst + 8)) == (lst + 4, lst)
 
+    def test_waitio_on_a_drained_reply_keeps_the_next_one(self):
+        """A WaitIO() on a drained request leaves a later reply linked.
+
+        WaitIO() unlinks a request whenever both its links are set, queued
+        or not, as amitools' ExecLibrary.WaitIO does.
+        """
+        bridge, pmgr = _bridge()
+        mem = bridge.mem
+        pmgr.register_port(IO_PORT)
+        _new_list(mem, IO_PORT)
+        pmgr.put_msg(IO_PORT, IO)
+        _add_tail(mem, IO_PORT, IO)
+        bridge._drain_non_essential_ports(pmgr)
+        assert _list_nodes(mem, IO_PORT) == []
+        pmgr.put_msg(IO_PORT, IO2)
+        _add_tail(mem, IO_PORT, IO2)
+
+        ln_succ, ln_pred = mem.r32(IO), mem.r32(IO + 4)
+        if ln_succ and ln_pred:
+            mem.w32(ln_pred, ln_succ)
+            mem.w32(ln_succ + 4, ln_pred)
+
+        assert pmgr.ports[IO_PORT].queue == [IO2]
+        assert _list_nodes(mem, IO_PORT) == [IO2]
+
     def test_kept_timer_reply_stays_linked_alone(self):
         """Around a delayed timer reply the drain keeps, the list is rejoined."""
         bridge, pmgr = _bridge(FakeTimer(delayed={IO2}))
