@@ -86,6 +86,7 @@ def fuse_mock(monkeypatch):
         _packet_type_name=lambda pkt_type: f"packet type {pkt_type}",
         _snapshot_block_state=lambda *args, **kwargs: None,
         _restore_block_state=lambda *args, **kwargs: None,
+        _unlink_msg_from_m68k_list=lambda *args, **kwargs: None,
     )
 
     _stub_module("amitools", vamos=types.SimpleNamespace())
