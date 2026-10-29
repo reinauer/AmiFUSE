@@ -1725,7 +1725,8 @@ class HandlerBridge:
             if dir_lock == 0 and dir_path != "/":
                 if path and path != "/" and dir_res2 in _NOT_FOUND_ERRORS:
                     self._set_neg_cached(path)
-                return None, dir_res2
+                # locate_path() gives -1 for no reply or a cached miss.
+                return None, max(dir_res2, 0)
             _, name_bptr = self._alloc_bstr(name)
             mode = flags & getattr(os, 'O_ACCMODE', 3)
             output = mode != os.O_RDONLY and bool(flags & os.O_TRUNC)
@@ -2247,7 +2248,10 @@ class HandlerBridge:
                 pkt_addr, _ = self.launcher.send_write_handle(
                     self.state, fh_addr, buf_mem.addr, len(chunk))
                 reply = self._run_until_reply(pkt_addr, "write")
+                # A write the handler accepted, or one it may still carry
+                # out, needs no zero-length write from close_file().
                 if reply is None:
+                    self._unwritten_outputs.discard(fh_addr)
                     return -1, 0
                 res1, res2 = reply
                 if res1 < 0 or res1 > len(chunk):
@@ -2548,23 +2552,39 @@ class HandlerBridge:
             reply = self._run_until_reply(pkt_addr, "mkdir")
             return reply if reply is not None else (0, -1)
 
+    def write_empty_reply(self, fh_addr: int) -> Tuple[int, int]:
+        """Send a zero-length ACTION_WRITE and return (dp_Res1, dp_Res2).
+
+        BFFS's ACTION_FINDOUTPUT leaves an existing file as it was and cuts
+        it at ACTION_END to the furthest byte the handle reached, but only
+        once the handle has written, and a write of no bytes counts. BFFS
+        can refuse even that one, with ERROR_DISK_FULL when it cannot
+        extend the file's last block. Returns (0, 0), or (-1, dp_Res2) when
+        the handler fails the write, or (-1, 0) when it gets no reply.
+        close_file() sends no second one either way.
+        """
+        with self._lock:
+            self._unwritten_outputs.discard(fh_addr)
+            buf_mem = self._alloc_read_buf(1)
+            pkt_addr, _ = self.launcher.send_write_handle(
+                self.state, fh_addr, buf_mem.addr, 0)
+            reply = self._run_until_reply(pkt_addr, "write")
+        if reply is None:
+            return -1, 0
+        # A refusal can come as DOSFALSE: BFFS's read-only checks reply 0.
+        return (0, 0) if reply == (0, 0) else (-1, reply[1])
+
     def close_file(self, fh_addr: int):
         """End the handle with ACTION_END and free its FileHandle.
 
         A handle opened with ACTION_FINDOUTPUT that wrote nothing first
-        gets a zero-length ACTION_WRITE. BFFS's ACTION_FINDOUTPUT leaves an
-        existing file as it was and cuts it at ACTION_END to the furthest
-        byte written, but only once the handle has written; a write of no
-        bytes counts. FastFileSystem, pfs3aio and SmartFilesystem empty the
-        file at the open, and the write changes nothing.
+        gets a zero-length ACTION_WRITE (write_empty_reply()), so that BFFS
+        empties the file. FastFileSystem, pfs3aio and SmartFilesystem empty
+        it at the open, and the write changes nothing.
         """
         with self._lock:
             if fh_addr in self._unwritten_outputs:
-                self._unwritten_outputs.discard(fh_addr)
-                buf_mem = self._alloc_read_buf(1)
-                pkt_addr, _ = self.launcher.send_write_handle(
-                    self.state, fh_addr, buf_mem.addr, 0)
-                self._run_until_reply(pkt_addr, "write")
+                self.write_empty_reply(fh_addr)
             pkt_addr, _ = self.launcher.send_end_handle(self.state, fh_addr)
             self._run_until_reply(pkt_addr, "end")
             # Note: ACTION_FLUSH is for flushing volume buffers, not file-specific.
@@ -3207,6 +3227,18 @@ class AmigaFuseFS(_FuseOperations):
         with entry["lock"]:
             if entry.get("closed"):
                 raise FuseOSError(errno.EIO)
+            # A file held on an exclusive lock holds only what its handle
+            # wrote, which its pinned size counts (_pin_stat). BFFS still
+            # serves the old data past that until release, and reading it
+            # would move the point BFFS cuts the file at.
+            pinned = _handle_path(entry, path)
+            if pinned in self._pinned_stats:
+                with self._cache_lock:
+                    cached = self._stat_cache.get(pinned)
+                if cached is not None:
+                    size = max(0, min(size, cached[1]["st_size"] - offset))
+                    if not size:
+                        return b""
             if entry["pos"] is None or offset != entry["pos"]:
                 data = self.bridge.read_handle_at(fh_addr, offset, size)
             else:
@@ -3331,6 +3363,8 @@ class AmigaFuseFS(_FuseOperations):
                 if size < 0 and not length and res2 == ERROR_OBJECT_NOT_FOUND:
                     size, res2 = self._reopen_for_output(
                         entry, _handle_path(entry, path))
+                    if res2 == ERROR_OBJECT_IN_USE:
+                        raise FuseOSError(errno.EBUSY)
                 if size < 0:
                     raise FuseOSError(_WRITE_ERRNOS.get(res2, errno.EIO))
                 entry["dirty"] = True  # Truncate modifies the file
@@ -3361,32 +3395,44 @@ class AmigaFuseFS(_FuseOperations):
 
         The entry's handle is replaced with one opened with
         ACTION_FINDOUTPUT. BFFS cuts a file opened that way to the furthest
-        byte written when the handle ends, and close_file() makes the
-        handle write if nothing else does. BFFS grants that open only while
+        byte the handle reached when it ends, once it has written, and a
+        zero-length write (write_empty_reply()) does that at once, so that
+        BFFS's refusal fails the truncate. BFFS grants the open only while
         no other handle holds the file, so the entry's own handle ends
-        first. Until the new handle ends, BFFS reports the old size, so the
-        size is pinned at 0, as open() does for O_TRUNC.
+        first, and the new handle holds the file alone until release().
+        Until then BFFS reports the old size, so the size is pinned at 0, as
+        open() does for O_TRUNC.
 
-        Returns (0, 0), or (-1, dp_Res2) when the open fails and the file
-        keeps its data; truncate() then fails with EIO while another
-        handle holds the file. After a refusal the file is opened again with
-        ACTION_FINDUPDATE, so the entry keeps a handle. After an open that
-        got no reply, which the handler may still hold, or a second
-        refusal, the entry is left closed with no handle: its reads,
+        Returns (0, 0), or (-1, dp_Res2) when the open or the write fails,
+        and the file keeps its data. After a refusal of either, the file is
+        opened again with ACTION_FINDUPDATE, so the entry keeps a handle; a
+        refused write's handle ends first, which cuts nothing. After a write
+        that got no reply, the entry keeps the new handle. After an open
+        that got no reply, which the handler may still hold, or a refused
+        open again, the entry is left closed with no handle: its reads,
         writes and truncates fail with EIO, and release() ends nothing.
         """
-        self.bridge.close_file(entry["fh_addr"])
-        output, res2 = self.bridge.open_file_reply(path, os.O_RDWR | os.O_TRUNC)
-        opened = output
+        bridge = self.bridge
+        bridge.close_file(entry["fh_addr"])
+        opened, res2 = bridge.open_file_reply(path, os.O_RDWR | os.O_TRUNC)
+        emptied = False
+        if opened is not None:
+            written, res2 = bridge.write_empty_reply(opened[0])
+            emptied = written == 0
+            if not emptied and res2:
+                bridge.close_file(opened[0])
+                if opened[1]:
+                    bridge.free_lock(opened[1])
+                opened = None
         if opened is None and res2:
-            opened = self.bridge.open_file(path, os.O_RDWR)
+            opened = bridge.open_file(path, os.O_RDWR)
         if entry.get("parent_lock"):
-            self.bridge.free_lock(entry["parent_lock"])
+            bridge.free_lock(entry["parent_lock"])
         if opened is None:
             entry.update(fh_addr=0, parent_lock=0, closed=True)
         else:
             entry["fh_addr"], entry["parent_lock"] = opened
-        if output is None:
+        if not emptied:
             return -1, res2
         self._pin_stat(path, 0)
         return 0, 0

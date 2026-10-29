@@ -1366,10 +1366,7 @@ def fs_with_mock_bridge(fuse_mock):
     bridge._write_enabled = False
     bridge.vh = MagicMock()
     bridge.backend = MagicMock()
-    # AmigaFuseFS.open asks for the error code too; open_file's result
-    # stands for both.
-    bridge.open_file_reply = MagicMock(
-        side_effect=lambda *a: (bridge.open_file(*a), 0))
+    _answer_open_file_reply(bridge)
     fs = AmigaFuseFS(bridge, debug=False, icons=False)
     return fs, bridge
 
@@ -2053,6 +2050,17 @@ class _FakeHandlerFile:
                 self.others[other] = min(pos, size)
             self.reply = _reply(size)
         return PKT, 0
+
+
+def _answer_open_file_reply(bridge):
+    """Answer the mock bridge's open_file_reply() from its open_file().
+
+    AmigaFuseFS.open calls open_file_reply(), which also returns the
+    handler's error code. Tests that stub open_file() then still decide
+    what every open returns, with dp_Res2 0.
+    """
+    bridge.open_file_reply = MagicMock(
+        side_effect=lambda *a: (bridge.open_file(*a), 0))
 
 
 def _fake_write_bridge(fuse_fs_mod, handler, free_blocks=2048):
@@ -3282,10 +3290,7 @@ def _fake_write_fs(fuse_fs_mod, handler, free_blocks=2048):
     bridge = _fake_write_bridge(fuse_fs_mod, handler, free_blocks)
     bridge._write_enabled = True
     bridge.open_file = MagicMock(return_value=(0x3000, 0))
-    # AmigaFuseFS.open asks for the error code too; open_file's result
-    # stands for both.
-    bridge.open_file_reply = MagicMock(
-        side_effect=lambda *a: (bridge.open_file(*a), 0))
+    _answer_open_file_reply(bridge)
     bridge.close_file = MagicMock()
     return fuse_fs_mod.AmigaFuseFS(bridge, debug=False, icons=False)
 
@@ -7406,10 +7411,7 @@ def write_fs(fuse_mock):
     bridge = MagicMock()
     bridge._write_enabled = True
     bridge.state = None  # _check_handler_alive treats this as "not crashed"
-    # AmigaFuseFS.open asks for the error code too; open_file's result
-    # stands for both.
-    bridge.open_file_reply = MagicMock(
-        side_effect=lambda *a: (bridge.open_file(*a), 0))
+    _answer_open_file_reply(bridge)
     fs = AmigaFuseFS(bridge, debug=False, icons=False)
     return fs, bridge
 
