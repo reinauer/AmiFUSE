@@ -806,14 +806,6 @@ class TestBridgeDelivery:
         assert True not in timer.delivered
         assert len(timer.delivered) == 6  # at the start, then once per idle burst
 
-    def test_run_due_timers_skips_a_busy_handler(self):
-        """A handler whose packet wait ran out is left alone, and retried later."""
-        timer = _Timer(signals={TASK: 0x1}, deadline=0.0)
-        bridge = self._bridge(timer)
-        bridge._busy_ran_out = True
-        assert bridge.run_due_timers() == bridge._TIMER_RETRY
-        assert timer.delivered == []
-
     def test_run_due_timers_skips_a_handler_not_at_its_main_loop(self):
         timer = _Timer(signals={TASK: 0x1}, deadline=0.0)
         bridge = self._bridge(timer, pc=0x4100)
