@@ -1366,6 +1366,10 @@ def fs_with_mock_bridge(fuse_mock):
     bridge._write_enabled = False
     bridge.vh = MagicMock()
     bridge.backend = MagicMock()
+    # AmigaFuseFS.open asks for the error code too; open_file's result
+    # stands for both.
+    bridge.open_file_reply = MagicMock(
+        side_effect=lambda *a: (bridge.open_file(*a), 0))
     fs = AmigaFuseFS(bridge, debug=False, icons=False)
     return fs, bridge
 
@@ -2062,6 +2066,7 @@ def _fake_write_bridge(fuse_fs_mod, handler, free_blocks=2048):
     bridge = object.__new__(fuse_fs_mod.HandlerBridge)
     bridge._lock = threading.RLock()
     bridge._debug = False
+    bridge._unwritten_outputs = set()
     bridge.state = MagicMock()
     bridge.launcher = MagicMock()
     bridge.launcher.send_seek_handle.side_effect = handler.seek
@@ -3277,6 +3282,10 @@ def _fake_write_fs(fuse_fs_mod, handler, free_blocks=2048):
     bridge = _fake_write_bridge(fuse_fs_mod, handler, free_blocks)
     bridge._write_enabled = True
     bridge.open_file = MagicMock(return_value=(0x3000, 0))
+    # AmigaFuseFS.open asks for the error code too; open_file's result
+    # stands for both.
+    bridge.open_file_reply = MagicMock(
+        side_effect=lambda *a: (bridge.open_file(*a), 0))
     bridge.close_file = MagicMock()
     return fuse_fs_mod.AmigaFuseFS(bridge, debug=False, icons=False)
 
@@ -7397,6 +7406,10 @@ def write_fs(fuse_mock):
     bridge = MagicMock()
     bridge._write_enabled = True
     bridge.state = None  # _check_handler_alive treats this as "not crashed"
+    # AmigaFuseFS.open asks for the error code too; open_file's result
+    # stands for both.
+    bridge.open_file_reply = MagicMock(
+        side_effect=lambda *a: (bridge.open_file(*a), 0))
     fs = AmigaFuseFS(bridge, debug=False, icons=False)
     return fs, bridge
 

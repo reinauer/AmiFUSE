@@ -173,6 +173,7 @@ def _run(fuse_fs_mod, monkeypatch, mode, table):
     bridge._free_fh = MagicMock()
     bridge._neg_cache = {}
     bridge._neg_cache_ttl = 0
+    bridge._unwritten_outputs = set()
     bridge._write_enabled = True
     bridge._volname = None
     bridge.backend = MagicMock()
