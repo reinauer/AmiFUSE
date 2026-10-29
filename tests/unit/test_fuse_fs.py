@@ -2849,7 +2849,7 @@ class TestHandlerBridgeSetSize:
     @pytest.mark.parametrize("rounds, expected", [
         ([LATE_WRITE, _reply(4)], 4),
         ([_reply(4) + LATE_WRITE], 4),
-        ([LATE_WRITE, NO_REPLY], -1),
+        ([LATE_WRITE, NO_REPLY, NO_REPLY], -1),
     ], ids=["before-answer", "with-answer", "then-timeout"])
     def test_late_reply_is_not_the_answer(self, fuse_mock, rounds, expected):
         """A reply to an earlier packet is dropped, not read as the new size."""
@@ -3626,7 +3626,9 @@ class TestFuseTruncateWithOtherHandles:
     def test_handle_past_long_max_is_left_alone(self, fuse_mock):
         """A seek offset is a signed LONG, so a reader past 0x7FFFFFFF in a
         file of 2 GiB or more could not seek back to where it reads next.
-        A truncate neither moves it nor makes it forget its position."""
+        A truncate does not move it. A zero-length OFFSET_CURRENT seek,
+        which pfs3aio refuses past 2 GiB, shows the handler did not move it
+        either, so it keeps its position."""
         import amifuse.fuse_fs as fuse_fs_mod
 
         handler = _FakeHandlerFile(self.CONTENT)
@@ -3636,10 +3638,20 @@ class TestFuseTruncateWithOtherHandles:
         big = self._open_other(fs, handler, 0, fh_addr=self.BIG,
                                path="/big.hdf")
         fs._fh_cache[big]["pos"] = 0x80000000
+        seek = handler.seek
+
+        def big_file_seek(state, fh_addr, offset, mode):
+            packet = seek(state, fh_addr, offset, mode)
+            if fh_addr == self.BIG:
+                handler.reply = _reply(-1, 219)
+            return packet
+
+        fs.bridge.launcher.send_seek_handle.side_effect = big_file_seek
 
         assert fs.truncate("/file", 100) == 0
         assert handler.data == self.CONTENT[:100]
-        assert [s for s in handler.seeks if s[0] == self.BIG] == []
+        assert [s for s in handler.seeks if s[0] == self.BIG] == [
+            (self.BIG, 0, fuse_fs_mod.OFFSET_CURRENT)]
         assert fs._fh_cache[big]["pos"] == 0x80000000
 
     def test_handle_at_long_max_forgets_its_position(self, fuse_mock):
@@ -3677,11 +3689,13 @@ class TestFuseTruncateWithOtherHandles:
         handle = fs.open("/file", os.O_RDWR) if use_handle else None
 
         assert fs.truncate("/file", 100, handle) == 0
-        # The truncating handle only measures the end of file.
+        # The truncating handle only measures the end of file, and goes to
+        # its start after the shrink.
         assert handler.seeks == [
             (self.FH_ADDR, 0, fuse_fs_mod.OFFSET_END),
             (self.FH_ADDR, 0, fuse_fs_mod.OFFSET_CURRENT),
             (self.OTHER, 0, fuse_fs_mod.OFFSET_BEGINNING),
+            (self.FH_ADDR, 0, fuse_fs_mod.OFFSET_BEGINNING),
         ]
         assert fs._fh_cache[directory] == dir_entry
         assert fs._fh_cache[icon] == icon_entry
