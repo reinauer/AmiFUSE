@@ -31,7 +31,10 @@ class _FakeVolume:
 
     Locks name directory paths. refuse maps (src name, dst name) to the
     res2 of each rename between them in turn, None for one that goes ahead.
+    A name longer than max_name is cut, as handlers cut it.
     """
+
+    max_name = None
 
     def __init__(self, objects):
         self._write_enabled = True
@@ -45,7 +48,13 @@ class _FakeVolume:
         self.freed = []
         self._next_lock = 0x100
 
+    def _cut(self, path):
+        if self.max_name is None:
+            return path
+        return "/".join(c[:self.max_name] for c in path.split("/"))
+
     def _find(self, path):
+        path = self._cut(path)
         return next((p for p in self.objects if p.lower() == path.lower()), None)
 
     def _lock(self, path):
@@ -77,8 +86,8 @@ class _FakeVolume:
         if found is None:
             return None
         is_dir = self.objects[found] is DIR
-        return {"dir_type": 2 if is_dir else -3, "size": 0, "name": found, "protection": 0,
-                "num_blocks": 0}
+        return {"dir_type": 2 if is_dir else -3, "size": 0, "name": found.rsplit("/", 1)[1],
+                "protection": 0, "num_blocks": 0}
 
     def list_dir_path(self, path):
         return [{"name": p.rsplit("/", 1)[1]} for p in self.objects
@@ -86,7 +95,7 @@ class _FakeVolume:
 
     def rename_object(self, src_lock, src_name, dst_lock, dst_name):
         src = self._find(_join(self._dir(src_lock), src_name))
-        dst_path = _join(self._dir(dst_lock), dst_name)
+        dst_path = self._cut(_join(self._dir(dst_lock), dst_name))
         self.renames.append((src_name, dst_name))
         script = self.refuse.get((src_name, dst_name))
         res2 = script.pop(0) if script else None
@@ -183,18 +192,96 @@ def test_refused_delete_puts_both_back(make_fs):
     fs, volume = make_fs({"/a": b"new", "/b": b"old"})
     deletes = []
 
-    def refuse_delete(lock, name):
-        deletes.append(name)
+    def refuse_delete(path):
+        deletes.append(path)
         return 0, 222  # ERROR_DELETE_PROTECTED
 
-    volume.delete_object = refuse_delete
+    volume.delete_dir_atomic = refuse_delete
 
-    assert _rename_errno(fs, "/a", "/b") == errno.EIO
+    assert _rename_errno(fs, "/a", "/b") == errno.EACCES
 
     assert volume.objects == {"/": DIR, "/a": b"new", "/b": b"old"}
     temp = volume.renames[1][1]
-    assert deletes == [temp]
+    assert deletes == ["/" + temp]
     assert volume.renames == [("a", "b"), ("b", temp), ("a", "b"), ("b", "a"), (temp, "b")]
+
+
+def test_failure_puts_the_target_back_under_its_own_name(make_fs):
+    fs, volume = make_fs({"/a": b"new", "/b": b"old"})
+    volume.refuse[("a", "B")] = [None, ERROR_DISK_FULL]
+
+    assert _rename_errno(fs, "/a", "/B") == errno.ENOSPC
+
+    assert volume.objects == {"/": DIR, "/a": b"new", "/b": b"old"}
+
+
+def test_exception_in_the_delete_puts_both_back(make_fs):
+    fs, volume = make_fs({"/a": b"new", "/b": b"old"})
+
+    class HandlerGone(Exception):
+        pass
+
+    def crash(path):
+        raise HandlerGone
+
+    volume.delete_dir_atomic = crash
+
+    with pytest.raises(HandlerGone):
+        fs.rename("/a", "/b")
+
+    assert volume.objects == {"/": DIR, "/a": b"new", "/b": b"old"}
+
+
+def test_delete_without_reply_keeps_the_replace(make_fs):
+    """The handler may still carry out a delete it did not answer: putting
+    the target back then would find it gone."""
+    fs, volume = make_fs({"/a": b"new", "/b": b"old"})
+    volume.delete_dir_atomic = lambda path: (0, -1)
+
+    assert fs.rename("/a", "/b") == 0
+
+    assert volume.objects["/b"] == b"new" and "/a" not in volume.objects
+
+
+def test_replaced_pending_delete_is_forgotten(make_fs):
+    """A target whose deferred delete failed at release() is hidden with no
+    handle left. Once replaced and deleted, nothing stays pending."""
+    fs, volume = make_fs({"/d": DIR, "/d/a": b"new", "/d/b": b"old"})
+    fs._pending_deletes.add("/d/b")
+
+    assert fs.rename("/d/a", "/d/b") == 0
+
+    assert volume.objects["/d/b"] == b"new"
+    assert fs._pending_deletes == set()
+
+
+def test_long_name_is_replaced_under_its_cut_name(make_fs):
+    """The handler keeps a name longer than it allows cut to its limit, the
+    one file both names find (#173), and a save that renames onto the long
+    name replaces it. A failure puts it back under the cut name."""
+    cut = "/" + "L" * 30
+    fs, volume = make_fs({"/src": b"new", cut: b"old"})
+    volume.max_name = 30
+    volume.refuse[("src", cut[1:] + "-extra")] = [None, ERROR_DISK_FULL]
+
+    assert _rename_errno(fs, "/src", cut + "-extra") == errno.ENOSPC
+    assert volume.objects == {"/": DIR, "/src": b"new", cut: b"old"}
+
+    assert fs.rename("/src", cut + "-extra") == 0
+    assert volume.objects == {"/": DIR, cut: b"new"}
+
+
+def test_name_the_mount_hides_is_not_replaced(make_fs, monkeypatch):
+    """getattr() reports Windows Explorer's probe names as absent, so WinFsp
+    passes a plain rename onto one, which must not delete the real file."""
+    import sys
+
+    fs, volume = make_fs({"/cover.jpg": b"new", "/desktop.ini": b"old"})
+    monkeypatch.setattr(sys, "platform", "win32")
+
+    assert _rename_errno(fs, "/cover.jpg", "/desktop.ini") == errno.EEXIST
+
+    assert volume.objects == {"/": DIR, "/cover.jpg": b"new", "/desktop.ini": b"old"}
 
 
 def test_open_target_is_deleted_at_its_release(make_fs):

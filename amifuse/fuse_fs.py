@@ -158,6 +158,7 @@ _WRITE_ERRNOS = {
 # whether the existing object is a file or a directory.
 ERROR_OBJECT_EXISTS = 203
 ERROR_DIRECTORY_NOT_EMPTY = 216
+ERROR_DELETE_PROTECTED = 222
 _RENAME_ERRNOS = {
     **_WRITE_ERRNOS,
     ERROR_OBJECT_IN_USE: errno.EBUSY,
@@ -165,6 +166,7 @@ _RENAME_ERRNOS = {
     ERROR_DIR_NOT_FOUND: errno.ENOENT,
     ERROR_OBJECT_NOT_FOUND: errno.ENOENT,
     ERROR_DIRECTORY_NOT_EMPTY: errno.ENOTEMPTY,
+    ERROR_DELETE_PROTECTED: errno.EACCES,
 }
 
 # AmigaDOS error codes a handler can return when it refuses ACTION_DISK_INFO.
@@ -3552,21 +3554,31 @@ class AmigaFuseFS(_FuseOperations):
         objects is under new at every step. A step that fails puts back
         what the steps before it moved, and rename() fails.
 
-        The deleted object goes the way unlink() and rmdir() take: a file
-        still open is deleted at its release(), and hidden until then.
+        The replaced object, at the temporary name, is deleted as unlink()
+        deletes a file: one still open is deleted at its release(), and
+        hidden until then.
         """
-        src_is_dir = self._is_dir(old)
-        dst_is_dir = self._is_dir(new)
-        if src_is_dir is None or dst_is_dir is None:
+        # The mount hides these names, so the host can't mean to replace one.
+        if self._is_platform_special(new):
+            raise FuseOSError(errno.EEXIST)
+        src = self._examine(old)
+        dst = self._examine(new)
+        if src is None or dst is None:
             # Neither examined nor pinned: gone, or held on an exclusive lock.
-            raise FuseOSError(errno.ENOENT if src_is_dir is None else errno.EBUSY)
+            raise FuseOSError(errno.ENOENT if src is None else errno.EBUSY)
+        dst_dir, _ = self._split_path(new)
+        src_is_dir = src["dir_type"] >= 0
+        dst_is_dir = dst["dir_type"] >= 0
         if dst_is_dir and not src_is_dir:
             raise FuseOSError(errno.EISDIR)
         if src_is_dir and not dst_is_dir:
             raise FuseOSError(errno.ENOTDIR)
         if dst_is_dir and self.bridge.list_dir_path(new):
             raise FuseOSError(errno.ENOTEMPTY)
-        dst_dir, _ = self._split_path(new)
+        # Put back under the name it had, which may differ from new in case,
+        # or be new cut to the volume's name limit.
+        on_disk = dst["name"]
+        orig = new if on_disk is None else dst_dir.rstrip("/") + "/" + on_disk
         for _ in range(8):
             temp = dst_dir.rstrip("/") + f"/.amifuse-{os.urandom(4).hex()}"
             res1, res2 = self._rename_object(new, temp)
@@ -3574,38 +3586,63 @@ class AmigaFuseFS(_FuseOperations):
                 break
         if res1 == 0:
             raise FuseOSError(_RENAME_ERRNOS.get(res2, errno.EIO))
-        res1, res2 = self._rename_object(old, new)
-        if res1 == 0:
-            self._rename_back(temp, new)
-            raise FuseOSError(_RENAME_ERRNOS.get(res2, errno.EIO))
         try:
-            if dst_is_dir:
-                res1, res2 = self.bridge.delete_dir_atomic(temp)
-                if res1 == 0:
-                    raise FuseOSError(_RENAME_ERRNOS.get(res2, errno.EIO))
-                # A deferred rmdir of the target moved to temp in step 1.
-                self._forget_pending_delete(temp)
-                with self._cache_lock:
-                    self._stat_cache.pop(temp, None)
-                    self._dir_cache.pop(dst_dir, None)
-            else:
-                self.unlink(temp)
-        except FuseOSError:
+            res1, res2 = self._rename_object(old, new)
+            if res1 == 0:
+                raise FuseOSError(_RENAME_ERRNOS.get(res2, errno.EIO))
+        except Exception:
+            self._rename_back(temp, orig)
+            raise
+        try:
+            self._delete_replaced(temp)
+        except Exception:
             self._rename_back(new, old)
-            self._rename_back(temp, new)
+            self._rename_back(temp, orig)
             raise
 
-    def _is_dir(self, path: str) -> Optional[bool]:
-        """Whether path is a directory; None when it can't be told.
+    def _examine(self, path: str) -> Optional[Dict]:
+        """Examine path for _replace_existing(); None when it can't be.
 
         A file held on an exclusive lock can't be examined, but has a
-        pinned entry (_pin_stat).
+        pinned entry (_pin_stat): a file whose name on disk is not known.
         """
         info = self.bridge.stat_path(path)
         if info:
-            return info["dir_type"] >= 0
+            return info
         with self._cache_lock:
-            return False if path in self._pinned_stats else None
+            if path in self._pinned_stats:
+                return {"dir_type": -3, "name": None}  # ST_FILE
+        return None
+
+    def _delete_replaced(self, temp: str):
+        """Delete the replaced object, now at temp, for _replace_existing().
+
+        A file still open is left to its release(), and hidden until then,
+        as unlink() does. A delete that gets no reply may still happen, so
+        the replace stands. Raises FuseOSError when the handler refuses.
+        """
+        # delete_dir_atomic() sends ACTION_DELETE_OBJECT, for a file too.
+        res1, res2 = self.bridge.delete_dir_atomic(temp)
+        deferred = False
+        if res1 == 0 and res2 == ERROR_OBJECT_IN_USE:
+            with self._fh_lock:
+                deferred = any(v.get("path") == temp and "fh_addr" in v
+                               for v in self._fh_cache.values())
+                if deferred:
+                    self._pending_deletes.add(temp)
+        if res1 == 0 and not deferred:
+            if res2 != -1:  # -1: no reply
+                raise FuseOSError(_RENAME_ERRNOS.get(res2, errno.EIO))
+            print(f"[amifuse] rename: no reply to the delete of the replaced "
+                  f"object, which may stay at {temp}", file=sys.stderr, flush=True)
+        if res1:
+            # A deferred delete of the target followed it to temp in step 1.
+            self._forget_pending_delete(temp)
+        with self._cache_lock:
+            if not deferred:
+                self._pinned_stats.discard(temp)
+            self._stat_cache.pop(temp, None)
+            self._dir_cache.pop(self._split_path(temp)[0], None)
 
     def _rename_back(self, old: str, new: str):
         """Undo one step of _replace_existing()."""

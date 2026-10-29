@@ -135,21 +135,26 @@ def test_rename_replaces_a_file(ops, src):
 
 
 def test_failed_rename_keeps_the_target(ops, monkeypatch):
-    """When the source can't take the name, the target is renamed back."""
+    """When the source can't take the name once the target has moved aside,
+    the target is renamed back."""
     _write(ops, "/a", NEW)
     _write(ops, "/b", OLD)
     rename_object = ops.bridge.rename_object
+    calls = []
 
-    def refuse_source(src_lock, src_name, dst_lock, dst_name):
-        if src_name == "a":
+    def refuse_source_after_temp(src_lock, src_name, dst_lock, dst_name):
+        calls.append((src_name, dst_name))
+        if src_name == "a" and any(d.startswith(".amifuse-") for _, d in calls):
             return 0, ERROR_DISK_FULL
         return rename_object(src_lock, src_name, dst_lock, dst_name)
 
-    monkeypatch.setattr(ops.bridge, "rename_object", refuse_source)
+    monkeypatch.setattr(ops.bridge, "rename_object", refuse_source_after_temp)
 
     assert _errno(ops.rename, "/a", "/b") == errno.ENOSPC
 
     monkeypatch.undo()
+    temp = calls[1][1]
+    assert calls == [("a", "b"), ("b", temp), ("a", "b"), (temp, "b")]
     assert _read(ops, "/b") == OLD
     assert _read(ops, "/a") == NEW
     _no_temp_names(ops)
@@ -161,18 +166,36 @@ def test_failed_delete_puts_both_back(ops, monkeypatch):
     _write(ops, "/b", OLD)
     deletes = []
 
-    def refuse_delete(lock, name):
-        deletes.append(name)
+    def refuse_delete(path):
+        deletes.append(path)
         return 0, 222  # ERROR_DELETE_PROTECTED
 
-    monkeypatch.setattr(ops.bridge, "delete_object", refuse_delete)
+    monkeypatch.setattr(ops.bridge, "delete_dir_atomic", refuse_delete)
 
-    assert _errno(ops.rename, "/a", "/b") == errno.EIO
+    assert _errno(ops.rename, "/a", "/b") == errno.EACCES
 
     monkeypatch.undo()
-    assert len(deletes) == 1 and deletes[0].startswith(".amifuse-")
+    assert len(deletes) == 1 and deletes[0].startswith("/.amifuse-")
     assert _read(ops, "/b") == OLD
     assert _read(ops, "/a") == NEW
+    _no_temp_names(ops)
+
+
+NAME_LIMITS = {"pfs3aio": 31, "SmartFilesystem": 107, "FastFileSystem": 30, BUNDLED: 30}
+
+
+def test_save_over_a_long_name(ops, request):
+    """The handler keeps a name longer than it allows cut to its limit (#173).
+    A save that renames a new file onto the long name replaces that file."""
+    cut = "/" + "L" * NAME_LIMITS[request.node.callspec.params["ops"][1]]
+    long = cut + "-extra"
+    _write(ops, long, OLD)
+    _write(ops, "/src", NEW)
+
+    assert ops.rename("/src", long) == 0
+
+    assert _read(ops, long) == NEW
+    assert _on_disk(ops) >= {cut[1:]} and "src" not in _on_disk(ops)
     _no_temp_names(ops)
 
 
