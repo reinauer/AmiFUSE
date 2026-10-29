@@ -696,9 +696,11 @@ def _locate_rdisk(image, block_size, mbr_partition_index, mbr_info, open_at):
             raise IOError(f"Failed to parse RDB at {image}: {e}")
 
         if mbr_partition_index is None or not _amiga_partitions(mbr_info):
-            # Check for Parceiro-style MBR+RDB coexistence
+            # Check for Parceiro-style MBR+RDB coexistence. An RDB at block 0
+            # beside an MBR that lists 0x76 entries is the disk's own as well.
             mbr_ctx = None
-            if mbr_info is not None and rdb_block.blk_num > 0:
+            if mbr_info is not None and (rdb_block.blk_num > 0
+                                         or _amiga_partitions(mbr_info)):
                 mbr_ctx = MBRContext(
                     mbr_info=mbr_info,
                     mbr_partition=None,

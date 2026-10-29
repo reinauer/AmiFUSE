@@ -38,6 +38,21 @@ def _parceiro(tmp_path, entries=(None, None)):
     """The disk's own RDB at block 2, its PART blocks DH0 and DH1 at blocks 3
     and 4, beside an MBR listing two 0x76 entries. Each entry holds an RDB
     with a partition of the name given, or is empty for None."""
+    image = _disk_rdb(tmp_path, entries, 2)
+    blkdev, rdisk, mbr_ctx = open_rdisk(image)
+    try:
+        assert mbr_ctx.scheme == "parceiro"
+        assert [str(p.get_drive_name()) for p in rdisk.parts] == ["DH0", "DH1"]
+    finally:
+        rdisk.close()
+        blkdev.close()
+    return image
+
+
+def _disk_rdb(tmp_path, entries, rdb_block):
+    """_parceiro's disk with its own RDB at rdb_block. At block 0, the RDSK
+    block keeps the MBR's table and signature in bytes 0x1BE-0x1FF, and its
+    checksum is redone over the whole block, as amitools reads it."""
     rdb_image = tmp_path / "rdb.hdf"
     raw = RawBlockDevice(str(rdb_image), read_only=False, block_bytes=512)
     with ExitStack() as cleanup:
@@ -55,18 +70,15 @@ def _parceiro(tmp_path, entries=(None, None)):
         (lba, bytes(160 * 512) if name is None else _make_rdb(tmp_path, 512, name))
         for lba, name in zip((200, 400), entries)])
     data = bytearray(image.read_bytes())
-    data[2 * 512:3 * 512] = _with_partition_list(rdb, 512, 3)[:512]
+    rdsk = _with_partition_list(rdb, 512, 3)[:0x1BE if rdb_block == 0 else 512]
+    data[rdb_block * 512:rdb_block * 512 + len(rdsk)] = rdsk
+    if rdb_block == 0:
+        struct.pack_into(">I", data, 8, 0)  # rdb_ChkSum
+        total = sum(struct.unpack_from(">128I", data, 0)) & 0xFFFFFFFF
+        struct.pack_into(">I", data, 8, -total & 0xFFFFFFFF)
     data[3 * 512:4 * 512] = _with_next(rdb[512:1024], 4)
     data[4 * 512:5 * 512] = rdb[1024:1536]
     image.write_bytes(bytes(data))
-
-    blkdev, rdisk, mbr_ctx = open_rdisk(image)
-    try:
-        assert mbr_ctx.scheme == "parceiro"
-        assert [str(p.get_drive_name()) for p in rdisk.parts] == ["DH0", "DH1"]
-    finally:
-        rdisk.close()
-        blkdev.close()
     return image
 
 
@@ -209,6 +221,39 @@ def test_clash_note_marks_the_copy_mount_does_not_use(user_driver_dir,
     assert used["driver"] is not None
     assert other["driver"] is None
     assert other["driver_note"].startswith("another RDB on this disk")
+
+
+def test_rdb_at_block_0_beside_the_mbr_is_listed_once(user_driver_dir,
+                                                      tmp_path, capsys):
+    # #178: an RDSK block at block 0 that keeps the MBR's table, whose two
+    # 0x76 entries are empty, is the disk's own RDB.
+    from amifuse.fuse_fs import main
+
+    image = _disk_rdb(tmp_path, (None, None), 0)
+    assert _names(image) == (["DH0", "DH1"], None)
+    listed = list_partitions(image)
+    assert [p.name for p in listed.partitions] == ["DH0", "DH1"]
+    assert listed.fallback_reason is None
+
+    main(["inspect", "--json", str(image)])
+    env = json.loads(capsys.readouterr().out)
+    assert "rdbs" not in env
+    assert env["mbr"]["scheme"] == "parceiro"
+    assert [p["name"] for p in env["partitions"]] == ["DH0", "DH1"]
+    assert all(p["driver"] is not None for p in env["partitions"])
+
+
+def test_rdb_at_block_0_beside_the_mbr_text_inspect(user_driver_dir,
+                                                    tmp_path, capsys):
+    from amifuse.fuse_fs import main
+
+    main(["inspect", str(_disk_rdb(tmp_path, (None, None), 0))])
+    out = capsys.readouterr().out
+    assert "MBR + RDB coexistence detected (Parceiro-style)" in out
+    assert "=== Amiga RDB in MBR partition" not in out
+    section = out.split("Filesystem driver per partition (without --driver):\n")[1]
+    assert [line.split(":")[0] for line in section.splitlines()] == [
+        "  DH0", "  DH1"]
 
 
 def test_entries_sharing_an_rdb_list_it_once(tmp_path):
