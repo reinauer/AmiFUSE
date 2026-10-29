@@ -25,6 +25,21 @@ jobs:
           # As the release does: the sdist, then the wheel built from it.
           python -m build
           python -c "import glob, subprocess, sys; subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--no-deps', glob.glob('dist/*.whl')[0]])"
+      - name: Check the licence text in the sdist and the wheel
+        shell: python
+        run: |
+          import glob, tarfile, zipfile
+          from pathlib import Path
+
+          text = Path("LICENSE").read_bytes()
+          with tarfile.open(glob.glob("dist/*.tar.gz")[0]) as sdist:
+              names = [n for n in sdist.getnames() if n.count("/") == 1 and n.endswith("/LICENSE")]
+              assert len(names) == 1, sdist.getnames()
+              assert sdist.extractfile(names[0]).read() == text
+          with zipfile.ZipFile(glob.glob("dist/*.whl")[0]) as wheel:
+              names = [n for n in wheel.namelist() if n.endswith(".dist-info/licenses/LICENSE")]
+              assert len(names) == 1, wheel.namelist()
+              assert wheel.read(names[0]) == text
       - name: Exercise the installed package outside the checkout
         working-directory: ${{ runner.temp }}
         run: |

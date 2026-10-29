@@ -70,8 +70,9 @@ Linux, macOS, and Windows:
 
 - **Installed wheel** -- Python 3.13. Builds the sdist, then the wheel
   from it, and installs the wheel with the declared minimum amitools
-  release. Checks the installed package from outside the checkout,
-  including the bundled FastFileSystem.
+  release. Checks that both carry `LICENSE`, and checks the installed
+  package from outside the checkout, including the bundled
+  FastFileSystem.
 - **Unit tests** -- Python 3.11--3.13. No external dependencies.
 - **Integration tests** -- Python 3.13. Clones AmiFUSE-testing for
   fixtures. Exercises the full m68k emulation stack.
