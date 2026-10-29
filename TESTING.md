@@ -481,10 +481,11 @@ pytest tests/integration/ -v
 
 ### CI (GitHub Actions)
 
-The CI workflow (`.github/workflows/ci.yml`) runs four jobs:
+The CI workflow (`.github/workflows/ci.yml`) runs five jobs:
 
 | Job | Platforms | Python | What |
 |-----|-----------|--------|------|
+| `package-smoke` | Linux, macOS, Windows | 3.13 | Builds the sdist and the wheel, installs the wheel with the declared minimum amitools release and checks it from outside the checkout |
 | `unit-tests` | Linux, macOS, Windows | 3.11, 3.12, 3.13 | `pytest tests/unit/` |
 | `integration-tests` | Linux, macOS, Windows | 3.13 | `pytest tests/integration/` with external fixtures |
 | `tools-smoke` | Linux, macOS, Windows | 3.13 | `amifuse_matrix.py` + `image_format_smoke.py` |
@@ -496,8 +497,9 @@ The `mount-tests` job installs a platform-specific FUSE backend:
 - **macOS:** FUSE-T (user-space, no kext required) with libfuse compatibility symlink
 - **Windows:** WinFSP via chocolatey
 
-Windows integration and tools-smoke jobs use the `machine68k-amifuse` fork
-which includes pre-built wheels with fixes for opcode table over-read
+The Windows integration, tools-smoke and mount-tests jobs use the
+`machine68k-amifuse` fork, which includes pre-built wheels with fixes for
+opcode table over-read
 ([cnvogelg/machine68k#8](https://github.com/cnvogelg/machine68k/issues/8))
 and JMP/CAS collision
 ([cnvogelg/machine68k#9](https://github.com/cnvogelg/machine68k/issues/9)).
