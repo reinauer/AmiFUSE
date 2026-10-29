@@ -312,6 +312,9 @@ def test_refused_zero_length_write_fails_the_truncate(fuse_mock):
     assert volume.writes == [0, 1]
     assert volume.files["file"] == b"X" + ORIGINAL[1:]
     assert volume.handles == {}
+    # The refused handle's lock, the old handle's, then the handle's at
+    # release.
+    assert fs.bridge.free_lock.call_count == 3
 
 
 def test_unanswered_zero_length_write_keeps_the_new_handle(fuse_mock):
@@ -331,6 +334,7 @@ def test_unanswered_zero_length_write_keeps_the_new_handle(fuse_mock):
 
     assert volume.writes == [0]
     assert len(volume.ends) == 2 and volume.handles == {}
+    assert fs.bridge.free_lock.call_count == 2  # the old handle's, the new
 
 
 @pytest.mark.parametrize("truncate", [True, False],
@@ -347,7 +351,12 @@ def test_read_stops_at_what_the_handle_wrote(fuse_mock, truncate):
     else:
         fh = fs.open("/file", os.O_RDWR | os.O_TRUNC)
 
+    launcher = fs.bridge.launcher
+    sent = (launcher.send_read_handle.call_count,
+            launcher.send_seek_handle.call_count)
     assert fs.read("/file", 4096, 0, fh) == b""
+    assert (launcher.send_read_handle.call_count,
+            launcher.send_seek_handle.call_count) == sent
     fs.write("/file", NEW, 0, fh)
     assert fs.read("/file", 4096, 0, fh) == NEW
     assert fs.read("/file", 10, len(NEW) - 4, fh) == NEW[-4:]
@@ -415,6 +424,47 @@ def test_reused_file_handle_carries_no_mark(fuse_mock):
 
     assert update == output
     assert volume.writes == [0]
+
+
+@pytest.mark.parametrize("truncate", [True, False],
+                         ids=["reopen", "O_TRUNC-open"])
+def test_listing_keeps_the_pinned_size(fuse_mock, truncate):
+    """BFFS lists the file at its old size until the handle ends. A
+    listing of its directory leaves the pin, and so the reads and the
+    file's end, at what the handle wrote."""
+    volume = _FakeBFFS({"file": ORIGINAL})
+    fs = _bffs_fs(volume)
+    fs.bridge.list_dir_path = lambda path: [
+        {"name": name, "dir_type": -3, "size": len(data), "protection": 0,
+         "num_blocks": 1} for name, data in volume.files.items()]
+    if truncate:
+        fh = fs.open("/file", os.O_RDWR)
+        fs.truncate("/file", 0, fh)
+    else:
+        fh = fs.open("/file", os.O_RDWR | os.O_TRUNC)
+    fs.write("/file", NEW, 0, fh)
+
+    assert "file" in fs.readdir("/", None)
+    assert fs.getattr("/file", fh)["st_size"] == len(NEW)
+    assert fs.read("/file", 4096, 0, fh) == NEW
+    fs.release("/file", fh)
+
+    assert volume.files["file"] == NEW
+
+
+def test_unanswered_write_gets_no_zero_length_write(fuse_mock):
+    """The handler may still carry the write out, so no other write
+    follows it."""
+    volume = _FakeBFFS({"file": ORIGINAL})
+    volume.write_replies = {0: NO_REPLY}
+    fs = _bffs_fs(volume)
+    fh = fs.open("/file", os.O_WRONLY | os.O_TRUNC)
+
+    with pytest.raises(fuse_fs.FuseOSError):
+        fs.write("/file", NEW, 0, fh)
+    fs.release("/file", fh)
+
+    assert volume.writes == [len(NEW)]
 
 
 def test_failed_first_write_still_gets_zero_length_write(fuse_mock):
@@ -499,3 +549,14 @@ def test_open_file_reply_carries_res2(fuse_mock, reply, expected):
 
     assert bridge.open_file_reply("/file", os.O_RDWR) == expected
     assert bridge.open_file("/file", os.O_RDWR) is not None
+
+
+def test_open_file_reply_of_unanswered_parent_lookup_is_zero(fuse_mock):
+    """locate_path() gives -1 for a LOCATE with no reply, or a parent in
+    the negative cache; dp_Res2 is 0 then, as for any open with no reply."""
+    volume = _FakeBFFS({"file": ORIGINAL})
+    bridge = _bffs_bridge(volume)
+    bridge.locate_path = MagicMock(side_effect=lambda path: (0, -1, []))
+
+    assert bridge.open_file_reply("/dir/file", os.O_RDWR) == (None, 0)
+    assert volume.opens == []
