@@ -80,7 +80,6 @@ from .startup_runner import (
     _packet_type_name,
     _snapshot_block_state,
     _restore_block_state,
-    _unlink_msg_from_m68k_list,
 )
 from amitools.vamos.libstructs.dos import FileInfoBlockStruct, FileHandleStruct, DosPacketStruct, InfoDataStruct  # type: ignore
 from amitools.vamos.lib.dos.DosProtection import DosProtection  # type: ignore
@@ -623,18 +622,34 @@ class HandlerBridge:
                 if timer is not None and timer.delays(msg_addr):
                     kept.append(msg_addr)
                 elif mem is not None:
-                    # Off the port's mp_MsgList too, as GetMsg() takes it.
-                    _unlink_msg_from_m68k_list(mem, msg_addr, debug=self._debug)
-                    # The handler may still WaitIO() on the request, and
-                    # WaitIO() unlinks it again. Linked to itself, the node
-                    # takes no later message with it.
-                    try:
-                        mem.w32(msg_addr, msg_addr)  # ln_Succ
-                        mem.w32(msg_addr + 4, msg_addr)  # ln_Pred
-                    except Exception:
-                        pass
+                    self._unlink_drained(mem, msg_addr)
             for msg_addr in kept:
                 pmgr.put_msg(port_addr, msg_addr)
+
+    @staticmethod
+    def _unlink_drained(mem, msg_addr: int):
+        """Take a drained message off its mp_MsgList, as GetMsg() does.
+
+        Only a node its neighbours point back at is linked: a message that
+        PutMsg() queued through the port manager is not, and its links may
+        be stale, into another port's list or freed memory. An unlinked node
+        is linked to itself: the handler may still WaitIO() on the request,
+        which unlinks it again, and so takes no later message with it.
+        Zeroed links would have a Remove() write to addresses 0 and 4
+        (ExecBase).
+        """
+        try:
+            succ = mem.r32(msg_addr)  # ln_Succ
+            pred = mem.r32(msg_addr + 4)  # ln_Pred
+            if not (succ and pred and mem.r32(pred) == msg_addr
+                    and mem.r32(succ + 4) == msg_addr):
+                return
+            mem.w32(pred, succ)
+            mem.w32(succ + 4, pred)
+            mem.w32(msg_addr, msg_addr)
+            mem.w32(msg_addr + 4, msg_addr)
+        except Exception:
+            pass
 
     def _timer_device(self):
         """The runtime's AmiFuseTimerDevice, or None."""
