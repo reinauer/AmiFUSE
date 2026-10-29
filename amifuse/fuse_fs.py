@@ -152,6 +152,21 @@ _WRITE_ERRNOS = {
     ERROR_WRITE_PROTECTED: errno.EACCES,
 }
 
+# AmigaDOS error codes from a failed ACTION_RENAME_OBJECT, and the errno
+# rename() reports for each. FastFileSystem, pfs3aio and SmartFilesystem
+# all refuse a rename onto an existing name with ERROR_OBJECT_EXISTS,
+# whether the existing object is a file or a directory.
+ERROR_OBJECT_EXISTS = 203
+ERROR_DIRECTORY_NOT_EMPTY = 216
+_RENAME_ERRNOS = {
+    **_WRITE_ERRNOS,
+    ERROR_OBJECT_IN_USE: errno.EBUSY,
+    ERROR_OBJECT_EXISTS: errno.EEXIST,
+    ERROR_DIR_NOT_FOUND: errno.ENOENT,
+    ERROR_OBJECT_NOT_FOUND: errno.ENOENT,
+    ERROR_DIRECTORY_NOT_EMPTY: errno.ENOTEMPTY,
+}
+
 # AmigaDOS error codes a handler can return when it refuses ACTION_DISK_INFO.
 # ERROR_ACTION_NOT_KNOWN is deliberately absent from the unmounted set in
 # HandlerBridge._UNMOUNTED_DISK_ERRORS: it means the handler does not
@@ -3794,18 +3809,112 @@ class AmigaFuseFS(_FuseOperations):
             print(f"[FUSE][rename] old={old} new={new}")
         if not self.bridge._write_enabled:
             raise FuseOSError(errno.EROFS)
-        src_dir, src_name = self._split_path(old)
-        dst_dir, dst_name = self._split_path(new)
+        _, src_name = self._split_path(old)
+        _, dst_name = self._split_path(new)
         if not src_name or not dst_name:
             raise FuseOSError(errno.EINVAL)
+        res1, res2 = self._rename_object(old, new)
+        # AmigaDOS renames onto no existing name, while rename(2) replaces
+        # one, and editors save by renaming a new file over the old one.
+        # Handlers match names case-insensitively, so two paths that differ
+        # only in case can name one object, which a replace would delete.
+        # lower() folds at least the letters any handler folds.
+        if res1 == 0 and res2 == ERROR_OBJECT_EXISTS and old.lower() != new.lower():
+            self._replace_existing(old, new)
+            return 0
+        if res1 == 0:
+            raise FuseOSError(_RENAME_ERRNOS.get(res2, errno.EIO))
+        return 0
+
+    def _replace_existing(self, old: str, new: str):
+        """Rename old onto new, which exists, as rename(2) does.
+
+        A file replaces a file, and a directory an empty directory. new is
+        renamed to a temporary name in its directory, old is renamed to
+        new, and the temporary name is deleted, so that one of the two
+        objects is under new at every step. A step that fails puts back
+        what the steps before it moved, and rename() fails.
+
+        The deleted object goes the way unlink() and rmdir() take: a file
+        still open is deleted at its release(), and hidden until then.
+        """
+        src_is_dir = self._is_dir(old)
+        dst_is_dir = self._is_dir(new)
+        if src_is_dir is None or dst_is_dir is None:
+            # Neither examined nor pinned: gone, or held on an exclusive lock.
+            raise FuseOSError(errno.ENOENT if src_is_dir is None else errno.EBUSY)
+        if dst_is_dir and not src_is_dir:
+            raise FuseOSError(errno.EISDIR)
+        if src_is_dir and not dst_is_dir:
+            raise FuseOSError(errno.ENOTDIR)
+        if dst_is_dir and self.bridge.list_dir_path(new):
+            raise FuseOSError(errno.ENOTEMPTY)
+        dst_dir, _ = self._split_path(new)
+        for _ in range(8):
+            temp = dst_dir.rstrip("/") + f"/.amifuse-{os.urandom(4).hex()}"
+            res1, res2 = self._rename_object(new, temp)
+            if res1 or res2 != ERROR_OBJECT_EXISTS:
+                break
+        if res1 == 0:
+            raise FuseOSError(_RENAME_ERRNOS.get(res2, errno.EIO))
+        res1, res2 = self._rename_object(old, new)
+        if res1 == 0:
+            self._rename_back(temp, new)
+            raise FuseOSError(_RENAME_ERRNOS.get(res2, errno.EIO))
+        try:
+            if dst_is_dir:
+                res1, res2 = self.bridge.delete_dir_atomic(temp)
+                if res1 == 0:
+                    raise FuseOSError(_RENAME_ERRNOS.get(res2, errno.EIO))
+                # A deferred rmdir of the target moved to temp in step 1.
+                self._forget_pending_delete(temp)
+                with self._cache_lock:
+                    self._stat_cache.pop(temp, None)
+                    self._dir_cache.pop(dst_dir, None)
+            else:
+                self.unlink(temp)
+        except FuseOSError:
+            self._rename_back(new, old)
+            self._rename_back(temp, new)
+            raise
+
+    def _is_dir(self, path: str) -> Optional[bool]:
+        """Whether path is a directory; None when it can't be told.
+
+        A file held on an exclusive lock can't be examined, but has a
+        pinned entry (_pin_stat).
+        """
+        info = self.bridge.stat_path(path)
+        if info:
+            return info["dir_type"] >= 0
+        with self._cache_lock:
+            return False if path in self._pinned_stats else None
+
+    def _rename_back(self, old: str, new: str):
+        """Undo one step of _replace_existing()."""
+        res1, res2 = self._rename_object(old, new)
+        if res1 == 0:
+            # The object stays under old, in sight, and nothing else says so.
+            print(f"[amifuse] rename: could not rename {old} back to {new} "
+                  f"(DOS error {res2})", file=sys.stderr, flush=True)
+
+    def _rename_object(self, old: str, new: str) -> Tuple[int, int]:
+        """Send one ACTION_RENAME_OBJECT; on success, move what follows old.
+
+        Returns the reply, or (0, ERROR_DIR_NOT_FOUND) when a parent
+        directory is not found. Open handles, pinned entries and deferred
+        deletes move from old to new, also below a renamed directory.
+        """
+        src_dir, src_name = self._split_path(old)
+        dst_dir, dst_name = self._split_path(new)
         src_lock, _, src_locks = self.bridge.locate_path(src_dir)
         dst_lock, _, dst_locks = self.bridge.locate_path(dst_dir)
         try:
             if (src_lock == 0 and src_dir != "/") or (dst_lock == 0 and dst_dir != "/"):
-                raise FuseOSError(errno.ENOENT)
-            res1, _ = self.bridge.rename_object(src_lock, src_name, dst_lock, dst_name)
+                return 0, ERROR_DIR_NOT_FOUND
+            res1, res2 = self.bridge.rename_object(src_lock, src_name, dst_lock, dst_name)
             if res1 == 0:
-                raise FuseOSError(errno.EIO)
+                return res1, res2
         finally:
             # Free the dir locks on every exit; a leaked lock lingers in
             # handler memory and can block later deletes with OBJECT_IN_USE.
@@ -3813,6 +3922,8 @@ class AmigaFuseFS(_FuseOperations):
                 self.bridge.free_lock(l)
             for l in reversed(dst_locks):
                 self.bridge.free_lock(l)
+        # Handles of the renamed file itself, now in another directory.
+        moved_out = []
         with self._cache_lock:
             self._stat_cache.pop(new, None)
             self._pinned_stats.discard(new)
@@ -3834,6 +3945,9 @@ class AmigaFuseFS(_FuseOperations):
                 for entry in self._fh_cache.values():
                     moved = _renamed_path(entry.get("path", ""), old, new)
                     if moved is not None:
+                        # Directory and icon handles have no fh_addr.
+                        if moved == new and src_dir != dst_dir and "fh_addr" in entry:
+                            moved_out.append(entry)
                         entry["path"] = moved
                 # Deferred deletes follow too. release() and releasedir()
                 # look for them under the handle's path, and one left under
@@ -3848,7 +3962,30 @@ class AmigaFuseFS(_FuseOperations):
                     }
                     for d, children in self._pending_dir_deletes.items()
                 }
-        return 0
+        for entry in moved_out:
+            self._move_parent_lock(entry, dst_dir)
+        return res1, res2
+
+    def _move_parent_lock(self, entry: Dict, dir_path: str):
+        """Move an open file's lock on its directory to dir_path.
+
+        open() keeps a lock on the directory a file was opened in until
+        release(). Left on the directory the file was renamed out of, it
+        keeps the handler from deleting that directory once it is empty.
+        The entry keeps the old lock if dir_path can't be locked.
+        """
+        with entry["lock"]:
+            # release() marks the entry closed before it frees the lock.
+            if entry.get("closed") or not entry.get("parent_lock"):
+                return
+            lock, _, _ = self.bridge.locate_path(dir_path)
+            if dir_path == "/" and lock == 0:
+                lock, _ = self.bridge.locate(0, "")
+            if lock == 0:
+                self._log_op("rename", dir_path, "could not lock the new directory")
+                return
+            self.bridge.free_lock(entry["parent_lock"])
+            entry["parent_lock"] = lock
 
     def flush(self, path, fh):
         self._log_op("flush", path, f"fh={fh}")
