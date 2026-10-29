@@ -4639,18 +4639,41 @@ def format_volume(
         # SFS. Callers that want to verify the new volume should do so in a
         # fresh HandlerBridge.
         pkt_addr, _ = bridge.launcher.send_flush(bridge.state)
-        bridge._run_until_reply(
+        reply = bridge._run_until_reply(
             pkt_addr, "format flush", max_iters=500, cycles=2_000_000
         )
         _raise_if_handler_crashed(bridge, "format flush")
-        bridge.backend.sync()
+        # A handler that does not implement ACTION_FLUSH answers
+        # ERROR_ACTION_NOT_KNOWN (SmartFilesystem does after a format); what
+        # it wrote is then already on the image, and the fsync below makes
+        # it durable. Any other refusal, or no reply, fails the format.
+        if reply is None:
+            raise SystemExit("Format failed: no reply to ACTION_FLUSH from handler.")
+        if reply[0] == 0 and reply[1] != ERROR_ACTION_NOT_KNOWN:
+            raise SystemExit(
+                f"Format failed: handler refused ACTION_FLUSH (error code {reply[1]})")
+        # "Format complete" promises the new volume is on stable storage.
+        try:
+            bridge.backend.sync()
+            bridge.backend.fsync()
+        except OSError as exc:
+            raise SystemExit(f"Format failed: {exc}") from exc
 
         print(f"Format complete. Volume '{volname}' created on partition '{partition}'.")
     finally:
-        if bridge is not None:
-            bridge.close()
-        if temp_driver is not None and temp_driver.exists():
-            temp_driver.unlink()
+        try:
+            if bridge is not None:
+                bridge.close()
+        finally:
+            # Every exit removes the driver extracted from the RDB, also one
+            # whose bridge fails to close. A failed removal is reported, but
+            # does not replace the message the format exits with.
+            if temp_driver is not None:
+                try:
+                    temp_driver.unlink(missing_ok=True)
+                except OSError as exc:
+                    print(f"[amifuse] could not remove {temp_driver}: {exc}",
+                          file=sys.stderr)
 
 
 def _json_error(command: str, code: str, message: str, details: dict = None) -> dict:
@@ -5537,6 +5560,51 @@ def cmd_read(args):
             _cleanup_bridge(bridge, temp_driver)
 
 
+def _open_write_source(host_path: Path, use_json: bool):
+    """Open the source of `amifuse write`, or exit with an argument error.
+
+    Returns the open file and its size. Both come from the one handle the
+    write loop reads, so a path that is replaced afterwards is not copied
+    in its place. Only a regular file is accepted; O_NONBLOCK keeps a FIFO
+    from blocking the open, and has no effect on a regular file. O_NOCTTY
+    keeps a terminal opened as the source from becoming this process's
+    controlling terminal before it is refused.
+    """
+    import json
+    import stat
+
+    flags = os.O_RDONLY
+    for name in ("O_BINARY", "O_NONBLOCK", "O_NOCTTY"):
+        flags |= getattr(os, name, 0)
+    try:
+        fd = os.open(host_path, flags)
+    except FileNotFoundError:
+        if use_json:
+            print(json.dumps(_json_error("write", "SOURCE_NOT_FOUND",
+                f"Source file not found: {host_path}")))
+            sys.exit(1)
+        raise SystemExit(f"Error: source file not found: {host_path}")
+    except OSError as exc:
+        if use_json:
+            print(json.dumps(_json_error("write", "INVALID_ARGUMENT",
+                f"Cannot read source file: {host_path}: {exc.strerror or exc}")))
+            sys.exit(1)
+        raise SystemExit(
+            f"Error: cannot read source file: {host_path}: {exc.strerror or exc}")
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            if use_json:
+                print(json.dumps(_json_error("write", "INVALID_ARGUMENT",
+                    f"Source is not a regular file: {host_path}")))
+                sys.exit(1)
+            raise SystemExit(f"Error: source is not a regular file: {host_path}")
+        return os.fdopen(fd, "rb"), st.st_size
+    except BaseException:
+        os.close(fd)
+        raise
+
+
 def cmd_write(args):
     """Handle the 'write' subcommand."""
     import json
@@ -5561,28 +5629,32 @@ def cmd_write(args):
             sys.exit(1)
         raise SystemExit(f"Error: source is a directory: {host_path}")
 
-    host_size = host_path.stat().st_size
-
     # Refuse before the bridge exists: opening the destination with O_TRUNC
-    # (ACTION_FINDOUTPUT) would already empty an existing file.
-    if host_size > _MAX_FILE_SIZE:
-        if use_json:
-            print(json.dumps(_json_error("write", "FILE_TOO_LARGE",
-                f"Source file is larger than {_MAX_FILE_SIZE} bytes, the "
-                f"largest AmigaDOS file: {host_path} ({host_size} bytes)",
-                {"size": host_size, "max_size": _MAX_FILE_SIZE})))
-            sys.exit(1)
-        raise SystemExit(
-            f"Error: source file is larger than {_MAX_FILE_SIZE} bytes, the "
-            f"largest AmigaDOS file: {host_path} ({host_size} bytes)")
+    # (ACTION_FINDOUTPUT) would already empty an existing file. So the
+    # source is opened here, and a source that cannot be read fails first.
+    source, host_size = _open_write_source(host_path, use_json)
+    try:
+        if host_size > _MAX_FILE_SIZE:
+            if use_json:
+                print(json.dumps(_json_error("write", "FILE_TOO_LARGE",
+                    f"Source file is larger than {_MAX_FILE_SIZE} bytes, the "
+                    f"largest AmigaDOS file: {host_path} ({host_size} bytes)",
+                    {"size": host_size, "max_size": _MAX_FILE_SIZE})))
+                sys.exit(1)
+            raise SystemExit(
+                f"Error: source file is larger than {_MAX_FILE_SIZE} bytes, the "
+                f"largest AmigaDOS file: {host_path} ({host_size} bytes)")
 
-    # Safety warning (stderr so it doesn't interfere with JSON output)
-    print(f"WARNING: This will modify the disk image: {args.image}", file=sys.stderr)
-    print(f"  Source: {host_path} ({host_size:,} bytes)", file=sys.stderr)
-    print(f"  Destination: {amiga_path}", file=sys.stderr)
-    print(f"  Ensure you have a backup of the image before proceeding.", file=sys.stderr)
+        # Safety warning (stderr so it doesn't interfere with JSON output)
+        print(f"WARNING: This will modify the disk image: {args.image}", file=sys.stderr)
+        print(f"  Source: {host_path} ({host_size:,} bytes)", file=sys.stderr)
+        print(f"  Destination: {amiga_path}", file=sys.stderr)
+        print(f"  Ensure you have a backup of the image before proceeding.", file=sys.stderr)
 
-    bridge, temp_driver = _create_bridge_from_args(args, "write", read_only=False)
+        bridge, temp_driver = _create_bridge_from_args(args, "write", read_only=False)
+    except BaseException:
+        source.close()
+        raise
     flushed = False  # Guard flag to avoid double flush
     write_started = False
     mount_details = None
@@ -5617,14 +5689,14 @@ def cmd_write(args):
             # - write_handle() returning -1 triggers the error path below
             chunk_size = IO_CHUNK
             bytes_written = 0
-            with open(host_path, "rb") as f:
+            with source as f:
                 while True:
                     data = f.read(chunk_size)
                     if not data:
                         break
                     if bytes_written + len(data) > _MAX_FILE_SIZE:
-                        # The source holds more than its stat() size: it grew
-                        # while it was read, or it is a stream that reports 0
+                        # The source holds more than its fstat() size: it grew
+                        # while it was read
                         if use_json:
                             print(json.dumps(_json_error("write", "FILE_TOO_LARGE",
                                 f"Source holds more than {_MAX_FILE_SIZE} bytes, "
@@ -5715,6 +5787,7 @@ def cmd_write(args):
             sys.exit(1)
         raise SystemExit(f"Error during write: {e}")
     finally:
+        source.close()
         # On error paths, we still want to flush what was written to
         # avoid losing partially-written data. But if flush_volume() already
         # succeeded on the success path, skip the redundant flush.

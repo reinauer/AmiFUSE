@@ -588,6 +588,7 @@ class TestFormatVolume:
         ]
         mock_bridge._run_until_replies.assert_not_called()
         mock_bridge.backend.sync.assert_called_once_with()
+        mock_bridge.backend.fsync.assert_called_once_with()
         mock_bridge.close.assert_called_once()
 
     def test_format_dos_partition_without_rdb_driver_uses_bundled(
