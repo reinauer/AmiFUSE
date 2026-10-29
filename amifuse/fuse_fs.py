@@ -4166,12 +4166,26 @@ def get_partition_name(image: Path, block_size: Optional[int], partition: Option
     return get_partition_info(image, block_size, partition)["name"]
 
 
+def _dos_type_tag(dos_type: int) -> str:
+    """Return a DOS type's tag, e.g. "PFS3", for printing.
+
+    An image chooses the bytes, so a character outside 0x20-0x7E is shown
+    escaped, e.g. "\\x1b", and never reaches the terminal.
+    """
+    import amitools.fs.DosType as DosType
+
+    return "".join(
+        ch if " " <= ch <= "~" else f"\\x{ord(ch):02x}"
+        for ch in DosType.num_to_tag_str(dos_type)
+    )
+
+
 def extract_embedded_driver(
     image: Path, block_size: Optional[int], partition: Optional[str]
 ) -> Optional[Tuple[Path, str, int]]:
     """Extract filesystem driver from RDB if available for the partition's dostype.
 
-    Returns (temp file path, dostype tag string, dostype) for the extracted
+    Returns (temp file path, printable dostype tag, dostype) for the extracted
     driver, or None if the RDB has no filesystem entry matching the
     partition's dostype. The caller is responsible for deleting the temp
     file when done.
@@ -4182,7 +4196,6 @@ def extract_embedded_driver(
     picked in its place.
     """
     import tempfile
-    import amitools.fs.DosType as DosType
     from .rdb_inspect import open_rdisk, find_partition_mbr_index
 
     mbr_idx = find_partition_mbr_index(image, block_size, partition) if partition else None
@@ -4197,15 +4210,17 @@ def extract_embedded_driver(
             return None
 
         target_dostype = part.part_blk.dos_env.dos_type
-        dt_str = DosType.num_to_tag_str(target_dostype)
+        dt_str = _dos_type_tag(target_dostype)
 
         # Search filesystem blocks for matching dostype
         for fs in rdisk.fs:
             if fs.fshd.dos_type == target_dostype:
                 # Found matching filesystem - extract to temp file
                 data = fs.get_data()
-                # Create temp file that persists until program exits
-                fd, temp_path = tempfile.mkstemp(suffix=f"_{dt_str}.handler", prefix="amifuse_")
+                # Create temp file that persists until program exits. It is
+                # named by number: the tag's characters come from the image.
+                fd, temp_path = tempfile.mkstemp(
+                    suffix=f"_{target_dostype:08x}.handler", prefix="amifuse_")
                 try:
                     # The file object closes fd even if a write fails, and
                     # retries short writes until all of data is written.
@@ -4356,172 +4371,179 @@ def mount_fuse(
     driver_desc = resolved.description
     temp_driver = resolved.path if resolved.temporary else None
 
-    # Auto-create mountpoint on macOS/Windows if not specified
-    if mountpoint is None:
-        mountpoint = plat.get_default_mountpoint(volname_opt or part_name)
+    try:
+        # Auto-create mountpoint on macOS/Windows if not specified
         if mountpoint is None:
-            if sys.platform.startswith("win"):
-                raise SystemExit(
-                    "No free drive letter found. Specify a mountpoint with --mountpoint D:"
-                )
-            raise SystemExit("--mountpoint is required on this platform")
+            mountpoint = plat.get_default_mountpoint(volname_opt or part_name)
+            if mountpoint is None:
+                if sys.platform.startswith("win"):
+                    raise SystemExit(
+                        "No free drive letter found. Specify a mountpoint with --mountpoint D:"
+                    )
+                raise SystemExit("--mountpoint is required on this platform")
 
-    validation_error = plat.validate_mountpoint(mountpoint)
-    if validation_error:
-        raise SystemExit(validation_error)
+        validation_error = plat.validate_mountpoint(mountpoint)
+        if validation_error:
+            raise SystemExit(validation_error)
 
-    try:
-        fuse_mountpoint = plat.get_fuse_mountpoint(mountpoint)
-    except ValueError as exc:
-        raise SystemExit(str(exc)) from exc
-    if sys.platform.startswith("win"):
-        drive = plat.windows_drive_mountpoint(mountpoint)
-        if drive:
-            # Keep OS probes, shell notifications and user-facing paths in
-            # the normal namespace; only WinFsp needs the device spelling.
-            mountpoint = Path(drive)
-
-    # Create mountpoint directory if it doesn't exist
-    if not plat.should_auto_create_mountpoint(mountpoint):
-        if not mountpoint.exists():
-            try:
-                mountpoint.mkdir(parents=True, exist_ok=True)
-            except FileExistsError:
-                raise SystemExit(plat.format_stale_mountpoint_error(mountpoint))
-            except OSError as exc:
-                if exc.errno in (errno.EIO, errno.ENOTCONN):
-                    raise SystemExit(plat.format_stale_mountpoint_error(mountpoint))
-                raise SystemExit(
-                    f"Could not create mountpoint {mountpoint}: {exc.strerror or exc}"
-                )
-
-    if foreground is None:
-        # Daemon mode is the default on every platform; --interactive /
-        # --foreground opts in to staying attached to the terminal.
-        foreground = False
-
-    # Print startup banner
-    print(__banner__)
-    if adf_info is not None:
-        floppy_type = "HD" if adf_info.is_hd else "DD"
-        print(f"Mounting ADF floppy ({floppy_type}) from {image}")
-    elif iso_info is not None:
-        print(f"Mounting ISO 9660 image ({iso_info.volume_id}) from {image}")
-    else:
-        print(f"Mounting partition '{part_name}' from {image}")
-    print(f"Filesystem driver: {driver_desc}")
-    print(f"Mount point: {mountpoint}")
-    if sys.platform.startswith("win") and fuse_mountpoint.startswith("\\\\.\\"):
-        print("[amifuse] global drive; unmount from an Administrator shell")
-    if foreground:
-        print("[amifuse] interactive mode; press Ctrl+C to unmount")
-    else:
-        print(f"[amifuse] daemon mode; unmount with: amifuse unmount {mountpoint}")
-
-    if write:
-        # Guard against accidental writes without explicit intent.
-        print("[amifuse] write mode enabled; ensure the image is backed up")
-
-    if icons:
-        print("[amifuse] icon mode enabled; Amiga icons will appear as macOS custom icons")
-
-    try:
-        bridge = HandlerBridge(
-            image,
-            driver,
-            block_size=block_size,
-            read_only=not write,
-            debug=debug,
-            trace=trace,
-            partition=partition,
-            adf_info=adf_info,
-            iso_info=iso_info,
-        )
-    except (OSError, ValueError) as exc:
-        # Lock conflicts and invalid partitions are expected refusals.
-        if debug:
-            raise
-        raise SystemExit(f"Cannot mount {image}: {exc}") from exc
-    if _handler_has_crashed(bridge):
-        bridge.close()
-        raise SystemExit("Filesystem handler crashed during startup; mount aborted.")
-
-    # Let default signal handling work - FUSE will call destroy() on unmount
-    volname = volname_opt or bridge.volume_name()
-    if _handler_has_crashed(bridge):
-        bridge.close()
-        raise SystemExit("Filesystem handler crashed during startup; mount aborted.")
-
-    # Pre-generate volume icon if platform requires it at mount time
-    temp_volicon = None
-    if icons:
-        temp_volicon = plat.pre_generate_volume_icon(bridge, debug=debug)
-        if temp_volicon:
-            print(f"[amifuse] Volume icon generated: {temp_volicon}")
-
-    # Multi-threaded mode with caching to minimize macOS polling.
-    use_threads = not write
-    fuse_kwargs = {
-        "foreground": foreground,
-        "ro": not write,
-        "allow_other": False,
-        "nothreads": not use_threads,
-        "fsname": f"amifuse:{volname}",
-        "default_permissions": True,  # Let kernel handle permission checks
-    }
-    # WinFSP maps FUSE uid=0/gid=0 to Windows SID S-1-5-0 (Nobody), blocking
-    # write access for the current user.  uid/gid=-1 tells WinFSP to use the
-    # mounting user's SID instead.
-    if sys.platform.startswith("win"):
-        fuse_kwargs["uid"] = -1
-        fuse_kwargs["gid"] = -1
-    # subtype is a Linux-only FUSE option; WinFSP and macFUSE don't support it
-    if sys.platform.startswith("linux"):
-        fuse_kwargs["subtype"] = "amifuse"
-    # Add platform-specific mount options
-    platform_opts = plat.get_mount_options(
-        volname=volname,
-        volicon_path=str(temp_volicon) if temp_volicon else None,
-        icons_enabled=icons
-    )
-    fuse_kwargs.update(platform_opts)
-
-    if debug:
-        print(f"[amifuse] FUSE options: {fuse_kwargs}", flush=True)
-
-    control = None
-    operations = None
-    try:
-        operations = AmigaFuseFS(bridge, debug=debug, icons=icons, mountpoint=mountpoint)
-        if sys.platform.startswith("win"):
-            from .windows_unmount import UnmountControl
-            control = UnmountControl()
-            operations._unmount_control = control
         try:
-            fuse_class(
-                operations,
-                fuse_mountpoint,
-                **fuse_kwargs,
+            fuse_mountpoint = plat.get_fuse_mountpoint(mountpoint)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+        if sys.platform.startswith("win"):
+            drive = plat.windows_drive_mountpoint(mountpoint)
+            if drive:
+                # Keep OS probes, shell notifications and user-facing paths in
+                # the normal namespace; only WinFsp needs the device spelling.
+                mountpoint = Path(drive)
+
+        # Create mountpoint directory if it doesn't exist
+        if not plat.should_auto_create_mountpoint(mountpoint):
+            if not mountpoint.exists():
+                try:
+                    mountpoint.mkdir(parents=True, exist_ok=True)
+                except FileExistsError:
+                    raise SystemExit(plat.format_stale_mountpoint_error(mountpoint))
+                except OSError as exc:
+                    if exc.errno in (errno.EIO, errno.ENOTCONN):
+                        raise SystemExit(plat.format_stale_mountpoint_error(mountpoint))
+                    raise SystemExit(
+                        f"Could not create mountpoint {mountpoint}: {exc.strerror or exc}"
+                    )
+
+        if foreground is None:
+            # Daemon mode is the default on every platform; --interactive /
+            # --foreground opts in to staying attached to the terminal.
+            foreground = False
+
+        # Print startup banner
+        print(__banner__)
+        if adf_info is not None:
+            floppy_type = "HD" if adf_info.is_hd else "DD"
+            print(f"Mounting ADF floppy ({floppy_type}) from {image}")
+        elif iso_info is not None:
+            print(f"Mounting ISO 9660 image ({iso_info.volume_id}) from {image}")
+        else:
+            print(f"Mounting partition '{part_name}' from {image}")
+        print(f"Filesystem driver: {driver_desc}")
+        print(f"Mount point: {mountpoint}")
+        if sys.platform.startswith("win") and fuse_mountpoint.startswith("\\\\.\\"):
+            print("[amifuse] global drive; unmount from an Administrator shell")
+        if foreground:
+            print("[amifuse] interactive mode; press Ctrl+C to unmount")
+        else:
+            print(f"[amifuse] daemon mode; unmount with: amifuse unmount {mountpoint}")
+
+        if write:
+            # Guard against accidental writes without explicit intent.
+            print("[amifuse] write mode enabled; ensure the image is backed up")
+
+        if icons:
+            print("[amifuse] icon mode enabled; Amiga icons will appear as macOS custom icons")
+
+        try:
+            bridge = HandlerBridge(
+                image,
+                driver,
+                block_size=block_size,
+                read_only=not write,
+                debug=debug,
+                trace=trace,
+                partition=partition,
+                adf_info=adf_info,
+                iso_info=iso_info,
             )
-        except RuntimeError as exc:
-            if not sys.platform.startswith("win") or debug:
+        except (OSError, ValueError) as exc:
+            # Lock conflicts and invalid partitions are expected refusals.
+            if debug:
                 raise
-            raise SystemExit(
-                f"WinFsp could not mount '{mountpoint}': {exc}"
-            ) from exc
+            raise SystemExit(f"Cannot mount {image}: {exc}") from exc
+        if _handler_has_crashed(bridge):
+            bridge.close()
+            raise SystemExit("Filesystem handler crashed during startup; mount aborted.")
+
+        # Let default signal handling work - FUSE will call destroy() on unmount
+        volname = volname_opt or bridge.volume_name()
+        if _handler_has_crashed(bridge):
+            bridge.close()
+            raise SystemExit("Filesystem handler crashed during startup; mount aborted.")
+
+        # Pre-generate volume icon if platform requires it at mount time
+        temp_volicon = None
+        if icons:
+            temp_volicon = plat.pre_generate_volume_icon(bridge, debug=debug)
+            if temp_volicon:
+                print(f"[amifuse] Volume icon generated: {temp_volicon}")
+
+        # Multi-threaded mode with caching to minimize macOS polling.
+        use_threads = not write
+        fuse_kwargs = {
+            "foreground": foreground,
+            "ro": not write,
+            "allow_other": False,
+            "nothreads": not use_threads,
+            "fsname": f"amifuse:{volname}",
+            "default_permissions": True,  # Let kernel handle permission checks
+        }
+        # WinFSP maps FUSE uid=0/gid=0 to Windows SID S-1-5-0 (Nobody), blocking
+        # write access for the current user.  uid/gid=-1 tells WinFSP to use the
+        # mounting user's SID instead.
+        if sys.platform.startswith("win"):
+            fuse_kwargs["uid"] = -1
+            fuse_kwargs["gid"] = -1
+        # subtype is a Linux-only FUSE option; WinFSP and macFUSE don't support it
+        if sys.platform.startswith("linux"):
+            fuse_kwargs["subtype"] = "amifuse"
+        # Add platform-specific mount options
+        platform_opts = plat.get_mount_options(
+            volname=volname,
+            volicon_path=str(temp_volicon) if temp_volicon else None,
+            icons_enabled=icons
+        )
+        fuse_kwargs.update(platform_opts)
+
+        if debug:
+            print(f"[amifuse] FUSE options: {fuse_kwargs}", flush=True)
+
+        control = None
+        operations = None
+        try:
+            operations = AmigaFuseFS(bridge, debug=debug, icons=icons, mountpoint=mountpoint)
+            if sys.platform.startswith("win"):
+                from .windows_unmount import UnmountControl
+                control = UnmountControl()
+                operations._unmount_control = control
+            try:
+                fuse_class(
+                    operations,
+                    fuse_mountpoint,
+                    **fuse_kwargs,
+                )
+            except RuntimeError as exc:
+                if not sys.platform.startswith("win") or debug:
+                    raise
+                raise SystemExit(
+                    f"WinFsp could not mount '{mountpoint}': {exc}"
+                ) from exc
+        finally:
+            if control is not None:
+                control.close()
+            # destroy() stops it, but a mount can end without destroy().
+            if operations is not None:
+                operations._stop_timer_thread()
+            bridge.close()
+            # Clean up temp volume icon file
+            if temp_volicon is not None and temp_volicon.exists():
+                temp_volicon.unlink()
     finally:
-        if control is not None:
-            control.close()
-        # destroy() stops it, but a mount can end without destroy().
-        if operations is not None:
-            operations._stop_timer_thread()
-        bridge.close()
-        # Clean up temp driver file if we extracted one
-        if temp_driver is not None and temp_driver.exists():
-            temp_driver.unlink()
-        # Clean up temp volume icon file
-        if temp_volicon is not None and temp_volicon.exists():
-            temp_volicon.unlink()
+        # Every exit removes the driver extracted from the RDB, also one
+        # that stops before mounting. A failed removal does not replace the
+        # message the mount exits with.
+        if temp_driver is not None:
+            try:
+                temp_driver.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def format_volume(
@@ -4532,7 +4554,6 @@ def format_volume(
     volname: str = "Empty",
     debug: bool = False,
 ):
-    import amitools.fs.DosType as DosType
     bridge = None
 
     # Name a missing image or a directory plainly, as the file commands do.
@@ -4553,7 +4574,7 @@ def format_volume(
     dostype = part_info["dostype"]
     if dostype is None:
         raise SystemExit(f"Could not determine dostype for partition '{partition}'.")
-    dt_str = DosType.num_to_tag_str(dostype)
+    dt_str = _dos_type_tag(dostype)
 
     # Resolve driver
     try:
