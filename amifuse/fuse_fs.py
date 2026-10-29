@@ -80,6 +80,7 @@ from .startup_runner import (
     _packet_type_name,
     _snapshot_block_state,
     _restore_block_state,
+    _unlink_msg_from_m68k_list,
 )
 from amitools.vamos.libstructs.dos import FileInfoBlockStruct, FileHandleStruct, DosPacketStruct, InfoDataStruct  # type: ignore
 from amitools.vamos.lib.dos.DosProtection import DosProtection  # type: ignore
@@ -594,6 +595,14 @@ class HandlerBridge:
 
     def _reserved_port_addrs(self) -> set[int]:
         reserved = {self.state.port_addr, self.state.reply_port_addr}
+        # The handler process's own pr_MsgPort stays its packet port after
+        # state.port_addr switches to the port the startup reply names.
+        # SmartFilesystem's front process forwards packets to it.
+        process_addr = getattr(self.state, "process_addr", 0)
+        if process_addr:
+            from amitools.vamos.libstructs.dos import ProcessStruct  # type: ignore
+            msg_port_off = ProcessStruct.sdef.find_field_def_by_name("pr_MsgPort").offset
+            reserved.add(process_addr + msg_port_off)
         if hasattr(self, "proc_mgr"):
             for proc in self.proc_mgr.processes.values():
                 if proc.is_child and not proc.exited and proc.port_addr:
@@ -603,6 +612,7 @@ class HandlerBridge:
     def _drain_non_essential_ports(self, pmgr):
         reserved_ports = self._reserved_port_addrs()
         timer = self._timer_device()
+        mem = getattr(self, "mem", None)
         for port_addr in list(pmgr.ports.keys()):
             if port_addr in reserved_ports:
                 continue
@@ -615,6 +625,9 @@ class HandlerBridge:
                 # once, go.
                 if timer is not None and timer.delays(msg_addr):
                     kept.append(msg_addr)
+                elif mem is not None:
+                    # Off the port's mp_MsgList too, as GetMsg() takes it.
+                    _unlink_msg_from_m68k_list(mem, msg_addr, debug=self._debug)
             for msg_addr in kept:
                 pmgr.put_msg(port_addr, msg_addr)
 
