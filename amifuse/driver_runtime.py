@@ -11,6 +11,11 @@ import stat
 from pathlib import Path
 from typing import Optional
 
+try:
+    import fcntl
+except ImportError:  # Windows
+    fcntl = None
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 AMITOOLS_PATH = REPO_ROOT / "amitools"
 
@@ -58,6 +63,42 @@ def _is_lock_conflict(exc):
                 return True
         exc = exc.__cause__
     return False
+
+
+# <sys/disk.h> DKIOCSYNCHRONIZECACHE, _IO('d', 22): flush a disk's write cache.
+_DKIOCSYNCHRONIZECACHE = 0x20006416
+# The filesystem or the device doesn't accept the call (SMB shares refuse
+# F_FULLFSYNC with ENOTSUP). None of these means that a write failed, and
+# a failed fsync fails every later one, so a refusal must not count.
+_CACHE_FLUSH_UNSUPPORTED_ERRNOS = {errno.ENOTSUP, errno.EOPNOTSUPP, errno.ENOTTY,
+                                   errno.EINVAL, errno.ENOSYS}
+
+
+def _fsync_to_stable_storage(fd):
+    """fsync() fd and, on macOS, also flush the drive's write cache."""
+    if (sys.platform != "darwin" or fcntl is None
+            or not hasattr(fcntl, "F_FULLFSYNC")):
+        # Linux fsync() and Windows FlushFileBuffers flush the drive's cache.
+        os.fsync(fd)
+        return
+    mode = os.fstat(fd).st_mode
+    if stat.S_ISBLK(mode) or stat.S_ISCHR(mode):
+        # F_FULLFSYNC is for files on a filesystem. fsync() writes out a
+        # block device's buffer cache; it writes nothing for /dev/rdiskN.
+        os.fsync(fd)
+        try:
+            fcntl.ioctl(fd, _DKIOCSYNCHRONIZECACHE)
+        except OSError as exc:
+            if exc.errno not in _CACHE_FLUSH_UNSUPPORTED_ERRNOS:
+                raise
+        return
+    # macOS fsync() leaves the data in the drive's write cache.
+    try:
+        fcntl.fcntl(fd, fcntl.F_FULLFSYNC)
+    except OSError as exc:
+        if exc.errno not in _CACHE_FLUSH_UNSUPPORTED_ERRNOS:
+            raise
+        os.fsync(fd)
 
 
 class BlockDeviceBackend:
@@ -309,7 +350,7 @@ class BlockDeviceBackend:
                           f"an earlier fsync of the image failed: "
                           f"{self._fsync_error.strerror}")
         try:
-            os.fsync(img_file.fobj.fileno())
+            _fsync_to_stable_storage(img_file.fobj.fileno())
         except OSError as exc:
             self._fsync_error = exc
             raise

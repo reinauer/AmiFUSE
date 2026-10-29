@@ -40,6 +40,9 @@ def events(monkeypatch):
         real_fsync(fd)
 
     monkeypatch.setattr(os, "fsync", fsync)
+    # Every host takes the plain fsync() path here; macOS's own flush of the
+    # drive's cache is in test_macos_full_fsync.py.
+    monkeypatch.setattr(driver_runtime, "fcntl", None)
     return log
 
 
