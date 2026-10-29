@@ -139,7 +139,13 @@ def test_fifo_source_refused_without_blocking(write_context, capsys, tmp_path):
 
 def test_source_removed_after_checks_refused_before_bridge(
         write_context, capsys, monkeypatch):
-    """A source deleted after the existence check is a missing source."""
+    """A source deleted after the existence check is a missing source.
+
+    The source is opened before its size is read, so a source removed in
+    between is SOURCE_NOT_FOUND, not an unhandled stat() error. The
+    destination loss itself is shown by the integration test with an
+    unreadable source.
+    """
     args, bridge, created, source = write_context
     real_is_dir = Path.is_dir
 
@@ -177,6 +183,41 @@ def test_source_replaced_after_open_is_not_copied(write_context, capsys, tmp_pat
     fs.cmd_write(args)
     assert json.loads(capsys.readouterr().out)["status"] == "ok"
     assert [c.args[1] for c in bridge.write_handle.call_args_list] == [SOURCE_DATA]
+
+
+@pytest.mark.skipif(sys.platform != "win32",
+                    reason="byte-range locks are advisory elsewhere")
+@pytest.mark.parametrize("use_json", [True, False], ids=["json", "text"])
+def test_locked_source_refused_before_bridge(write_context, capsys, use_json):
+    """Another handle's byte-range lock lets the open succeed, but not a read."""
+    import msvcrt
+
+    args, bridge, created, source = write_context
+    args.json = use_json
+    with open(source, "rb") as other:
+        msvcrt.locking(other.fileno(), msvcrt.LK_NBLCK, len(SOURCE_DATA))
+        try:
+            with pytest.raises(SystemExit) as caught:
+                fs.cmd_write(args)
+        finally:
+            other.seek(0)
+            msvcrt.locking(other.fileno(), msvcrt.LK_UNLCK, len(SOURCE_DATA))
+    _assert_refused(caught, capsys, use_json, "INVALID_ARGUMENT",
+                    f"Cannot read source file: {source}")
+    assert created == []
+    bridge.open_file.assert_not_called()
+
+
+@pytest.mark.skipif(not hasattr(os, "O_NONBLOCK"), reason="needs O_NONBLOCK")
+def test_source_is_read_in_blocking_mode(write_context):
+    """O_NONBLOCK is only for the open: a non-blocking read can return None,
+    which the write loop would take for the end of the file."""
+    _, _, _, source = write_context
+    f, size = fs._open_write_source(source, True)
+    with f:
+        assert os.get_blocking(f.fileno())
+        assert size == len(SOURCE_DATA)
+        assert f.read() == SOURCE_DATA
 
 
 # ---------------------------------------------------------------------------
@@ -277,8 +318,13 @@ def _complete_printed(events):
                for e in events if isinstance(e, tuple))
 
 
-@pytest.mark.parametrize("reply", [ACK, NOT_KNOWN], ids=["DOSTRUE", "ACTION_NOT_KNOWN"])
+@pytest.mark.parametrize("reply", [
+    ACK, NOT_KNOWN,
+    (0, fs.ERROR_DEVICE_NOT_MOUNTED), (0, fs.ERROR_NOT_A_DOS_DISK), (0, fs.ERROR_NO_DISK),
+], ids=["DOSTRUE", "ACTION_NOT_KNOWN", "DEVICE_NOT_MOUNTED", "NOT_A_DOS_DISK", "NO_DISK"])
 def test_format_fsyncs_after_the_flush_reply_before_complete(format_context, reply):
+    """The flush is sent while the volume is still inhibited: a refusal that
+    says there is no volume passes, as SmartFilesystem's does."""
     ctx = format_context
     ctx.flush_reply = reply
     ctx.run()
@@ -293,9 +339,9 @@ def test_format_fsyncs_after_the_flush_reply_before_complete(format_context, rep
 
 @pytest.mark.parametrize("reply, message", [
     (NAK, "Format failed: handler refused ACTION_FLUSH (error code 0)"),
-    ((0, 225), "Format failed: handler refused ACTION_FLUSH (error code 225)"),
+    ((0, 214), "Format failed: handler refused ACTION_FLUSH (error code 214)"),
     (None, "Format failed: no reply to ACTION_FLUSH from handler."),
-], ids=["DOSFALSE", "not-a-dos-disk", "no-reply"])
+], ids=["DOSFALSE", "write-protected", "no-reply"])
 def test_format_fails_when_the_flush_is_not_acknowledged(format_context, reply,
                                                          message):
     ctx = format_context
