@@ -451,8 +451,9 @@ class _FakeDriveName:
 class _FakePartition:
     """Minimal amitools Partition.
 
-    Exposes the three fields list_partitions reads: ``num`` (per-RDB index),
-    ``get_drive_name()`` (BSTR), and ``part_blk.dos_env.dos_type``.
+    Exposes the fields list_partitions reads: ``num`` (per-RDB index),
+    ``get_drive_name()`` (BSTR), ``get_flags()`` and
+    ``part_blk.dos_env.dos_type``.
     """
 
     def __init__(self, num, name, dos_type):
@@ -464,6 +465,9 @@ class _FakePartition:
 
     def get_drive_name(self):
         return _FakeDriveName(self._name)
+
+    def get_flags(self):
+        return 0  # mounted automatically
 
 
 class _FakeRDisk:
@@ -678,13 +682,12 @@ def test_list_partitions_multi_rdb_distinct_names(
     assert all(blk.closed and rdisk.closed for blk, rdisk, _ in opened)
 
 
-def test_list_partitions_duplicate_name_fallback(amitools_mock, monkeypatch, tmp_path):
-    """Name colliding across RDBs -> first-partition-only fallback + reason.
+def test_list_partitions_duplicate_name_renamed(amitools_mock, monkeypatch, tmp_path):
+    """Name colliding across RDBs -> the later copy is listed as DH0.1.
 
-    Two 0x76 RDBs both hold a ``DH0``. Because ``--partition <name>`` cannot be
-    routed unambiguously, list_partitions falls back to index 0 of the FIRST RDB
-    and surfaces a reason string for the caller's summary dialog. Every opened
-    handle (including the RDB that triggered the fallback) is closed.
+    Two 0x76 RDBs both hold a ``DH0``. AmigaOS mounts the second as ``DH0.1``,
+    and so does list_partitions, so ``--partition <name>`` routes each name to
+    one partition. Every opened handle is closed.
     """
     import amifuse.rdb_inspect as rdb_inspect
     from amifuse.rdb_inspect import MBRInfo, MBRPartition, MBR_TYPE_AMIGA_RDB
@@ -730,14 +733,9 @@ def test_list_partitions_duplicate_name_fallback(amitools_mock, monkeypatch, tmp
 
     result = rdb_inspect.list_partitions(tmp_path / "collide.hdf")
 
-    assert result.fallback_reason is not None
-    assert "colliding partition names" in result.fallback_reason
-    assert "mounted first only" in result.fallback_reason
-    # Fell back to index 0 of the FIRST RDB, exactly one unit.
-    assert len(result.partitions) == 1
-    assert result.partitions[0].name == "DH0"
-    assert result.partitions[0].index == 0
-    # No leaked handles, including the collision-triggering RDB.
+    assert result.fallback_reason is None
+    assert [(p.index, p.name) for p in result.partitions] == [
+        (0, "DH0"), (1, "DH1"), (0, "DH0.1")]
     # The default open's handles and each RDB's are all released.
     assert len(opened) == 3
     assert all(blk.closed and rdisk.closed for blk, rdisk, _ in opened)

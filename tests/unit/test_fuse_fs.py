@@ -828,9 +828,10 @@ class TestExtractEmbeddedDriver:
         fs.fshd.dos_type = 0x50465303
         fs.get_data.return_value = self.DATA
         rdisk = MagicMock()
-        rdisk.find_partition_by_string.return_value.part_blk.dos_env.dos_type = 0x50465303
+        rdisk.get_partition.return_value.part_blk.dos_env.dos_type = 0x50465303
         rdisk.fs = [fs]
-        monkeypatch.setattr(rdb_inspect, "find_partition_mbr_index", lambda *a: None)
+        monkeypatch.setattr(rdb_inspect, "find_partition",
+                            lambda *a: rdb_inspect.PartitionRef(None, 0, "DH0"))
         monkeypatch.setattr(
             rdb_inspect, "open_rdisk", lambda *a, **kw: (MagicMock(), rdisk, None))
         return rdisk
@@ -6009,6 +6010,8 @@ class TestCmdInspectJson:
         fake_rdb_inspect.detect_iso.return_value = None
         fake_rdb_inspect.amiga_rdb_partitions.return_value = []
 
+        opened_names = []
+
         def open_each_rdb(image, block_size, count):
             # One open_rdisk per 0x76 entry, as on a disk with no RDB
             # beside its MBR, or the default open with fewer than two.
@@ -6016,11 +6019,16 @@ class TestCmdInspectJson:
                 try:
                     opened = fake_rdb_inspect.open_rdisk(
                         image, block_size=block_size, mbr_partition_index=idx)
+                    opened_names.append([part["name"] for part in
+                                         opened[1].get_desc()["partitions"]])
                 except IOError as e:
                     opened = e
                 yield idx, opened
 
         fake_rdb_inspect.open_each_rdb.side_effect = open_each_rdb
+        # Each partition keeps its drive name; test_driver_resolver covers
+        # the renaming of a repeated one.
+        fake_rdb_inspect.mount_names.side_effect = lambda rdb_parts: opened_names
         monkeypatch.setitem(sys.modules, "amifuse.rdb_inspect", fake_rdb_inspect)
         # The RDB path names each partition's driver; test_driver_resolver
         # covers the lookup itself.
@@ -6286,9 +6294,6 @@ class TestCmdInspectJson:
             make_rdisk_result(0),
             make_rdisk_result(1),
         ]
-        # mount --partition DHn would open RDB n.
-        fake_rdb.find_partition_mbr_index.side_effect = (
-            lambda image, block_size, name: int(name[2:]))
 
         fuse_fs_mod.cmd_inspect(inspect_args)
         output = capsys.readouterr().out

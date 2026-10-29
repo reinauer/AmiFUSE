@@ -251,9 +251,9 @@ def _claim_drive_letters(n: int) -> tuple[list[str], list]:
 class _MountUnit:
     """One drive to mount in a fan-out.
 
-    ``name`` is the ``--partition`` key (the RDB drive name). It is ``None`` for
-    the degenerate single-unit case -- an ADF/ISO, a single-partition RDB, the
-    duplicate-name fallback, or an un-enumerable image -- so the spawned command
+    ``name`` is the ``--partition`` key (the drive name, a repeated one renamed
+    DH0.1). It is ``None`` for the degenerate single-unit case -- an ADF/ISO, a
+    single-partition RDB, or an un-enumerable image -- so the spawned command
     omits ``--partition`` and is byte-for-byte the legacy single-partition path
     (a lone partition IS index 0, which the no-``--partition`` default resolves
     to). ``label`` is the human name used in the summary dialog.
@@ -293,8 +293,7 @@ def _enumerate_mount_units(image: str) -> tuple[list[_MountUnit], Optional[str]]
     single logical unit (no fan-out); otherwise the RDB partitions are
     enumerated by name via :func:`rdb_inspect.list_partitions`.
 
-    A lone partition (single-partition RDB, or the duplicate-name fallback where
-    ``list_partitions`` returns index 0 of the first RDB) collapses to a single
+    A lone partition (single-partition RDB) collapses to a single
     ``_MountUnit`` with ``name=None`` so the spawn is byte-for-byte the legacy
     single-partition command.
 

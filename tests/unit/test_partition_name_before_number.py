@@ -101,11 +101,14 @@ def test_name_in_the_rdb_beside_the_mbr_is_found_first(tmp_path):
 
 
 class _FakeRDisk:
-    """The parts of an RDisk the lookup reads: drive names and numbers."""
+    """The parts of an RDisk the lookup reads: drive names, flags and
+    numbers, and its RDSK block."""
 
     def __init__(self, names):
-        self.parts = [types.SimpleNamespace(get_drive_name=lambda n=n: FSString(n))
+        self.parts = [types.SimpleNamespace(get_drive_name=lambda n=n: FSString(n),
+                                            get_flags=lambda: 0)
                       for n in names]
+        self.rdb = types.SimpleNamespace(blk_num=1)
 
     def get_partition(self, num):
         return self.parts[num] if 0 <= num < len(self.parts) else None
@@ -133,7 +136,8 @@ def test_single_entry_beside_the_disk_rdb_is_searched(monkeypatch,
             names, ctx = ["DH0"], MBRContext(mbr, None, 0, "parceiro")
         else:
             names, ctx = ["PI0"], MBRContext(mbr, entry, 200)
-        return types.SimpleNamespace(close=lambda: None), _FakeRDisk(names), ctx
+        blkdev = types.SimpleNamespace(close=lambda: None, block_bytes=512)
+        return blkdev, _FakeRDisk(names), ctx
 
     monkeypatch.setattr(rdb_inspect, "detect_mbr", lambda image: mbr)
     monkeypatch.setattr(rdb_inspect, "open_rdisk", fake_open_rdisk)

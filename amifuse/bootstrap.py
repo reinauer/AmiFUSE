@@ -92,7 +92,7 @@ class SyntheticIsoPartition:
 class BootstrapAllocator:
     def __init__(self, vh, image_path: Path, block_size=None, partition=None,
                  adf_info: Optional[ADFInfo] = None, iso_info: Optional[ISOInfo] = None,
-                 mbr_partition_index=None):
+                 mbr_partition_index=None, partition_number=None):
         self.vh = vh
         self.alloc = vh.alloc
         self.mem = vh.alloc.get_mem()
@@ -102,6 +102,9 @@ class BootstrapAllocator:
         self.adf_info = adf_info  # Pre-detected ADF info, if any
         self.iso_info = iso_info  # Pre-detected ISO info, if any
         self.mbr_partition_index = mbr_partition_index  # For MBR disks with multiple 0x76 partitions
+        # The partition's number in that RDB, as BlockDeviceBackend found it
+        # for partition (rdb_inspect.find_partition).
+        self.partition_number = partition_number
 
     def _read_partition_env(self):
         from .rdb_inspect import open_rdisk
@@ -113,7 +116,8 @@ class BootstrapAllocator:
         if self.partition is None:
             part = rd.get_partition(0)
         else:
-            part = rd.find_partition_by_string(str(self.partition))
+            part = (rd.get_partition(self.partition_number)
+                    if self.partition_number is not None else None)
             if part is None:
                 rd.close()
                 blk.close()

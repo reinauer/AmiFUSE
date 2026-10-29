@@ -17,7 +17,8 @@ from amitools.fs.block.rdb.RDBlock import RDBlock
 from amitools.fs.rdb.RDisk import RDisk
 
 from amifuse.driver_runtime import BlockDeviceBackend
-from amifuse.rdb_inspect import (find_partition_mbr_index, list_partitions,
+from amifuse.rdb_inspect import (PartitionRef, find_partition,
+                                 find_partition_mbr_index, list_partitions,
                                  open_rdisk)
 from tests.unit.test_mbr_rdb_block_size import (_make_mbr, _make_rdb,
                                                 _with_partition_list)
@@ -201,26 +202,44 @@ def test_inspect_text_reports_every_rdb(user_driver_dir, tmp_path, capsys):
         "  DH0", "  DH1", "  PI1"]
 
 
-def test_clash_note_marks_the_copy_mount_does_not_use(user_driver_dir,
-                                                      tmp_path, capsys):
+def test_name_repeated_in_an_entry_rdb_mounts_as_its_copy(user_driver_dir,
+                                                          tmp_path, capsys):
     from amifuse.fuse_fs import main
+    from amifuse.launcher import _enumerate_mount_units
 
+    # The disk's own RDB names DH0 first, so the second entry's DH0 is
+    # DH0.1, as AmigaOS mounts it.
     image = _parceiro(tmp_path, ("PI0", "DH0"))
     listed = list_partitions(image)
-    assert [p.name for p in listed.partitions] == ["DH0"]
-    assert "colliding partition names ('DH0')" in listed.fallback_reason
+    assert [p.name for p in listed.partitions] == ["DH0", "DH1", "PI0", "DH0.1"]
+    assert listed.fallback_reason is None
+    units, fallback_reason = _enumerate_mount_units(str(image))
+    assert [u.name for u in units] == ["DH0", "DH1", "PI0", "DH0.1"]
+    assert fallback_reason is None
+
+    assert find_partition(image, None, "DH0") == PartitionRef(None, 0, "DH0")
+    assert find_partition(image, None, "dh0.1") == PartitionRef(1, 0, "DH0.1")
+    assert find_partition_mbr_index(image, None, "DH0") is None
 
     main(["inspect", "--json", str(image)])
     rdbs = json.loads(capsys.readouterr().out)["rdbs"]
     disk, entry = rdbs[0]["partitions"][0], rdbs[2]["partitions"][0]
-    # mount --partition DH0 opens the RDB this lookup selects; None is the
-    # disk's own.
-    selected = find_partition_mbr_index(image, None, "DH0")
-    assert selected in (None, 1)
-    used, other = (disk, entry) if selected is None else (entry, disk)
-    assert used["driver"] is not None
-    assert other["driver"] is None
-    assert other["driver_note"].startswith("another RDB on this disk")
+    assert (disk["name"], entry["name"]) == ("DH0", "DH0")
+    assert "mount_name" not in disk
+    assert entry["mount_name"] == "DH0.1"
+    for part in (disk, entry):
+        assert part["driver"] is not None
+        assert "driver_note" not in part
+
+    backend = BlockDeviceBackend(image, partition_scope=True,
+                                 partition="DH0.1")
+    backend.open()
+    try:
+        assert backend.mbr_context.mbr_partition.index == 1
+        part = backend.rdb.get_partition(backend.partition_number)
+        assert str(part.get_drive_name()) == "DH0"
+    finally:
+        backend.close()
 
 
 def test_rdb_at_block_0_beside_the_mbr_is_listed_once(user_driver_dir,
@@ -272,6 +291,7 @@ def test_single_entry_rdb_is_listed_beside_the_disk_rdb(user_driver_dir,
     listed = list_partitions(image)
     assert [p.name for p in listed.partitions] == ["DH0", "DH1", "PI0"]
     assert listed.fallback_reason is None
+    assert find_partition_mbr_index(image, None, "PI0") == 0
 
     main(["inspect", "--json", str(image)])
     rdbs = json.loads(capsys.readouterr().out)["rdbs"]

@@ -173,7 +173,7 @@ amifuse mount /path/to/disk.hdf
 | `image` | Yes | Path to the Amiga hard disk image file |
 | `--driver` | No | Path to filesystem handler binary (default: RDB, your drivers folder, then the bundled FastFileSystem for DOS0-7; see [Bundled FastFileSystem](#bundled-fastfilesystem)) |
 | `--mountpoint` | macOS/Windows: No, Linux: Yes | Mount location (macOS: `/Volumes/<partition>`, Windows: first free drive letter) |
-| `--partition` | No | Partition name (e.g., `DH0`) or index (default: first partition) |
+| `--partition` | No | Partition name (e.g., `DH0`) or index (default: first partition). A repeated name is renamed as AmigaOS renames it, so a second `DH0` is `DH0.1`; a partition marked not to mount takes its name after those that mount |
 | `--block-size` | No | Override block size (default: auto-detect or 512) |
 | `--volname` | No | Override the volume name shown in Finder |
 | `--daemon` | No | Detach after mounting (default on macOS/Linux) |

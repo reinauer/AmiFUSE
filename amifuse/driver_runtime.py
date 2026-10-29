@@ -122,6 +122,8 @@ class BlockDeviceBackend:
         self.host_lock = HostFileLock(image, read_only=read_only)
         self.partition_scope = partition_scope and adf_info is None and iso_info is None
         self.partition = partition
+        # The partition's number in its RDB, once open() has found it.
+        self.partition_number = None
         self._block_range = None
         self._fsync_error = None
         # Physical disks keep their existing whole-device exclusion policy.
@@ -153,9 +155,11 @@ class BlockDeviceBackend:
             raise
         try:
             if self.partition_scope and self.partition is not None:
-                from .rdb_inspect import find_partition_mbr_index
-                self.mbr_partition_index = find_partition_mbr_index(
+                from .rdb_inspect import find_partition
+                ref = find_partition(
                     self.image, self._requested_block_size, self.partition)
+                self.mbr_partition_index = ref.mbr_partition_index if ref else None
+                self.partition_number = ref.number if ref else None
             self._open_image()
             if self.partition_scope:
                 self._lock_partition()
@@ -169,8 +173,12 @@ class BlockDeviceBackend:
             raise
 
     def _lock_partition(self):
-        part = (self.rdb.get_partition(0) if self.partition is None else
-                self.rdb.find_partition_by_string(str(self.partition)))
+        if self.partition is None:
+            part = self.rdb.get_partition(0)
+        elif self.partition_number is None:
+            part = None
+        else:
+            part = self.rdb.get_partition(self.partition_number)
         if part is None:
             raise ValueError(f"Partition not found: {self.partition}")
         env = part.part_blk.dos_env

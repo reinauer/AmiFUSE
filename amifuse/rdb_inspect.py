@@ -17,6 +17,7 @@ if str(AMITOOLS_PATH) not in sys.path:
 
 from amitools.fs.blkdev.RawBlockDevice import RawBlockDevice  # type: ignore  # noqa: E402
 from amitools.fs.rdb.RDisk import RDisk  # type: ignore  # noqa: E402
+from amitools.fs.block.rdb.PartitionBlock import PartitionBlock  # type: ignore  # noqa: E402
 import amitools.fs.DosType as DosType  # type: ignore  # noqa: E402
 from amitools.util.Win32Disk import image_size, open_image  # type: ignore  # noqa: E402
 
@@ -91,11 +92,12 @@ class PartInfo:
 
     ``index`` is the amitools ``Partition.num`` -- the per-RDB positional index.
     It restarts at 0 within each RDB, so it is NOT unique across a multi-RDB
-    image; use ``name`` (the drive name) as the stable fan-out key
-    (``--partition <name>``), never the index.
+    image; use ``name`` as the stable fan-out key (``--partition <name>``),
+    never the index. ``name`` is the drive name as AmigaOS mounts it, so a
+    repeated drive name reads ``DH0.1`` (:func:`mount_names`).
     """
     index: int          # Partition.num (per-RDB positional index; collides across RDBs)
-    name: str           # drive name -- the --partition key for the fan-out
+    name: str           # unique drive name -- the --partition key for the fan-out
     dostype: int        # dos_env.dos_type
     dostype_str: str    # DosType tag string (e.g. "DOS1")
 
@@ -105,16 +107,14 @@ class PartitionList:
     """Result of ``list_partitions``: the partitions plus an optional fallback signal.
 
     ``partitions`` is the stable-ordered list of :class:`PartInfo` the caller
-    should fan out over (one drive per entry). Normally it holds every partition
-    across the image's RDB(s).
+    should fan out over (one drive per entry). It holds every partition across
+    the image's RDB(s).
 
-    ``fallback_reason`` is ``None`` in the normal case. It is set to a
-    human-readable string ONLY when a partition name collided across multiple
-    RDBs (which would make name-keyed ``--partition`` routing ambiguous), forcing
-    a fall back to first-partition-only: in that case ``partitions`` holds exactly
-    ONE ``PartInfo`` (index 0 of the first RDB) and ``fallback_reason`` explains
-    why. The caller is responsible for logging it and naming it in the summary
-    dialog; ``list_partitions`` performs no I/O of its own.
+    ``fallback_reason``, when set, is a human-readable string saying why
+    ``partitions`` holds fewer than every partition. The caller is responsible
+    for logging it and naming it in the summary dialog. ``list_partitions``
+    leaves it ``None``: it renames a repeated drive name instead of falling
+    back to the first partition.
     """
     partitions: List[PartInfo]
     fallback_reason: Optional[str] = None
@@ -808,86 +808,156 @@ def _locate_rdisk(image, block_size, mbr_partition_index, mbr_info, open_at):
     raise IOError(error_msg)
 
 
+@dataclass
+class PartitionRef:
+    """Where ``--partition`` finds a partition: see :func:`find_partition`."""
+    mbr_partition_index: Optional[int]  # open_rdisk's index of its RDB
+    number: int         # its number in that RDB, for RDisk.get_partition
+    name: Optional[str]  # its name on this disk; None for a damaged one
+
+
+def _unique_name(name: str, taken: set) -> str:
+    """The name AmigaOS mounts a partition as, after the names in taken.
+
+    taken holds lower-cased names. As the A4091 mounter's
+    CheckAndFixDevName does, a name already taken gets ".1", and one that
+    already ends in a dot and a digit below 9 has that digit raised, until
+    the name is free, ignoring case: DH0, DH0.1, DH0.2.
+    """
+    while name.lower() in taken:
+        if len(name) > 2 and name[-2] == "." and "0" <= name[-1] < "9":
+            name = name[:-1] + chr(ord(name[-1]) + 1)
+        else:
+            name += ".1"
+    return name
+
+
+def mount_names(rdb_parts: list) -> List[List[Optional[str]]]:
+    """Name the partitions of a disk as AmigaOS mounts them.
+
+    rdb_parts holds each RDB's partitions (RDisk.parts), in the order the
+    disk's RDBs open; the result holds their names in the same shape. The
+    A4091 mounter names only the partitions it mounts, so those without the
+    no-automount flag are named first, in that order, and then the others,
+    which AmiFUSE mounts too, take names left free. A damaged drive name
+    gives None and takes no name.
+    """
+    names = [[None] * len(parts) for parts in rdb_parts]
+    taken: set = set()
+    for automount in (True, False):
+        for rdb_names, parts in zip(names, rdb_parts):
+            for i, p in enumerate(parts):
+                no_automount = p.get_flags() & PartitionBlock.FLAG_NO_AUTOMOUNT
+                drive_name = p.get_drive_name()
+                if bool(no_automount) == automount or drive_name is None:
+                    continue
+                rdb_names[i] = _unique_name(str(drive_name), taken)
+                taken.add(rdb_names[i].lower())
+    return names
+
+
+def _disk_names(
+    image: Path, block_size: Optional[int],
+) -> List[Tuple[Optional[int], int, List[Optional[str]]]]:
+    """(mbr_partition_index, RDB offset, mount_names) per RDB that opens."""
+    rdbs = []
+    rdb_parts = []
+    count = len(amiga_rdb_partitions(image))
+    for rdb_idx, opened in open_each_rdb(image, block_size, count):
+        if isinstance(opened, IOError):
+            continue
+        blkdev, rdisk, mbr_ctx = opened
+        try:
+            rdbs.append((rdb_idx, _rdb_offset(blkdev, rdisk, mbr_ctx)))
+            rdb_parts.append(list(rdisk.parts))
+        finally:
+            rdisk.close()
+            blkdev.close()
+    return [(rdb_idx, offset, names) for (rdb_idx, offset), names
+            in zip(rdbs, mount_names(rdb_parts))]
+
+
+def _find_in(rdbs, partition: str):
+    """(PartitionRef, RDB offset) for partition in _disk_names, or None.
+
+    Looks the name up in every RDB first, then the number.
+    """
+    lowered = partition.lower()
+    for rdb_idx, offset, names in rdbs:
+        for number, name in enumerate(names):
+            if name is not None and name.lower() == lowered:
+                return PartitionRef(rdb_idx, number, name), offset
+    try:
+        number = int(partition)
+    except ValueError:
+        return None
+    # As RDisk.get_partition, which numbers each RDB from 0.
+    for rdb_idx, offset, names in rdbs:
+        if number < len(names):
+            name = names[number] if names else None
+            return PartitionRef(rdb_idx, number, name), offset
+    return None
+
+
+def find_partition(
+    image: Path, block_size: Optional[int], partition: str
+) -> Optional[PartitionRef]:
+    """Find the partition that ``--partition`` names, or None.
+
+    Each partition is named as AmigaOS would mount it (:func:`mount_names`)
+    in the order of :func:`open_each_rdb`: the disk's own RDB beside the
+    MBR, then each 0x76 entry's own RDB. A repeated name, within one RDB or
+    across RDBs, gets ".1", ".2" and so on. partition matches a name,
+    ignoring case; failing that in every RDB, a number selects the first
+    RDB that has a partition of that number. open_rdisk with the returned
+    mbr_partition_index opens its RDB, and get_partition(number) the
+    partition.
+
+    Raises IOError if a forced block_size rules out an RDB, so that the
+    partition found differs from the one auto-detection finds.
+    """
+    partition = str(partition)
+    rdbs = _disk_names(image, block_size)
+    found = _find_in(rdbs, partition)
+    if block_size is None:
+        return None if found is None else found[0]
+    auto = _find_in(_disk_names(image, None), partition)
+    # Tell the RDBs apart by offset: the default open, index None, can
+    # reach a different RDB at the forced size.
+    if auto is None or (found is not None and
+                        (found[1], found[0].number) == (auto[1], auto[0].number)):
+        return None if found is None else found[0]
+    if auto[1] not in {offset for _idx, offset, _names in rdbs}:
+        raise IOError(
+            f"Partition {partition} is in an RDB that does not open "
+            f"with {block_size}-byte blocks"
+        )
+    if found is None:
+        raise IOError(
+            f"Partition {partition} is not found with {block_size}-byte "
+            f"blocks, as an RDB on this disk does not open with them"
+        )
+    raise IOError(
+        f"Partition {partition} names another partition with {block_size}-byte "
+        f"blocks, as an RDB on this disk does not open with them"
+    )
+
+
 def find_partition_mbr_index(
     image: Path, block_size: Optional[int], partition_name: str
 ) -> Optional[int]:
-    """Find which 0x76 MBR partition index contains a named Amiga partition.
+    """open_rdisk's mbr_partition_index for the RDB holding a partition.
 
-    For MBR images with multiple 0x76 partitions, searches each RDB for the
-    named partition.  Returns the 0-based index into the list of 0x76
-    partitions (0 when the first RDB holds it), or None if the image is not
-    MBR, has only one 0x76 partition and no RDB beside the MBR, or no RDB
-    that opens holds the name or, when the name is a number, a partition of
-    that number. A number selects a partition by its number only when no
-    RDB holds a partition of that name. The disk's own RDB beside the MBR
-    is searched first, and None selects it, as open_rdisk opens it by
-    default.
+    The partition is found as :func:`find_partition` finds it. None selects
+    the default open: the disk's own RDB beside the MBR if there is one,
+    else the first 0x76 entry's, or a plain RDB. None also stands for a
+    partition not found.
 
-    Raises IOError if a forced block_size rules out an RDB that holds the
-    partition at its own block size.
+    Raises IOError if a forced block_size rules out an RDB, so that the
+    partition found differs from the one auto-detection finds.
     """
-    mbr_info = detect_mbr(image)
-    if mbr_info is None or not mbr_info.has_amiga_partitions:
-        return None
-    amiga_parts = [p for p in mbr_info.partitions if p.partition_type == MBR_TYPE_AMIGA_RDB]
-    if len(amiga_parts) == 1:
-        # One 0x76 entry adds an RDB to search only beside the disk's own,
-        # which the default open returns; otherwise that open is the one RDB.
-        try:
-            blkdev, rdisk, mbr_ctx = open_rdisk(image)
-        except IOError:
-            return None
-        rdisk.close()
-        blkdev.close()
-        if mbr_ctx is not None and mbr_ctx.mbr_partition is not None:
-            return None
-
-    name = str(partition_name)
-
-    def holds_partition(idx, size, number):
-        # True or False if RDB idx opens at size, None if not.
-        # Looks for the name when number is None, else for that number.
-        try:
-            blkdev, rdisk, mbr_ctx = open_rdisk(image, block_size=size, mbr_partition_index=idx)
-            try:
-                if idx is None and mbr_ctx is not None and mbr_ctx.mbr_partition is not None:
-                    return None  # No RDB beside the MBR.
-                if number is not None:
-                    return rdisk.get_partition(number) is not None
-                # find_partition_by_drive_name, but a damaged name (None)
-                # does not match rather than raise.
-                return any(
-                    p.get_drive_name() is not None
-                    and p.get_drive_name().get_unicode().lower() == name.lower()
-                    for p in rdisk.parts)
-            finally:
-                rdisk.close()
-                blkdev.close()
-        except IOError:
-            return None
-
-    # find_partition_by_string falls back to a number within one RDB, so
-    # every RDB is asked for the name before any is asked for the number.
-    lookups = [None]
-    try:
-        lookups.append(int(name))
-    except ValueError:
-        pass
-    for number in lookups:
-        for idx in [None, *range(len(amiga_parts))]:
-            found = holds_partition(idx, block_size, number)
-            if found:
-                return idx
-            if (found is None and block_size is not None
-                    and holds_partition(idx, None, number)):
-                # The forced size skips an RDB holding the partition, so a
-                # later match, or none, would differ from what
-                # auto-detection resolves.
-                raise IOError(
-                    f"Partition {partition_name} is in an RDB that does not open "
-                    f"with {block_size}-byte blocks"
-                )
-    return None
+    found = find_partition(image, block_size, partition_name)
+    return None if found is None else found.mbr_partition_index
 
 
 def _part_info(p) -> PartInfo:
@@ -923,22 +993,19 @@ def list_partitions(
     mirroring the multi-RDB loop in ``rdb_inspect.main`` / ``fuse_fs.cmd_inspect``.
     Names -- not indices -- are the fan-out key, because ``Partition.num``
     restarts at 0 in each RDB and so collides across RDBs; every emitted name
-    re-resolves through the existing, tested ``find_partition_mbr_index`` name
-    path when the caller spawns ``--partition <name>``. A Parceiro disk's own
-    RDB, beside its MBR, comes first, then each ``0x76`` entry's own RDB
-    (:func:`open_each_rdb`).
+    re-resolves through :func:`find_partition` when the caller spawns
+    ``--partition <name>``. A Parceiro disk's own RDB, beside its MBR, comes
+    first, then each ``0x76`` entry's own RDB (:func:`open_each_rdb`).
 
     RDB-ONLY: the caller performs the non-RDB short-circuit (``detect_adf`` /
     ``detect_iso``) BEFORE calling this. ``list_partitions`` does not probe for
     ADF/ISO and propagates :class:`IOError` from :func:`open_rdisk` on a non-RDB
     image.
 
-    Duplicate-name guard (narrow): amitools does not enforce drive-name
-    uniqueness across RDBs, and ``--partition`` resolves name-first, so two RDBs
-    each holding e.g. ``DH0`` would be ambiguous to route. When (and only when) a
-    name collides ACROSS RDBs, this falls back to first-partition-only (index 0
-    of the first RDB) and sets ``PartitionList.fallback_reason``. The guard never
-    fires for a plain RDB or for a multi-RDB image whose names are all distinct.
+    Repeated names: amitools does not enforce drive-name uniqueness, within
+    one RDB or across RDBs. Each partition is named as AmigaOS mounts it
+    (:func:`mount_names`), so a repeated ``DH0`` is listed as ``DH0.1``,
+    ``DH0.2``, and every name selects one partition.
 
     Args:
         image: Path to the RDB disk image.
@@ -946,18 +1013,14 @@ def list_partitions(
 
     Returns:
         A :class:`PartitionList`. ``.partitions`` is in stable RDB order
-        (normally >= 1 entry); ``.fallback_reason`` is ``None`` normally and, on
-        the duplicate-name fallback, a string with ``.partitions`` holding a
-        single entry. The caller logs and surfaces ``.fallback_reason``.
+        (normally >= 1 entry); ``.fallback_reason`` is ``None``.
     """
     amiga_parts = amiga_rdb_partitions(image)
 
     # Enumerate across every RDB, keyed by name. Each iteration opens its own
     # (blkdev, rdisk) and MUST close both inside the loop or N block-device
     # handles leak.
-    all_parts: List[PartInfo] = []
-    seen_names: dict = {}   # lower-cased names from previously-processed RDBs
-    first_part: Optional[PartInfo] = None
+    rdb_parts = []
     for rdb_idx, opened in open_each_rdb(image, block_size, len(amiga_parts)):
         if isinstance(opened, IOError):
             if rdb_idx is None:
@@ -966,28 +1029,19 @@ def list_partitions(
             continue
         blkdev, rdisk, _mbr_ctx = opened
         try:
-            rdb_parts = [_part_info(p) for p in rdisk.parts]
+            rdb_parts.append(list(rdisk.parts))
         finally:
             rdisk.close()
             blkdev.close()
 
-        if first_part is None and rdb_parts:
-            first_part = rdb_parts[0]
-
-        # A name shared with a PRIOR RDB makes name-keyed fan-out unsafe ->
-        # fall back to first-partition-only for the whole image.
-        for info in rdb_parts:
-            if info.name.lower() in seen_names:
-                reason = (
-                    "multiple RDBs with colliding partition names "
-                    "(%r); mounted first only" % info.name
-                )
-                return PartitionList(partitions=[first_part], fallback_reason=reason)
-
-        for info in rdb_parts:
-            seen_names[info.name.lower()] = info
+    # The partitions' parsed fields outlive the closed handles (_part_info).
+    all_parts: List[PartInfo] = []
+    for parts, names in zip(rdb_parts, mount_names(rdb_parts)):
+        for p, name in zip(parts, names):
+            info = _part_info(p)
+            if name is not None:
+                info.name = name
             all_parts.append(info)
-
     return PartitionList(partitions=all_parts)
 
 
@@ -1022,6 +1076,12 @@ def _amiga_partitions(mbr_info: Optional[MBRInfo]) -> List[MBRPartition]:
 def _is_entry_rdb(mbr_ctx: Optional[MBRContext]) -> bool:
     """Whether open_rdisk opened an RDB inside a 0x76 entry."""
     return mbr_ctx is not None and mbr_ctx.mbr_partition is not None
+
+
+def _rdb_offset(blkdev, rdisk: RDisk, mbr_ctx: Optional[MBRContext]) -> int:
+    """The byte offset of an opened RDB's RDSK block on the disk."""
+    start = mbr_ctx.offset_blocks * MBR_SECTOR_SIZE if mbr_ctx else 0
+    return start + rdisk.rdb.blk_num * blkdev.block_bytes
 
 
 def open_each_rdb(
@@ -1069,8 +1129,7 @@ def open_each_rdb(
             continue
         blkdev, rdisk, mbr_ctx = opened
         # Tell RDBs apart by the byte offset of their RDSK block.
-        start = mbr_ctx.offset_blocks * MBR_SECTOR_SIZE if mbr_ctx else 0
-        offset = start + rdisk.rdb.blk_num * blkdev.block_bytes
+        offset = _rdb_offset(blkdev, rdisk, mbr_ctx)
         if (index is None and _is_entry_rdb(mbr_ctx)) or offset in seen:
             # The default open fell back to an entry's RDB, which comes in
             # its turn, or this RDB came already.
