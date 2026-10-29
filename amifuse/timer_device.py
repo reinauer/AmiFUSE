@@ -14,15 +14,15 @@ It also corrects the system time. amitools counts it from the Unix epoch,
 while AmigaOS, and dos.library's DateStamp in vamos, count from 1978-01-01,
 so a handler stamping files with GetSysTime dated them eight years ahead.
 
-OpenDevice writes a token into io_Unit, as timer.device writes its unit
-pointer there, and the device knows its requests by that token. A copy of
-an opened request (CopyMem, or a struct assignment) carries it, and is held
-like the original.
+OpenDevice puts a Unit of the device's own into io_Unit, as timer.device
+does, and amitools' ScsiDevice for the same reason: a copy of an opened
+request (CopyMem, or a struct assignment) carries it, and is held like the
+original. Each open has its own Unit until CloseDevice.
 
 amitools' DoIO and WaitIO do not wait for a request the device holds.
-AmiFuseExecLibrary has them complete it at once instead, the behaviour
-before requests were held, so that no reply comes later to a request the
-handler takes for finished.
+With AmiFuseExecLibrary (exec_library.py) they have the device complete it
+at once instead (complete_now), the behaviour before requests were held,
+so that no reply comes later to a request the handler takes for finished.
 
 The table is touched only while the bridge lock is held: the device runs
 inside emulator bursts, and the bridge and its timer thread take the lock.
@@ -35,12 +35,10 @@ What it relies on in amitools:
   and WaitPort parks only on such a port; on any other empty port it spins.
 - CheckIO reads only IOF_QUICK.
 - OpenDevice clears io_Unit before the open_dev hook and keeps what the
-  hook writes there.
+  hook writes there; ctx.alloc allocates in emulated memory.
 - LibImpl's setup_lib, open_dev and close_dev hooks run on OpenDevice and
   CloseDevice.
 - lib_mgr.add_impl_cls accepts a factory, so one instance serves a runtime.
-- A library's stub binds its methods when the library opens, so
-  AmiFuseExecLibrary is registered before exec.library opens.
 """
 
 import math
@@ -49,7 +47,6 @@ import time
 from collections import Counter
 from typing import Callable, Dict, Optional, Tuple
 
-from amitools.vamos.lib.ExecLibrary import ExecLibrary  # type: ignore
 from amitools.vamos.lib.TimerDevice import (  # type: ignore
     TR_ADDREQUEST,
     TR_GETSYSTIME,
@@ -61,6 +58,7 @@ from amitools.vamos.libstructs.exec_ import (  # type: ignore
     MsgPortStruct,
     NodeStruct,
     NodeType,
+    UnitStruct,
 )
 from amitools.vamos.log import log_timer  # type: ignore
 
@@ -93,10 +91,6 @@ _TR_MICRO = _TR_SECS + 4
 _MP_SIGBIT = MsgPortStruct.sdef.find_field_def_by_name("mp_SigBit").offset
 _MP_SIGTASK = MsgPortStruct.sdef.find_field_def_by_name("mp_SigTask").offset
 _MP_MSGLIST = MsgPortStruct.sdef.find_field_def_by_name("mp_MsgList").offset
-# Unit tokens are odd, so that no aligned pointer left in io_Unit is taken
-# for one, and have the top bit set, so that no small number is.
-_TOKEN_FIRST = 0x80000001
-_TOKEN_LAST = 0xFFFFFFFF
 
 
 class AmiFuseTimerDevice(TimerDevice):
@@ -119,9 +113,8 @@ class AmiFuseTimerDevice(TimerDevice):
         self.clock = clock
         # io address -> (deadline, io_Device when armed)
         self._pending: Dict[int, Tuple[float, int]] = {}
-        # io_Unit token -> unit, from OpenDevice until CloseDevice
-        self._tokens: Dict[int, int] = {}
-        self._last_token = _TOKEN_LAST
+        # io_Unit address -> (unit, its Unit), from OpenDevice until CloseDevice
+        self._units: Dict[int, Tuple[int, object]] = {}
         self._bases = set()
         self._logged = set()
         # Set when a request arms earlier than every pending one, so that a
@@ -151,16 +144,29 @@ class AmiFuseTimerDevice(TimerDevice):
         self._bases.add(base_addr)
 
     def open_dev(self, ctx, io_request, unit, flags):
-        token = self._new_token()
-        self._tokens[token] = unit
-        ctx.mem.w32(io_request + _IO_UNIT, token)
+        unit_mem = ctx.alloc.alloc_astruct(UnitStruct, label="timer.device unit")
+        self._units[unit_mem.addr] = (unit, unit_mem)
+        ctx.mem.w32(io_request + _IO_UNIT, unit_mem.addr)
         return 0
 
     def close_dev(self, ctx, io_request):
-        # Copies of the request carry the same token, and no longer count
-        # as opened here either.
-        self._tokens.pop(ctx.mem.r32(io_request + _IO_UNIT), None)
+        mem = ctx.mem
         self._pending.pop(io_request, None)
+        unit_addr = mem.r32(io_request + _IO_UNIT)
+        binding = self._units.pop(unit_addr, None)
+        if binding is None:
+            return
+        binding[1].free()
+        mem.w32(io_request + _IO_UNIT, 0)
+        # Its copies no longer count as opened here, and those still pending
+        # are forgotten with it, never replied.
+        for io in list(self._pending):
+            try:
+                same_unit = mem.r32(io + _IO_UNIT) == unit_addr
+            except Exception:
+                continue
+            if same_unit:
+                del self._pending[io]
 
     def BeginIO(self, ctx, io_request):
         mem = ctx.mem
@@ -210,21 +216,35 @@ class AmiFuseTimerDevice(TimerDevice):
         self._reply(mem, io_request)
         return 0
 
-    def complete_early(self, ctx, io_request, call) -> bool:
-        """Complete a pending request now, for DoIO or WaitIO; see AmiFuseExecLibrary.
+    def complete_now(self, ctx, io_request, call) -> bool:
+        """Complete a pending request for a DoIO or WaitIO waiting for it.
 
-        The reply goes to its port without a signal, as Exec's wait would
-        have taken the signal, and WaitIO then takes it back out. Warns once
-        per call. Returns whether the request was pending.
+        AmiFuseExecLibrary's hook. The reply goes to its port without a
+        signal, as Exec's wait would have taken the signal, and WaitIO then
+        takes it back out. A request completed before its deadline counts in
+        completed_early, with one warning per call. Returns whether it
+        completed the request.
         """
-        if self._pending.pop(io_request, None) is None:
+        entry = self._pending.pop(io_request, None)
+        if entry is None:
             return False
-        if call not in self.completed_early:
-            log_timer.warning(
-                "%s on a pending TR_ADDREQUEST: vamos cannot wait for it, so "
-                "it completes at once, before its delay", call)
-        self.completed_early[call] += 1
+        deadline, device = entry
         mem = ctx.mem
+        # Not one freed or reused since it was sent, as in deliver().
+        if (
+            mem.r32(io_request + _IO_DEVICE) != device
+            or mem.r8(io_request + _LN_TYPE) != NodeType.NT_MESSAGE
+        ):
+            return False
+        if deadline <= self.clock():
+            self.deliveries += 1
+        else:
+            if call not in self.completed_early:
+                log_timer.warning(
+                    "timer.device: %s on pending TR_ADDREQUEST 0x%06x: vamos "
+                    "cannot wait for it, so it completes at once, before its "
+                    "delay", call, io_request)
+            self.completed_early[call] += 1
         mem.w8(io_request + _IO_ERROR, 0)
         self._reply(mem, io_request, signal=False)
         return True
@@ -296,15 +316,8 @@ class AmiFuseTimerDevice(TimerDevice):
 
     def _unit(self, mem, io) -> Optional[int]:
         """The unit io was opened on, or None if not opened here."""
-        return self._tokens.get(mem.r32(io + _IO_UNIT))
-
-    def _new_token(self) -> int:
-        token = self._last_token
-        while True:
-            token = token + 2 if token < _TOKEN_LAST else _TOKEN_FIRST
-            if token not in self._tokens:
-                self._last_token = token
-                return token
+        binding = self._units.get(mem.r32(io + _IO_UNIT))
+        return binding[0] if binding is not None else None
 
     def _reply(self, mem, io, signal: bool = True) -> Tuple[int, int]:
         """Reply io as ExecLibrary.SendIO's quick path does.
@@ -352,33 +365,3 @@ class AmiFuseTimerDevice(TimerDevice):
         if key not in self._logged:
             self._logged.add(key)
             log_timer.info(fmt, *args)
-
-
-class AmiFuseExecLibrary(ExecLibrary):
-    """ExecLibrary whose DoIO and WaitIO return with no request pending.
-
-    Exec's DoIO and WaitIO wait until the device replies; amitools' return
-    at once. While every request completed in BeginIO that did not matter.
-    A request AmiFuseTimerDevice holds is replied later, to a handler that
-    takes it for finished: after DoIO the reply is a stray message on its
-    port, and after WaitIO the handler may reuse or free the request while
-    it is still queued. vamos cannot block in a library call, so a device
-    that holds requests completes one at once here (complete_early), and
-    WaitIO takes the reply back off the port, as after a wait.
-    """
-
-    def DoIO(self, ctx, io_request):
-        result = super().DoIO(ctx, io_request)
-        if self._complete_early(ctx, io_request, "DoIO"):
-            result = super().WaitIO(ctx, io_request)
-        return result
-
-    def WaitIO(self, ctx, io_request):
-        self._complete_early(ctx, io_request, "WaitIO")
-        return super().WaitIO(ctx, io_request)
-
-    def _complete_early(self, ctx, io_request, call) -> bool:
-        vlib = self.lib_mgr.get_vlib_by_addr(ctx.mem.r32(io_request + self._io_device_off))
-        impl = vlib.get_impl() if vlib is not None else None
-        complete = getattr(impl, "complete_early", None)
-        return complete is not None and complete(ctx, io_request, call)

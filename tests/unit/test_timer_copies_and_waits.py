@@ -1,8 +1,8 @@
 """Copied timer requests, and DoIO and WaitIO on a request the device holds.
 
 A handler may open one timerequest and send copies of it (CopyMem, or a
-struct assignment), so the device knows its requests by the token
-OpenDevice writes into io_Unit, not by address. And Exec in vamos cannot
+struct assignment), so the device knows its requests by the Unit that
+OpenDevice puts into io_Unit, not by address. And Exec in vamos cannot
 wait in DoIO or WaitIO, so AmiFuseExecLibrary has the device complete a
 held request at once there, leaving no reply to come later.
 
@@ -36,7 +36,7 @@ def exec_timer(timer):
     The fixture builds its ExecLibrary without a runtime, by __new__, so
     the subclass is swapped in the same way.
     """
-    from amifuse.timer_device import AmiFuseExecLibrary
+    from amifuse.exec_library import AmiFuseExecLibrary
 
     timer.exec.__class__ = AmiFuseExecLibrary
     return timer
@@ -73,7 +73,7 @@ class TestCopiedRequest:
         assert timer.exec.port_mgr.ports[PORT].queue == [IO, COPY]
 
     def test_copy_keeps_the_unit_of_the_original(self, timer):
-        """The token tells the copy's unit: E-clock ticks, or an absolute unit."""
+        """The Unit tells the copy's unit: E-clock ticks, or an absolute unit."""
         timer.device.open_dev(timer.ctx, IO, UNIT_ECLOCK, 0)
         timer.device.open_dev(timer.ctx, IO2, UNIT_WAITUNTIL, 0)
         _copy(timer, IO, COPY)
@@ -82,6 +82,15 @@ class TestCopiedRequest:
         assert timer.device.next_deadline() == pytest.approx(100.5)
         timer.send(COPY + 0x40, secs=5)
         assert timer.exec.port_mgr.ports[PORT].queue == [COPY + 0x40]
+
+    def test_each_open_has_its_own_unit_in_emulated_memory(self, timer):
+        """io_Unit points at a Unit allocated for that open, freed at CloseDevice."""
+        unit_io, unit_io2 = timer.mem.r32(IO + _IO_UNIT), timer.mem.r32(IO2 + _IO_UNIT)
+        assert unit_io != unit_io2
+        assert timer.ctx.alloc.live == {unit_io, unit_io2}
+        timer.device.close_dev(timer.ctx, IO)
+        assert timer.ctx.alloc.live == {unit_io2}
+        assert timer.mem.r32(IO + _IO_UNIT) == 0
 
     def test_close_device_ends_the_copies(self, timer):
         """After CloseDevice on the original, its copies complete at once."""
@@ -92,36 +101,36 @@ class TestCopiedRequest:
         assert timer.device.next_deadline() == float("inf")
         assert not timer.device.delays(COPY)
 
-    def test_each_open_has_its_own_token(self, timer):
+    def test_close_device_forgets_a_pending_copy(self, timer):
+        """A copy still pending at CloseDevice goes with the open: it is never replied."""
+        _copy(timer)
+        timer.send(COPY, secs=1)
+        timer.send(IO2, secs=2)
+        timer.device.close_dev(timer.ctx, IO)
+        assert timer.device.next_deadline() == pytest.approx(102.0)
+        assert timer.device.deliver(fast_forward=True) == {TASK: 1 << SIGBIT}
+        assert timer.exec.port_mgr.ports[PORT].queue == [IO2]
+
+    def test_closing_one_open_leaves_another_and_its_copies_held(self, timer):
         """Closing one opened request leaves another, and its copies, held."""
-        assert timer.mem.r32(IO + _IO_UNIT) != timer.mem.r32(IO2 + _IO_UNIT)
         _copy(timer)
         timer.device.close_dev(timer.ctx, IO2)
         timer.send(COPY, secs=1)
         assert timer.exec.port_mgr.has_msg(PORT) is False
         assert timer.device.delays(COPY)
 
-    @pytest.mark.parametrize("unit", [0, 0x4000, 0x80000000])
+    @pytest.mark.parametrize("unit", [0, 0x4000, 0x6080])
     def test_request_never_opened_completes_at_once(self, timer, unit):
-        """A request with this device's io_Device but no token is not held."""
+        """A request with this device's io_Device but no Unit of its own is not held.
+
+        0x6080 is where the next Unit would go: not allocated yet.
+        """
         timer.mem.w32(COPY + 14, PORT)
         timer.mem.w32(COPY + 20, BASE)
         timer.mem.w32(COPY + _IO_UNIT, unit)
         timer.send(COPY, secs=5)
         assert timer.exec.port_mgr.ports[PORT].queue == [COPY]
         assert timer.device.next_deadline() == float("inf")
-
-    def test_tokens_wrap_without_reusing_a_live_one(self, timer):
-        """Past the last token, numbering starts again and skips those in use."""
-        from amifuse.timer_device import _TOKEN_FIRST, _TOKEN_LAST
-
-        live = timer.mem.r32(IO + _IO_UNIT)
-        assert live == _TOKEN_FIRST
-        timer.device._last_token = _TOKEN_LAST
-        timer.device.open_dev(timer.ctx, COPY, UNIT_VBLANK, 0)
-        token = timer.mem.r32(COPY + _IO_UNIT)
-        assert token not in (live, timer.mem.r32(IO2 + _IO_UNIT))
-        assert token & 1 and token >= _TOKEN_FIRST
 
 
 # ---------------------------------------------------------------------------
@@ -141,6 +150,7 @@ def _assert_done_and_off_the_port(timer, io=IO):
     assert timer.mem.r8(io + 8) == NT_REPLYMSG
     assert timer.mem.r8s(io + 31) == 0
     assert timer.exec.CheckIO(timer.ctx, io) == io
+    assert timer.exec.signal_func.sent == []
     # Nothing comes later: no stray reply on the handler's port.
     assert timer.device.next_deadline() == float("inf")
     assert timer.device.deliver(fast_forward=True) == {}
@@ -155,7 +165,6 @@ class TestDoIOAndWaitIO:
         _arm(t)
         assert t.exec.DoIO(t.ctx, IO) == 0
         _assert_done_and_off_the_port(t)
-        assert t.exec.signal_func.sent == []
         assert t.device.completed_early == {"DoIO": 1}
 
     def test_waitio_completes_a_pending_request(self, exec_timer):
@@ -164,8 +173,21 @@ class TestDoIOAndWaitIO:
         t.send(secs=1)
         assert t.exec.WaitIO(t.ctx, IO) == 0
         _assert_done_and_off_the_port(t)
-        assert t.exec.signal_func.sent == []
         assert t.device.completed_early == {"WaitIO": 1}
+
+    def test_waitio_on_a_request_already_due_is_a_delivery(self, exec_timer):
+        """Past its deadline, before the bridge delivered it, WaitIO completes it on time.
+
+        That is SendIO, work longer than the delay, then WaitIO: nothing
+        completes early, so nothing is counted or warned about.
+        """
+        t = exec_timer
+        t.send(micro=100_000)
+        t.clock.now = 100.5
+        assert t.exec.WaitIO(t.ctx, IO) == 0
+        _assert_done_and_off_the_port(t)
+        assert t.device.completed_early == {}
+        assert t.device.deliveries == 1
 
     def test_a_copy_is_completed_too(self, exec_timer):
         """A held copy of an opened request is completed like the original."""
@@ -184,6 +206,7 @@ class TestDoIOAndWaitIO:
         assert t.exec.WaitIO(t.ctx, IO) == 0
         assert t.exec.port_mgr.ports[PORT].queue == []
         assert t.device.completed_early == {}
+        assert t.device.deliveries == 1
 
     def test_abortio_then_waitio_keeps_the_abort(self, exec_timer):
         """AbortIO and WaitIO, the usual way to cancel, still give IOERR_ABORTED."""
@@ -193,6 +216,16 @@ class TestDoIOAndWaitIO:
         assert t.exec.WaitIO(t.ctx, IO) == -2
         assert t.exec.port_mgr.ports[PORT].queue == []
         assert _m68k_list(t.mem) == []
+        assert t.device.completed_early == {}
+
+    def test_waitio_on_a_request_reused_since_it_was_sent(self, exec_timer):
+        """A pending entry for memory reused since is dropped, not replied."""
+        t = exec_timer
+        t.send(secs=1)
+        t.mem.w8(IO + 8, NT_REPLYMSG)  # a new request at the same address
+        assert t.exec.WaitIO(t.ctx, IO) == 0
+        assert t.exec.port_mgr.has_msg(PORT) is False
+        assert t.device.next_deadline() == float("inf")
         assert t.device.completed_early == {}
 
     @pytest.mark.parametrize("cmd, unit", [
@@ -210,7 +243,7 @@ class TestDoIOAndWaitIO:
         assert t.device.completed_early == {}
 
     def test_other_devices_are_left_alone(self, exec_timer):
-        """A device without complete_early gets amitools' DoIO and WaitIO."""
+        """A device without complete_now gets amitools' DoIO and WaitIO."""
         t = exec_timer
         begun = []
         other = SimpleNamespace(BeginIO=lambda ctx, io: begun.append(io))
@@ -230,7 +263,10 @@ class TestDoIOAndWaitIO:
                 t.send(secs=1)
                 t.exec.WaitIO(t.ctx, IO)
         warnings = [r.getMessage() for r in caplog.records if r.name == "timer"]
-        assert len(warnings) == 2
-        assert warnings[0].startswith("DoIO on a pending TR_ADDREQUEST")
-        assert warnings[1].startswith("WaitIO on a pending TR_ADDREQUEST")
+        assert warnings == [
+            "timer.device: DoIO on pending TR_ADDREQUEST 0x001000: vamos cannot "
+            "wait for it, so it completes at once, before its delay",
+            "timer.device: WaitIO on pending TR_ADDREQUEST 0x001000: vamos "
+            "cannot wait for it, so it completes at once, before its delay",
+        ]
         assert t.device.completed_early == {"DoIO": 2, "WaitIO": 2}

@@ -18,6 +18,7 @@ IO = 0x1000            # a struct timerequest
 IO2 = 0x1100
 PORT = 0x2000          # the handler's timer reply port
 TASK = 0x3000          # the task the port signals
+UNITS = 0x6000         # the Units OpenDevice allocates
 SIGBIT = 4
 
 TR_ADDREQUEST = 9
@@ -79,6 +80,20 @@ class FakeClock:
 
     def __call__(self):
         return self.now
+
+
+class FakeAlloc:
+    """ctx.alloc's alloc_astruct: hands out 64-byte blocks from UNITS on."""
+
+    def __init__(self):
+        self.next = UNITS
+        self.live = set()
+
+    def alloc_astruct(self, struct, label=None):
+        addr = self.next
+        self.next += 0x40
+        self.live.add(addr)
+        return SimpleNamespace(addr=addr, free=lambda: self.live.remove(addr))
 
 
 class Signals:
@@ -154,7 +169,7 @@ def timer():
     ns.exec.lib_mgr = SimpleNamespace(
         get_vlib_by_addr=lambda addr: SimpleNamespace(get_impl=lambda: ns.device)
         if addr == BASE else None)
-    ns.ctx = SimpleNamespace(mem=mem)
+    ns.ctx = SimpleNamespace(mem=mem, alloc=FakeAlloc())
     ns.device.setup_lib(ns.ctx, BASE)
     _new_port(mem)
     for io in (IO, IO2):
