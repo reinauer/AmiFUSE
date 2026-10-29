@@ -3,9 +3,10 @@
 - An inhibit cycle with a file open breaks SmartFilesystem's handles and
   can stop pfs3aio (#129). rmdir()'s retry after ERROR_OBJECT_IN_USE
   (202), releasedir() and the release() of a pending child send one only
-  while no file is open, and take their locks after it.
-- rmdir() defers only while every entry the handler lists is a pending
-  delete; any other entry stays, so the directory is not empty (#168).
+  while no file is open, and take their locks after it. A 202 that only
+  the cycle could clear fails with EBUSY while a file is open.
+- rmdir() defers only while the directory lists nothing but pending
+  deletes; any other entry stays, so the directory is not empty (#168).
 - A deferred delete refused at release() or releasedir() keeps the
   directory hidden only while another retry is coming (#168, #197).
 
@@ -107,30 +108,32 @@ def test_in_use_rmdir_sends_no_inhibit_cycle_while_a_file_is_open(make_fs):
 def test_releasedir_sends_no_inhibit_cycle_while_a_file_is_open(make_fs):
     fs, volume = make_fs(_InUseVolume, dirs={"/", "/d", "/a"}, files={"/a/y"})
     volume.busy.add("/d")
-    _hold(fs, volume, "/a/y")
     dh = fs.opendir("/d")
-    assert fs.rmdir("/d") == 0
+    assert fs.rmdir("/d") == 0  # cycles with nothing open, deferred
+    cycles = len(volume.inhibit_cycles)
+    _hold(fs, volume, "/a/y")
     volume.busy.clear()
 
     fs.releasedir("/d", dh)
 
-    assert volume.inhibit_cycles == []
+    assert volume.inhibit_cycles[cycles:] == []
     assert volume.deleted == ["/d"]
     assert fs._pending_deletes == set()
 
 
-def test_in_use_rmdir_with_a_file_open_elsewhere_shows_the_directory_again(make_fs):
-    # Without the cycle the refusal stands; the directory deferred behind
-    # its open handle is shown again once releasedir() is refused too.
+def test_in_use_rmdir_with_a_file_open_elsewhere_is_busy_though_the_directory_is_open(make_fs):
+    # Only the cycle clears this refusal, and the file open rules it out at
+    # releasedir() too: deferring would report a delete that never happens.
     fs, volume = make_fs(_StaleStateVolume, dirs={"/", "/d", "/a"}, files={"/a/y"})
     volume.busy.add("/d")
     _hold(fs, volume, "/a/y")
     dh = fs.opendir("/d")
-    assert fs.rmdir("/d") == 0
 
+    assert _errno_of(fs.rmdir, "/d") == errno.EBUSY
     fs.releasedir("/d", dh)
 
     assert volume.inhibit_cycles == []
+    assert volume.deletes == ["/d"]
     assert fs._pending_deletes == set()
     assert _visible(fs, "/d")
 
@@ -175,7 +178,7 @@ def test_deferred_rmdir_at_release_takes_the_parent_lock_after_the_cycle(make_fs
     assert fs._pending_dir_deletes == {}
 
 
-# Defer only while every listed entry is a pending delete (#168)
+# Defer only while the directory lists nothing but pending deletes (#168)
 
 
 @pytest.mark.parametrize("volume_cls", [_FfsVolume, _InUseVolume], ids=["216", "202"])
@@ -198,16 +201,25 @@ def test_rmdir_of_a_directory_with_a_live_entry_is_not_empty(make_fs, volume_cls
     assert _visible(fs, live_path)
 
 
-def test_pending_entry_listed_in_another_letter_case_still_defers(make_fs):
-    # The handler lists "z"; the FUSE caller unlinked it as "Z".
-    fs, volume = make_fs(_FfsVolume, dirs={"/", "/g"}, files={"/g/z"})
-    _hold(fs, volume, "/g/z")
-    fs._pending_deletes.add("/g/Z")
+class _ShortNameVolume(_FfsVolume):
+    """Lists names cut to 30 characters, as FastFileSystem stores them."""
+
+    def list_dir_path(self, path):
+        return [{"name": e["name"][:30]} for e in super().list_dir_path(path)]
+
+
+def test_pending_entry_the_handler_lists_under_another_name_still_defers(make_fs):
+    long_name = "/g/a_rather_long_file_name_past_thirty_chars.txt"
+    fs, volume = make_fs(_ShortNameVolume, dirs={"/", "/g"}, files={long_name})
+    h = _hold(fs, volume, long_name)
+    assert fs.unlink(long_name) == 0
 
     assert fs.rmdir("/g") == 0
+    fs.release(long_name, h)
 
-    assert fs._pending_dir_deletes == {"/g": {"/g/Z"}}
-    assert not _visible(fs, "/g")
+    assert volume.deleted == [long_name, "/g"]
+    assert fs._pending_deletes == set()
+    assert fs._pending_dir_deletes == {}
 
 
 # A refused deferred delete hides the directory only while a retry is

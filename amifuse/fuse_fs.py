@@ -3411,7 +3411,8 @@ class AmigaFuseFS(_FuseOperations):
         if not name:
             raise FuseOSError(errno.EINVAL)
         res1, res2 = self.bridge.delete_dir_atomic(path)
-        if res1 == 0 and res2 == 202 and not self._any_file_open():
+        files_open = res1 == 0 and res2 == 202 and self._any_file_open()
+        if res1 == 0 and res2 == 202 and not files_open:
             # OBJECT_IN_USE with no file open: pfs3aio and SmartFilesystem
             # keep in-use state after a directory change, which an inhibit
             # cycle clears. With a file open the cycle breaks
@@ -3428,26 +3429,30 @@ class AmigaFuseFS(_FuseOperations):
             # DIRECTORY_NOT_EMPTY: the directory holds entries, an unlinked
             # open file among them. Defer only where a retry will come:
             # release() of the last pending child, or, for 202, releasedir()
-            # of a FUSE directory handle open on this path. And defer only
-            # while every entry the handler lists is a pending delete; any
-            # other entry stays, so the directory is not empty (#168).
-            listed = self.bridge.list_dir_path(path)
+            # of a FUSE directory handle open on this path, which can clear
+            # the refusal only with the cycle that a file open now rules
+            # out. And defer only while the directory holds nothing but
+            # pending deletes; anything else stays, so it is not empty (#168).
             with self._fh_lock:
                 pending_children = self._pending_children(path)
-                dir_open = res2 == 202 and any(
+                dir_open = res2 == 202 and not files_open and any(
                     v.get("dir_handle") and v.get("path") == path
                     for v in self._fh_cache.values()
                 )
-                # Amiga names are case-insensitive; a FUSE path keeps the
-                # caller's case.
-                pending_names = {p.rsplit("/", 1)[1].lower() for p in pending_children}
-                live = any(e["name"].lower() not in pending_names for e in listed)
-                defer = not live and bool(pending_children or dir_open)
-                if defer:
+            listed = []
+            if pending_children or res2 == 202:
+                listed = self.bridge.list_dir_path(path)
+            # Each pending child is still listed until its release, so any
+            # further entry is live. Names are not compared: the handler
+            # stores a host name in its own case, encoding and length.
+            live = len(listed) > len(pending_children)
+            defer = not live and bool(pending_children or dir_open)
+            if defer:
+                with self._fh_lock:
                     if pending_children:
                         self._pending_dir_deletes[path] = pending_children
                     self._pending_deletes.add(path)
-            if not defer:
+            else:
                 err = errno.ENOTEMPTY if listed or res2 == 216 else errno.EBUSY
                 self._log_op("rmdir", path, f"nothing would retry: {errno.errorcode[err]}")
                 raise FuseOSError(err)

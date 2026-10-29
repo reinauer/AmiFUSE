@@ -8,6 +8,9 @@
 - rmdir() of a directory that holds a file that is open, not unlinked,
   fails with ENOTEMPTY while the directory is open too, and the directory
   stays visible after releasedir() (#197).
+- rmdir() still defers behind unlinked open files whose names the handler
+  stores differently, and fails with EBUSY, leaving the directory visible,
+  when a lock that an open file holds refuses it.
 
 The tests call the AmigaFuseFS callbacks directly, as a mount would, on
 copies of the fixture images or on an FFS floppy made with xdftool for the
@@ -163,3 +166,43 @@ def test_rmdir_of_an_open_directory_holding_an_open_file_is_not_empty(open_ops, 
     assert ops._pending_deletes == set()
     assert _shown(ops, "/d")
     assert _listed(ops, "/d") == ["x"]
+
+
+@pytest.mark.parametrize("handler", [_fixture(OFS), BUNDLED_FFS, _fixture(PFS), _fixture(SFS)])
+def test_rmdir_defers_behind_unlinked_open_files_the_handler_names_differently(open_ops, handler):
+    ops = open_ops(handler)
+    ops.mkdir("/g", 0o755)
+    # Stored as "?uro.txt", and cut to the handler's name length.
+    names = ["/g/\u20acuro.txt", "/g/a_rather_long_file_name_past_thirty_chars.txt"]
+    handles = []
+    for name in names:
+        _make(ops, name, b"n" * 50)
+        handles.append(ops.open(name, os.O_RDONLY))
+        assert ops.unlink(name) == 0
+
+    assert ops.rmdir("/g") == 0
+    for name, fh in zip(names, handles):
+        ops.release(name, fh)
+
+    assert "g" not in _listed(ops, "/")
+    assert ops._pending_deletes == set()
+    assert ops._pending_dir_deletes == {}
+
+
+@pytest.mark.parametrize("handler", [_fixture(PFS), _fixture(SFS), _fixture(OFS)])
+def test_rmdir_refused_by_a_lock_an_open_file_holds_is_busy(open_ops, handler):
+    ops = open_ops(handler)
+    ops.mkdir("/d", 0o755)
+    _make(ops, "/d/x", b"x" * 100)
+    hx = ops.open("/d/x", os.O_RDONLY)  # holds a lock on /d
+    assert ops.rename("/d/x", "/x") == 0
+    dh = ops.opendir("/d")
+
+    assert _errno_of(ops.rmdir, "/d") == errno.EBUSY
+    ops.releasedir("/d", dh)
+    assert ops._pending_deletes == set()
+    assert _shown(ops, "/d")
+
+    ops.release("/x", hx)
+    assert ops.rmdir("/d") == 0
+    assert "d" not in _listed(ops, "/")
