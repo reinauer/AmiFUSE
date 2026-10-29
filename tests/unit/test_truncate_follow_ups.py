@@ -2,8 +2,8 @@
 
 - After a shrink, SmartFilesystem on a nearly full volume fails a write at
   the new end of file until the handle moves, and a seek to where the
-  handle already is does not count. The shrink leaves the handle at the
-  start of the file.
+  handle already is does not count. truncate() through an open handle
+  leaves it at the start of the file.
 - A shrink whose reply comes just after the wait runs out gets a second
   wait for the same packet, which sends nothing.
 - AROS afs refuses a shrink past another open handle with ERROR_SEEK_ERROR
@@ -98,13 +98,15 @@ class _AfsFile(_FakeHandlerFile):
 class TestShrinkLeavesHandleAtStart:
     """SmartFilesystem: a write at the new end works after the shrink."""
 
-    def test_truncate_handle_seeks_to_start(self, fuse_mock):
+    def test_handle_is_left_at_start(self, fuse_mock):
         handler = _FakeHandlerFile(CONTENT)
-        bridge = _fake_write_bridge(fuse_fs, handler)
+        fs = _fake_write_fs(fuse_fs, handler)
+        handle = fs.open("/file", os.O_RDWR)
 
-        assert bridge.truncate_handle(FH_ADDR, 1000) == (1000, 0)
+        assert fs.truncate("/file", 1000, handle) == 0
         assert handler.seeks[-1] == (FH_ADDR, 0, fuse_fs.OFFSET_BEGINNING)
         assert handler.pos == 0
+        assert fs._fh_cache[handle]["pos"] == 0
 
     def test_write_at_new_end_lands(self, fuse_mock):
         handler = _SfsAfterShrink(CONTENT)
@@ -221,11 +223,13 @@ class TestHandlesPastLongMax:
         assert exc_info.value.args[0] == errno.EIO
         assert self._far_seeks(handler)[0] == (FAR, 0, fuse_fs.OFFSET_CURRENT)
 
-    @pytest.mark.parametrize("reply", [_reply(-1, 219), _reply(-0x80000000)],
-                             ids=["pfs3aio-refusal", "sfs-negative"])
+    @pytest.mark.parametrize("reply", [
+        _reply(-1, 219), _reply(-1, 0), _reply(-0x80000000),
+    ], ids=["pfs3aio-refusal", "ffs-v0.2-no-code", "sfs-negative"])
     def test_unmoved_handle_keeps_its_position(self, fuse_mock, reply):
-        """pfs3aio refuses the check past 2 GiB, and SFS answers with a
-        position that a signed LONG carries as negative."""
+        """pfs3aio refuses the check past 2 GiB, FastFileSystem v0.2
+        answers -1 with no error code, and SFS answers with a position that
+        a signed LONG carries as negative."""
         handler = _FakeHandlerFile(CONTENT)
         fs = _fake_write_fs(fuse_fs, handler)
         far = self._open_far(fs, handler)
@@ -264,3 +268,27 @@ class TestHandlesPastLongMax:
         assert len(self._far_seeks(handler)) == 1
         assert fs._fh_cache[first]["pos"] is None
         assert fs._fh_cache[second]["pos"] is None
+
+    def test_unanswered_seek_to_start_sends_no_check(self, fuse_mock):
+        """The truncating handle's seek to the start after the shrink may
+        still be with the handler, so no check follows it, and the far
+        handle forgets its position."""
+        handler = _FakeHandlerFile(CONTENT)
+        fs = _fake_write_fs(fuse_fs, handler)
+        far = self._open_far(fs, handler)
+        handle = fs.open("/file", os.O_RDWR)
+        seek = handler.seek
+
+        def start_seek_unanswered(state, fh_addr, offset, mode):
+            packet = seek(state, fh_addr, offset, mode)
+            if handler.set_sizes and fh_addr == FH_ADDR:
+                handler.reply = NO_REPLY
+            return packet
+
+        fs.bridge.launcher.send_seek_handle.side_effect = start_seek_unanswered
+
+        assert fs.truncate("/file", 100, handle) == 0
+        assert handler.seeks[-1] == (FH_ADDR, 0, fuse_fs.OFFSET_BEGINNING)
+        assert self._far_seeks(handler) == []
+        assert fs._fh_cache[far]["pos"] is None
+        assert fs._fh_cache[handle]["pos"] is None

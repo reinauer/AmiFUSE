@@ -3689,14 +3689,13 @@ class TestFuseTruncateWithOtherHandles:
         handle = fs.open("/file", os.O_RDWR) if use_handle else None
 
         assert fs.truncate("/file", 100, handle) == 0
-        # The truncating handle only measures the end of file, and goes to
-        # its start after the shrink.
+        # The truncating handle only measures the end of file, and an open
+        # one goes to its start after the shrink.
         assert handler.seeks == [
             (self.FH_ADDR, 0, fuse_fs_mod.OFFSET_END),
             (self.FH_ADDR, 0, fuse_fs_mod.OFFSET_CURRENT),
             (self.OTHER, 0, fuse_fs_mod.OFFSET_BEGINNING),
-            (self.FH_ADDR, 0, fuse_fs_mod.OFFSET_BEGINNING),
-        ]
+        ] + [(self.FH_ADDR, 0, fuse_fs_mod.OFFSET_BEGINNING)] * use_handle
         assert fs._fh_cache[directory] == dir_entry
         assert fs._fh_cache[icon] == icon_entry
 
