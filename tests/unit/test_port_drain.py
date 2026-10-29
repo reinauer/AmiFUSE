@@ -9,6 +9,8 @@ manager's queue, as GetMsg() does (#216).
 
 from types import SimpleNamespace
 
+from amifuse import fuse_fs as fs
+
 PROCESS = 0x3000       # the handler process amifuse created
 DOS_PORT = 0x5000      # the port the startup reply switched state.port_addr to
 REPLY_PORT = 0x5100    # the bridge's caller port
@@ -19,7 +21,7 @@ PKT_MSG = 0x7200       # a packet's message
 
 
 class FakeMem:
-    """Big-endian 32-bit memory, enough for Exec list links."""
+    """Big-endian memory, enough for Exec list links and an io_Error."""
 
     def __init__(self, size=0x10000):
         self.data = bytearray(size)
@@ -29,6 +31,9 @@ class FakeMem:
 
     def w32(self, addr, val):
         self.data[addr:addr + 4] = val.to_bytes(4, "big")
+
+    def r8s(self, addr):
+        return int.from_bytes(self.data[addr:addr + 1], "big", signed=True)
 
 
 class FakeTimer:
@@ -77,7 +82,6 @@ def _list_nodes(mem, port):
 
 
 def _bridge(timer=None):
-    from amifuse import fuse_fs as fs
     from amitools.vamos.lib.lexec.PortManager import PortManager  # type: ignore
 
     bridge = fs.HandlerBridge.__new__(fs.HandlerBridge)
@@ -93,6 +97,20 @@ def _process_port():
     from amitools.vamos.libstructs.dos import ProcessStruct  # type: ignore
 
     return PROCESS + ProcessStruct.sdef.find_field_def_by_name("pr_MsgPort").offset
+
+
+def _wait_io(mem, pmgr, io, reply_port):
+    """amitools' ExecLibrary.WaitIO on io, whose mn_ReplyPort is reply_port."""
+    from amitools.vamos.lib.ExecLibrary import ExecLibrary  # type: ignore
+    from amitools.vamos.libstructs.exec_ import IORequestStruct, MessageStruct  # type: ignore
+
+    exec_lib = ExecLibrary.__new__(ExecLibrary)
+    exec_lib.port_mgr = pmgr
+    exec_lib._io_error_off = IORequestStruct.sdef.find_field_def_by_name("io_Error").offset
+    exec_lib._io_reply_port_off = MessageStruct.sdef.find_field_def_by_name(
+        "mn_ReplyPort").offset
+    mem.w32(io + exec_lib._io_reply_port_off, reply_port)
+    return exec_lib.WaitIO(SimpleNamespace(mem=mem), io)
 
 
 class TestDrainKeepsTheProcessPort:
@@ -134,8 +152,8 @@ class TestDrainUnlinksWhatItDrops:
     def test_waitio_on_a_drained_reply_keeps_the_next_one(self):
         """A WaitIO() on a drained request leaves a later reply linked.
 
-        WaitIO() unlinks a request whenever both its links are set, queued
-        or not, as amitools' ExecLibrary.WaitIO does.
+        amitools' WaitIO unlinks a request whenever both its links are set,
+        queued or not.
         """
         bridge, pmgr = _bridge()
         mem = bridge.mem
@@ -148,13 +166,36 @@ class TestDrainUnlinksWhatItDrops:
         pmgr.put_msg(IO_PORT, IO2)
         _add_tail(mem, IO_PORT, IO2)
 
-        ln_succ, ln_pred = mem.r32(IO), mem.r32(IO + 4)
-        if ln_succ and ln_pred:
-            mem.w32(ln_pred, ln_succ)
-            mem.w32(ln_succ + 4, ln_pred)
+        _wait_io(mem, pmgr, IO, IO_PORT)
 
         assert pmgr.ports[IO_PORT].queue == [IO2]
         assert _list_nodes(mem, IO_PORT) == [IO2]
+
+    def test_message_not_linked_on_the_port_is_left_alone(self):
+        """Stale links of a message queued without linking write nowhere.
+
+        IO2 was once alone in DOS_PORT's list and taken off it, so its links
+        still point at that list's head and tail; it was then queued on
+        IO_PORT through the port manager, which does not link it. The drain
+        unlinks IO, and DOS_PORT's list keeps its packet.
+        """
+        bridge, pmgr = _bridge()
+        mem = bridge.mem
+        _new_list(mem, DOS_PORT)
+        _add_tail(mem, DOS_PORT, IO2)
+        _new_list(mem, DOS_PORT)  # IO2 taken off, its links left as they were
+        _add_tail(mem, DOS_PORT, PKT_MSG)
+        pmgr.register_port(IO_PORT)
+        _new_list(mem, IO_PORT)
+        pmgr.put_msg(IO_PORT, IO)
+        _add_tail(mem, IO_PORT, IO)
+        pmgr.put_msg(IO_PORT, IO2)
+
+        bridge._drain_non_essential_ports(pmgr)
+
+        assert pmgr.ports[IO_PORT].queue == []
+        assert _list_nodes(mem, IO_PORT) == []
+        assert _list_nodes(mem, DOS_PORT) == [PKT_MSG]
 
     def test_kept_timer_reply_stays_linked_alone(self):
         """Around a delayed timer reply the drain keeps, the list is rejoined."""
