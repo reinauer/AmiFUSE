@@ -43,10 +43,15 @@ def test_truncate_handle_fails_on_refusal(fuse_mock, length, res2, expected):
 
 
 @pytest.mark.parametrize("use_handle", [False, True], ids=["path", "handle"])
-@LENGTHS
-@BFFS_REFUSALS
+@pytest.mark.parametrize("res2, length, expected", [
+    (205, 5, errno.EIO),
+    (214, 0, errno.EROFS),
+    (214, 5, errno.EROFS),
+], ids=["read-write-shrink", "read-only-empty", "read-only-shrink"])
 def test_truncate_raises_on_refusal(fuse_mock, use_handle, length, res2,
                                     expected):
+    """The read-write build's refusal of a truncate to 0 is handled by
+    opening the file again: test_bffs_overwrite.py."""
     handler = _FakeHandlerFile(ORIGINAL, set_size_reply=_reply(0, res2))
     fs = _fake_write_fs(fuse_fs, handler)
     handle = fs.open("/file", os.O_RDWR) if use_handle else None
