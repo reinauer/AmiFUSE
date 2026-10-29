@@ -342,6 +342,9 @@ class HandlerBridge:
         self._closed = False
         # Set when a wait runs out of busy cycles; see _run_until_replies.
         self._busy_ran_out = False
+        # Busy cycles the timer thread has run such a handler for since it
+        # last parked; see run_due_timers.
+        self._idle_busy_cycles = 0
         try:
             self._initialize(image, driver, block_size, read_only, debug,
                              trace, partition, adf_info, iso_info)
@@ -718,6 +721,43 @@ class HandlerBridge:
         signals = self._deliver_timers(fast_forward=not at_main_loop)
         self._leave_timer_signals_to_wait_frame(signals)
 
+    # How long after its start a packet wait may still sleep until a timer
+    # request falls due; see _sleep_to_timer_in_packet_wait.
+    _PACKET_TIMER_WAIT = 1.0
+
+    def _sleep_to_timer_in_packet_wait(self, wait_until: float) -> bool:
+        """Sleep to the next timer deadline, for a wait about to end without a reply.
+
+        At its main loop the handler's timers keep their deadlines, so a
+        reply that waits on one, such as a delayed retry or a child's
+        timer, cannot come within the wait's bursts. If the handler is
+        parked there and a request falls due by wait_until, on the device
+        clock, the wait sleeps to its deadline and replies to the due
+        requests. Returns whether it replied to any, so the wait runs on.
+        The sleep holds the bridge lock, as the whole wait does, so a wait
+        that would have failed at once costs up to _PACKET_TIMER_WAIT more,
+        even when the due request cannot wake the handler: in a main-loop
+        WaitPort() only a child's timer can lead to the reply.
+        """
+        timer = self._timer_device()
+        state = self.state
+        if (
+            timer is None
+            or not state.main_loop_pc
+            or state.pc != state.main_loop_pc
+            or state.sp != state.main_loop_sp
+        ):
+            return False
+        deadline = timer.next_deadline()
+        if deadline > wait_until:
+            return False
+        delay = deadline - timer.clock()
+        if delay > 0:
+            time.sleep(delay)
+        deliveries = timer.deliveries
+        self._leave_timer_signals_to_wait_frame(self._deliver_timers())
+        return timer.deliveries != deliveries
+
     def _leave_timer_signals_to_wait_frame(self, signals: int):
         """Keep due timer bits for a handler parked in Wait() in tc_SigRecvd only.
 
@@ -762,16 +802,15 @@ class HandlerBridge:
         # A WaitPort() wakes only for a message, never for a signal.
         return block is None or block.get("wait_blocked_sp") is not None
 
-    def _resume_with(self, signals: int, cycles: int = 200_000, max_iters: int = 50):
+    def _resume_with(
+        self, signals: int, cycles: int = 200_000, max_iters: int = 50
+    ) -> Tuple[int, bool]:
         """Wake the handler parked at its main loop with signals, and run it.
 
         Wait() returns the signals the handler waits for, which are cleared
-        from the fallback signals and tc_SigRecvd as Wait() would. The
-        parent and then any ready children run until the parent parks with
-        nothing pending, under the busy limits of _run_until_replies and at
-        most max_iters parks. Signals the handler does not wait for stay
-        pending. Nothing polls the reply port here: a late reply belongs to
-        the next packet's wait.
+        from the fallback signals and tc_SigRecvd as Wait() would. It then
+        runs as in _run_until_parked, whose result it returns. Signals the
+        handler does not wait for stay pending.
         """
         from amitools.vamos.lib.lexec.signalfunc import SignalFunc
         from amitools.vamos.libstructs.exec_ import TaskStruct
@@ -784,7 +823,7 @@ class HandlerBridge:
         if not signals or not self._parked_at_main_loop():
             # A child may have been signalled instead.
             self._run_ready_children(cycles // 4)
-            return
+            return 0, True
         SignalFunc._fallback_signals &= ~signals
         sigrecvd_off = TaskStruct.sdef.find_field_def_by_name("tc_SigRecvd").offset
         sigrecvd_addr = state.process_addr + sigrecvd_off
@@ -796,11 +835,27 @@ class HandlerBridge:
         state.block_state = None
         if self._debug:
             print(f"[amifuse] timer: resuming handler with D0=0x{signals:x}")
+        return self._run_until_parked(cycles, max_iters)
 
+    def _run_until_parked(
+        self, cycles: int = 200_000, max_iters: int = 50,
+        busy_limit: Optional[int] = None,
+    ) -> Tuple[int, bool]:
+        """Run the handler from where it is until it parks with nothing pending.
+
+        The parent and then any ready children run, at most max_iters
+        parks, and busy for at most busy_limit cycles, or by default under
+        the busy limits of _run_until_replies. Nothing polls the reply
+        port here: a late reply belongs to the next packet's wait. Returns
+        the busy cycles spent and whether the handler stopped, parked with
+        nothing pending, exited or crashed; if not, it is still running.
+        """
+        state = self.state
         busy_cycles = 0
         idle_iters = 0
+        fixed_limit = busy_limit
         while idle_iters < max_iters:
-            busy_limit = (
+            busy_limit = fixed_limit or (
                 self._SHORT_BUSY_CYCLES if self._busy_ran_out
                 else self._MAX_BUSY_CYCLES
             )
@@ -810,11 +865,11 @@ class HandlerBridge:
                 if self._debug:
                     print(f"[amifuse] timer: handler still busy after "
                           f"{busy_cycles:,} cycles, pc=0x{state.pc:x}")
-                return
+                return busy_cycles, False
             self.launcher.run_burst(state, max_cycles=cycles, debug=self._debug)
             rs = state.run_state
             if state.crashed:
-                return
+                return busy_cycles, True
             busy = not getattr(rs, "error", None) and not getattr(rs, "done", False)
             if busy:
                 busy_cycles += cycles
@@ -824,7 +879,7 @@ class HandlerBridge:
             if busy:
                 continue
             if getattr(rs, "done", False):
-                return
+                return busy_cycles, True
             # It parked. A burst that parks reports no cycles, so the parked
             # state decides: with a wake already pending (a self-signal, a
             # quick reply, a child's reply) run_burst left no block state,
@@ -833,31 +888,55 @@ class HandlerBridge:
                 _get_active_block_state(state.block_state) is not None
                 and not self.launcher.setup_resume_if_blocked(state, debug=self._debug)
             ):
-                return
+                return busy_cycles, True
             idle_iters += 1
+        # Its last park had a wake pending: it runs on.
+        return busy_cycles, False
 
     # How long the mount's timer thread waits before it looks again at a
-    # handler it could not wake (busy, or waiting somewhere else).
+    # handler it could not wake (busy past its budget, or waiting somewhere
+    # else).
     _TIMER_RETRY = 1.0
 
     def run_due_timers(self) -> Optional[float]:
-        """Reply to due timer requests and let the parked handler act on them.
+        """Run a busy handler on, then reply to due timer requests.
 
-        Called by the mount's timer thread between FUSE operations. Skips
-        a handler that is not parked at its main loop, such as one whose
-        packet wait ran out. Returns the seconds until the next call is
-        due, or None when no timer request is pending.
+        Called by the mount's timer thread between FUSE operations. A
+        handler whose packet wait ran out is still working on that packet:
+        each call runs it on for at most _SHORT_BUSY_CYCLES busy cycles,
+        until it parks, leaving any late reply on the reply port for the
+        next packet's wait. A handler still running after _MAX_BUSY_CYCLES
+        cycles of such slices, likely caught in a loop, is left for the
+        next FUSE operation. Due timer requests are then replied, unless
+        the handler is parked elsewhere than its main loop, and a handler
+        that is still running after the timer resume is run on the same
+        way. Returns the seconds until the next call is due, or None when
+        nothing is pending.
         """
         with self._lock:
             timer = self._timer_device()
             if timer is None or self.state.crashed:
                 return None
-            if self._busy_ran_out or not self._parked_at_main_loop():
+            if self._busy_ran_out:
+                if self._idle_busy_cycles >= self._MAX_BUSY_CYCLES:
+                    return None if timer.next_deadline() == math.inf else self._TIMER_RETRY
+                busy, stopped = self._run_until_parked(busy_limit=self._SHORT_BUSY_CYCLES)
+                self._idle_busy_cycles += busy
+                if not stopped:
+                    # Still running: the next look, a tick later, runs it on.
+                    self._busy_ran_out = True
+                    return 0.0
+            self._idle_busy_cycles = 0
+            if not self._parked_at_main_loop():
                 return None if timer.next_deadline() == math.inf else self._TIMER_RETRY
             deliveries = timer.deliveries
             signals = self._deliver_timers()
             if timer.deliveries != deliveries:
-                self._resume_with(signals)
+                busy, stopped = self._resume_with(signals)
+                if not stopped:
+                    self._busy_ran_out = True
+                    self._idle_busy_cycles = busy
+                    return 0.0
             deadline = timer.next_deadline()
             if deadline == math.inf:
                 return None
@@ -1014,9 +1093,10 @@ class HandlerBridge:
         A handler whose wait ran out is still running, and the next packet
         would resume it with the full busy limit again. Until it replies to
         any packet, waits or exits, later waits get _SHORT_BUSY_CYCLES
-        instead. The limit is checked before every burst, so a handler that
-        waits or exits during such a wait gets the full limit for the rest
-        of it. A reply may belong to an earlier packet, so every packet
+        instead, and a mount's timer thread runs it on while the mount
+        idles (run_due_timers). The limit is checked before every burst,
+        so a handler that waits or exits during such a wait gets the full
+        limit for the rest of it. A reply may belong to an earlier packet, so every packet
         wait must go through _run_until_reply, which drops such a reply.
 
         A handler waiting on timer.device parks like any other. Timer
@@ -1024,8 +1104,12 @@ class HandlerBridge:
         their signals wake the handler with the packet's, and so are those
         due whenever the wait finds it parked. Parked anywhere but its main
         loop, it may wait for its own timer before it replies, so every
-        pending request is then due. Between packets, a mount's timer
-        thread replies to them (run_due_timers). The limits
+        pending request is then due. Parked at its main loop, it keeps
+        real time, so a wait that would end without a reply first sleeps
+        to the next deadline, if it comes within _PACKET_TIMER_WAIT of the
+        wait's start, and runs on: a handler may reply only once its own
+        timer fires, or a child may wait on one. Between packets, a mount's
+        timer thread replies to them (run_due_timers). The limits
         count cycles and bursts, not time: Delay() sleeps on the host and
         spends no cycles, so the time a handler spends in it is bounded by
         neither, as before.
@@ -1041,18 +1125,17 @@ class HandlerBridge:
         reply to the first carries the new packet's address and passes for
         its answer. A wait that ends at max_iters leaves its packet behind
         the same way, as every wait of more than 50 bursts did before the
-        busy limit. Last, while the parent is parked at its main loop its
-        timers keep their deadlines, so a reply that waits on a timer cannot
-        come within the packet wait: a handler that replies only once its
-        own timer fires, or a child that waits on a timer while the parent
-        sits at its main loop. The wait ends without that reply, and the
-        late reply is dropped (_run_until_reply).
+        busy limit.
         """
         from amitools.vamos.lib.ExecLibrary import ExecLibrary
         replies = []
         sleep_time = sleep_base
         idle_iters = 0
         busy_cycles = 0
+        timer = self._timer_device()
+        timer_wait_until = (
+            -math.inf if timer is None else timer.clock() + self._PACKET_TIMER_WAIT
+        )
 
         # Check if handler has crashed - if so, don't try to run it
         if self.state.crashed:
@@ -1129,8 +1212,13 @@ class HandlerBridge:
                 self._SHORT_BUSY_CYCLES if self._busy_ran_out
                 else self._MAX_BUSY_CYCLES
             )
-            if idle_iters >= max_iters or busy_cycles >= busy_limit:
+            if busy_cycles >= busy_limit:
                 break
+            if idle_iters >= max_iters:
+                if not self._sleep_to_timer_in_packet_wait(timer_wait_until):
+                    break
+                # The timer's reply may bring the packet's: a full wait again.
+                idle_iters = 0
             old_pc = self.state.pc
             self.launcher.run_burst(self.state, max_cycles=cycles, debug=self._debug)
             rs = self.state.run_state
@@ -1260,7 +1348,13 @@ class HandlerBridge:
                     f"busy limit of {busy_limit:,} emulated cycles",
                     file=sys.stderr,
                 )
+                # It ran out with the full limit, so it was not busy before:
+                # the timer thread's budget for it starts afresh.
+                self._idle_busy_cycles = 0
             self._busy_ran_out = True
+            if timer is not None:
+                # The mount's timer thread runs the handler on while idle.
+                timer.event.set()
 
         # Drain stray IO replies that accumulated during packet processing:
         # SendIO queues them at once. timer.device replies stay, since they
@@ -4445,7 +4539,10 @@ class AmigaFuseFS(_FuseOperations):
         Without it an idle handler never sees time pass, so work it defers
         to a timer, such as a write-back, would wait for the next operation.
         It sleeps until the earliest deadline, or until a request arms an
-        earlier one, and costs nothing while no request is pending.
+        earlier one, and costs nothing while no request is pending. It also
+        runs on a handler whose packet wait ran out, in slices a tick
+        apart, until it parks (run_due_timers); a wait that runs out sets
+        the event, so that it starts at once.
         """
         bridge = self.bridge
         while True:

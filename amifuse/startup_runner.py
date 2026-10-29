@@ -838,13 +838,21 @@ class HandlerLauncher:
             return 0x800 <= pc < ram_end
 
         ret_addr = blocked_ret if blocked_ret is not None else mem.r32(blocked_sp)
-        # Save as main loop PC if not yet initialized
+        # Save as main loop PC if not yet initialized, but only once the
+        # startup reply is on the reply port: before it, the handler may
+        # block in its init code, for instance on its own timer, whose frame
+        # is gone by the time the main loop is resumed. Such a block still
+        # marks it initialized, so the bridge keeps its block state across
+        # child runs. A block after the reply was polled, or in a handler
+        # that never replied, is captured by the bridge when startup ends.
         if (not state.initialized or state.main_loop_pc == 0) and _pc_valid(ret_addr):
-            state.main_loop_pc = ret_addr
-            state.main_loop_sp = blocked_sp + 4
             state.initialized = True
-            if wait_mask is not None and not state.wait_mask:
-                state.wait_mask = wait_mask
+            pmgr = self.exec_impl.port_mgr
+            if pmgr.has_port(state.reply_port_addr) and pmgr.has_msg(state.reply_port_addr):
+                state.main_loop_pc = ret_addr
+                state.main_loop_sp = blocked_sp + 4
+                if wait_mask is not None and not state.wait_mask:
+                    state.wait_mask = wait_mask
         # Determine if there's something pending that would wake the handler
         if wait_mask is not None:
             # Wait() blocked - check for ANY pending signals (messages OR IO completion)
