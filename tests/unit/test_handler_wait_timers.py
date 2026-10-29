@@ -46,18 +46,29 @@ def _isolate_exec_state(monkeypatch):
 
 
 class Clock:
-    """The timer device's clock, which the bridge's sleeps move on."""
+    """The timer device's clock, which the bridge's sleeps move on.
 
-    def __init__(self):
-        self.now = 100.0
+    tick > 0 makes it read real time rounded down to a tick, as
+    time.monotonic does on Windows before Python 3.13 (15.6 ms).
+    """
+
+    def __init__(self, tick=0.0):
+        self.real = 100.0
+        self.tick = tick
         self.sleeps = []
+
+    @property
+    def now(self):
+        if not self.tick:
+            return self.real
+        return math.floor(self.real / self.tick) * self.tick
 
     def __call__(self):
         return self.now
 
     def sleep(self, seconds):
         self.sleeps.append(seconds)
-        self.now += seconds
+        self.real += seconds
 
 
 @pytest.fixture
@@ -124,6 +135,7 @@ def _bridge(timer, launcher, **state):
     bridge = fs.HandlerBridge.__new__(fs.HandlerBridge)
     bridge._debug = False
     bridge._busy_ran_out = False
+    bridge._idle_unfinished = False
     bridge._idle_busy_cycles = 0
     bridge._lock = threading.RLock()
     bridge._write_enabled = False
@@ -223,7 +235,7 @@ class TestStartupMainLoop:
     def _state(self):
         return SimpleNamespace(
             port_addr=DOS_PORT, reply_port_addr=REPLY_PORT, block_state=None,
-            pc=0x4400, sp=0x7c00, regs=[0] * 16, initialized=False,
+            pc=0x4400, sp=0x7c00, regs=[0] * 16, initialized=False, startup_replied=False,
             main_loop_pc=0, main_loop_sp=0, wait_mask=0)
 
     def _block(self, launcher, state, ret, sp, port=None, wait_mask=None):
@@ -265,6 +277,23 @@ class TestStartupMainLoop:
         assert (state.main_loop_pc, state.main_loop_sp) == (self.LOOP_RET, self.LOOP_SP)
         assert state.wait_mask == 0x100
 
+    def test_block_after_the_polled_startup_reply_is_the_main_loop(self):
+        """The bridge took the reply off already, and a wake is pending at the block."""
+        launcher = self._launcher()
+        state = self._state()
+        state.startup_replied = True
+        launcher._compute_pending_signals = lambda mask: mask  # it runs on at once
+        launcher._clear_signals_from_task = lambda signals: None
+        self._block(launcher, state, self.LOOP_RET, self.LOOP_SP, wait_mask=0x100)
+        assert (state.main_loop_pc, state.main_loop_sp) == (self.LOOP_RET, self.LOOP_SP)
+
+    def test_startup_wait_notes_the_startup_reply(self):
+        """_run_startup_until_replies sets the flag when it polls the reply."""
+        launcher = Launcher(reply_when=lambda: True)
+        bridge = _bridge(None, launcher, initialized=False, startup_replied=False)
+        assert bridge._run_startup_until_replies(cycles=10_000, max_iters=5) == [REPLY]
+        assert bridge.state.startup_replied is True
+
     def test_main_loop_is_kept_after_startup(self):
         """Once recorded, the main loop stays, as before."""
         launcher = self._launcher()
@@ -298,7 +327,7 @@ class TestBusyHandlerWhileIdle:
         launcher = Launcher([BUSY] * 5)
         bridge = _bridge(Timer(clock), launcher, pc=0x4800, block_state=None)
         bridge._busy_ran_out = True
-        assert bridge.run_due_timers() == 0.0
+        assert bridge.run_due_timers() == Timer.MIN_DELAY
         assert launcher.bursts == 3
         assert bridge._busy_ran_out is True
         assert bridge.run_due_timers() is None
@@ -322,8 +351,8 @@ class TestBusyHandlerWhileIdle:
         launcher = Launcher([BUSY] * 100)
         bridge = _bridge(Timer(clock), launcher, pc=0x4800, block_state=None)
         bridge._busy_ran_out = True
-        assert bridge.run_due_timers() == 0.0
-        assert bridge.run_due_timers() == 0.0
+        assert bridge.run_due_timers() == Timer.MIN_DELAY
+        assert bridge.run_due_timers() == Timer.MIN_DELAY
         assert launcher.bursts == 4
         assert bridge.run_due_timers() is None
         assert launcher.bursts == 4
@@ -338,22 +367,54 @@ class TestBusyHandlerWhileIdle:
         launcher = Launcher([BUSY, PARKED] + [BUSY] * 10, wake=lambda burst: burst == 2)
         bridge = _bridge(Timer(clock), launcher, pc=0x4800, block_state=None)
         bridge._busy_ran_out = True
-        assert bridge.run_due_timers() == 0.0
+        assert bridge.run_due_timers() == Timer.MIN_DELAY
         assert launcher.resumes == 1
         assert launcher.bursts == 4  # busy, parks with a wake, busy twice
-        assert bridge._busy_ran_out is True
+        # It waited, so the next packet gets the full limit; the thread runs it on.
+        assert bridge._busy_ran_out is False
+        assert bridge._idle_unfinished is True
 
     def test_handler_that_keeps_waking_itself_is_run_on(self, clock):
         """A slice that ends at max_iters parks, each with a wake, leaves it running."""
         launcher = Launcher([BUSY] + [PARKED] * 60, wake=lambda burst: burst <= 55)
         bridge = _bridge(Timer(clock), launcher, pc=0x4800, block_state=None)
         bridge._busy_ran_out = True
-        assert bridge.run_due_timers() == 0.0
+        assert bridge.run_due_timers() == Timer.MIN_DELAY
         assert launcher.bursts == 51
-        assert bridge._busy_ran_out is True
+        assert bridge._busy_ran_out is False  # not caught in a busy loop
+        assert bridge._idle_unfinished is True
         assert bridge.run_due_timers() is None
         assert launcher.bursts == 56  # it parked with nothing pending
-        assert bridge._busy_ran_out is False
+        assert bridge._idle_unfinished is False
+
+    def test_handler_kept_awake_by_a_stray_reply_is_drained(self, clock):
+        """A reply no one takes is drained after a run that leaves it awake."""
+        launcher = Launcher([BUSY] + [PARKED] * 60, wake=lambda burst: True)
+        bridge = _bridge(Timer(clock), launcher, pc=0x4800, block_state=None)
+        pmgr = bridge.vh.slm.exec_impl.port_mgr
+        pmgr.register_port(0x6300)
+        pmgr.put_msg(0x6300, 0x1800)  # another device's reply
+        bridge._busy_ran_out = True
+        assert bridge.run_due_timers() == Timer.MIN_DELAY
+        assert not pmgr.has_msg(0x6300)
+
+    def test_waking_itself_uses_up_the_idle_budget(self, clock, monkeypatch):
+        """Each look that leaves it awake costs a slice, so the thread stops."""
+        monkeypatch.setattr(fs.HandlerBridge, "_MAX_BUSY_CYCLES",
+                            2 * fs.HandlerBridge._SHORT_BUSY_CYCLES)
+        launcher = Launcher([PARKED] * 1000, wake=lambda burst: True)
+        bridge = _bridge(Timer(clock), launcher, pc=0x4800, block_state=None)
+        bridge._idle_unfinished = True
+        assert bridge.run_due_timers() == Timer.MIN_DELAY
+        assert bridge.run_due_timers() == Timer.MIN_DELAY
+        assert bridge.run_due_timers() is None
+        assert launcher.bursts == 100
+
+    def test_packet_wait_takes_the_handler_over(self, clock):
+        bridge = _bridge(Timer(clock), Launcher(reply_when=lambda: True))
+        bridge._idle_unfinished = True
+        assert bridge._run_until_replies() == [REPLY]
+        assert bridge._idle_unfinished is False
 
     def test_timer_resume_that_runs_out_uses_the_idle_budget(self, clock, monkeypatch):
         """Its cycles count, so a handler caught in a loop is left at once."""
@@ -361,7 +422,7 @@ class TestBusyHandlerWhileIdle:
         timer = Timer(clock, [(0.0, TASK, 0x1)])
         launcher = Launcher([BUSY] * 100)
         bridge = _bridge(timer, launcher)
-        assert bridge.run_due_timers() == 0.0
+        assert bridge.run_due_timers() == Timer.MIN_DELAY
         assert launcher.bursts == 2
         assert bridge._busy_ran_out is True
         assert bridge.run_due_timers() is None
@@ -413,6 +474,54 @@ class TestPacketWaitSleepsToTimer:
         assert bridge._run_until_replies() == [REPLY]
         assert clock.sleeps == [pytest.approx(0.3)]
         assert timer.fast_forwards == 0
+
+    def test_coarse_clock_still_delivers_within_the_wait(self, monkeypatch):
+        """A sleep that ends before the clock's next tick does not lose the timer."""
+        clock = Clock(tick=1 / 64)
+        monkeypatch.setattr(fs.time, "sleep", clock.sleep)
+        timer = Timer(clock, [(0.3, TASK, 0x1)])
+        bridge = _bridge(timer, Launcher(reply_when=lambda: timer.deliveries > 0))
+        assert bridge._run_until_replies() == [REPLY]
+        assert len(clock.sleeps) > 1
+
+    # The handler parked in its main-loop WaitPort() on its DOS port.
+    MAIN_LOOP_WAITPORT = {"waitport_blocked_sp": MAIN_SP - 4,
+                          "waitport_blocked_port": DOS_PORT,
+                          "waitport_blocked_ret": MAIN_PC, "waitpkt_blocked": False}
+
+    @pytest.mark.parametrize("children", [False, True],
+                             ids=["its timer replies to the DOS port", "a child's timer"])
+    def test_waitport_main_loop_gets_a_reply_that_waits_on_a_timer(self, clock, children):
+        """A handler in WaitPort() on its DOS port is slept for too.
+
+        Its own timer request may reply to that port, which wakes it; or a
+        child replies once its own timer fired.
+        """
+        timer = Timer(clock, [(0.3, CHILD if children else TASK, 0x1)])
+        launcher = Launcher(reply_when=lambda: not children and timer.deliveries > 0)
+        run_burst = launcher.run_burst
+
+        def in_waitport(state, max_cycles=0, debug=False):
+            rs = run_burst(state, max_cycles, debug)
+            state.block_state = dict(self.MAIN_LOOP_WAITPORT)
+            return rs
+
+        launcher.run_burst = in_waitport
+        bridge = _bridge(timer, launcher, block_state=dict(self.MAIN_LOOP_WAITPORT))
+        if children:
+            def run_children(cycles_per_child):
+                # The child replies once its timer was delivered.
+                if timer.deliveries and not launcher.polls_since_reply:
+                    launcher.queued.append(REPLY)
+                    launcher.polls_since_reply = 1
+                return 1
+
+            launcher.polls_since_reply = 0
+            bridge.proc_mgr = SimpleNamespace(
+                processes={CHILD: SimpleNamespace(is_child=True, exited=False, port_addr=0x6400)},
+                run_all_ready_children=run_children)
+        assert bridge._run_until_replies() == [REPLY]
+        assert clock.sleeps == [pytest.approx(0.3)]
 
     def test_timer_beyond_the_wait_is_not_slept_to(self, clock):
         timer = Timer(clock, [(fs.HandlerBridge._PACKET_TIMER_WAIT + 0.5, TASK, 0x1)])
