@@ -2245,9 +2245,10 @@ class TestHandlerBridgeWriteChunks:
         sizes = [c.args[0] for c in bridge._alloc_read_buf.call_args_list]
         assert max(sizes) == chunk
 
-    def test_only_a_write_of_several_chunks_measures_the_end(self, fuse_mock):
-        """A write of one chunk sends no seek. A larger write seeks to the
-        end and back before its first chunk and lands where the handle was."""
+    def test_only_a_write_without_an_extent_measures_the_end(self, fuse_mock):
+        """A write given no extent seeks to the end and back before its
+        first chunk and lands where the handle was. A write given one
+        sends no seek."""
         import amifuse.fuse_fs as fuse_fs_mod
 
         chunk = fuse_fs_mod.IO_CHUNK
@@ -2257,11 +2258,12 @@ class TestHandlerBridgeWriteChunks:
         one, two = _pattern(chunk), _pattern(chunk + 1)
 
         assert bridge.write_handle_reply(self.FH_ADDR, one) == (chunk, 0)
-        bridge.launcher.send_seek_handle.assert_not_called()
-        assert bridge.write_handle_reply(self.FH_ADDR, two) == (chunk + 1, 0)
         seeks = [c.args[1:] for c in bridge.launcher.send_seek_handle.call_args_list]
         assert seeks == [(self.FH_ADDR, 0, fuse_fs_mod.OFFSET_END),
-                         (self.FH_ADDR, 3 + chunk, fuse_fs_mod.OFFSET_BEGINNING)]
+                         (self.FH_ADDR, 3, fuse_fs_mod.OFFSET_BEGINNING)]
+        end = 3 + chunk
+        assert bridge.write_handle_reply(self.FH_ADDR, two, (end, end)) == (chunk + 1, 0)
+        assert bridge.launcher.send_seek_handle.call_count == 2
         assert handler.data == self.ORIGINAL[:3] + one + two
 
     @pytest.mark.parametrize("failed_seek", [1, 2], ids=["to-end", "back"])
@@ -2534,7 +2536,8 @@ class TestHandlerBridgeWriteChunks:
         return fs, fake, fs.open("/big.bin", os.O_RDWR)
 
     def test_fuse_write_larger_than_memory(self, write_fs):
-        """One write() of 9 MiB lands whole, and the next follows it without a seek."""
+        """One write() of 9 MiB lands whole, and the next follows it without
+        a seek to its offset, only the two that measure the end."""
         import amifuse.fuse_fs as fuse_fs_mod
 
         handler = _FakeHandlerFile(b"", capacity=16 << 20)
@@ -2544,7 +2547,7 @@ class TestHandlerBridgeWriteChunks:
         assert fs.write("/big.bin", data, 0, handle) == len(data)
         seeks = fake.launcher.send_seek_handle.call_count
         assert fs.write("/big.bin", b"tail", len(data), handle) == 4
-        assert fake.launcher.send_seek_handle.call_count == seeks
+        assert fake.launcher.send_seek_handle.call_count == seeks + 2
         assert handler.data == data + b"tail"
         assert max(handler.writes) == fuse_fs_mod.IO_CHUNK
 
@@ -2565,7 +2568,8 @@ class TestHandlerBridgeWriteChunks:
         assert handler.data == b""
         seeks = fake.launcher.send_seek_handle.call_count
         assert fs.write("/big.bin", b"x", 0, handle) == 1
-        assert fake.launcher.send_seek_handle.call_count == seeks + 1
+        # The seek to 0, then the two that measure the end.
+        assert fake.launcher.send_seek_handle.call_count == seeks + 3
         assert handler.data == b"x"
 
     def test_fuse_failed_write_keeps_created_size(self, write_fs):
@@ -2742,9 +2746,8 @@ class TestHandlerBridgeWriteAt:
     def test_write_handle_reply_keeps_res2(self, fuse_mock, reply, expected):
         import amifuse.fuse_fs as fuse_fs_mod
 
-        handler = _FakeHandlerFile(b"")
+        handler = _FakeHandlerFile(b"", write_reply=reply)
         bridge = _fake_write_bridge(fuse_fs_mod, handler)
-        bridge._run_until_replies = MagicMock(side_effect=[reply, reply])
 
         assert bridge.write_handle_reply(self.FH_ADDR, self.DATA) == expected
         # write_handle keeps returning only the count, for the CLI.

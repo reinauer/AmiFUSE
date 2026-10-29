@@ -172,10 +172,9 @@ class TestLargeTransfers:
 
         In one packet such a write left nothing behind on pfs3aio and
         SmartFilesystem. In packets, those before the failed one were on
-        the disk and kept the free space they had used. A write of one
-        packet is not undone, and FastFileSystem keeps the part of it that
-        it wrote. After the shrink, SmartFilesystem failed the next write
-        at the new end until the handle moved.
+        the disk and kept the free space they had used. After the shrink,
+        SmartFilesystem failed the next write at the new end until the
+        handle moved.
         """
         image, driver, partition, _ = small_volume
         head = _pattern(1000)
