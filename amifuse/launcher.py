@@ -173,20 +173,28 @@ def _select_drive_letter() -> Optional[str]:
     return chosen[0] if chosen else None
 
 
+_ERROR_ACCESS_DENIED = 5
 _ERROR_ALREADY_EXISTS = 183
+# Local\ (this session), not Global\: a launch's drive letters belong to its
+# session, so launches in other sessions need not skip them. The
+# exception, elevated launches in two sessions that make global drives at
+# the same moment, is not covered.
+_CLAIM_NAME = "Local\\AmiFUSE-drive-{}"
 _kernel32 = None
 
 
 def _claim_drive_letter(letter: str):
     """Claim ``letter`` for this launch; return the claim's handle, or ``None``
-    when a launch (this one or another) already holds it. A claim that
-    cannot be created, e.g. one an elevated launch holds, counts as held.
+    when a launch (this one or another) already holds it. ``ACCESS_DENIED``,
+    the answer for a claim an elevated launch holds, counts as held. Any
+    other failure to create the claim is logged and returns 0: the letter is
+    then used unclaimed, as before claims existed.
 
     A letter stays unallocated until its mount is up, seconds after it was
     selected, so launches that run at once would otherwise pick the same one.
-    The claim is the named mutex ``Local\\AmiFUSE-drive-<letter>``, which
-    exists for as long as a handle to it is open: closing the handle, or the
-    launcher exiting, releases the letter."""
+    The claim is the named mutex ``_CLAIM_NAME``, which exists for as long as
+    a handle to it is open: closing the handle, or the launcher exiting,
+    releases the letter."""
     global _kernel32
     if _kernel32 is None:
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -197,11 +205,13 @@ def _claim_drive_letter(letter: str):
         kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
         _kernel32 = kernel32
     ctypes.set_last_error(0)
-    handle = _kernel32.CreateMutexW(
-        None, False, f"Local\\AmiFUSE-drive-{letter[0]}"
-    )
+    handle = _kernel32.CreateMutexW(None, False, _CLAIM_NAME.format(letter[0]))
     if not handle:
-        return None
+        error = ctypes.get_last_error()
+        if error == _ERROR_ACCESS_DENIED:
+            return None
+        _log(f"Could not claim {letter} (error {error}); using it unclaimed")
+        return 0
     if ctypes.get_last_error() == _ERROR_ALREADY_EXISTS:
         _kernel32.CloseHandle(handle)
         return None
@@ -209,8 +219,9 @@ def _claim_drive_letter(letter: str):
 
 
 def _claim_drive_letters(n: int) -> tuple[list[str], list]:
-    """Return up to ``n`` free letters that this launch has claimed, as
-    ``"X:"`` strings, and their claim handles.
+    """Return up to ``n`` free letters, as ``"X:"`` strings, and the handles
+    of the claims this launch holds on them. A letter whose claim cannot be
+    created (:func:`_claim_drive_letter` returns 0) comes without a handle.
 
     A letter is free when :func:`_select_drive_letters` reports it, no launch
     holds its claim (:func:`_claim_drive_letter`), and it is still
@@ -227,10 +238,12 @@ def _claim_drive_letters(n: int) -> tuple[list[str], list]:
         # drive is up unless the mount timed out, so a letter claimed just
         # after another launch's drive arrived shows as allocated here.
         if letter[0] in platform._windows_allocated_drive_letters():
-            _kernel32.CloseHandle(handle)
+            if handle:
+                _kernel32.CloseHandle(handle)
             continue
         chosen.append(letter)
-        claims.append(handle)
+        if handle:
+            claims.append(handle)
     return chosen, claims
 
 

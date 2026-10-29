@@ -186,3 +186,37 @@ def test_letter_allocated_just_before_its_claim_is_skipped(world, monkeypatch):
     assert w.spawned == ["E:"]
     assert w.opened == ["E:\\"]
     assert w.dialogs == []
+
+
+def test_claims_that_cannot_be_created_use_the_letters_unclaimed(world,
+                                                                 tmp_path):
+    """No claim can be created: an object of another type holds every
+    claim's name, so each fails with an error other than ACCESS_DENIED. The
+    launch logs it and mounts on D: unclaimed, as before claims, instead of
+    finding no letter."""
+    import ctypes
+
+    w = world
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateEventW.restype = ctypes.c_void_p
+    kernel32.CreateEventW.argtypes = [
+        ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_wchar_p,
+    ]
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    events = [
+        kernel32.CreateEventW(None, True, False, w.mod._CLAIM_NAME.format(c))
+        for c in w.mod._DRIVE_LETTER_ALPHABET
+    ]
+    try:
+        assert all(events)
+        w.on_sleep = lambda: w.drives.add(w.spawned[0][0])
+        w.mod.main(["mount", "a.adf"])
+    finally:
+        for event in events:
+            if event:
+                kernel32.CloseHandle(event)
+
+    assert w.spawned == ["D:"]
+    assert w.dialogs == []
+    assert "Could not claim D: (error 6)" in (
+        tmp_path / "launcher.log").read_text()

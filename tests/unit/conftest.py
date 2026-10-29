@@ -4,6 +4,7 @@ import json
 import os
 import site
 import sys
+import uuid
 
 import pytest
 
@@ -32,6 +33,23 @@ def appdata_sandbox(monkeypatch, tmp_path):
     monkeypatch.setattr(windows_shell, "_LAUNCH_VBS", amifuse_dir / "launch.vbs")
     monkeypatch.setattr(launcher, "_LOG_DIR", amifuse_dir)
     return amifuse_dir
+
+
+@pytest.fixture(autouse=True)
+def launcher_claim_names(monkeypatch):
+    """Give each test its own names for the launcher's drive-letter claims.
+
+    The claims are real named mutexes in this Windows session. With the real
+    names, a launch running on the machine would make the tests skip D:, the
+    tests would make it skip letters, and a claim left by a failing test
+    would move every later test's letters.
+    """
+    from amifuse import launcher
+
+    monkeypatch.setattr(
+        launcher, "_CLAIM_NAME",
+        f"Local\\AmiFUSE-test-{uuid.uuid4().hex}-drive-{{}}",
+    )
 
 
 @pytest.fixture

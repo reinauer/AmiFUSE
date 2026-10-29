@@ -55,7 +55,7 @@ def launcher(monkeypatch, tmp_path):
         "_enumerate_mount_units",
         lambda image: ([mod._MountUnit(name=None, label="floppy disk")], None),
     )
-    # Another launch's mount already holds D:.
+    # Something other than this launch already holds D:.
     monkeypatch.setattr(mod.os.path, "exists", lambda p: str(p) == "D:\\")
     opened = []
     monkeypatch.setattr(mod.os, "startfile", lambda p: opened.append(str(p)))
