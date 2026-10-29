@@ -1030,39 +1030,26 @@ class TestInspectMultiRdb:
 
     def test_json_shared_name_is_not_given_the_first_rdbs_driver(
             self, user_driver_dir, tmp_path, capsys):
-        """mount --partition dh0 opens the first RDB, whose DH0 matches the
-        name, so the second RDB's dh0 has no driver mount would use."""
+        """The second RDB's dh0 mounts as dh0.1, from its own RDB, which
+        has no driver, so the bundled file serves it."""
         first, second = self._partitions(_two_rdbs(tmp_path, "dh0"), capsys)
         assert first["driver"]["source"] == "rdb"
-        assert second["driver"] is None
-        assert second["driver_note"] == (
-            "another RDB on this disk also has a partition named dh0, "
-            "and mount --partition dh0 uses that one")
+        assert "mount_name" not in first
+        assert second["mount_name"] == "dh0.1"
+        assert second["driver"]["source"] == "bundled"
+        assert "driver_note" not in second
 
-    def test_text_says_why_partitions_are_missing(
+    def test_text_lists_a_repeated_name_renamed(
             self, user_driver_dir, tmp_path, capsys):
         from amifuse.fuse_fs import main
 
         main(["inspect", str(_two_rdbs(tmp_path, "DH0"))])
         out = capsys.readouterr().out
-        assert out.endswith(
-            "Filesystem driver per partition (without --driver):\n"
-            "  DH0: DOS3/0x444f5303 (from RDB)\n"
-            "  Note: multiple RDBs with colliding partition names ('DH0'); "
-            "mounted first only\n")
-
-    def test_json_failed_lookup_is_not_a_clash(
-            self, user_driver_dir, tmp_path, capsys, monkeypatch):
-        """A name mount's lookup cannot place gets the driver mount would
-        use, not a clash note."""
-        from amifuse import rdb_inspect
-
-        image = _two_rdbs(tmp_path, "dh0")
-        monkeypatch.setattr(rdb_inspect, "find_partition_mbr_index",
-                            lambda *a: None)
-        for part in self._partitions(image, capsys):
-            assert part["driver"]["source"] == "rdb"
-            assert "driver_note" not in part
+        first, second = out.split(
+            "Filesystem driver per partition (without --driver):\n")[1].splitlines()
+        assert first == "  DH0: DOS3/0x444f5303 (from RDB)"
+        assert second.startswith(
+            "  DH0.1: FastFileSystem 0.2 (21.10.2026) (bundled, ")
 
     def test_json_lookup_error_is_the_drivers_note(
             self, user_driver_dir, tmp_path, capsys, monkeypatch):
@@ -1075,7 +1062,7 @@ class TestInspectMultiRdb:
                           f"open with 1024-byte blocks")
 
         image = _two_rdbs(tmp_path, "DH1")
-        monkeypatch.setattr(rdb_inspect, "find_partition_mbr_index", refuse)
+        monkeypatch.setattr(rdb_inspect, "find_partition", refuse)
         parts = self._partitions(image, capsys)
         assert [part["driver_note"] for part in parts] == [
             "Partition DH0 is in an RDB that does not open with 1024-byte "
@@ -1145,11 +1132,8 @@ def _two_partitions(tmp_path, second_drive, second_type):
 
 
 class TestInspectSameRdbNames:
-    """mount --partition NAME takes the first partition of that name in an
-    RDB, so a later one of the same name gets no driver."""
-
-    NOTE = ("an earlier partition in this RDB is also named dh0, "
-            "and mount --partition dh0 uses that one")
+    """A later partition named like an earlier one in its RDB mounts as
+    dh0.1, and gets the driver mount --partition dh0.1 would use."""
 
     def _partitions(self, image, capsys):
         from amifuse.fuse_fs import main
@@ -1157,12 +1141,18 @@ class TestInspectSameRdbNames:
         main(["inspect", "--json", str(image)])
         return json.loads(capsys.readouterr().out)["partitions"]
 
+    NOTE = ("No embedded filesystem driver found for this partition. "
+            "You need to specify a filesystem handler with --driver")
+
     def test_json_shared_name(self, user_driver_dir, tmp_path, capsys):
-        """The second dh0 gets no driver, although the bundled handler would
-        serve its DOS type, because mount --partition dh0 reaches DH0."""
+        """The second dh0, of DOS type PFS3, is not given the bundled
+        handler that serves DH0's DOS3."""
         first, second = self._partitions(
-            _two_partitions(tmp_path, "dh0", "DOS7"), capsys)
+            _two_partitions(tmp_path, "dh0", "PFS3"), capsys)
         assert first["driver"]["source"] == "bundled"
+        assert "mount_name" not in first
+        assert second["name"] == "dh0"
+        assert second["mount_name"] == "dh0.1"
         assert second["driver"] is None
         assert second["driver_note"] == self.NOTE
 
@@ -1175,10 +1165,10 @@ class TestInspectSameRdbNames:
     def test_text_shared_name(self, user_driver_dir, tmp_path, capsys):
         from amifuse.fuse_fs import main
 
-        main(["inspect", str(_two_partitions(tmp_path, "dh0", "DOS7"))])
+        main(["inspect", str(_two_partitions(tmp_path, "dh0", "PFS3"))])
         out = capsys.readouterr().out
         assert "  DH0: FastFileSystem 0.2 (21.10.2026) (bundled, " in out
-        assert out.endswith(f"  dh0: {self.NOTE}\n")
+        assert out.endswith(f"\n  dh0.1: {self.NOTE}\n")
 
     def test_text_distinct_names(self, user_driver_dir, tmp_path, capsys):
         from amifuse.fuse_fs import main
@@ -1187,4 +1177,4 @@ class TestInspectSameRdbNames:
         out = capsys.readouterr().out
         assert "  DH0: FastFileSystem 0.2 (21.10.2026) (bundled, " in out
         assert "  DH1: FastFileSystem 0.2 (21.10.2026) (bundled, " in out
-        assert "earlier partition" not in out
+        assert "DH0.1" not in out

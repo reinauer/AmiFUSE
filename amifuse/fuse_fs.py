@@ -374,6 +374,7 @@ class HandlerBridge:
         ba = BootstrapAllocator(
             self.vh, image, block_size=block_size, partition=partition, adf_info=adf_info,
             iso_info=iso_info, mbr_partition_index=mbr_idx,
+            partition_number=self.backend.partition_number,
         )
         if adf_info:
             handler_name = "DF0:"
@@ -4602,19 +4603,24 @@ class AmigaFuseFS(_FuseOperations):
 
 
 def get_partition_info(image: Path, block_size: Optional[int], partition: Optional[str]) -> dict:
-    """Get partition name and dostype from RDB."""
-    from .rdb_inspect import open_rdisk, find_partition_mbr_index
-    mbr_idx = find_partition_mbr_index(image, block_size, partition) if partition else None
+    """Get partition name and dostype from RDB.
+
+    The name is the one the partition mounts as: a repeated drive name reads
+    DH0.1 (rdb_inspect.find_partition).
+    """
+    from .rdb_inspect import open_rdisk, find_partition
+    ref = find_partition(image, block_size, partition) if partition else None
+    mbr_idx = ref.mbr_partition_index if ref else None
     blkdev, rdisk, _mbr_ctx = open_rdisk(image, block_size=block_size, mbr_partition_index=mbr_idx)
     try:
         if partition is None:
             part = rdisk.get_partition(0)
         else:
-            part = rdisk.find_partition_by_string(str(partition))
+            part = rdisk.get_partition(ref.number) if ref else None
         if part is None:
             return {"name": "AmigaFS", "dostype": None}
         return {
-            "name": str(part.get_drive_name()),
+            "name": ref.name if ref and ref.name else str(part.get_drive_name()),
             "dostype": part.part_blk.dos_env.dos_type,
         }
     finally:
@@ -4658,16 +4664,17 @@ def extract_embedded_driver(
     picked in its place.
     """
     import tempfile
-    from .rdb_inspect import open_rdisk, find_partition_mbr_index
+    from .rdb_inspect import open_rdisk, find_partition
 
-    mbr_idx = find_partition_mbr_index(image, block_size, partition) if partition else None
+    ref = find_partition(image, block_size, partition) if partition else None
+    mbr_idx = ref.mbr_partition_index if ref else None
     blkdev, rdisk, _mbr_ctx = open_rdisk(image, block_size=block_size, mbr_partition_index=mbr_idx)
     try:
         # Get the partition and its dostype
         if partition is None:
             part = rdisk.get_partition(0)
         else:
-            part = rdisk.find_partition_by_string(str(partition))
+            part = rdisk.get_partition(ref.number) if ref else None
         if part is None:
             return None
 
@@ -6334,7 +6341,7 @@ def cmd_inspect(args):
     from .rdb_inspect import (
         open_each_rdb, detect_adf, detect_iso, list_partitions,
         amiga_rdb_partitions, build_rdisk_desc, print_inspect_report,
-        find_partition_mbr_index,
+        mount_names,
     )
 
     use_json = getattr(args, "json", False)
@@ -6421,7 +6428,7 @@ def cmd_inspect(args):
         # is fatal here so scripts get a definitive error envelope.
         amiga_parts = amiga_rdb_partitions(args.image)
         all_rdbs = []
-        rdb_indices = []
+        rdb_parts = []
         for rdb_idx, opened in open_each_rdb(
                 args.image, args.block_size, len(amiga_parts)):
             if isinstance(opened, IOError):
@@ -6432,49 +6439,20 @@ def cmd_inspect(args):
             blkdev, rdisk, mbr_ctx = opened
             try:
                 all_rdbs.append(build_rdisk_desc(rdisk, mbr_ctx))
-                rdb_indices.append(rdb_idx)
+                rdb_parts.append(list(rdisk.parts))
             finally:
                 rdisk.close()
                 blkdev.close()
 
         # Resolved with the image closed: a Windows disk admits one reader.
-        multi_rdb = len(all_rdbs) > 1
-        disk_names = ({p["name"].lower() for p in all_rdbs[0]["partitions"]}
-                      if rdb_indices and rdb_indices[0] is None else set())
-        for rdb_idx, desc in zip(rdb_indices, all_rdbs):
-            seen = set()
-            for part in desc["partitions"]:
-                name = part["name"]
-                earlier = name.lower() in seen
-                seen.add(name.lower())
-                # mount --partition picks the first RDB holding the name, so
-                # a same-named partition in a later RDB cannot be mounted.
-                # None stands for the disk's own RDB beside the MBR.
-                selected = rdb_idx
-                if multi_rdb:
-                    try:
-                        selected = find_partition_mbr_index(
-                            args.image, args.block_size, name)
-                    except (IOError, AttributeError):
-                        # A failed lookup, or a damaged drive name (#192):
-                        # the driver lookup below meets the same error and
-                        # gives it as the note.
-                        pass
-                    if selected is None and name.lower() not in disk_names:
-                        # Unless the disk's own RDB holds the name, None
-                        # means no RDB was found holding it.
-                        selected = rdb_idx
-                if selected != rdb_idx:
-                    part["driver"] = None
-                    part["driver_note"] = (
-                        f"another RDB on this disk also has a partition named "
-                        f"{name}, and mount --partition {name} uses that one")
-                    continue
-                # Within an RDB, mount --partition picks the first match too.
-                if earlier:
-                    part["driver"] = None
-                    part["driver_note"] = _earlier_name_note(name)
-                    continue
+        for desc, names in zip(all_rdbs, mount_names(rdb_parts)):
+            for part, name in zip(desc["partitions"], names):
+                if name is None:
+                    name = part["name"]
+                elif name != part["name"]:
+                    # A repeated drive name, which mount --partition takes
+                    # as AmigaOS names it.
+                    part["mount_name"] = name
                 part["driver"], text = _partition_driver(
                     args.image, args.block_size, name)
                 if part["driver"] is None:
@@ -6493,24 +6471,10 @@ def cmd_inspect(args):
 
     print_inspect_report(args.image, args.block_size, args.full)
     print("\nFilesystem driver per partition (without --driver):")
-    listed = list_partitions(args.image, args.block_size)
-    # Without a fallback, names repeat only within one RDB.
-    seen = set()
-    for part in listed.partitions:
-        if part.name.lower() in seen:
-            text = _earlier_name_note(part.name)
-        else:
-            text = _partition_driver(args.image, args.block_size, part.name)[1]
-        seen.add(part.name.lower())
+    # Names are unique: list_partitions renames a repeated one (DH0.1).
+    for part in list_partitions(args.image, args.block_size).partitions:
+        text = _partition_driver(args.image, args.block_size, part.name)[1]
         print(f"  {part.name}: {text}")
-    if listed.fallback_reason:
-        print(f"  Note: {listed.fallback_reason}")
-
-
-def _earlier_name_note(name: str) -> str:
-    """Why a partition named like an earlier one in its RDB has no driver."""
-    return (f"an earlier partition in this RDB is also named {name}, "
-            f"and mount --partition {name} uses that one")
 
 
 def cmd_mount(args):

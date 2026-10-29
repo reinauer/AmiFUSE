@@ -693,8 +693,8 @@ class TestMountImageAllFanOut:
     def test_fallback_reason_surfaced_in_summary(
         self, mock_popen, mock_windll, mock_exit, fanout
     ):
-        """A duplicate-name fallback_reason is surfaced in the summary dialog even
-        though the (single) mount itself succeeds."""
+        """A fallback_reason, if list_partitions sets one, is surfaced in the
+        summary dialog even though the (single) mount itself succeeds."""
         configure, _opened = fanout
         reason = ("multiple RDBs with colliding partition names "
                   "('DH0'); mounted first only")
@@ -959,8 +959,9 @@ class TestEnumerateMountUnits:
         assert fallback is None
 
     def test_duplicate_name_fallback_returns_reason_and_single_unit(self, rdb):
-        """The duplicate-name fallback (partitions == [first], fallback_reason set)
-        collapses to one no---partition unit and propagates the reason."""
+        """A fallback (partitions == [first], fallback_reason set), if
+        list_partitions gives one, collapses to one no---partition unit and
+        propagates the reason."""
         helper = rdb(adf=None, iso=None)
         reason = "multiple RDBs with colliding partition names ('DH0'); mounted first only"
         rdb(adf=None, iso=None,
