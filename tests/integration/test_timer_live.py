@@ -7,12 +7,12 @@ write back, FFS too), so each must see deliveries, and the image must
 change while the mount idles.
 
 The probe counts the uses of timer.device that a delayed reply would
-break. amitools' Exec waits for neither DoIO, which returns with the
-request still pending, nor WaitIO on a pending request. WaitPort on the
-reply port of a pending request spins if the port manager does not know
-the port. And a packet wait that ends without a reply while a timer is
-pending may have left the handler waiting for its own timer. All four
-must stay at zero.
+break. Exec in vamos cannot wait in DoIO, or in WaitIO on a pending
+request, so AmiFUSE's completes such a request before its delay, and the
+device counts it. WaitPort on the reply port of a pending request spins
+if the port manager does not know the port. And a packet wait that ends
+without a reply while a timer is pending may have left the handler
+waiting for its own timer. All four must stay at zero.
 """
 
 import os
@@ -37,11 +37,11 @@ DATA = bytes(range(256)) * 300  # 76,800 bytes: several blocks, two packets
 def timer_probe(monkeypatch):
     """Count the uses of timer.device that a delayed reply would break.
 
-    DoIO left pending, WaitIO on a pending request, WaitPort on an
-    unregistered reply port of a pending request, and packet waits that
-    ended without a reply while a request was pending. Library stubs bind
-    ExecLibrary's methods when a runtime is set up, so the class is
-    patched before the bridge is built.
+    WaitPort on an unregistered reply port of a pending request, and
+    packet waits that ended without a reply while a request was pending;
+    DoIO and WaitIO on a pending request are the device's own count.
+    Library stubs bind ExecLibrary's methods when a runtime is set up, so
+    the class is patched before the bridge is built.
     """
     from amifuse.fuse_fs import HandlerBridge
     from amitools.vamos.lib.ExecLibrary import ExecLibrary
@@ -49,20 +49,8 @@ def timer_probe(monkeypatch):
 
     counts = Counter()
     devices = []
-    do_io, wait_io, wait_port = ExecLibrary.DoIO, ExecLibrary.WaitIO, ExecLibrary.WaitPort
+    wait_port = ExecLibrary.WaitPort
     run_until_replies = HandlerBridge._run_until_replies
-
-    def pending(io_request):
-        return any(io_request in dev._pending for dev in devices)
-
-    def DoIO(self, ctx, io_request):
-        result = do_io(self, ctx, io_request)
-        counts["DoIO"] += pending(io_request)
-        return result
-
-    def WaitIO(self, ctx, io_request):
-        counts["WaitIO"] += pending(io_request)
-        return wait_io(self, ctx, io_request)
 
     # Annotated as ExecLibrary's own: the stub converts arguments by them.
     def WaitPort(self, ctx, msg_port: MsgPort) -> Message:
@@ -77,8 +65,6 @@ def timer_probe(monkeypatch):
         counts["NoReply"] += not replies and any(dev._pending for dev in devices)
         return replies
 
-    monkeypatch.setattr(ExecLibrary, "DoIO", DoIO)
-    monkeypatch.setattr(ExecLibrary, "WaitIO", WaitIO)
     monkeypatch.setattr(ExecLibrary, "WaitPort", WaitPort)
     monkeypatch.setattr(HandlerBridge, "_run_until_replies", _run_until_replies)
     return counts, devices
@@ -153,7 +139,8 @@ def test_idle_mount_delivers_timers(fixture_root, tmp_path, timer_probe,
         assert not bridge.state.crashed
     finally:
         fs.destroy("/")
-    assert [counts[k] for k in ("DoIO", "WaitIO", "WaitPort", "NoReply")] == [0, 0, 0, 0]
+    assert timer.completed_early == {}
+    assert [counts[k] for k in ("WaitPort", "NoReply")] == [0, 0]
     assert _read_back(image, driver, adf_info, "/timer_live.bin") == DATA
 
 
