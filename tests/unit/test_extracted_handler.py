@@ -25,8 +25,10 @@ HOSTILE = {
     "nul": (0x00414201, "\\x00AB1"),
     "colon": (0x413A4201, "A:B1"),
     "slash-dotdot": (0x2F2E2E01, "/..1"),
-    "backslash-dotdot": (0x5C2E2E01, "\\..1"),
+    "backslash-dotdot": (0x5C2E2E01, "\\x5c..1"),
     "c1-csi": (0x9B324A20, "\\x9b2J "),
+    # A backslash and "x1b", which must not pass for an escaped ESC.
+    "faked-escape": (0x5C783162, "\\x5cx1b"),
 }
 
 
@@ -194,8 +196,9 @@ def test_failing_bridge_close_still_removes_extracted_handler(
 
 
 def test_failed_removal_keeps_the_mount_error(
-        monkeypatch, tmp_path, temp_dir, extracted, bridge, fuse_runs):
-    """A handler that cannot be removed does not hide why the mount ended."""
+        monkeypatch, capsys, tmp_path, temp_dir, extracted, bridge, fuse_runs):
+    """A handler that cannot be removed is reported, and does not hide why
+    the mount ended."""
     failure = RuntimeError("WinFsp refused the mount")
     fuse_runs.side_effect = failure
     real_unlink = Path.unlink
@@ -215,6 +218,8 @@ def test_failed_removal_keeps_the_mount_error(
 
     assert caught.value is failure
     bridge.close.assert_called_once_with()
+    assert (f"[amifuse] could not remove {extracted.paths[0]}: "
+            in capsys.readouterr().err)
 
 
 @pytest.mark.parametrize("dos_type, shown", HOSTILE.values(), ids=HOSTILE)

@@ -4170,12 +4170,13 @@ def _dos_type_tag(dos_type: int) -> str:
     """Return a DOS type's tag, e.g. "PFS3", for printing.
 
     An image chooses the bytes, so a character outside 0x20-0x7E is shown
-    escaped, e.g. "\\x1b", and never reaches the terminal.
+    escaped, e.g. "\\x1b", and never reaches the terminal. A backslash is
+    escaped too, as "\\x5c", so that an escape cannot be faked.
     """
     import amitools.fs.DosType as DosType
 
     return "".join(
-        ch if " " <= ch <= "~" else f"\\x{ord(ch):02x}"
+        ch if " " <= ch <= "~" and ch != "\\" else f"\\x{ord(ch):02x}"
         for ch in DosType.num_to_tag_str(dos_type)
     )
 
@@ -4537,13 +4538,14 @@ def mount_fuse(
                 temp_volicon.unlink()
     finally:
         # Every exit removes the driver extracted from the RDB, also one
-        # that stops before mounting. A failed removal does not replace the
-        # message the mount exits with.
+        # that stops before mounting. A failed removal is reported, but does
+        # not replace the message the mount exits with.
         if temp_driver is not None:
             try:
                 temp_driver.unlink(missing_ok=True)
-            except OSError:
-                pass
+            except OSError as exc:
+                print(f"[amifuse] could not remove {temp_driver}: {exc}",
+                      file=sys.stderr)
 
 
 def format_volume(
