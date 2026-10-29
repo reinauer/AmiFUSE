@@ -117,11 +117,14 @@ def _read_back(image, driver, adf_info, path):
 def test_idle_mount_delivers_timers(fixture_root, tmp_path, timer_probe,
                                     driver_name, image_name):
     """While the mount idles after a write, the handler's timers fire."""
+    from amifuse.exec_library import AmiFuseExecLibrary
     from amifuse.fuse_fs import AmigaFuseFS, HandlerBridge
 
     image, driver, adf_info = _setup(fixture_root, tmp_path, driver_name, image_name)
     counts, devices = timer_probe
     bridge = HandlerBridge(image, driver, read_only=False, adf_info=adf_info)
+    # The device counts DoIO and WaitIO only under AmiFUSE's Exec.
+    assert type(bridge.vh.slm.exec_impl) is AmiFuseExecLibrary
     timer = bridge.vh.timer_device
     devices.append(timer)
     fs = AmigaFuseFS(bridge)

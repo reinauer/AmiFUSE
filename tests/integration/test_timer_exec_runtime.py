@@ -1,8 +1,8 @@
-"""AmiFuseExecLibrary and the timer.device unit token in a real runtime.
+"""AmiFuseExecLibrary and timer.device's Unit in a real runtime.
 
 Exec's stub binds its methods when exec.library opens, so the runtime
 registers AmiFuseExecLibrary before then; and amitools' OpenDevice must
-keep the token that timer.device writes into io_Unit.
+keep the Unit that timer.device puts into io_Unit.
 """
 
 from types import SimpleNamespace
@@ -31,7 +31,7 @@ def runtime():
 
 def test_exec_is_amifuses_and_a_copy_of_an_opened_request_is_held(runtime):
     """The runtime's Exec is AmiFuseExecLibrary; a copied request waits; WaitIO ends it."""
-    from amifuse.timer_device import AmiFuseExecLibrary
+    from amifuse.exec_library import AmiFuseExecLibrary
 
     exec_impl = runtime.slm.exec_impl
     assert type(exec_impl) is AmiFuseExecLibrary
@@ -43,7 +43,9 @@ def test_exec_is_amifuses_and_a_copy_of_an_opened_request_is_held(runtime):
         mem.w32(io + off, 0)
     name = SimpleNamespace(str="timer.device")
     assert exec_impl.OpenDevice(ctx, name, UNIT_VBLANK, io, 0) == 0
-    assert mem.r32(io + _IO_UNIT) != 0
+    unit = mem.r32(io + _IO_UNIT)
+    assert unit != 0
+    mem.r16(unit + 36)  # unit_OpenCnt: a Unit a handler can read
     for off in range(0, _REQ_SIZE, 4):
         mem.w32(copy + off, mem.r32(io + off))
     mem.w16(copy + 28, TR_ADDREQUEST)
@@ -56,3 +58,4 @@ def test_exec_is_amifuses_and_a_copy_of_an_opened_request_is_held(runtime):
     assert timer.next_deadline() == float("inf")
     assert timer.completed_early == {"WaitIO": 1}
     exec_impl.CloseDevice(ctx, io)
+    assert mem.r32(io + _IO_UNIT) == 0
