@@ -172,12 +172,14 @@ class VamosHandlerRuntime:
         if not self.slm.parse_config(libs_cfg):
             raise RuntimeError("Failed to parse lib manager config")
         self.slm.setup()
+        from amifuse.timer_device import AmiFuseExecLibrary, AmiFuseTimerDevice
+        # Before exec.library opens: its stub binds the methods then.
+        self.slm.lib_mgr.add_impl_cls("exec.library", AmiFuseExecLibrary)
         self.slm.open_base_libs()
         # Register the shared vamos disk device. The backend is supplied by
         # HandlerBridge after it has applied AmiFUSE's image detection.
         self.disk_session.install_devices(self.slm)
         from amifuse.null_device import NullDevice  # lazy import to avoid cycles
-        from amifuse.timer_device import AmiFuseTimerDevice
         self.slm.lib_mgr.add_impl_cls("keyboard.device", NullDevice)
         # One device for the runtime, so that pending requests survive the
         # device being expunged and opened again, and the bridge can reach it.

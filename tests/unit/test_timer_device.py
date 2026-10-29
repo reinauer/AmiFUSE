@@ -547,7 +547,7 @@ class TestTimerDevice:
         copy = 0x1200                       # copied from an opened request
         timer.mem.data[copy:copy + 40] = timer.mem.data[IO:IO + 40]
         timer.mem.w16(copy + 28, TR_ADDREQUEST)
-        assert not timer.device.delays(copy)
+        assert timer.device.delays(copy)
         timer.mem.w32(IO + 20, BASE + 0x100)  # another device
         timer.mem.w16(IO + 28, TR_ADDREQUEST)
         assert not timer.device.delays(IO)
