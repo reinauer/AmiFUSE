@@ -89,9 +89,12 @@ def test_sfs_write_at_new_end_on_nearly_full_volume(fixture_root, tmp_path):
 def _answer_first_shrink_late(bridge):
     """Make the first ACTION_SET_FILE_SIZE's wait end before its reply.
 
-    That wait runs out at once, as one that reached its limit does, so the
-    handler answers during the next wait. A wait cut to a few cycles would
-    not do: a handler stopped mid-work runs on against the busy limit.
+    That wait returns no reply without running the handler, as one that
+    used up its idle bursts (max_iters) before the handler got to the
+    packet does, so the handler answers during the next wait. It does not
+    model a wait that ran out of busy cycles, after which later waits are
+    short (_SHORT_BUSY_CYCLES). A wait cut to a few cycles would not do
+    either: a handler stopped mid-work runs on against the busy limit.
     Returns a list that holds True once the cut wait ran.
     """
     send = bridge.launcher.send_set_file_size
@@ -156,6 +159,10 @@ def test_pfs3_reader_past_2_gib_after_shrink(fixture_root, tmp_path):
 
     Each reader seeks to 2000, then gets 0x80000000 written into pfs3aio's
     offset for it, standing in for a reader past 2 GiB of a file that size.
+    That offset is also past the end of the 3072-byte file, so pfs3aio's
+    ERROR_SEEK_ERROR for the reader on the other file may come from its
+    end-of-file check; any answer other than a position in a LONG keeps
+    the cached position.
     """
     image, driver = _volume(fixture_root, tmp_path, "pfs3aio", "pfs.hdf")
     content = bytes(range(256)) * 12  # 3072 bytes

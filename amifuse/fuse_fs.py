@@ -2051,6 +2051,26 @@ class HandlerBridge:
             return SeekResult.FAILED, None
         return SeekResult.OK, res1
 
+    def handle_position(self, fh_addr: int) -> Tuple[bool, Optional[int]]:
+        """Return the handler's position for the handle, without moving it.
+
+        A zero-length OFFSET_CURRENT seek answers with the position.
+        Returns (False, None) when it gets no reply: the handler may still
+        hold the packet. Otherwise (True, position), where position is None
+        when the answer is no position from 0 to 0x7FFFFFFF. Past 2 GiB,
+        pfs3aio refuses with ERROR_SEEK_ERROR, FastFileSystem v0.2 answers
+        -1 with no error code, and SmartFilesystem answers with a position
+        that dp_Res1, a signed LONG, carries as negative.
+        """
+        with self._lock:
+            pkt_addr, _ = self.launcher.send_seek_handle(
+                self.state, fh_addr, 0, OFFSET_CURRENT)
+            reply = self._run_until_reply(pkt_addr, "seek")
+        if reply is None:
+            return False, None
+        position = reply[0]
+        return True, (position if 0 <= position <= _LONG_MAX else None)
+
     def _handle_end(self, fh_addr: int) -> Optional[int]:
         """Move the handle to end of file and return that position.
 
@@ -2341,8 +2361,7 @@ class HandlerBridge:
         hold them. ACTION_SET_FILE_SIZE would add the range in one packet,
         but AmigaDOS does not define its bytes, and FFS, OFS, pfs3aio and
         SFS leave whatever the new blocks held before, such as a deleted
-        file's data. A shrink is one ACTION_SET_FILE_SIZE, and a seek then
-        leaves the handle at the start of the file. A truncate to
+        file's data. A shrink is one ACTION_SET_FILE_SIZE. A truncate to
         the measured end of file sends none: BFFS refuses every
         ACTION_SET_FILE_SIZE, even one that would change nothing.
 
@@ -2408,13 +2427,6 @@ class HandlerBridge:
                        for other in others):
                     size, res2 = self.set_handle_size_reply(fh_addr, length)
             if size >= 0 and not res2:
-                # After a shrink, SmartFilesystem can fail a write at the
-                # new end of file until the handle moves, and a seek to
-                # where the handle already is does not count. Leave it at
-                # the start, so that the write's own seek moves it. After
-                # a truncate to 0 the start is where it already is.
-                if length:
-                    self.seek_handle(fh_addr, 0)
                 return size, 0
             # A truncate to 0 skipped the end check, and BFFS refuses even
             # one that changes nothing, so its refusal of an empty file is
@@ -3252,36 +3264,46 @@ class AmigaFuseFS(_FuseOperations):
                     self._pin_stat(path, offset + written)
         return written
 
-    def _check_far_handles(self, far):
-        """Make handles past 0x7FFFFFFF that a truncate moved forget it.
+    def _settle_handles(self, entry, far, seek: bool):
+        """Set the cached positions after a truncate that reached its length.
+
+        With seek, the truncating handle moves to the start of the file and
+        caches that position. After a shrink, SmartFilesystem can fail a
+        write at the new end of file until the handle moves, and a seek to
+        where the handle already is does not count, so the write's own seek
+        to the new end would not help. The caller asks for no seek when the
+        file is now empty, where the start is the new end, or when the
+        handle is a temporary one that is released next.
 
         far holds the other open handles whose cached position is past
         0x7FFFFFFF. A truncate neither moves them nor clears that position,
         since no seek could return them there. But a pfs3aio shrink moves
         every handle on the file past the new end to it, and a read at the
         cached position would then skip its seek and return whatever is
-        written there next.
+        written there next. So each one's position is checked
+        (handle_position): one from 0 to 0x7FFFFFFF means it moved, and it
+        forgets its cached position. A read at its old offset then fails,
+        as no seek can reach it, rather than return the wrong bytes. Any
+        other answer means it is still past 0x7FFFFFFF, and it keeps it.
 
-        A zero-length OFFSET_CURRENT seek moves nothing and answers with
-        the handle's position. ERROR_SEEK_ERROR, as from pfs3aio, or a
-        negative position, as from SFS, means the handle is still past
-        0x7FFFFFFF, and it keeps its position. A position that fits in a
-        LONG means it moved, and it forgets its position: a read at its old
-        offset then fails, as no seek can reach it, rather than return the
-        wrong bytes. A seek that fails otherwise may have had no reply and
-        still be with the handler, so no seek follows it, as in
-        truncate_handle, and it and the handles not yet checked forget
-        their positions.
+        A packet that gets no reply may still be with the handler, and more
+        packets would reuse its memory sooner, so none follows it, as in
+        truncate_handle. A seek to the start is not expected to be refused,
+        so one that fails counts as such. The far handles not yet checked
+        then forget their positions.
         """
-        failed = False
+        answered = True
+        if seek:
+            result = self.bridge.seek_handle(entry["fh_addr"], 0)[0]
+            if result is SeekResult.OK:
+                entry["pos"] = 0
+            answered = result is not SeekResult.FAILED
         for other in far:
-            if not failed:
-                result, pos = self.bridge.seek_handle(
-                    other["fh_addr"], 0, OFFSET_CURRENT)
-                if (result is SeekResult.PAST_END
-                        or (result is SeekResult.OK and pos < 0)):
+            if answered:
+                answered, position = self.bridge.handle_position(
+                    other["fh_addr"])
+                if answered and position is None:
                     continue
-                failed = result is SeekResult.FAILED
             other["pos"] = None
 
     def truncate(self, path, length, fh=None):
@@ -3341,7 +3363,8 @@ class AmigaFuseFS(_FuseOperations):
                     raise FuseOSError(_WRITE_ERRNOS.get(res2, errno.EIO))
                 entry["dirty"] = True  # Truncate modifies the file
                 if size == length:
-                    self._check_far_handles(far)
+                    self._settle_handles(entry, far,
+                                         seek=length > 0 and not temp_handle)
             # A pinned size is all getattr reports until release, and
             # write() only ever raises it. Left stale, it would place the
             # next O_APPEND write past the new end of file. The pin is under
