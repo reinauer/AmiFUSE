@@ -3009,26 +3009,30 @@ class AmigaFuseFS(_FuseOperations):
         # Guard: skip deferred delete if handler is dead or read-only
         if self.bridge.state.crashed or not self.bridge._write_enabled:
             return 0
+        delete_succeeded = False
         try:
             self.bridge.flush_volume()
-            self.bridge.inhibit_cycle()
+            # The cycle clears pfs3aio's and SmartFilesystem's in-use state
+            # after a directory change, but with a file open it breaks
+            # SmartFilesystem's handles and can stop pfs3aio (#129).
+            if not self._any_file_open():
+                self.bridge.inhibit_cycle()
             res1, res2 = self.bridge.delete_dir_atomic(resolved_path)
             if res1 == 0:
-                with self._fh_lock:
-                    self._pending_deletes.add(resolved_path)
-                self._log_op("releasedir", resolved_path, "deferred delete failed permanently, path hidden until unmount")
+                self._log_op("releasedir", resolved_path, f"deferred delete failed res2={res2}")
             else:
+                delete_succeeded = True
                 with self._cache_lock:
                     self._stat_cache.pop(resolved_path, None)
                     parent_path = resolved_path.rsplit("/", 1)[0] or "/"
                     self._dir_cache.pop(parent_path, None)
         except Exception as e:
             self._log_op("releasedir", resolved_path, f"deferred delete exception: {type(e).__name__}: {e}")
+        if not delete_succeeded:
             with self._fh_lock:
-                self._pending_deletes.add(resolved_path)
-        # Only resolve parent dir deletes if deletion succeeded
-        if resolved_path not in self._pending_deletes:
-            self._resolve_pending_dir_deletes(resolved_path)
+                self._drop_failed_dir_delete(resolved_path)
+            return 0
+        self._resolve_pending_dir_deletes(resolved_path)
         return 0
 
     def readdir(self, path, fh):
@@ -3407,57 +3411,52 @@ class AmigaFuseFS(_FuseOperations):
         if not name:
             raise FuseOSError(errno.EINVAL)
         res1, res2 = self.bridge.delete_dir_atomic(path)
-        if res1 == 0 and res2 == 202:
-            # OBJECT_IN_USE — inhibit cycle clears handler internal state, retry
+        if res1 == 0 and res2 == 202 and not self._any_file_open():
+            # OBJECT_IN_USE with no file open: pfs3aio and SmartFilesystem
+            # keep in-use state after a directory change, which an inhibit
+            # cycle clears. With a file open the cycle breaks
+            # SmartFilesystem's handles and can stop pfs3aio (#129).
             self.bridge.inhibit_cycle()
             res1, res2 = self.bridge.delete_dir_atomic(path)
         self._log_op("rmdir", path, f"delete_dir_atomic res1={res1} res2={res2}")
         if res1 == 0:
-            if res2 == 202:
-                # OBJECT_IN_USE: pfs3aio refuses while a file inside is open,
-                # even an unlinked one. Defer only where a retry will come:
-                # release() of the last pending child, or releasedir() of a
-                # FUSE directory handle open on this path.
-                with self._fh_lock:
-                    pending_children = self._pending_children(path)
-                    dir_open = any(
-                        v.get("dir_handle") and v.get("path") == path
-                        for v in self._fh_cache.values()
-                    )
+            if res2 not in (202, 216):
+                # Unrecognized error
+                raise FuseOSError(errno.EIO)
+            # OBJECT_IN_USE: pfs3aio refuses while a file inside is open,
+            # even an unlinked one, and answers 202 before 216.
+            # DIRECTORY_NOT_EMPTY: the directory holds entries, an unlinked
+            # open file among them. Defer only where a retry will come:
+            # release() of the last pending child, or, for 202, releasedir()
+            # of a FUSE directory handle open on this path. And defer only
+            # while every entry the handler lists is a pending delete; any
+            # other entry stays, so the directory is not empty (#168).
+            listed = self.bridge.list_dir_path(path)
+            with self._fh_lock:
+                pending_children = self._pending_children(path)
+                dir_open = res2 == 202 and any(
+                    v.get("dir_handle") and v.get("path") == path
+                    for v in self._fh_cache.values()
+                )
+                # Amiga names are case-insensitive; a FUSE path keeps the
+                # caller's case.
+                pending_names = {p.rsplit("/", 1)[1].lower() for p in pending_children}
+                live = any(e["name"].lower() not in pending_names for e in listed)
+                defer = not live and bool(pending_children or dir_open)
+                if defer:
                     if pending_children:
                         self._pending_dir_deletes[path] = pending_children
-                    if pending_children or dir_open:
-                        self._pending_deletes.add(path)
-                if not (pending_children or dir_open):
-                    # Nothing would retry. pfs3aio answers 202 before 216, so
-                    # a directory that still lists entries is not empty.
-                    err = errno.ENOTEMPTY if self.bridge.list_dir_path(path) else errno.EBUSY
-                    self._log_op("rmdir", path, f"in use, nothing would retry: {errno.errorcode[err]}")
-                    raise FuseOSError(err)
-                with self._cache_lock:
-                    self._stat_cache.pop(path, None)
-                    self._dir_cache.pop(dir_path, None)
-                    self._dir_cache.pop(path, None)
-                self._log_op("rmdir", path, "deferred (object in use)")
-                return 0
-            if res2 == 216:
-                # DIRECTORY_NOT_EMPTY — defer only if pending children exist.
-                with self._fh_lock:
-                    pending_children = self._pending_children(path)
-                    if pending_children:
-                        self._pending_dir_deletes[path] = pending_children.copy()
-                        self._pending_deletes.add(path)
-                if pending_children:
-                    with self._cache_lock:
-                        self._stat_cache.pop(path, None)
-                        self._dir_cache.pop(dir_path, None)
-                        self._dir_cache.pop(path, None)
-                    self._log_op("rmdir", path, "deferred (pending child deletes)")
-                    return 0
-                # No pending children — genuinely not empty
-                raise FuseOSError(errno.ENOTEMPTY)
-            # Unrecognized error
-            raise FuseOSError(errno.EIO)
+                    self._pending_deletes.add(path)
+            if not defer:
+                err = errno.ENOTEMPTY if listed or res2 == 216 else errno.EBUSY
+                self._log_op("rmdir", path, f"nothing would retry: {errno.errorcode[err]}")
+                raise FuseOSError(err)
+            with self._cache_lock:
+                self._stat_cache.pop(path, None)
+                self._dir_cache.pop(dir_path, None)
+                self._dir_cache.pop(path, None)
+            self._log_op("rmdir", path, f"deferred (res2={res2})")
+            return 0
         # Immediate success
         self._forget_pending_delete(path)
         with self._cache_lock:
@@ -3481,6 +3480,34 @@ class AmigaFuseFS(_FuseOperations):
         with self._fh_lock:
             self._pending_deletes.discard(path)
             self._pending_dir_deletes.pop(path, None)
+
+    def _any_file_open(self) -> bool:
+        """True while a FUSE handle holds an AmigaDOS FileHandle and a lock."""
+        with self._fh_lock:
+            return any("fh_addr" in v for v in self._fh_cache.values())
+
+    def _drop_failed_dir_delete(self, path: str):
+        """Keep a directory whose deferred delete failed hidden only while a
+        retry is coming. Caller holds _fh_lock.
+
+        A retry comes from the release() of a pending child (path is in
+        _pending_dir_deletes) or the releasedir() of a FUSE directory handle
+        open on path. Otherwise the directory shows again, and so does each
+        deferred parent waiting on it, which can now never be emptied.
+        """
+        while True:
+            if path in self._pending_dir_deletes or any(
+                v.get("dir_handle") and v.get("path") == path
+                for v in self._fh_cache.values()
+            ):
+                self._pending_deletes.add(path)
+                return
+            self._pending_deletes.discard(path)
+            parent = path.rsplit("/", 1)[0] or "/"
+            if path not in self._pending_dir_deletes.get(parent, ()):
+                return
+            del self._pending_dir_deletes[parent]
+            path = parent
 
     def mkdir(self, path, mode):
         self._check_handler_alive()
@@ -3836,6 +3863,13 @@ class AmigaFuseFS(_FuseOperations):
                 del self._pending_dir_deletes[parent_dir]
             # Attempt the actual directory deletion outside the lock
             try:
+                # pfs3aio stops answering after an inhibit cycle with a file
+                # open deeper in the tree, and SmartFilesystem drops every
+                # open handle (#129). Cycle only with no file open, and
+                # before taking the parent's lock: SmartFilesystem answers a
+                # lock from before the cycle with ERROR_DEVICE_NOT_MOUNTED.
+                if not self._any_file_open():
+                    self.bridge.inhibit_cycle()
                 dir_path, name = self._split_path(parent_dir)
                 lock_bptr, _, locks = self.bridge.locate_path(dir_path)
                 if dir_path == "/" and lock_bptr == 0:
@@ -3843,24 +3877,17 @@ class AmigaFuseFS(_FuseOperations):
                     if lock_bptr:
                         locks.append(lock_bptr)
                 if lock_bptr != 0:
-                    # pfs3aio stops answering after an inhibit cycle with a
-                    # file open deeper in the tree, and SmartFilesystem drops
-                    # every open handle (#129). Cycle only with no file open.
-                    with self._fh_lock:
-                        files_open = any("fh_addr" in v for v in self._fh_cache.values())
-                    if not files_open:
-                        self.bridge.inhibit_cycle()
                     res1, res2 = self.bridge.delete_object(lock_bptr, name)
                     self._log_op("release", parent_dir, f"deferred rmdir res1={res1} res2={res2}")
                     if res1 == 0:
-                        # Directory still not empty (new files created?) - silently discard
-                        self._log_op("release", parent_dir, "deferred rmdir failed (dir not empty), discarding")
                         for l in reversed(locks):
                             self.bridge.free_lock(l)
-                        # Delete failed - _pending_deletes still has it, just stop
+                        with self._fh_lock:
+                            self._drop_failed_dir_delete(parent_dir)
                         break
                 else:
-                    # Could not locate parent - _pending_deletes still has it, just stop
+                    with self._fh_lock:
+                        self._drop_failed_dir_delete(parent_dir)
                     break
                 for l in reversed(locks):
                     self.bridge.free_lock(l)
@@ -3871,8 +3898,9 @@ class AmigaFuseFS(_FuseOperations):
                     self._stat_cache.pop(parent_dir, None)
                     self._dir_cache.pop(dir_path, None)
             except Exception:
-                self._log_op("release", parent_dir, "deferred rmdir exception, discarding")
-                # Delete failed - _pending_deletes still has it, just stop
+                self._log_op("release", parent_dir, "deferred rmdir exception")
+                with self._fh_lock:
+                    self._drop_failed_dir_delete(parent_dir)
                 break
             # Successfully deleted this directory - walk up to check its parent
             deleted_child_path = parent_dir

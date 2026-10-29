@@ -53,6 +53,13 @@ class _FakeVolume:
     def inhibit_cycle(self):
         pass
 
+    def list_dir_path(self, path):
+        return [
+            {"name": p.rsplit("/", 1)[1]}
+            for p in sorted(self.dirs | self.files)
+            if p != "/" and _parent(p) == path
+        ]
+
     def _delete(self, path):
         if path in self.open_files.values():
             return 0, ERROR_OBJECT_IN_USE

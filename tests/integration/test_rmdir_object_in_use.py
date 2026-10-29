@@ -61,13 +61,7 @@ def _unlink_and_rmdir_while_open(ops):
     ops.release("/d/x", fh)
 
 
-def test_deferred_rmdir_runs_at_release(ops, request):
-    if request.node.callspec.params["ops"][1] == "SmartFilesystem":
-        request.applymarker(pytest.mark.xfail(
-            strict=True, raises=AssertionError,
-            reason="SmartFilesystem answers the deferred delete with "
-                   "ERROR_DEVICE_NOT_MOUNTED (218) after inhibit_cycle() (#129)",
-        ))
+def test_deferred_rmdir_runs_at_release(ops):
     _unlink_and_rmdir_while_open(ops)
 
     assert not _on_disk(ops, "/d")
