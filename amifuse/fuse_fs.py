@@ -3355,9 +3355,11 @@ class AmigaFuseFS(_FuseOperations):
         caches that position. After a shrink, SmartFilesystem can fail a
         write at the new end of file until the handle moves, and a seek to
         where the handle already is does not count, so the write's own seek
-        to the new end would not help. The caller asks for no seek when the
-        file is now empty, where the start is the new end, or when the
-        handle is a temporary one that is released next.
+        to the new end would not help. The seek also follows a grow, or a
+        truncate that changed nothing, as truncate_handle does not say
+        which it made; that costs one packet. The caller asks for no seek
+        when the file is now empty, where the start is the new end, or when
+        the handle is a temporary one that is released next.
 
         far holds the other open handles whose cached position is past
         0x7FFFFFFF. A truncate neither moves them nor clears that position,
@@ -3373,8 +3375,9 @@ class AmigaFuseFS(_FuseOperations):
         A packet that gets no reply may still be with the handler, and more
         packets would reuse its memory sooner, so none follows it, as in
         truncate_handle. A seek to the start is not expected to be refused,
-        so one that fails counts as such. The far handles not yet checked
-        then forget their positions.
+        so one that fails other than with ERROR_SEEK_ERROR, which is a
+        reply, counts as such. The far handles not yet checked then forget
+        their positions.
         """
         answered = True
         if seek:

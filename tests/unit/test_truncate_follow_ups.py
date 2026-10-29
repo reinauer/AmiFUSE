@@ -108,6 +108,42 @@ class TestShrinkLeavesHandleAtStart:
         assert handler.pos == 0
         assert fs._fh_cache[handle]["pos"] == 0
 
+    @pytest.mark.parametrize("short", ["stopped", "retry-seek-unanswered"])
+    def test_no_seek_until_length_is_reached(self, fuse_mock, short):
+        """A truncate that falls short sends no seek to the start: one
+        stopped at a handle the mount cannot move, or one whose retry seek
+        may still be with the handler. Once the truncate reaches its
+        length, the seek goes out."""
+        handler = _FakeHandlerFile(CONTENT)
+        fs = _fake_write_fs(fuse_fs, handler)
+        handle = fs.open("/file", os.O_RDWR)
+        seek = handler.seek
+        if short == "stopped":
+            handler.stop_at = 2000
+        else:
+            _open_other(fs, handler, 2000)
+
+            def retry_seek_unanswered(state, fh_addr, offset, mode):
+                packet = seek(state, fh_addr, offset, mode)
+                if fh_addr == OTHER and len(handler.set_sizes) == 1:
+                    handler.reply = NO_REPLY
+                return packet
+
+            fs.bridge.launcher.send_seek_handle.side_effect = (
+                retry_seek_unanswered)
+
+        with pytest.raises(fuse_fs.FuseOSError) as exc_info:
+            fs.truncate("/file", 100, handle)
+        assert exc_info.value.args[0] == errno.EIO
+        start = (FH_ADDR, 0, fuse_fs.OFFSET_BEGINNING)
+        assert start not in handler.seeks
+
+        # The unanswered retry seek still moved the other handle to 0.
+        handler.stop_at = 0
+        fs.bridge.launcher.send_seek_handle.side_effect = seek
+        assert fs.truncate("/file", 100, handle) == 0
+        assert handler.seeks[-1] == start
+
     def test_write_at_new_end_lands(self, fuse_mock):
         handler = _SfsAfterShrink(CONTENT)
         fs = _fake_write_fs(fuse_fs, handler)
