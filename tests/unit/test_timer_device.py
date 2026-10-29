@@ -647,6 +647,8 @@ class TestBridgeDelivery:
         bridge = fs.HandlerBridge.__new__(fs.HandlerBridge)
         bridge._debug = False
         bridge._busy_ran_out = False
+        bridge._idle_unfinished = False
+        bridge._idle_busy_cycles = 0
         bridge._lock = threading.RLock()
         bridge.state = SimpleNamespace(
             crashed=False, process_addr=TASK, port_addr=0x6000,

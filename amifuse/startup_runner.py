@@ -367,6 +367,7 @@ class HandlerLaunchState:
     main_loop_pc: int = 0   # PC to restart from when waiting for messages
     main_loop_sp: int = 0   # SP to use when restarting
     initialized: bool = False  # True after startup is complete
+    startup_replied: bool = False  # The bridge polled the startup reply
     exit_count: int = 0  # Count consecutive exits without WaitPort block
     crashed: bool = False  # True if handler hit an unrecoverable error
     last_error_pc: int = 0  # PC at time of crash for diagnostics
@@ -839,16 +840,20 @@ class HandlerLauncher:
 
         ret_addr = blocked_ret if blocked_ret is not None else mem.r32(blocked_sp)
         # Save as main loop PC if not yet initialized, but only once the
-        # startup reply is on the reply port: before it, the handler may
+        # handler has replied to the startup packet: the bridge polled the
+        # reply, or it is on the reply port. Before it, the handler may
         # block in its init code, for instance on its own timer, whose frame
         # is gone by the time the main loop is resumed. Such a block still
         # marks it initialized, so the bridge keeps its block state across
-        # child runs. A block after the reply was polled, or in a handler
-        # that never replied, is captured by the bridge when startup ends.
+        # child runs. A handler that never replied during startup has its
+        # main loop captured by the bridge when startup ends.
         if (not state.initialized or state.main_loop_pc == 0) and _pc_valid(ret_addr):
             state.initialized = True
             pmgr = self.exec_impl.port_mgr
-            if pmgr.has_port(state.reply_port_addr) and pmgr.has_msg(state.reply_port_addr):
+            if state.startup_replied or (
+                pmgr.has_port(state.reply_port_addr)
+                and pmgr.has_msg(state.reply_port_addr)
+            ):
                 state.main_loop_pc = ret_addr
                 state.main_loop_sp = blocked_sp + 4
                 if wait_mask is not None and not state.wait_mask:
