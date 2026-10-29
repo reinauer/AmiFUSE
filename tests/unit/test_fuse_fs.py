@@ -2258,10 +2258,9 @@ class TestHandlerBridgeWriteChunks:
         sizes = [c.args[0] for c in bridge._alloc_read_buf.call_args_list]
         assert max(sizes) == chunk
 
-    def test_only_a_write_without_an_extent_measures_the_end(self, fuse_mock):
-        """A write given no extent seeks to the end and back before its
-        first chunk and lands where the handle was. A write given one
-        sends no seek."""
+    def test_every_write_measures_the_end(self, fuse_mock):
+        """A write of one chunk or more seeks to the end and back before
+        its first chunk and lands where the handle was."""
         import amifuse.fuse_fs as fuse_fs_mod
 
         chunk = fuse_fs_mod.IO_CHUNK
@@ -2271,12 +2270,12 @@ class TestHandlerBridgeWriteChunks:
         one, two = _pattern(chunk), _pattern(chunk + 1)
 
         assert bridge.write_handle_reply(self.FH_ADDR, one) == (chunk, 0)
+        assert bridge.write_handle_reply(self.FH_ADDR, two) == (chunk + 1, 0)
         seeks = [c.args[1:] for c in bridge.launcher.send_seek_handle.call_args_list]
         assert seeks == [(self.FH_ADDR, 0, fuse_fs_mod.OFFSET_END),
-                         (self.FH_ADDR, 3, fuse_fs_mod.OFFSET_BEGINNING)]
-        end = 3 + chunk
-        assert bridge.write_handle_reply(self.FH_ADDR, two, (end, end)) == (chunk + 1, 0)
-        assert bridge.launcher.send_seek_handle.call_count == 2
+                         (self.FH_ADDR, 3, fuse_fs_mod.OFFSET_BEGINNING),
+                         (self.FH_ADDR, 0, fuse_fs_mod.OFFSET_END),
+                         (self.FH_ADDR, 3 + chunk, fuse_fs_mod.OFFSET_BEGINNING)]
         assert handler.data == self.ORIGINAL[:3] + one + two
 
     @pytest.mark.parametrize("failed_seek", [1, 2], ids=["to-end", "back"])
