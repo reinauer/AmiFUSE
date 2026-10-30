@@ -16,6 +16,7 @@ from types import SimpleNamespace
 import pytest
 
 from amifuse import driver_resolver
+from amifuse import driver_runtime
 from amifuse import fuse_fs as fs
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -128,7 +129,7 @@ def test_format_fsyncs_the_image_before_complete(tmp_path, no_user_driver,
     )
     image_stat = os.stat(image)
     fsynced = []
-    real_fsync = os.fsync
+    real_fsync = driver_runtime._fsync_to_stable_storage
 
     def fsync(fd):
         if os.path.samestat(os.fstat(fd), image_stat):
@@ -136,7 +137,8 @@ def test_format_fsyncs_the_image_before_complete(tmp_path, no_user_driver,
             fsynced.append(capsys.readouterr().out)
         real_fsync(fd)
 
-    monkeypatch.setattr(os, "fsync", fsync)
+    # The image's fsync is os.fsync(), or fcntl(F_FULLFSYNC) on macOS.
+    monkeypatch.setattr(driver_runtime, "_fsync_to_stable_storage", fsync)
     fs.format_volume(image, None, None, "DH0", volname="Fresh")
     assert fsynced, "format did not fsync the image"
     assert "Format complete." not in "".join(fsynced)
