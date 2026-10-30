@@ -387,15 +387,23 @@ class TestBusyHandlerWhileIdle:
         assert launcher.bursts == 56  # it parked with nothing pending
         assert bridge._idle_unfinished is False
 
-    def test_handler_kept_awake_by_a_stray_reply_is_drained(self, clock):
-        """A reply no one takes is drained after a run that leaves it awake."""
-        launcher = Launcher([BUSY] + [PARKED] * 60, wake=lambda burst: True)
+    def test_slice_that_ends_busy_keeps_a_sendio_reply(self, clock, monkeypatch):
+        """A reply the running handler has not taken yet stays queued (#240).
+
+        Once it parks at its main loop without taking it, the reply is stale
+        and is drained.
+        """
+        monkeypatch.setattr(fs.HandlerBridge, "_SHORT_BUSY_CYCLES", 2 * 200_000)
+        launcher = Launcher([BUSY] * 3)
         bridge = _bridge(Timer(clock), launcher, pc=0x4800, block_state=None)
         pmgr = bridge.vh.slm.exec_impl.port_mgr
         pmgr.register_port(0x6300)
-        pmgr.put_msg(0x6300, 0x1800)  # another device's reply
+        pmgr.put_msg(0x6300, 0x1800)  # its device's reply to a SendIO()
         bridge._busy_ran_out = True
         assert bridge.run_due_timers() == Timer.MIN_DELAY
+        assert bridge._idle_unfinished is True
+        assert pmgr.has_msg(0x6300)
+        assert bridge.run_due_timers() is None  # it parked at its main loop
         assert not pmgr.has_msg(0x6300)
 
     def test_waking_itself_uses_up_the_idle_budget(self, clock, monkeypatch):
