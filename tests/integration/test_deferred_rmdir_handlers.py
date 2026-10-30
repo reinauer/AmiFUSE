@@ -10,7 +10,8 @@
   stays visible after releasedir() (#197).
 - rmdir() still defers behind unlinked open files whose names the handler
   stores differently, and fails with EBUSY, leaving the directory visible,
-  when a lock that an open file holds refuses it.
+  when a lock that an open file keeps on the directory it was renamed out
+  of refuses it.
 
 The tests call the AmigaFuseFS callbacks directly, as a mount would, on
 copies of the fixture images or on an FFS floppy made with xdftool for the
@@ -190,12 +191,22 @@ def test_rmdir_defers_behind_unlinked_open_files_the_handler_names_differently(o
 
 
 @pytest.mark.parametrize("handler", [_fixture(PFS), _fixture(SFS), _fixture(OFS)])
-def test_rmdir_refused_by_a_lock_an_open_file_holds_is_busy(open_ops, handler):
+def test_rmdir_refused_by_a_lock_an_open_file_holds_is_busy(open_ops, handler, monkeypatch):
     ops = open_ops(handler)
     ops.mkdir("/d", 0o755)
     _make(ops, "/d/x", b"x" * 100)
-    hx = ops.open("/d/x", os.O_RDONLY)  # holds a lock on /d
-    assert ops.rename("/d/x", "/x") == 0
+    hx = ops.open("/d/x", os.O_RDONLY)  # keeps its lock on /d when the new directory can't be locked
+    move = ops._move_parent_lock
+
+    def new_directory_unlockable(entry, dir_path):
+        with monkeypatch.context() as m:
+            m.setattr(ops.bridge, "locate_path", lambda path: (0, 0, []))
+            m.setattr(ops.bridge, "locate", lambda lock, name: (0, 0))
+            move(entry, dir_path)
+
+    with monkeypatch.context() as m:
+        m.setattr(ops, "_move_parent_lock", new_directory_unlockable)
+        assert ops.rename("/d/x", "/x") == 0
     dh = ops.opendir("/d")
 
     assert _errno_of(ops.rmdir, "/d") == errno.EBUSY
