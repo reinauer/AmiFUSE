@@ -30,10 +30,15 @@ REPLY = (0x1900, 0x1a00, 1, 0)  # (msg, pkt, res1, res2), as poll_replies return
 # How HandlerLauncher.run_burst reports a burst that ended:
 BUSY = SimpleNamespace(done=False, error=False, cycles=200_000)  # at its cycle limit
 PARKED = SimpleNamespace(done=False, error=True, cycles=0)       # in Wait()
+PARKED_ELSEWHERE = SimpleNamespace(done=False, error=True, cycles=0)  # in a deeper Wait()
 
 # The handler parked in its main-loop Wait().
 MAIN_LOOP_WAIT = {"wait_blocked_sp": MAIN_SP - 4, "wait_blocked_mask": 0x101,
                   "wait_blocked_ret": MAIN_PC}
+# The handler parked in a Wait() in a subroutine, below its main loop.
+INNER_PC, INNER_SP = 0x4900, MAIN_SP - 0x40
+INNER_WAIT = {"wait_blocked_sp": INNER_SP - 4, "wait_blocked_mask": 0x10,
+              "wait_blocked_ret": INNER_PC}
 
 
 @pytest.fixture(autouse=True)
@@ -185,6 +190,9 @@ class Launcher:
         if rs is PARKED:
             state.pc, state.sp = MAIN_PC, MAIN_SP
             state.block_state = dict(MAIN_LOOP_WAIT)
+        elif rs is PARKED_ELSEWHERE:
+            state.pc, state.sp = INNER_PC, INNER_SP
+            state.block_state = dict(INNER_WAIT)
         else:
             state.pc, state.sp = 0x4800, MAIN_SP - 0x40
             state.block_state = None
@@ -405,6 +413,20 @@ class TestBusyHandlerWhileIdle:
         assert pmgr.has_msg(0x6300)
         assert bridge.run_due_timers() is None  # it parked at its main loop
         assert not pmgr.has_msg(0x6300)
+
+    def test_slice_that_parks_away_from_the_main_loop_keeps_a_sendio_reply(self, clock):
+        """A handler parked below its main loop is still at work on a packet."""
+        launcher = Launcher([BUSY, PARKED_ELSEWHERE])
+        bridge = _bridge(Timer(clock), launcher, pc=0x4800, block_state=None)
+        pmgr = bridge.vh.slm.exec_impl.port_mgr
+        pmgr.register_port(0x6300)
+        pmgr.put_msg(0x6300, 0x1800)  # its device's reply to a SendIO()
+        bridge._busy_ran_out = True
+        assert bridge.run_due_timers() is None  # it stopped, not at its main loop
+        assert launcher.bursts == 2
+        assert (bridge.state.pc, bridge.state.sp) == (INNER_PC, INNER_SP)
+        assert bridge._idle_unfinished is False
+        assert pmgr.has_msg(0x6300)
 
     def test_waking_itself_uses_up_the_idle_budget(self, clock, monkeypatch):
         """Each look that leaves it awake costs a slice, so the thread stops."""
