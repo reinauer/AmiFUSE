@@ -54,7 +54,7 @@ def extracted(monkeypatch):
         fs.fshd.dos_type = state.dos_type
         fs.get_data.return_value = HANDLER
         rdisk = MagicMock()
-        rdisk.find_partition_by_string.return_value.part_blk.dos_env.dos_type = (
+        rdisk.get_partition.return_value.part_blk.dos_env.dos_type = (
             state.dos_type)
         rdisk.fs = [fs]
         return MagicMock(), rdisk, None
@@ -66,7 +66,8 @@ def extracted(monkeypatch):
         state.paths.append(Path(path))
         return fd, path
 
-    monkeypatch.setattr(rdb_inspect, "find_partition_mbr_index", lambda *a: None)
+    monkeypatch.setattr(rdb_inspect, "find_partition",
+                        lambda *a: rdb_inspect.PartitionRef(None, 0, "DH0"))
     monkeypatch.setattr(rdb_inspect, "open_rdisk", open_rdisk)
     monkeypatch.setattr(tempfile, "mkstemp", recording_mkstemp)
     monkeypatch.setattr(
