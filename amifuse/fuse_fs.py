@@ -949,14 +949,16 @@ class HandlerBridge:
 
         A run that leaves it running marks it unfinished and costs at least
         one slice of the idle budget, though it may have spent its parks
-        rather than cycles. Stray IO replies are then drained, as after a
-        packet wait, so that one the handler never takes cannot keep
-        waking it.
+        rather than cycles. Its ports are left alone then: a SendIO() reply
+        it has not taken yet is still its own (#240). Once it is parked at
+        its main loop, an IO reply still queued is stale and is drained, as
+        after a packet wait.
         """
         busy, stopped = run
         self._idle_unfinished = not stopped
         if not stopped:
             self._idle_busy_cycles += max(busy, self._SHORT_BUSY_CYCLES)
+        elif not self.state.crashed and self._at_main_loop_frame():
             self._drain_non_essential_ports(self.vh.slm.exec_impl.port_mgr)
         return stopped
 
