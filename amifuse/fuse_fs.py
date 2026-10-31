@@ -34,8 +34,30 @@ class FuseOSError(OSError):
         super().__init__(error, os.strerror(error))
 
 
+# In AmigaDOS a colon ends a device or volume name, so the handler would read
+# a host name holding one as another path (#242). Creating such a name gets
+# EINVAL and looking one up gets ENOENT, before any packet. mknod, symlink and
+# link refuse every call already.
+_COLON_CREATE_OPS = frozenset(("create", "mkdir"))
+_COLON_UNCHECKED_OPS = frozenset(("mknod", "symlink", "link"))
+
+
+def _colon_path_errno(op, args):
+    """The errno refusing a volume path with a colon in `op`'s args, or None."""
+    if op in _COLON_UNCHECKED_OPS:
+        return None
+    paths = args[:2] if op == "rename" else args[:1]
+    for index, path in enumerate(paths):
+        if isinstance(path, str) and ":" in path:
+            if op in _COLON_CREATE_OPS or (op == "rename" and index == 1):
+                return errno.EINVAL
+            return errno.ENOENT
+    return None
+
+
 class _FuseOperations:
-    """The fusepy Operations defaults used by AmigaFuseFS."""
+    """The fusepy Operations defaults used by AmigaFuseFS, plus the refusal
+    of host names with a colon at dispatch."""
 
     bmap = None
     lock = None
@@ -43,6 +65,9 @@ class _FuseOperations:
     def __call__(self, op, *args):
         if not hasattr(self, op):
             raise FuseOSError(errno.EFAULT)
+        error = _colon_path_errno(op, args)
+        if error is not None:
+            raise FuseOSError(error)
         return getattr(self, op)(*args)
 
     def fsyncdir(self, path, datasync, fh):
