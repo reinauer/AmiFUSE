@@ -6,8 +6,16 @@ calls destroy on the mount thread, where handler and device cleanup belong.
 
 import ctypes
 import os
+import sys
 import threading
 import time
+
+# The shell launcher passes each mount it spawns a random token in this
+# environment variable. Once FUSE init has run, the mount holds the named
+# event READY_EVENT for that token until it ends, so the launcher can tell
+# its own drive from another program's drive at the same letter (#237).
+READY_TOKEN_ENV = "AMIFUSE_READY_TOKEN"
+READY_EVENT = "Local\\amifuse-ready-{}"
 
 
 class _Events:
@@ -37,6 +45,17 @@ class _Events:
         if create and ctypes.get_last_error() == 183:
             self.close(handle)
             raise OSError("unmount control event already exists")
+        return handle
+
+    def create_ready(self, token):
+        ctypes.set_last_error(0)
+        handle = self.dll.CreateEventW(None, True, False, READY_EVENT.format(token))
+        if not handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+        if ctypes.get_last_error() == 183:
+            # Another process holds it, so it would outlive this mount.
+            self.close(handle)
+            raise OSError("ready event already exists")
         return handle
 
     def set(self, handle):
@@ -95,8 +114,24 @@ class UnmountControl:
         thread = threading.Thread(target=watch, daemon=True)
         thread.start()
         self.thread = thread
+        # stop(), which destroy() and close() call first, drops it, so the
+        # event goes when the mount ends. A launch that never sees it
+        # reports a timeout.
+        token = os.environ.get(READY_TOKEN_ENV)
+        if token:
+            try:
+                self.handles["ready"] = self.api.create_ready(token)
+            except OSError as exc:
+                print(f"[amifuse] could not signal the launcher: {exc}",
+                      file=sys.stderr, flush=True)
 
     def stop(self):
+        # The mount is going: drop the ready event before destroy's flush,
+        # which may take seconds, so that a launch never reads a mount whose
+        # mount point WinFsp refused after init as up.
+        ready = self.handles.pop("ready", None)
+        if ready is not None:
+            self.api.close(ready)
         self.stopped.set()
         if self.thread is not None:
             self.thread.join()
