@@ -94,10 +94,11 @@ class PartInfo:
     It restarts at 0 within each RDB, so it is NOT unique across a multi-RDB
     image; use ``name`` as the stable fan-out key (``--partition <name>``),
     never the index. ``name`` is the drive name as AmigaOS mounts it, so a
-    repeated drive name reads ``DH0.1`` (:func:`mount_names`).
+    repeated drive name reads ``DH0.1`` (:func:`mount_names`); it is None
+    for a damaged drive name, which no ``--partition`` name selects.
     """
     index: int          # Partition.num (per-RDB positional index; collides across RDBs)
-    name: str           # unique drive name -- the --partition key for the fan-out
+    name: Optional[str]  # unique drive name -- the --partition key for the fan-out
     dostype: int        # dos_env.dos_type
     dostype_str: str    # DosType tag string (e.g. "DOS1")
 
@@ -108,7 +109,8 @@ class PartitionList:
 
     ``partitions`` is the stable-ordered list of :class:`PartInfo` the caller
     should fan out over (one drive per entry). It holds every partition across
-    the image's RDB(s).
+    the image's RDB(s), also one whose damaged drive name gives a ``name`` of
+    None, which has no name to fan out by.
 
     ``fallback_reason``, when set, is a human-readable string saying why
     ``partitions`` holds fewer than every partition. The caller is responsible
@@ -891,11 +893,11 @@ def _find_in(rdbs, partition: str):
         number = int(partition)
     except ValueError:
         return None
-    # As RDisk.get_partition, which numbers each RDB from 0.
+    # As RDisk.get_partition, which numbers each RDB from 0. A negative
+    # number selects none, rather than one counted from the end.
     for rdb_idx, offset, names in rdbs:
-        if number < len(names):
-            name = names[number] if names else None
-            return PartitionRef(rdb_idx, number, name), offset
+        if 0 <= number < len(names):
+            return PartitionRef(rdb_idx, number, names[number]), offset
     return None
 
 
@@ -965,13 +967,14 @@ def _part_info(p) -> PartInfo:
 
     Reads only already-parsed, in-memory fields (``num``, the drive-name BSTR,
     and ``dos_env.dos_type``), so it is safe to call after the block device is
-    closed. ``str(p.get_drive_name())`` matches the existing name idiom in
-    ``fuse_fs.get_partition_info``.
+    closed. A damaged drive name, which amitools reads as None, gives a
+    ``name`` of None: no ``--partition`` name selects that partition.
     """
     dos_type = p.part_blk.dos_env.dos_type
+    drive_name = p.get_drive_name()
     return PartInfo(
         index=p.num,
-        name=str(p.get_drive_name()),
+        name=None if drive_name is None else str(drive_name),
         dostype=dos_type,
         dostype_str=DosType.num_to_tag_str(dos_type),
     )
@@ -993,7 +996,8 @@ def list_partitions(
     mirroring the multi-RDB loop in ``rdb_inspect.main`` / ``fuse_fs.cmd_inspect``.
     Names -- not indices -- are the fan-out key, because ``Partition.num``
     restarts at 0 in each RDB and so collides across RDBs; every emitted name
-    re-resolves through :func:`find_partition` when the caller spawns
+    but None (a damaged drive name) re-resolves through
+    :func:`find_partition` when the caller spawns
     ``--partition <name>``. A Parceiro disk's own RDB, beside its MBR, comes
     first, then each ``0x76`` entry's own RDB (:func:`open_each_rdb`).
 
