@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Optional
 
 import amifuse.platform as platform
+from amifuse.windows_unmount import READY_EVENT, READY_TOKEN_ENV
 
 DETACHED_PROCESS = 0x00000008
 CREATE_NEW_PROCESS_GROUP = 0x00000200
@@ -374,6 +375,23 @@ def _report_summary(succeeded, skipped, spawn_failed, exited, failed,
     _show_error("AmiFUSE", "\n\n".join(parts))
 
 
+_SYNCHRONIZE = 0x00100000
+
+
+def _mount_ready(token: str) -> bool:
+    """Return whether the mount spawned with ``token`` holds its ready event,
+    which it creates once FUSE init has run and drops when it ends
+    (``windows_unmount.UnmountControl``). The launcher's handle is closed at
+    once, so that it never keeps the event alive itself."""
+    handle = ctypes.windll.kernel32.OpenEventW(
+        _SYNCHRONIZE, False, READY_EVENT.format(token)
+    )
+    if not handle:
+        return False
+    ctypes.windll.kernel32.CloseHandle(handle)
+    return True
+
+
 def mount_image_all(image: str, *, write: bool, explorer: str) -> None:
     """Mount every partition of ``image``, one per free drive letter (fan-out).
 
@@ -428,6 +446,7 @@ def mount_image_all(image: str, *, write: bool, explorer: str) -> None:
     exited: list[tuple[_MountUnit, str, str]] = []  # (unit, letter, message)
     failed: list[tuple[_MountUnit, str]] = []
     procs: dict[str, tuple[subprocess.Popen, Optional[Path]]] = {}
+    tokens: dict[str, str] = {}  # letter -> its mount's ready-event token
     held_logs = []  # mount logs this launcher holds open until the poll ends
     for unit, letter in pairs:
         cmd = [python_exe, "-m", "amifuse", "mount"]
@@ -441,6 +460,9 @@ def mount_image_all(image: str, *, write: bool, explorer: str) -> None:
         # The mount's stderr goes to a file, so an error it exits with can be
         # shown instead of the soft timeout.
         stderr, stderr_path = _open_mount_log(letter)
+        # Neither the PID (the venv's pythonw.exe is a redirector) nor the
+        # letter (another program may hold it) identifies this mount.
+        token = os.urandom(16).hex()
         try:
             proc = _spawn_detached(
                 cmd,
@@ -448,6 +470,7 @@ def mount_image_all(image: str, *, write: bool, explorer: str) -> None:
                 stdout=subprocess.DEVNULL,
                 stderr=stderr,
                 close_fds=True,
+                env={**os.environ, READY_TOKEN_ENV: token},
             )
         except Exception as exc:
             if stderr_path is not None:
@@ -461,17 +484,24 @@ def mount_image_all(image: str, *, write: bool, explorer: str) -> None:
             held_logs.append(stderr)
         pending[letter] = unit
         procs[letter] = (proc, stderr_path)
+        tokens[letter] = token
 
     # Single aggregate-deadline poll. Once the mount's process is known not to
-    # have failed, os.path.exists("<letter>\\") is the "did my mount appear"
-    # probe (a live WinFSP mount has media). It is distinct
-    # from the GetLogicalDrives allocation bitmask used to SELECT letters -- do
-    # not merge the two probes. This blocks up to the aggregate deadline before
-    # main() reaches os._exit(0); safe because both shell verbs launch hidden and
-    # non-waiting via `WScript.Shell.Run cmd, 0, False`, so Explorer's UI thread
+    # have failed, its drive has arrived when os.path.exists("<letter>\\")
+    # (a live WinFSP mount has media) and its ready event (_mount_ready) both
+    # hold on two consecutive ticks. A drive without the event is another
+    # program's. WinFsp calls init before it sets the mount point, so a mount
+    # whose mount point is then refused holds the event only until its
+    # teardown starts; the second tick rules that out. The drive
+    # probe is distinct from the GetLogicalDrives allocation bitmask used to
+    # SELECT letters -- do not merge the two probes. This blocks up to the
+    # aggregate deadline before main() reaches os._exit(0); safe because both
+    # shell verbs launch hidden and non-waiting via
+    # `WScript.Shell.Run cmd, 0, False`, so Explorer's UI thread
     # is not blocked. Do not "optimize" the poll away -- it is what surfaces
     # mount failures instead of re-silencing them.
     succeeded: list[tuple[_MountUnit, str]] = []
+    seen_ready: set[str] = set()  # drive and event both held on the last tick
     if pending:
         timeout = _aggregate_timeout(len(pending))
         poll_interval = 0.25
@@ -492,7 +522,12 @@ def mount_image_all(image: str, *, write: bool, explorer: str) -> None:
                     exited.append(
                         (unit, letter, _mount_error(stderr_path, proc.returncode))
                     )
-                elif os.path.exists(letter + "\\"):
+                elif not (os.path.exists(letter + "\\")
+                          and _mount_ready(tokens[letter])):
+                    seen_ready.discard(letter)
+                elif letter not in seen_ready:
+                    seen_ready.add(letter)
+                else:
                     unit = pending.pop(letter)
                     succeeded.append((unit, letter))
                     _log(f"Mount ready at {letter} after {elapsed:.1f}s")
