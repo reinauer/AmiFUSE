@@ -240,18 +240,18 @@ class TestTimerDevice:
     def test_system_time_counts_from_the_amiga_epoch_like_datestamp(self):
         """GetSysTime and dos.library's DateStamp tell the same time.
 
-        AmigaOS counts from 1978-01-01, 2922 days after the Unix epoch;
-        vamos' DateStamp subtracts them from UTC, and so must the timer.
+        AmigaOS counts from 1978-01-01, 2922 days after the Unix epoch, in
+        local time; AmiFUSE's DateStamp does, and so must the timer.
         """
-        from amitools.vamos.lib.dos.AmiTime import sys_to_ami_time
+        from amifuse.amiga_time import AMIGA_EPOCH, to_datestamp
         from amifuse.timer_device import AmiFuseTimerDevice
 
         now = time.time()
-        stamp = sys_to_ami_time(now)
+        days, minute, tick = to_datestamp(now)
         secs, micros = AmiFuseTimerDevice.get_sys_time()
         assert 0 <= micros < 1_000_000
-        assert abs(secs - (stamp.tday * 86400 + stamp.tmin * 60 + stamp.tick // 50)) <= 2
-        assert AmiFuseTimerDevice.AMIGA_EPOCH_OFFSET == 252_460_800
+        assert abs(secs - (days * 86400 + minute * 60 + tick // 50)) <= 2
+        assert AMIGA_EPOCH == 252_460_800
 
     @pytest.mark.parametrize("unit", [UNIT_WAITUNTIL, None])
     def test_absolute_or_unknown_unit_stays_quick(self, timer, unit):

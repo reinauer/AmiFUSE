@@ -64,6 +64,7 @@ class _FuseOperations:
         raise FuseOSError(errno.EROFS)
 
 from . import driver_resolver
+from .amiga_time import host_time, to_datestamp
 from .driver_resolver import DriverNotFound, ResolvedDriver
 from .driver_runtime import BlockDeviceBackend, ImageInUseError
 from .vamos_runner import VamosHandlerRuntime
@@ -167,6 +168,14 @@ _RENAME_ERRNOS = {
     ERROR_OBJECT_NOT_FOUND: errno.ENOENT,
     ERROR_DIRECTORY_NOT_EMPTY: errno.ENOTEMPTY,
     ERROR_DELETE_PROTECTED: errno.EACCES,
+}
+
+# AmigaDOS error codes from a failed ACTION_SET_DATE, and the errno
+# utimens() reports for each.
+_SET_DATE_ERRNOS = {
+    **_WRITE_ERRNOS,
+    ERROR_OBJECT_IN_USE: errno.EBUSY,
+    ERROR_OBJECT_NOT_FOUND: errno.ENOENT,
 }
 
 # AmigaDOS error codes a handler can return when it refuses ACTION_DISK_INFO.
@@ -301,6 +310,9 @@ def _parse_fib(mem, fib_addr: int) -> Dict:
       fib_EntryType: LONG at 120
       fib_Size: ULONG at 124
       fib_NumBlocks: LONG at 128
+      fib_Date: DateStamp (ds_Days, ds_Minute, ds_Tick: 3 LONGs) at 132
+
+    "mtime" is fib_Date as host time.
     """
     dir_type = mem.r32s(fib_addr + 4)   # fib_DirEntryType (signed LONG)
     protection = mem.r32(fib_addr + 116)  # fib_Protection (LONG)
@@ -309,12 +321,15 @@ def _parse_fib(mem, fib_addr: int) -> Dict:
     name_bytes = mem.r_block(fib_addr + 8, 108)  # fib_FileName starts at offset 8
     name_len = name_bytes[0]
     name = name_bytes[1 : 1 + name_len].decode("latin-1", errors="ignore")
+    mtime = host_time(mem.r32s(fib_addr + 132), mem.r32s(fib_addr + 136),
+                      mem.r32s(fib_addr + 140))
     return {
         "dir_type": dir_type,
         "size": size,
         "name": name,
         "protection": protection,
         "num_blocks": num_blocks,
+        "mtime": mtime,
     }
 
 
@@ -563,6 +578,7 @@ class HandlerBridge:
         # cache a best-effort volume name
         self._volname = None
         self._fib_mem = None
+        self._datestamp_mem = None
         self._read_buf_mem = None
         self._read_buf_size = 0
         self._bstr_ring = []
@@ -2758,6 +2774,23 @@ class HandlerBridge:
             reply = self._run_until_reply(pkt_addr, "mkdir")
             return reply if reply is not None else (0, -1)
 
+    def set_date(self, parent_lock_bptr: int, name: str, when: float) -> Tuple[int, int]:
+        """Date name in the directory with ACTION_SET_DATE, to Unix time when.
+
+        Returns (dp_Res1, dp_Res2), or (0, -1) when no reply comes.
+        """
+        with self._lock:
+            if self._datestamp_mem is None:
+                self._datestamp_mem = self.vh.alloc.alloc_memory(12, label="FUSE_DATESTAMP")
+            ds_addr = self._datestamp_mem.addr
+            for offset, value in zip((0, 4, 8), to_datestamp(when)):
+                self.mem.w32(ds_addr + offset, value)
+            _, name_bptr = self._alloc_bstr(name)
+            pkt_addr, _ = self.launcher.send_set_date(
+                self.state, parent_lock_bptr, name_bptr, ds_addr)
+            reply = self._run_until_reply(pkt_addr, "set_date")
+            return reply if reply is not None else (0, -1)
+
     def write_empty_reply(self, fh_addr: int) -> Tuple[int, int]:
         """Send a zero-length ACTION_WRITE and return (dp_Res1, dp_Res2).
 
@@ -2837,6 +2870,12 @@ class HandlerBridge:
 
 
 class AmigaFuseFS(_FuseOperations):
+    # Mounted through WinFsp, which goes on passing a handle's callbacks the
+    # name the file was opened under after rename() moved it (_handle_path),
+    # and passes utimens() an unchanged time as getattr() reports it. The
+    # kernel's FUSE on Linux and macOS passes the current name, and libfuse
+    # both times as asked for.
+    _winfsp = sys.platform.startswith("win")
     # macOS special files we should reject immediately without calling handler.
     # Note: "Icon\r" and ".VolumeIcon.icns" are NOT in this list - we handle them for custom icons.
     _MACOS_SPECIAL = frozenset([
@@ -2911,6 +2950,9 @@ class AmigaFuseFS(_FuseOperations):
         self._next_fh = 1
         self._pending_deletes: set = set()
         self._pending_dir_deletes: Dict[str, set] = {}  # dir_path -> set of pending child paths blocking removal
+        # path -> the date utimens() set on an open file, sent at its last
+        # release(). Guarded by _fh_lock.
+        self._held_dates: Dict[str, float] = {}
         self._last_op_time = time.time()
         self._op_count = 0
         # Replies to timer.device requests while the mount is idle; see
@@ -3171,8 +3213,11 @@ class AmigaFuseFS(_FuseOperations):
         """Build a FUSE stat dict from a parsed FileInfoBlock entry.
 
         ``name`` is only used for the trailing ``.info`` check, so both a
-        full path (getattr) and a bare entry name (readdir) work.
+        full path (getattr) and a bare entry name (readdir) work. The
+        times are the entry's date, or ``now`` for an entry with none (a
+        pinned one). AmigaDOS keeps no access or change time.
         """
+        mtime = ent.get("mtime", now)
         is_dir = ent["dir_type"] >= 0
         # Convert Amiga protection bits to Unix mode
         prot = DosProtection(ent.get("protection", 0))
@@ -3192,9 +3237,9 @@ class AmigaFuseFS(_FuseOperations):
             "st_mode": base_mode | (0o040000 if is_dir else 0o100000),
             "st_nlink": 2 if is_dir else 1,
             "st_size": ent["size"],
-            "st_ctime": now,
-            "st_mtime": now,
-            "st_atime": now,
+            "st_ctime": mtime,
+            "st_mtime": mtime,
+            "st_atime": mtime,
             "st_uid": self._uid,
             "st_gid": self._gid,
             "st_blksize": 512,  # TODO: compute from ACTION_DISK_INFO?
@@ -4104,6 +4149,8 @@ class AmigaFuseFS(_FuseOperations):
                         # Directory and icon handles have no fh_addr.
                         if moved == new and src_dir != dst_dir and "fh_addr" in entry:
                             moved_out.append(entry)
+                        if self._winfsp:  # see utimens()
+                            entry.setdefault("opened_as", entry["path"])
                         entry["path"] = moved
                 # Deferred deletes follow too. release() and releasedir()
                 # look for them under the handle's path, and one left under
@@ -4117,6 +4164,10 @@ class AmigaFuseFS(_FuseOperations):
                         _renamed_path(c, old, new) or c for c in children
                     }
                     for d, children in self._pending_dir_deletes.items()
+                }
+                self._held_dates = {
+                    _renamed_path(p, old, new) or p: when
+                    for p, when in self._held_dates.items()
                 }
         for entry in moved_out:
             self._move_parent_lock(entry, dst_dir)
@@ -4186,10 +4237,108 @@ class AmigaFuseFS(_FuseOperations):
         return 0
 
     def utimens(self, path, times=None):
+        """Set the file's date to the modification time.
+
+        A handler stamps a file it closes after a write, and Windows dates
+        a copy on its open handle, so the date of an open file is held, the
+        last one asked for, and set at its last release(). A closed file is
+        dated at once. A date before 1978 is set to 1978-01-01.
+
+        A request for the date a closed file has sends nothing. AmigaDOS
+        keeps no access time, and WinFsp (_winfsp) passes an access-time-
+        only change with the date getattr() reports, so there a request for
+        that date holds nothing for an open file either: the handler's stamp
+        at close stands. libfuse passes both times as asked for, so the last
+        date asked for an open file is held even when it is that date.
+
+        WinFsp also goes on passing the name a file was opened under after
+        rename() moved it. A request for the name an open file was renamed
+        from is held for that file, and one that two objects could answer
+        is dropped.
+        """
         if not self.bridge._write_enabled:
             raise FuseOSError(errno.EROFS)
-        # Ignore timestamp updates for now.
+        self._check_handler_alive()
+        if path == "/" or (self._icon_handler and (
+                self._is_icon_file(path) or self._is_volume_icon_file(path))):
+            return 0
+        mtime = time.time() if times is None else times[1]
+        with self._fh_lock:
+            target = self._renamed_open_file(path)
+        if target is None:
+            return 0
+        try:
+            current = self.getattr(target)["st_mtime"]
+        except FuseOSError as e:
+            if e.args[0] != errno.ENOENT:
+                raise
+            current = None
+        unchanged = current is not None and abs(mtime - current) < 0.01  # half a tick
+        with self._fh_lock:
+            # Write mounts run single-threaded: no handle came or went since.
+            if self._has_open_file(target):
+                if not (unchanged and self._winfsp):
+                    self._held_dates[target] = mtime
+                return 0
+        if current is None or unchanged:
+            return 0
+        self._set_date(target, mtime)
         return 0
+
+    def _has_open_file(self, path: str) -> bool:
+        """Whether a file handle is open on path. Hold _fh_lock."""
+        return any(
+            "fh_addr" in v and v.get("path") == path and not v.get("closed")
+            for v in self._fh_cache.values()
+        )
+
+    def _renamed_open_file(self, path: str) -> Optional[str]:
+        """The path an object opened as path was renamed to, else path.
+
+        None when that name could be two objects: another open handle, of
+        a file or a directory, has it, or two renamed ones were opened
+        under it. Hold _fh_lock.
+        """
+        moved = {
+            v.get("path") for v in self._fh_cache.values()
+            if not v.get("closed") and v.get("opened_as") == path != v.get("path")
+        }
+        if not moved:
+            return path
+        if len(moved) > 1 or any(
+                v.get("path") == path and not v.get("closed")
+                for v in self._fh_cache.values()):
+            return None
+        return moved.pop()
+
+    def _set_date(self, path: str, when: float):
+        dir_path, name = self._split_path(path)
+        lock, _, locks = self.bridge.locate_path(dir_path)
+        try:
+            if lock == 0 and dir_path != "/":
+                raise FuseOSError(errno.ENOENT)
+            res1, res2 = self.bridge.set_date(lock, name, when)
+        finally:
+            for l in reversed(locks):
+                self.bridge.free_lock(l)
+        with self._cache_lock:
+            self._stat_cache.pop(path, None)
+        # A handler without the packet keeps its own dates, as before.
+        if res1 == 0 and res2 != ERROR_ACTION_NOT_KNOWN:
+            raise FuseOSError(_SET_DATE_ERRNOS.get(res2, errno.EIO))
+
+    def _set_held_date(self, path: str):
+        """Set the date utimens() held for path, once no handle is open on it."""
+        with self._fh_lock:
+            if path not in self._held_dates or self._has_open_file(path):
+                return
+            when = self._held_dates.pop(path)
+            if path in self._pending_deletes:  # deleted at this release
+                return
+        try:
+            self._set_date(path, when)
+        except FuseOSError as e:
+            self._log_op("release", path, f"held date not set: errno {e.args[0]}")
 
     def access(self, path, mode):
         self._log_op("access", path, f"mode={mode}")
@@ -4486,6 +4635,8 @@ class AmigaFuseFS(_FuseOperations):
         if self._cache_ttl <= 0:
             with self._cache_lock:
                 self._stat_cache.pop(resolved_path, None)
+        if resolved_path:
+            self._set_held_date(resolved_path)
         # Check for deferred deletes (WinFSP unlink-before-release pattern)
         if resolved_path:
             with self._fh_lock:

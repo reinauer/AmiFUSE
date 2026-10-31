@@ -172,9 +172,13 @@ class VamosHandlerRuntime:
         if not self.slm.parse_config(libs_cfg):
             raise RuntimeError("Failed to parse lib manager config")
         self.slm.setup()
+        from amifuse.clock_libraries import AmiFuseDosLibrary, AmiFuseIntuitionLibrary
         from amifuse.exec_library import AmiFuseExecLibrary
-        # Before exec.library opens: its stub binds the methods then.
+        # Before exec.library and dos.library open: a stub binds the methods
+        # then. The clock reads tell local time (clock_libraries).
         self.slm.lib_mgr.add_impl_cls("exec.library", AmiFuseExecLibrary)
+        self.slm.lib_mgr.add_impl_cls("dos.library", AmiFuseDosLibrary)
+        self.slm.lib_mgr.add_impl_cls("intuition.library", AmiFuseIntuitionLibrary)
         self.slm.open_base_libs()
         # Register the shared vamos disk device. The backend is supplied by
         # HandlerBridge after it has applied AmiFUSE's image detection.

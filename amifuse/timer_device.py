@@ -10,9 +10,10 @@ bridge calls deliver() between emulator bursts, and delivery replies the
 request the way SendIO's quick path does. Absolute units and the clock
 arithmetic are amitools' behaviour.
 
-It also corrects the system time. amitools counts it from the Unix epoch,
-while AmigaOS, and dos.library's DateStamp in vamos, count from 1978-01-01,
-so a handler stamping files with GetSysTime dated them eight years ahead.
+It also corrects the system time. amitools counts it from the Unix epoch
+in UTC, while AmigaOS counts from 1978-01-01 in local time, so a handler
+stamping files with GetSysTime dated them eight years ahead. It tells the
+time of AmiFUSE's dos.library DateStamp (amiga_time).
 
 OpenDevice puts a Unit of the device's own into io_Unit, as timer.device
 does, and amitools' ScsiDevice for the same reason: a copy of an opened
@@ -62,6 +63,8 @@ from amitools.vamos.libstructs.exec_ import (  # type: ignore
 )
 from amitools.vamos.log import log_timer  # type: ignore
 
+from amifuse.amiga_time import sys_time
+
 UNIT_MICROHZ = 0
 UNIT_VBLANK = 1
 UNIT_ECLOCK = 2
@@ -104,9 +107,6 @@ class AmiFuseTimerDevice(TimerDevice):
     # One VBLANK tick. It bounds how often a handler that re-arms with no
     # delay can wake.
     MIN_DELAY = 0.02
-    # Seconds from the Unix epoch to the Amiga epoch, 1978-01-01: the 2922
-    # days that vamos' DateStamp subtracts (amitools.vamos.lib.dos.AmiTime).
-    AMIGA_EPOCH_OFFSET = 2922 * 24 * 60 * 60
 
     def __init__(self, exec_impl, clock: Callable[[], float] = time.monotonic):
         self._exec = exec_impl
@@ -128,15 +128,13 @@ class AmiFuseTimerDevice(TimerDevice):
 
     @classmethod
     def get_sys_time(cls):
-        """The system time as (secs, micros) since the Amiga epoch, in UTC.
+        """The system time as (secs, micros) since 1978-01-01, in local time.
 
-        UTC, as vamos' DateStamp uses, so that both clocks agree. GetSysTime
-        and TR_GETSYSTIME both read it. Computed here rather than from
-        amitools' Unix-epoch value, so a fix there cannot apply twice.
+        GetSysTime and TR_GETSYSTIME both read it. Computed in amiga_time
+        rather than from amitools' Unix-epoch value, so a fix there cannot
+        apply twice.
         """
-        now = time.time()
-        secs = int(now)
-        return secs - cls.AMIGA_EPOCH_OFFSET, int((now - secs) * cls.MICRO_HZ)
+        return sys_time()
 
     # ---- library hooks ----
 
