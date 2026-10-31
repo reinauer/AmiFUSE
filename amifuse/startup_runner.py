@@ -397,6 +397,14 @@ class HandlerLauncher:
         self._stdpkt_sizes = []
         self._stdpkt_index = 0
         self._stdpkt_ring_size = 8
+        # Packets send_packet() queued that have no reply yet: packet
+        # address -> (dp_Type, args). poll_replies() removes each packet it
+        # sees answered. Until then the handler may still read the packet
+        # and the memory its args point to, so none of it is reused.
+        self.pending: Dict[int, Tuple[int, Tuple[int, ...]]] = {}
+        # StandardPackets taken out of the ring while their packet was
+        # still out; each is freed once its packet is answered.
+        self._stdpkt_retired = []
         # Cache hot struct sizes/offsets for packet marshalling.
         self._msg_size = MessageStruct.get_size()
         self._pkt_size = DosPacketStruct.get_size()
@@ -637,14 +645,30 @@ class HandlerLauncher:
     def _build_std_packet(
         self, dest_port_addr: int, reply_port_addr: int, pkt_type: int, args
     ) -> Tuple[int, int]:
-        """Allocate contiguous StandardPacket = Message + DosPacket."""
+        """Allocate contiguous StandardPacket = Message + DosPacket.
+
+        A ring slot whose packet is still out (pending) gets a new
+        StandardPacket, and the old one is freed once its reply has come,
+        so that no packet is built where the handler may still read
+        another, and a late reply's address names one packet only.
+        """
         total = self._msg_size + self._pkt_size
         if not self._stdpkt_ring:
             self._stdpkt_ring = [None] * self._stdpkt_ring_size
             self._stdpkt_sizes = [0] * self._stdpkt_ring_size
+        retired = []
+        for old in self._stdpkt_retired:
+            if old.addr + self._msg_size in self.pending:
+                retired.append(old)
+            else:
+                self.alloc.free_memory(old)
+        self._stdpkt_retired = retired
         idx = self._stdpkt_index
         self._stdpkt_index = (idx + 1) % self._stdpkt_ring_size
         sp_mem = self._stdpkt_ring[idx]
+        if sp_mem is not None and sp_mem.addr + self._msg_size in self.pending:
+            self._stdpkt_retired.append(sp_mem)
+            sp_mem = self._stdpkt_ring[idx] = None
         if sp_mem is None or total > self._stdpkt_sizes[idx]:
             new_mem = self.alloc.alloc_memory(total, label=f"stdpkt_scratch_{idx}")
             if sp_mem is not None:
@@ -1131,13 +1155,20 @@ class HandlerLauncher:
             if debug:
                 print(f"[poll_replies] got msg=0x{msg_addr:x} pkt=0x{pkt_addr:x} res1=0x{res1:x} res2={res2}")
             results.append((msg_addr, pkt_addr, res1, res2))
+            self.pending.pop(pkt_addr, None)
             has_msg = pmgr.has_msg(port_addr)
         return results
 
     def send_packet(self, state: HandlerLaunchState, pkt_type: int, args):
-        """Queue a packet to the handler and return the msg/pkt addresses."""
+        """Queue a packet to the handler and return the msg/pkt addresses.
+
+        The packet stays in pending until poll_replies() sees its reply.
+        """
         pkt_addr, msg_addr = self._build_std_packet(
             state.port_addr, state.reply_port_addr, pkt_type, args
+        )
+        self.pending[pkt_addr] = (
+            pkt_type, tuple(val & 0xFFFFFFFF for val in args[:7])
         )
         return pkt_addr, msg_addr
 
