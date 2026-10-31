@@ -3107,9 +3107,12 @@ class AmigaFuseFS(_FuseOperations):
     # --- FUSE operations ---
     def getattr(self, path, fh=None):
         self._check_handler_alive()
+        open_file = False
         if fh is not None:
             with self._fh_lock:
-                path = _handle_path(self._fh_cache.get(fh), path)
+                entry = self._fh_cache.get(fh)
+                open_file = bool(entry and entry.get("path") and "fh_addr" in entry)
+                path = _handle_path(entry, path)
         # Reject OS special files immediately without calling handler
         if self._is_platform_special(path):
             self._track_op("getattr", path, cached=True)
@@ -3139,10 +3142,11 @@ class AmigaFuseFS(_FuseOperations):
         if self._is_neg_cached(path):
             self._track_op("getattr", path, cached=True)
             raise FuseOSError(errno.ENOENT)
-        # Check if path has a pending (deferred) delete - hide from callers
+        # A pending (deferred) delete is hidden from lookups by name, but a
+        # file handle still open on it describes it until release() (#244).
         with self._fh_lock:
             pending = path in self._pending_deletes
-        if pending:
+        if pending and not open_file:
             self._track_op("getattr", path, cached=True)
             raise FuseOSError(errno.ENOENT)
         # Check positive cache
@@ -4041,9 +4045,12 @@ class AmigaFuseFS(_FuseOperations):
             # A deferred delete of the target followed it to temp in step 1.
             self._forget_pending_delete(temp)
         with self._cache_lock:
+            # A file still open keeps its pinned entry, which is all
+            # getattr() has through its handle while it is held on an
+            # exclusive lock.
             if not deferred:
                 self._pinned_stats.discard(temp)
-            self._stat_cache.pop(temp, None)
+                self._stat_cache.pop(temp, None)
             self._dir_cache.pop(self._split_path(temp)[0], None)
 
     def _rename_back(self, old: str, new: str):
