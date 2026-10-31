@@ -75,7 +75,8 @@ Linux, macOS, and Windows:
   FastFileSystem.
 - **Unit tests** -- Python 3.11--3.13. No external dependencies.
 - **Integration tests** -- Python 3.13. Clones AmiFUSE-testing for
-  fixtures. Exercises the full m68k emulation stack.
+  fixtures, at the commit `AMIFUSE_TESTING_SHA` in `ci.yml` pins.
+  Exercises the full m68k emulation stack.
 - **Tools smoke** -- Python 3.13. Same fixtures. Runs
   `amifuse_matrix.py` and `image_format_smoke.py` as CI-visible smoke
   checks.
