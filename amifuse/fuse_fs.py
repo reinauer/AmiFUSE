@@ -2475,15 +2475,24 @@ class HandlerBridge:
             self.set_handle_size(fh_addr, end)
             self.seek_handle(fh_addr, 0)
 
-    def write_handle_at(self, fh_addr: int, offset: int, data: bytes) -> Tuple[int, int]:
+    def write_handle_at(self, fh_addr: int, offset: int, data: bytes,
+                        end: Optional[int] = None) -> Tuple[int, int]:
         """Write data at offset and return (dp_Res1, dp_Res2) like write_handle_reply().
 
         A write past end of file first fills the gap with zeros, as POSIX
         requires. Any other failed seek, including one to an offset that
         does not fit in a LONG, fails the write instead of writing at the
         handle's old position.
+
+        end, when given, is the end of file the caller holds for the
+        handle, and a write past it fills the gap from it. BFFS keeps an
+        existing file's old bytes past what an ACTION_FINDOUTPUT handle
+        wrote, and seeks into them, until the handle ends
+        (AmigaFuseFS._pinned_end).
         """
         with self._lock:
+            if end is not None and offset > end:
+                return self._write_past_end(fh_addr, offset, data, end)
             result, _ = self.seek_handle(fh_addr, offset)
             if result is SeekResult.PAST_END:
                 return self._write_past_end(fh_addr, offset, data)
@@ -2491,7 +2500,8 @@ class HandlerBridge:
                 return -1, 0
             return self.write_handle_reply(fh_addr, data)
 
-    def _write_past_end(self, fh_addr: int, offset: int, data: bytes) -> Tuple[int, int]:
+    def _write_past_end(self, fh_addr: int, offset: int, data: bytes,
+                        end: Optional[int] = None) -> Tuple[int, int]:
         """Fill the file with zeros from its end to offset, then write data.
 
         AmigaDOS cannot seek past end of file, so this writes the gap
@@ -2499,6 +2509,13 @@ class HandlerBridge:
         no data, the file only grows to offset, as truncate() needs. A
         write that fails once the fill has begun shrinks the file back to
         its old end, so the zeros do not stay behind and fill the volume.
+
+        end, when given, is the end of file to fill from in place of the
+        handler's, as write_handle_at() takes it. The handler's end is
+        still measured: when it is lower, the fill starts there, and
+        otherwise the fill up to it overwrites blocks the file already
+        holds, as BFFS keeps the old file's, which the space check does
+        not count as new.
 
         The bridge lock is held until the fill ends, and a writable mount
         serves one request at a time, so a large gap stalls the whole mount.
@@ -2508,11 +2525,17 @@ class HandlerBridge:
         held before, such as a deleted file's data.
         """
         with self._lock:
-            end = self._handle_end(fh_addr)
+            measured = self._handle_end(fh_addr)
+            if end is None or (measured is not None and measured < end):
+                end = measured
+            elif self.seek_handle(fh_addr, end)[0] is not SeekResult.OK:
+                return -1, 0
             # ERROR_SEEK_ERROR inside the file (AROS afs cannot follow a
             # damaged file's extension blocks) is a failure, not a gap.
             if end is None or end > offset:
                 return -1, 0
+            # The file holds blocks up to the handler's end.
+            held_end = max(end, measured or 0)
             # Fail before writing anything when the volume cannot hold the
             # gap and the data. Block overhead can still run the fill out of
             # space near the limit, and the handler then reports disk full.
@@ -2522,7 +2545,8 @@ class HandlerBridge:
                 free_blocks = max(info["num_blocks"] - info["num_blocks_used"], 0)
                 # The file's last block may still have room before a new one
                 # is needed.
-                if offset - end + len(data) > free_blocks * bpb + (-end % bpb):
+                if (offset + len(data) - held_end
+                        > free_blocks * bpb + (-held_end % bpb)):
                     return -1, ERROR_DISK_FULL
             zeros = bytes(min(offset - end, ZERO_FILL_CHUNK))
             written, res2 = 0, 0
@@ -2543,7 +2567,8 @@ class HandlerBridge:
             return written, res2
 
     def truncate_handle(self, fh_addr: int, length: int,
-                        others: Sequence[int] = ()) -> Tuple[int, int]:
+                        others: Sequence[int] = (),
+                        end: Optional[int] = None) -> Tuple[int, int]:
         """Make the file length bytes long, as POSIX ftruncate() does.
 
         Returns (new size, 0), or (-1, error) when the change fails: a
@@ -2573,6 +2598,11 @@ class HandlerBridge:
         2 GiB or more, SFS answers it with an end dp_Res1 cannot carry,
         and AROS afs can fail the seek to the end of a damaged file.
 
+        end, when given, is the end of file the caller holds for the
+        handle, and replaces the measured one, as in write_handle_at():
+        a grow writes zeros from it, and a shrink below it goes out as
+        ACTION_SET_FILE_SIZE, which BFFS refuses.
+
         SetFileSize() leaves no other handle on the file past its new end.
         FFS stops a shrink at such a handle and replies with the size it
         reached, SFS refuses it with ERROR_OBJECT_IN_USE, and AROS afs with
@@ -2589,24 +2619,34 @@ class HandlerBridge:
         if not 0 <= length <= _LONG_MAX:
             return -1, 0
         with self._lock:
-            # A truncate to 0 cannot grow the file, so it skips the seeks.
             grow = False
-            if length:
-                end = self._handle_end(fh_addr)
+            # A truncate to 0 still goes out at a caller's end of 0: after
+            # a write that got no reply the file may hold more, and BFFS's
+            # refusal then has truncate() empty it (_reopen_for_output).
+            if end is not None and length:
+                # The caller's end needs no seeks, and BFFS would refuse a
+                # packet that changes nothing.
                 if end == length:
+                    return length, 0
+                grow = length > end
+            elif length:
+                # A truncate to 0 cannot grow the file, so it skips the seeks.
+                measured = self._handle_end(fh_addr)
+                if measured == length:
                     # Nothing to change, and BFFS would refuse the packet.
                     return length, 0
-                if end is not None:
-                    grow = length > end
+                if measured is not None:
+                    grow = length > measured
                 else:
                     result, _ = self.seek_handle(fh_addr, length)
                     if result is SeekResult.FAILED:
                         return -1, 0
                     grow = result is SeekResult.PAST_END
             if grow:
-                # _write_past_end measures the end again. Two more seeks
-                # cost little next to the zeros it then writes.
-                written, res2 = self._write_past_end(fh_addr, length, b"")
+                # Without the caller's end, _write_past_end measures the end
+                # again. Two more seeks cost little next to the zeros it
+                # then writes.
+                written, res2 = self._write_past_end(fh_addr, length, b"", end)
                 return (length, 0) if written >= 0 else (-1, res2)
             size, res2 = self.set_handle_size_reply(fh_addr, length)
             # Send it again only after a reply that shows the stop: a size
@@ -2992,7 +3032,13 @@ class AmigaFuseFS(_FuseOperations):
         return "/" + path.lstrip("/").rsplit("/", 1)[0]
 
     def _get_cached_stat(self, path: str) -> Optional[Dict]:
-        """Return cached stat result if still valid, else None."""
+        """Return cached stat result if still valid, else None.
+
+        A stale pin is measured first (_measure_stale_pin), which can send
+        packets and takes the handle's lock, so the caller must not hold
+        it.
+        """
+        self._measure_stale_pin(path)
         with self._cache_lock:
             if path in self._stat_cache:
                 ts, result = self._stat_cache[path]
@@ -3000,6 +3046,47 @@ class AmigaFuseFS(_FuseOperations):
                     return result
                 del self._stat_cache[path]
         return None
+
+    def _measure_stale_pin(self, path: str) -> None:
+        """Lower path's pinned size to the end a late shrink left.
+
+        truncate() marks a handle (stale_pin) when its shrink below the
+        pinned size got no reply in either wait: the handler may still
+        carry it out. The end is measured through that handle, until a
+        measure gets its replies, and the pin becomes the smaller of the
+        two. A handler that takes its
+        packets in turn ends a shrink still under way before it answers
+        the seeks. The pin never rises: a BFFS ACTION_FINDOUTPUT
+        handle's end still counts the old file's bytes past what the
+        handle wrote (_pinned_end).
+
+        _handle_extent leaves the handle where it was; when the handle may
+        have moved, it forgets its cached position. The caller holds
+        neither _cache_lock nor the handle's lock.
+        """
+        if path not in self._pinned_stats:
+            return
+        with self._fh_lock:
+            stale = [e for e in self._fh_cache.values()
+                     if e.get("stale_pin") and _handle_path(e, "") == path]
+        for entry in stale:
+            with entry["lock"]:
+                if not entry.get("stale_pin") or entry.get("closed"):
+                    continue
+                extent = self.bridge._handle_extent(entry["fh_addr"])
+                if extent is None:
+                    # The handler may still be busy with the shrink: the
+                    # next callback measures again.
+                    entry["pos"] = None
+                    continue
+                del entry["stale_pin"]
+                end = extent[1]
+                with self._cache_lock:
+                    cached = self._stat_cache.get(path)
+                    if (end is not None and path in self._pinned_stats
+                            and cached is not None
+                            and end < cached[1]["st_size"]):
+                        self._pin_stat(path, end)
 
     def _set_cached_stat(self, path: str, result: Dict):
         """Cache a stat result."""
@@ -3224,6 +3311,26 @@ class AmigaFuseFS(_FuseOperations):
         with self._cache_lock:
             self._stat_cache[path] = (now, self._stat_from_fib(fib, path, int(now)))
             self._pinned_stats.add(path)
+
+    def _pinned_end(self, entry, path: str) -> Optional[int]:
+        """Return the pinned size of the file the entry's handle holds, or None.
+
+        A file held on an exclusive lock holds only what its handle wrote,
+        which its pinned size counts (_pin_stat). BFFS keeps an existing
+        file's old bytes until such a handle ends, and seeks into them, so
+        truncate() and write() take the pinned size as the end of file,
+        not the handler's. On the other handlers the two agree, except
+        after a write that got no reply, which write() does not count:
+        if the handler carried it out, the file reaches past the pin, and
+        a truncate to a length between the two leaves it longer. A stale
+        pin is measured first (_measure_stale_pin), so the caller must not
+        hold the handle's lock.
+        """
+        path = _handle_path(entry, path)
+        if path not in self._pinned_stats:
+            return None
+        cached = self._get_cached_stat(path)
+        return None if cached is None else cached["st_size"]
 
     def _filter_pending_deletes(self, path: str, entries: List[str]) -> List[str]:
         """Drop directory entries whose full path has a pending (deferred) delete."""
@@ -3490,6 +3597,7 @@ class AmigaFuseFS(_FuseOperations):
         if entry is None:
             raise FuseOSError(errno.EIO)
         fh_addr = entry["fh_addr"]
+        end = self._pinned_end(entry, path)
         with entry["lock"]:
             if entry.get("closed"):
                 raise FuseOSError(errno.EIO)
@@ -3499,7 +3607,8 @@ class AmigaFuseFS(_FuseOperations):
                 # of file.
                 return 0
             if entry["pos"] is None or offset != entry["pos"]:
-                written, res2 = self.bridge.write_handle_at(fh_addr, offset, data)
+                written, res2 = self.bridge.write_handle_at(
+                    fh_addr, offset, data, end=end)
             else:
                 written, res2 = self.bridge.write_handle_reply(fh_addr, data)
             if written < 0:
@@ -3600,6 +3709,7 @@ class AmigaFuseFS(_FuseOperations):
             if entry is None:
                 raise FuseOSError(errno.EIO)
             fh_addr = entry["fh_addr"]
+            end = self._pinned_end(entry, path)
             with entry["lock"]:
                 if entry.get("closed"):
                     raise FuseOSError(errno.EIO)
@@ -3608,7 +3718,7 @@ class AmigaFuseFS(_FuseOperations):
                 # carries its offset, so the handler's position for another
                 # handle is only a cache.
                 size, res2 = self.bridge.truncate_handle(
-                    fh_addr, length, [e["fh_addr"] for e in others])
+                    fh_addr, length, [e["fh_addr"] for e in others], end=end)
                 # truncate_handle moves the handle, and handlers differ in
                 # where a size change leaves it, so the next read or write
                 # seeks. The retry moves the others, and a pfs3aio shrink
@@ -3625,6 +3735,20 @@ class AmigaFuseFS(_FuseOperations):
                         entry, _handle_path(entry, path))
                     if res2 == ERROR_OBJECT_IN_USE:
                         raise FuseOSError(errno.EBUSY)
+                if size < 0 and not res2:
+                    # A size change with no reply in either wait gives
+                    # (-1, 0) (set_handle_size_reply), and the handler may
+                    # still carry it out, so no packet follows it here. A
+                    # pfs3aio shrink would move the far handles, so they
+                    # forget their positions, as a moved one does in
+                    # _settle_handles. A shrink below the pin has the pin
+                    # measured again (_measure_stale_pin). A lost grow is
+                    # not marked: it cannot leave the end below the pin,
+                    # and the measure only ever lowers it.
+                    for other in far:
+                        other["pos"] = None
+                    if end is not None and length < end:
+                        entry["stale_pin"] = True
                 if size < 0:
                     raise FuseOSError(_WRITE_ERRNOS.get(res2, errno.EIO))
                 entry["dirty"] = True  # Truncate modifies the file

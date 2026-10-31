@@ -2904,7 +2904,7 @@ class TestFuseWriteErrors:
         # The retry seeks instead of trusting the cached position.
         bridge.write_handle_at.return_value = (6, 0)
         assert fs.write("/file", b" world", 5, handle) == 6
-        bridge.write_handle_at.assert_called_with(self.FH_ADDR, 5, b" world")
+        bridge.write_handle_at.assert_called_with(self.FH_ADDR, 5, b" world", end=None)
         bridge.write_handle_reply.assert_called_once()
 
     def test_failed_seek_write_forgets_position(self, write_fs):
@@ -2921,7 +2921,7 @@ class TestFuseWriteErrors:
 
         bridge.write_handle_at.return_value = (6, 0)
         fs.write("/file", b" world", 5, handle)
-        bridge.write_handle_at.assert_called_with(self.FH_ADDR, 5, b" world")
+        bridge.write_handle_at.assert_called_with(self.FH_ADDR, 5, b" world", end=None)
         bridge.write_handle_reply.assert_not_called()
 
     def test_offset_at_or_beyond_size_limit_is_efbig(self, write_fs):
@@ -3008,7 +3008,7 @@ class TestFuseTruncateLength:
         bridge.open_file.return_value = (self.FH_ADDR, 0)
         # The handler reaches every length it is sent.
         bridge.truncate_handle.side_effect = (
-            lambda fh_addr, length, others=(): (length, 0))
+            lambda fh_addr, length, others=(), end=None: (length, 0))
         return fs, bridge
 
     @pytest.mark.parametrize("length", [0x80000000, 1 << 32, (1 << 32) + 4])
@@ -3077,7 +3077,8 @@ class TestFuseTruncateLength:
         fs, bridge = writable
         handle = fs.open("/file", os.O_WRONLY) if use_handle else None
         assert fs.truncate("/file", 0x7FFFFFFF, handle) == 0
-        bridge.truncate_handle.assert_called_once_with(self.FH_ADDR, 0x7FFFFFFF, [])
+        bridge.truncate_handle.assert_called_once_with(
+            self.FH_ADDR, 0x7FFFFFFF, [], end=None)
 
     def test_read_only_mount_raises_erofs_first(self, fs_with_mock_bridge):
         """A read-only mount reports EROFS whatever the length."""
