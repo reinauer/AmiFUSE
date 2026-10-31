@@ -365,12 +365,14 @@ def test_format_fails_when_the_image_fsync_fails(format_context):
     assert not _complete_printed(ctx.events)
 
 
-def test_format_removes_extracted_handler_when_close_fails(format_context):
+def test_format_removes_extracted_handler_when_close_fails(format_context, capsys):
     ctx = format_context
     ctx.close_error = OSError(errno.EIO, "backend close failed")
-    with pytest.raises(OSError) as caught:
-        ctx.run()
-    assert caught.value is ctx.close_error
+    # A finished format reports the failed close instead of raising it.
+    ctx.run()
+    assert (f"[amifuse] could not close the bridge: {ctx.close_error}"
+            in capsys.readouterr().err)
+    assert _complete_printed(ctx.events)
     assert not ctx.handler.exists()
 
 

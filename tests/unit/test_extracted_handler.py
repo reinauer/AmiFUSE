@@ -182,15 +182,17 @@ def fuse_runs(monkeypatch):
 
 
 def test_failing_bridge_close_still_removes_extracted_handler(
-        tmp_path, temp_dir, extracted, bridge, fuse_runs):
+        capsys, tmp_path, temp_dir, extracted, bridge, fuse_runs):
     """An error closing the bridge after unmount does not keep the handler."""
     bridge.close.side_effect = RuntimeError("shutdown")
 
-    with pytest.raises(RuntimeError, match="shutdown"):
-        fuse_fs.mount_fuse(
-            Path("work.hdf"), None, tmp_path / "mnt", None,
-            partition="DH0", foreground=True)
+    # The failed close is reported, not raised.
+    fuse_fs.mount_fuse(
+        Path("work.hdf"), None, tmp_path / "mnt", None,
+        partition="DH0", foreground=True)
 
+    assert ("[amifuse] could not close the bridge: shutdown"
+            in capsys.readouterr().err)
     fuse_runs.assert_called_once()
     assert not extracted.paths[0].exists()
     assert list(temp_dir.iterdir()) == []
