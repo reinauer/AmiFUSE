@@ -1108,7 +1108,8 @@ class HandlerBridge:
     # caught in a loop fails later than it did then.
     _SHORT_BUSY_CYCLES = 10_000_000
 
-    def _run_until_replies(self, max_iters: int = 50, cycles: int = 200_000, sleep_base: float = 0.0005, sleep_max: float = 0.01, drain_non_essential: bool = True):
+    def _run_until_replies(self, max_iters: int = 50, cycles: int = 200_000, sleep_base: float = 0.0005, sleep_max: float = 0.01, drain_non_essential: bool = True,
+                           deadline: Optional[float] = None):
         """Run handler bursts until at least one reply is queued.
 
         A burst that ends at its cycle limit, with neither done nor error
@@ -1140,7 +1141,11 @@ class HandlerBridge:
         timer thread replies to them (run_due_timers). The limits
         count cycles and bursts, not time: Delay() sleeps on the host and
         spends no cycles, so the time a handler spends in it is bounded by
-        neither, as before.
+        neither, as before. A deadline, on the time.monotonic() clock,
+        also ends the wait before the next burst once it has passed,
+        whatever limit the handler has then; a handler still at work then
+        gets the short limit next, as when a limit runs out, without the
+        warning.
 
         Known limits: a parent that waits while a child process does the
         packet's work still counts against max_iters, because
@@ -1233,12 +1238,16 @@ class HandlerBridge:
                         f"tc_SigRecvd@0x{proc_addr + sigrecvd_off:x}=0x{dos_signal:x}"
                     )
 
+        busy = timed_out = False
         for i in itertools.count():
             busy_limit = (
                 self._SHORT_BUSY_CYCLES if self._busy_ran_out
                 else self._MAX_BUSY_CYCLES
             )
             if busy_cycles >= busy_limit:
+                break
+            if deadline is not None and time.monotonic() >= deadline:
+                timed_out = True
                 break
             if idle_iters >= max_iters:
                 if not self._sleep_to_timer_in_packet_wait(timer_wait_until):
@@ -1361,8 +1370,10 @@ class HandlerBridge:
             # It answered a packet, so it is not caught in a loop, even if it
             # went on to the next packet without waiting.
             self._busy_ran_out = False
-        elif busy_cycles >= busy_limit:
-            if busy_limit == self._MAX_BUSY_CYCLES:
+        elif busy_cycles >= busy_limit or (timed_out and busy):
+            # A wait that ends at its deadline in the middle of the
+            # handler's work leaves it running, as one that runs out does.
+            if busy_cycles >= busy_limit and busy_limit == self._MAX_BUSY_CYCLES:
                 # Shown even without --debug, as in --interactive mounts and
                 # CLI commands. It is lost where stderr is discarded: at
                 # /dev/null by libfuse's daemonize, or at DEVNULL for a mount
@@ -1769,7 +1780,9 @@ class HandlerBridge:
         Stopping it then leaves the volume half changed, so unmount waits
         here first. The handler runs in waits of the short busy limit
         until no packet is out, it parks without replying, or timeout
-        seconds have passed. Late replies are given back as in
+        seconds have passed. Each wait also ends at that deadline: a
+        handler that parks during a wait has the full busy limit for the
+        rest of it. Late replies are given back as in
         _run_until_reply. Returns the names of the packets still out.
         """
         with self._lock:
@@ -1778,7 +1791,7 @@ class HandlerBridge:
                    and time.monotonic() < deadline):
                 sent = dict(self._pending_packets())
                 self._busy_ran_out = True
-                replies = self._run_until_replies()
+                replies = self._run_until_replies(deadline=deadline)
                 self._log_replies("pending", replies)
                 for _, reply_pkt, res1, _ in replies:
                     self._give_back_late_reply(sent.get(reply_pkt), res1)

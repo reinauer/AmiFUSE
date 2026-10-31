@@ -344,3 +344,53 @@ def test_unmount_reports_a_packet_never_answered(bridge, short_limits, capsys):
     assert "Unmount completed with errors." in out
     # The volume is still flushed.
     assert handler.taken(ACTION_FLUSH)
+
+
+def _busy_for_good(b, handler, monkeypatch, parks_once, never=(ACTION_SET_FILE_SIZE,)):
+    """Leave a packet out with a handler still at work on it, 1 s a burst.
+
+    One that waits once (in Wait() within the packet) has the full busy
+    limit for the rest of that wait, 60 bursts here. Returns the fake
+    clock, a list holding the time.monotonic() value.
+    """
+    fh = _open(b, handler, "/grow", 0x5550)
+    handler.delay = lambda pkt_type, name: NEVER if pkt_type in never else 0
+    assert b.set_handle_size(fh, 0x7FFFFFFF) == -1
+
+    now = [1000.0]
+    monkeypatch.setattr(fs.time, "monotonic", lambda: now[0])
+    bursts = []
+
+    def run_burst(state, max_cycles=200000, debug=False):
+        handler.run_burst(state, max_cycles, debug)
+        now[0] += 1.0
+        bursts.append(state)
+        state.run_state = PARKED if parks_once and len(bursts) == 1 else BUSY
+        return state.run_state
+    b.launcher.run_burst = run_burst
+    return now
+
+
+@pytest.mark.parametrize("parks_once", [False, True], ids=["busy", "parks-once"])
+def test_unmount_wait_ends_at_its_deadline(bridge, short_limits, monkeypatch, parks_once):
+    b, handler = bridge
+    now = _busy_for_good(b, handler, monkeypatch, parks_once)
+
+    unanswered = b.wait_for_pending(timeout=15.0)
+    assert now[0] - 1000.0 == 15.0
+    assert unanswered == [fs._packet_type_name(ACTION_SET_FILE_SIZE)]
+
+
+@pytest.mark.parametrize("parks_once", [False, True], ids=["busy", "parks-once"])
+def test_unmount_flush_after_the_deadline_gets_the_short_limit(
+        bridge, short_limits, monkeypatch, capsys, parks_once):
+    # Still at work on the grow, the handler takes no ACTION_FLUSH either.
+    b, handler = bridge
+    now = _busy_for_good(b, handler, monkeypatch, parks_once,
+                         never=(ACTION_SET_FILE_SIZE, ACTION_FLUSH))
+
+    _mount(b).destroy(None)
+
+    # 15 s of waiting for the grow, then 10 bursts for the flush.
+    assert now[0] - 1000.0 == 25.0
+    assert "Unmount completed with errors." in capsys.readouterr().out
