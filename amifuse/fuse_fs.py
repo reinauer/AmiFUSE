@@ -4734,7 +4734,8 @@ def get_partition_info(image: Path, block_size: Optional[int], partition: Option
     """Get partition name and dostype from RDB.
 
     The name is the one the partition mounts as: a repeated drive name reads
-    DH0.1 (rdb_inspect.find_partition).
+    DH0.1 (rdb_inspect.find_partition). A damaged drive name, which amitools
+    reads as None, is named by the partition's number: #0.
     """
     from .rdb_inspect import open_rdisk, find_partition
     ref = find_partition(image, block_size, partition) if partition else None
@@ -4747,8 +4748,15 @@ def get_partition_info(image: Path, block_size: Optional[int], partition: Option
             part = rdisk.get_partition(ref.number) if ref else None
         if part is None:
             return {"name": "AmigaFS", "dostype": None}
+        drive_name = part.get_drive_name()
+        if ref and ref.name:
+            name = ref.name
+        elif drive_name is not None:
+            name = str(drive_name)
+        else:
+            name = f"#{part.num}"
         return {
-            "name": ref.name if ref and ref.name else str(part.get_drive_name()),
+            "name": name,
             "dostype": part.part_blk.dos_env.dos_type,
         }
     finally:
@@ -6429,23 +6437,25 @@ def cmd_write(args):
         source.close()
 
 
-def _partition_driver(image: Path, block_size: Optional[int], name: str):
+def _partition_driver(image: Path, block_size: Optional[int],
+                      name: Optional[str]):
     """Name the driver `mount --partition name` would use without --driver.
 
     Returns the driver's inspect --json object, or None, and a line of text:
     its description, or why there is none. An RDB driver is extracted to
-    hash it, then deleted; its object has no path.
+    hash it, then deleted; its object has no path. A name of None is a
+    damaged drive name (rdb_inspect.list_partitions).
     """
     import hashlib
 
+    if name is None:
+        # Without --partition a mount opens partition 0 of the disk's first
+        # RDB, which need not be this one.
+        return None, "damaged drive name: no --partition name selects it"
     try:
         resolved = resolve_driver(image, None, block_size, name)
     except (DriverNotFound, OSError) as exc:
         return None, " ".join(str(exc).splitlines())
-    except AttributeError as exc:
-        # amitools raises it on a damaged drive name in an RDB the partition
-        # lookup reads (#192).
-        return None, f"a damaged drive name stops the partition lookup: {exc}"
     info = resolved.to_json()
     if resolved.temporary:
         try:
@@ -6576,7 +6586,9 @@ def cmd_inspect(args):
         for desc, names in zip(all_rdbs, mount_names(rdb_parts)):
             for part, name in zip(desc["partitions"], names):
                 if name is None:
-                    name = part["name"]
+                    # A damaged drive name, which amitools' desc gives as
+                    # "None": no --partition name selects the partition.
+                    part["name"] = None
                 elif name != part["name"]:
                     # A repeated drive name, which mount --partition takes
                     # as AmigaOS names it.
@@ -6599,10 +6611,13 @@ def cmd_inspect(args):
 
     print_inspect_report(args.image, args.block_size, args.full)
     print("\nFilesystem driver per partition (without --driver):")
-    # Names are unique: list_partitions renames a repeated one (DH0.1).
+    # Names are unique: list_partitions renames a repeated one (DH0.1). A
+    # damaged drive name has none, so the partition is labelled by its
+    # number, as get_partition_info names it.
     for part in list_partitions(args.image, args.block_size).partitions:
         text = _partition_driver(args.image, args.block_size, part.name)[1]
-        print(f"  {part.name}: {text}")
+        label = part.name if part.name is not None else f"#{part.index}"
+        print(f"  {label}: {text}")
 
 
 def cmd_mount(args):
