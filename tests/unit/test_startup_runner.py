@@ -144,6 +144,8 @@ class TestStdpktRingBuffer:
         launcher._stdpkt_sizes = []
         launcher._stdpkt_ring_size = 8
         launcher._stdpkt_index = 0
+        launcher.pending = {}
+        launcher._stdpkt_retired = []
         # Minimal field offsets (actual values don't matter for allocation tests)
         launcher._msg_size = 20
         launcher._pkt_size = 48

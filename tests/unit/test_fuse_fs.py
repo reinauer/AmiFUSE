@@ -1368,6 +1368,7 @@ def fs_with_mock_bridge(fuse_mock):
     bridge._write_enabled = False
     bridge.vh = MagicMock()
     bridge.backend = MagicMock()
+    bridge.wait_for_pending.return_value = []  # no packet still out
     _answer_open_file_reply(bridge)
     fs = AmigaFuseFS(bridge, debug=False, icons=False)
     return fs, bridge
