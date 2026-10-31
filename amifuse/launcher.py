@@ -297,6 +297,10 @@ def _enumerate_mount_units(image: str) -> tuple[list[_MountUnit], Optional[str]]
     ``_MountUnit`` with ``name=None`` so the spawn is byte-for-byte the legacy
     single-partition command.
 
+    A partition whose drive name is damaged has no name to pass as
+    ``--partition``: it is skipped, and ``fallback_reason`` says so. With no
+    readable name at all, partition 0 is mounted as a lone partition is.
+
     Any enumeration failure (non-RDB / unreadable image, IOError from
     ``open_rdisk``) degrades to a single no-``--partition`` unit -- exactly the
     legacy behavior: spawn one mount and let the mount process itself surface a
@@ -319,11 +323,25 @@ def _enumerate_mount_units(image: str) -> tuple[list[_MountUnit], Optional[str]]
         return [_MountUnit(name=None, label="disk image")], None
 
     parts = result.partitions
-    if len(parts) <= 1:
-        label = parts[0].name if parts else "disk image"
-        return [_MountUnit(name=None, label=label)], result.fallback_reason
-    units = [_MountUnit(name=p.name, label=p.name) for p in parts]
-    return units, result.fallback_reason
+    named = [p for p in parts if p.name is not None]
+    if len(parts) <= 1 or not named:
+        # The mount opens partition 0, whatever its drive name.
+        label = parts[0].name if parts and parts[0].name else "disk image"
+        units = [_MountUnit(name=None, label=label)]
+        skipped = len(parts[1:])
+    else:
+        # A damaged drive name (None) selects no partition, and a mount
+        # without --partition opens partition 0: such a partition is skipped.
+        units = [_MountUnit(name=p.name, label=p.name) for p in named]
+        skipped = len(parts) - len(named)
+    reason = result.fallback_reason
+    if skipped:
+        note = ("A partition was not mounted, as its drive name is damaged."
+                if skipped == 1 else
+                f"{skipped} partitions were not mounted, as their drive names "
+                f"are damaged.")
+        reason = f"{reason}\n\n{note}" if reason else note
+    return units, reason
 
 
 def _report_summary(succeeded, skipped, spawn_failed, exited, failed,
