@@ -73,7 +73,7 @@ class TestBundledFiles:
         assert info["license"] == "BSD-2-Clause"
         assert info["dos_types"] == [f"DOS{n}" for n in range(8)]
         assert info["build"] == {
-            "image": "stefanreinauer/amiga-gcc:gcc-v13.4",
+            "image": "stefanreinauer/amiga-gcc:gcc-v13.4-20261011",
             "command": "make amigaos3",
             "reproducible": True,
         }
