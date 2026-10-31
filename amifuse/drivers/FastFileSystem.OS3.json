@@ -8,7 +8,7 @@
   "license": "BSD-2-Clause",
   "dos_types": ["DOS0", "DOS1", "DOS2", "DOS3", "DOS4", "DOS5", "DOS6", "DOS7"],
   "build": {
-    "image": "stefanreinauer/amiga-gcc:gcc-v13.4",
+    "image": "stefanreinauer/amiga-gcc:gcc-v13.4-20261011",
     "command": "make amigaos3",
     "reproducible": true
   }
