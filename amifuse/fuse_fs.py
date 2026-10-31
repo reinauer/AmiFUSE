@@ -6462,7 +6462,7 @@ def cmd_inspect(args):
     from .rdb_inspect import (
         open_each_rdb, detect_adf, detect_iso, list_partitions,
         amiga_rdb_partitions, build_rdisk_desc, print_inspect_report,
-        mount_names,
+        mount_names, DiskRDBError, rdb_label,
     )
 
     use_json = getattr(args, "json", False)
@@ -6545,25 +6545,43 @@ def cmd_inspect(args):
 
     if use_json:
         # JSON mode: collect all RDBs into a single envelope. Unlike the
-        # rdb-inspect tool (which skips unreadable RDBs), any open failure
-        # is fatal here so scripts get a definitive error envelope.
+        # rdb-inspect tool (which skips unreadable RDBs), an open failure
+        # is fatal here so scripts get a definitive error envelope. On a
+        # disk with its own RDB beside the MBR, the failures of that RDB
+        # and of entries holding one are notes, unless nothing opens.
         amiga_parts = amiga_rdb_partitions(args.image)
         all_rdbs = []
         rdb_parts = []
+        notes = []
+        first_error = None
+        beside_mbr = False  # The disk has its own RDB beside the MBR.
         for rdb_idx, opened in open_each_rdb(
                 args.image, args.block_size, len(amiga_parts)):
             if isinstance(opened, IOError):
+                beside_mbr = beside_mbr or bool(
+                    amiga_parts and isinstance(opened, DiskRDBError))
+                first_error = first_error or opened
+                if beside_mbr:
+                    notes.append(f"{rdb_label(amiga_parts, rdb_idx)}: {opened}")
+                    continue
                 envelope = _json_error("inspect", "OPEN_FAILED", str(opened))
                 envelope["image"] = str(args.image)
                 print(_json.dumps(envelope, indent=2))
                 sys.exit(1)
             blkdev, rdisk, mbr_ctx = opened
+            beside_mbr = beside_mbr or (
+                mbr_ctx is not None and mbr_ctx.mbr_partition is None)
             try:
                 all_rdbs.append(build_rdisk_desc(rdisk, mbr_ctx))
                 rdb_parts.append(list(rdisk.parts))
             finally:
                 rdisk.close()
                 blkdev.close()
+        if not all_rdbs:
+            envelope = _json_error("inspect", "OPEN_FAILED", str(first_error))
+            envelope["image"] = str(args.image)
+            print(_json.dumps(envelope, indent=2))
+            sys.exit(1)
 
         # Resolved with the image closed: a Windows disk admits one reader.
         for desc, names in zip(all_rdbs, mount_names(rdb_parts)):
@@ -6587,6 +6605,8 @@ def cmd_inspect(args):
             envelope.update(all_rdbs[0])
         else:
             envelope["rdbs"] = all_rdbs
+        if notes:
+            envelope["notes"] = notes
         print(_json.dumps(envelope, indent=2))
         return
 

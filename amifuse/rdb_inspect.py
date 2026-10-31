@@ -113,8 +113,9 @@ class PartitionList:
     ``fallback_reason``, when set, is a human-readable string saying why
     ``partitions`` holds fewer than every partition. The caller is responsible
     for logging it and naming it in the summary dialog. ``list_partitions``
-    leaves it ``None``: it renames a repeated drive name instead of falling
-    back to the first partition.
+    renames a repeated drive name instead of falling back to the first
+    partition; it sets this only when a disk's own RDB beside its MBR fails
+    to open while a 0x76 entry's RDB opens.
     """
     partitions: List[PartInfo]
     fallback_reason: Optional[str] = None
@@ -180,6 +181,22 @@ class RDBContentError(OSError):
 
     open_rdisk skips a 0x76 partition for this error and lets any other
     OSError, such as a device or media error, end the open.
+    """
+
+
+class DiskRDBError(OSError):
+    """The disk's own RDB, beside an MBR listing 0x76 entries, does not open.
+
+    open_rdisk raises it for the default open. The entries' own RDBs may
+    still open, and open_each_rdb reports this error once, with index None.
+    """
+
+
+class NoEntryRDBError(OSError):
+    """The selected 0x76 entry holds no RDSK block that _scan_for_rdb accepts.
+
+    Beside the disk's own RDB, open_each_rdb skips such an entry without a
+    message; an entry whose RDB is found but fails to open is reported.
     """
 
 
@@ -586,6 +603,21 @@ def _no_valid_rdb_message(image: Path, count: int) -> str:
             f"but none contain a valid RDB: {image}")
 
 
+def _no_rdb_opens_message(image: Path) -> str:
+    """Describe a disk whose own RDB and 0x76 entries' RDBs all fail."""
+    return f"No RDB on this disk opens: {image}"
+
+
+def _disk_rdb_context(mbr_info: MBRInfo) -> MBRContext:
+    """The MBRContext of a disk's own RDB beside its MBR (Parceiro-style)."""
+    return MBRContext(
+        mbr_info=mbr_info,
+        mbr_partition=None,
+        offset_blocks=0,
+        scheme="parceiro",
+    )
+
+
 def open_rdisk(
     image: Path,
     block_size: Optional[int] = None,
@@ -626,9 +658,12 @@ def open_rdisk(
             inside a 0x76 partition's sectors belongs to that partition and
             is opened only through the MBR, so a failure reports the MBR
             error. Any other direct RDB that fails to parse raises "Failed
-            to parse RDB" without trying the 0x76 partitions. A 0x76
-            partition is skipped only for RDBContentError; any other
-            OSError in it, such as a device or media error, ends the open.
+            to parse RDB" without trying the 0x76 partitions (DiskRDBError
+            beside 0x76 entries); a selected 0x76 partition opens its own
+            RDB without parsing it. A 0x76 partition is skipped only for
+            RDBContentError; any other OSError in it, such as a device or
+            media error, ends the open. A selected partition with no RDSK
+            block raises NoEntryRDBError.
     """
     # Read the MBR first: a Windows physical disk opened outside a mount
     # session is locked against other readers until blkdev closes.
@@ -689,28 +724,23 @@ def _locate_rdisk(image, block_size, mbr_partition_index, mbr_info, open_at):
                for p in mbr_info.partitions):
             rdb_block = None
 
-    if rdb_block is not None:
+    # A selected 0x76 partition holds its own RDB, if any, beside this one,
+    # so this one is not parsed: its failure must not end that open.
+    if rdb_block is not None and (mbr_partition_index is None
+                                  or not _amiga_partitions(mbr_info)):
         try:
             rdisk = _parse_rdb(blkdev, rdb_block)
         except IOError as e:
-            raise IOError(f"Failed to parse RDB at {image}: {e}")
+            error = DiskRDBError if _amiga_partitions(mbr_info) else IOError
+            raise error(f"Failed to parse RDB at {image}: {e}")
 
-        if mbr_partition_index is None or not _amiga_partitions(mbr_info):
-            # Check for Parceiro-style MBR+RDB coexistence. An RDB at block 0
-            # beside an MBR that lists 0x76 entries is the disk's own as well.
-            mbr_ctx = None
-            if mbr_info is not None and (rdb_block.blk_num > 0
-                                         or _amiga_partitions(mbr_info)):
-                mbr_ctx = MBRContext(
-                    mbr_info=mbr_info,
-                    mbr_partition=None,
-                    offset_blocks=0,
-                    scheme="parceiro",
-                )
-            return blkdev, rdisk, mbr_ctx
-        # A selected 0x76 partition holds its own RDB, if any, beside this
-        # one. Parsing this one first keeps its failure ending every open.
-        rdisk.close()
+        # Check for Parceiro-style MBR+RDB coexistence. An RDB at block 0
+        # beside an MBR that lists 0x76 entries is the disk's own as well.
+        mbr_ctx = None
+        if mbr_info is not None and (rdb_block.blk_num > 0
+                                     or _amiga_partitions(mbr_info)):
+            mbr_ctx = _disk_rdb_context(mbr_info)
+        return blkdev, rdisk, mbr_ctx
 
     # No direct RDB outside the 0x76 partitions - check those partitions
     if mbr_info is not None and mbr_info.has_amiga_partitions:
@@ -729,6 +759,7 @@ def _locate_rdisk(image, block_size, mbr_partition_index, mbr_info, open_at):
         # (partition, reason) for the error below; each reason reads on
         # from "partition N at LBA L".
         skipped = []
+        holds_rdb = False  # A scan found an RDSK block in a partition.
         for mbr_part in amiga_parts:
             # An earlier partition may have reopened the device with its
             # RDB's block size; map and scan each one in its own units.
@@ -751,6 +782,7 @@ def _locate_rdisk(image, block_size, mbr_partition_index, mbr_info, open_at):
             except RDBContentError as e:
                 skipped.append((mbr_part, f": {e}"))
                 continue
+            holds_rdb = holds_rdb or rdb_block is not None or new_block_size is not None
 
             if new_block_size is not None:
                 # Need to reopen base device with new block size and rescan
@@ -786,12 +818,15 @@ def _locate_rdisk(image, block_size, mbr_partition_index, mbr_info, open_at):
             f"; partition {part.index} at LBA {part.start_lba}{reason}"
             for part, reason in skipped
         )
+        error = IOError
         if mbr_partition_index is not None:
             found = (f"MBR partition {amiga_parts[0].index} does not contain "
                      f"a valid RDB: {image}")
+            if not holds_rdb:
+                error = NoEntryRDBError
         else:
             found = _no_valid_rdb_message(image, len(amiga_parts))
-        raise IOError(f"{found}{reasons}")
+        raise error(f"{found}{reasons}")
 
     # Check for other partition types to give helpful error messages
     error_msg = f"No valid RDB found in blocks 0-15 at {image}"
@@ -1013,7 +1048,8 @@ def list_partitions(
 
     Returns:
         A :class:`PartitionList`. ``.partitions`` is in stable RDB order
-        (normally >= 1 entry); ``.fallback_reason`` is ``None``.
+        (normally >= 1 entry); ``.fallback_reason`` is ``None`` unless the
+        disk's own RDB beside the MBR failed to open, which it then names.
     """
     amiga_parts = amiga_rdb_partitions(image)
 
@@ -1021,11 +1057,11 @@ def list_partitions(
     # (blkdev, rdisk) and MUST close both inside the loop or N block-device
     # handles leak.
     rdb_parts = []
+    default_error = None
     for rdb_idx, opened in open_each_rdb(image, block_size, len(amiga_parts)):
         if isinstance(opened, IOError):
             if rdb_idx is None:
-                # A plain or single-0x76 image whose one RDB does not open.
-                raise opened
+                default_error = opened
             continue
         blkdev, rdisk, _mbr_ctx = opened
         try:
@@ -1033,6 +1069,10 @@ def list_partitions(
         finally:
             rdisk.close()
             blkdev.close()
+    if default_error is not None and not rdb_parts:
+        # A plain or single-0x76 image whose one RDB does not open, or a
+        # disk's own RDB that does not open beside entries holding none.
+        raise default_error
 
     # The partitions' parsed fields outlive the closed handles (_part_info).
     all_parts: List[PartInfo] = []
@@ -1042,7 +1082,11 @@ def list_partitions(
             if name is not None:
                 info.name = name
             all_parts.append(info)
-    return PartitionList(partitions=all_parts)
+    # The disk's own RDB failed beside entries that opened: its partitions
+    # are missing from the list.
+    fallback_reason = (None if default_error is None
+                       else f"{rdb_label(amiga_parts, None)}: {default_error}")
+    return PartitionList(partitions=all_parts, fallback_reason=fallback_reason)
 
 
 def format_fs_summary(rdisk: RDisk):
@@ -1094,11 +1138,13 @@ def open_each_rdb(
     Yields (mbr_partition_index, opened). The disk's own RDB beside the
     MBR comes first, with index None, then each 0x76 entry's own RDB, in
     MBR order. opened is open_rdisk's (blkdev, rdisk, mbr_ctx), which the
-    caller closes, or the IOError the entry failed with. With an RDB beside
-    the MBR, entries that do not open are skipped instead. An RDB already
-    yielded, as by two entries starting at the same sector, is skipped too.
-    With fewer than two entries, yields the default open, or its error,
-    with index None, then beside the disk's own RDB a single entry's own.
+    caller closes, or the IOError the RDB failed with. The disk's own RDB
+    that does not open gives its DiskRDBError once, with index None, and
+    the entries are still opened. Beside the disk's own RDB, entries that
+    hold no RDB (NoEntryRDBError) are skipped. An RDB already yielded, as
+    by two entries starting at the same sector, is skipped too. With fewer
+    than two entries, yields the default open, or its error, with index
+    None, then beside the disk's own RDB a single entry's own.
     """
     if count <= 1:
         try:
@@ -1106,13 +1152,18 @@ def open_each_rdb(
         except IOError as e:
             opened = e
         yield None, opened
-        if count == 0 or isinstance(opened, IOError) or _is_entry_rdb(opened[2]):
+        if isinstance(opened, IOError):
+            if count == 0 or not isinstance(opened, DiskRDBError):
+                return
+        elif count == 0 or _is_entry_rdb(opened[2]):
             return
         try:
             opened = open_rdisk(image, block_size=block_size,
                                 mbr_partition_index=0)
-        except IOError:
+        except NoEntryRDBError:
             return  # The entry holds no RDB of its own.
+        except IOError as e:
+            opened = e
         yield 0, opened
         return
     seen = set()
@@ -1122,9 +1173,15 @@ def open_each_rdb(
             opened = open_rdisk(image, block_size=block_size,
                                 mbr_partition_index=index)
         except IOError as e:
-            # With no RDB beside the MBR the entries give their own errors,
-            # and an unreadable one beside it ends each entry's open too.
-            if index is not None and not disk_rdb:
+            if index is None:
+                # Any other failure of the default open is an entry's, or
+                # comes again in each entry's turn.
+                if isinstance(e, DiskRDBError):
+                    disk_rdb = True
+                    yield index, e
+            elif not (disk_rdb and isinstance(e, NoEntryRDBError)):
+                # With no RDB beside the MBR every entry gives its error;
+                # beside it, only an entry that holds an RDB.
                 yield index, e
             continue
         blkdev, rdisk, mbr_ctx = opened
@@ -1196,9 +1253,9 @@ def print_inspect_report(image: Path, block_size: Optional[int], full: bool) -> 
 
     Handles plain-RDB, Parceiro-style MBR+RDB, and Emu68-style multi-RDB
     layouts. Shared by `amifuse inspect` and the rdb-inspect tool. Raises
-    SystemExit when the image cannot be opened, or when no RDB of a multi-RDB
-    image can; per-RDB failures in a multi-RDB image are reported inline and
-    skipped.
+    SystemExit when the image cannot be opened, or when no RDB of an image
+    with 0x76 entries can; per-RDB failures on a disk with more than one RDB
+    are reported inline and skipped.
     """
     mbr_info = detect_mbr(image)
     amiga_parts = _amiga_partitions(mbr_info)
@@ -1207,10 +1264,16 @@ def print_inspect_report(image: Path, block_size: Optional[int], full: bool) -> 
         # first one that opened. Each section holds one partition's report
         # lines, or the reason it could not be opened.
         header_ctx = None
+        disk_error = None
+        opened_any = False
         sections = []
         for rdb_idx, opened in open_each_rdb(image, block_size, len(amiga_parts)):
             if isinstance(opened, IOError):
-                sections.append([f"\nMBR partition [{amiga_parts[rdb_idx].index}]: "
+                if rdb_idx is None:
+                    # The disk's own RDB, beside the MBR, did not open.
+                    disk_error = opened
+                    header_ctx = _disk_rdb_context(mbr_info)
+                sections.append([f"\n{rdb_label(amiga_parts, rdb_idx)}: "
                                  f"Error: {opened}"])
                 continue
             blkdev, rdisk, mbr_ctx = opened
@@ -1227,6 +1290,7 @@ def print_inspect_report(image: Path, block_size: Optional[int], full: bool) -> 
                 blkdev.close()
             if header_ctx is None:
                 header_ctx = mbr_ctx
+            opened_any = True
             sections.append(lines)
 
         if header_ctx is not None:
@@ -1240,7 +1304,10 @@ def print_inspect_report(image: Path, block_size: Optional[int], full: bool) -> 
         for lines in sections:
             for line in lines:
                 print(line)
-        if header_ctx is None:
+        if not opened_any:
+            if disk_error is not None:
+                # Its error is already printed above.
+                raise SystemExit(f"Error: {_no_rdb_opens_message(image)}")
             raise SystemExit(
                 f"Error: {_no_valid_rdb_message(image, len(amiga_parts))}"
             )
@@ -1248,9 +1315,19 @@ def print_inspect_report(image: Path, block_size: Optional[int], full: bool) -> 
 
     # Single RDB (plain or Parceiro-style), then beside a Parceiro disk's own
     # RDB its single 0x76 entry's own RDB, if it holds one.
+    opened_any = False
     for rdb_idx, opened in open_each_rdb(image, block_size, len(amiga_parts)):
         if isinstance(opened, IOError):
-            raise SystemExit(f"Error: {opened}")
+            if rdb_idx is None:
+                if not (amiga_parts and isinstance(opened, DiskRDBError)):
+                    raise SystemExit(f"Error: {opened}")
+                # The disk's own RDB, beside the MBR, did not open; its
+                # 0x76 entry's own RDB comes next.
+                for line in format_mbr_info(_disk_rdb_context(mbr_info)):
+                    print(line)
+            print(f"\n{rdb_label(amiga_parts, rdb_idx)}: Error: {opened}")
+            continue
+        opened_any = True
         blkdev, rdisk, mbr_ctx = opened
         try:
             if rdb_idx is not None:
@@ -1264,6 +1341,16 @@ def print_inspect_report(image: Path, block_size: Optional[int], full: bool) -> 
         finally:
             rdisk.close()
             blkdev.close()
+    if not opened_any:
+        # The disk's own RDB failed, and its error is already printed above.
+        raise SystemExit(f"Error: {_no_rdb_opens_message(image)}")
+
+
+def rdb_label(amiga_parts: List[MBRPartition], rdb_idx: Optional[int]) -> str:
+    """How inspect names the RDB that open_each_rdb yields at rdb_idx."""
+    if rdb_idx is None:
+        return "RDB beside the MBR"
+    return f"MBR partition [{amiga_parts[rdb_idx].index}]"
 
 
 def _entry_heading(mbr_ctx: MBRContext) -> str:
