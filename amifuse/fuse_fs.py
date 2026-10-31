@@ -2599,10 +2599,11 @@ class HandlerBridge:
         and AROS afs can fail the seek to the end of a damaged file.
 
         end, when given, is the end of file the caller holds for the
-        handle, and replaces the measured one, as in write_handle_at():
-        a grow writes zeros from it, and a shrink below it goes out as
-        ACTION_SET_FILE_SIZE, which BFFS refuses. For a length at or below
-        it the handler's end is measured as well, and a length past that
+        handle, as in write_handle_at(). A grow past it writes zeros from
+        it, or from the handler's end where that is lower
+        (_write_past_end), and a shrink below it goes out as
+        ACTION_SET_FILE_SIZE, which BFFS refuses. For a length from 1 up
+        to end the handler's end is measured too, and a length past that
         lower end is a grow from it.
 
         SetFileSize() leaves no other handle on the file past its new end.
@@ -3767,9 +3768,10 @@ class AmigaFuseFS(_FuseOperations):
                     # pfs3aio shrink would move the far handles, so they
                     # forget their positions, as a moved one does in
                     # _settle_handles. A shrink below the pin has the pin
-                    # measured again (_measure_stale_pin). A lost grow is
-                    # not marked: it cannot leave the end below the pin,
-                    # and the measure only ever lowers it.
+                    # measured again (_measure_stale_pin). A change to a
+                    # length at or past the pin is not marked: from a pin
+                    # that agrees with the handler, a lost grow cannot
+                    # leave the end below it.
                     if far_may_move:
                         for other in far:
                             other["pos"] = None
