@@ -42,7 +42,7 @@ def write_context(monkeypatch, tmp_path):
     bridge = Mock()
     bridge.is_mounted.return_value = fs.MountState(True, None, None)
     bridge.open_file.return_value = (0x1000, 0x2000)
-    bridge.write_handle.side_effect = lambda fh, data: len(data)
+    bridge.write_handle_reply.side_effect = lambda fh, data: (len(data), 0)
     created = []
 
     def fake_create(*a, **kw):
@@ -182,7 +182,7 @@ def test_source_replaced_after_open_is_not_copied(write_context, capsys, tmp_pat
     monkeypatch.setattr(fs, "_create_bridge_from_args", replace_then_create)
     fs.cmd_write(args)
     assert json.loads(capsys.readouterr().out)["status"] == "ok"
-    assert [c.args[1] for c in bridge.write_handle.call_args_list] == [SOURCE_DATA]
+    assert [c.args[1] for c in bridge.write_handle_reply.call_args_list] == [SOURCE_DATA]
 
 
 @pytest.mark.skipif(sys.platform != "win32",

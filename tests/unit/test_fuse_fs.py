@@ -2764,7 +2764,7 @@ class TestHandlerBridgeWriteAt:
         bridge = _fake_write_bridge(fuse_fs_mod, handler)
 
         assert bridge.write_handle_reply(self.FH_ADDR, self.DATA) == expected
-        # write_handle keeps returning only the count, for the CLI.
+        # write_handle keeps returning only the count.
         assert bridge.write_handle(self.FH_ADDR, self.DATA) == expected[0]
 
 
@@ -6786,7 +6786,7 @@ class TestCmdWrite:
     def test_write_json_output_structure(self, mock_bridge_for_write, capsys, tmp_path):
         mock_bridge, fuse_fs_mod = mock_bridge_for_write
         mock_bridge.open_file.return_value = (0x1000, 0x2000)
-        mock_bridge.write_handle.return_value = 5
+        mock_bridge.write_handle_reply.return_value = (5, 0)
         mock_bridge.close_file.return_value = None
         mock_bridge.flush_volume.return_value = None
 
@@ -6817,7 +6817,7 @@ class TestCmdWrite:
     def test_write_calls_flush_volume(self, mock_bridge_for_write, capsys, tmp_path):
         mock_bridge, fuse_fs_mod = mock_bridge_for_write
         mock_bridge.open_file.return_value = (0x1000, 0x2000)
-        mock_bridge.write_handle.return_value = 5
+        mock_bridge.write_handle_reply.return_value = (5, 0)
         mock_bridge.close_file.return_value = None
         mock_bridge.flush_volume.return_value = None
 
@@ -6842,7 +6842,7 @@ class TestCmdWrite:
         """On success, flush_volume is called exactly once."""
         mock_bridge, fuse_fs_mod = mock_bridge_for_write
         mock_bridge.open_file.return_value = (0x1000, 0x2000)
-        mock_bridge.write_handle.return_value = 5
+        mock_bridge.write_handle_reply.return_value = (5, 0)
         mock_bridge.close_file.return_value = None
         mock_bridge.flush_volume.return_value = None
 
@@ -6869,7 +6869,7 @@ class TestCmdWrite:
         captured = {}
         mock_bridge = _make_mock_bridge()
         mock_bridge.open_file.return_value = (0x1000, 0x2000)
-        mock_bridge.write_handle.return_value = 5
+        mock_bridge.write_handle_reply.return_value = (5, 0)
         mock_bridge.close_file.return_value = None
         mock_bridge.flush_volume.return_value = None
 
@@ -6961,10 +6961,10 @@ class TestCmdWrite:
         assert data["error"]["code"] == "HANDLER_ERROR"
 
     def test_write_negative_write_handle(self, mock_bridge_for_write, capsys, tmp_path):
-        """Verify details dict structure for negative write_handle."""
+        """Verify details dict structure for a negative write_handle_reply."""
         mock_bridge, fuse_fs_mod = mock_bridge_for_write
         mock_bridge.open_file.return_value = (0x1000, 0x2000)
-        mock_bridge.write_handle.return_value = -1
+        mock_bridge.write_handle_reply.return_value = (-1, 0)
         mock_bridge.close_file.return_value = None
         mock_bridge.flush_volume.return_value = None
 
@@ -6990,10 +6990,10 @@ class TestCmdWrite:
         assert data["error"]["details"]["expected"] == 5
 
     def test_write_zero_write_handle(self, mock_bridge_for_write, capsys, tmp_path):
-        """write_handle returning 0 (DOSFALSE) is a distinct failure."""
+        """write_handle_reply returning 0 is a short write of no bytes."""
         mock_bridge, fuse_fs_mod = mock_bridge_for_write
         mock_bridge.open_file.return_value = (0x1000, 0x2000)
-        mock_bridge.write_handle.return_value = 0
+        mock_bridge.write_handle_reply.return_value = (0, 0)
         mock_bridge.close_file.return_value = None
         mock_bridge.flush_volume.return_value = None
 
@@ -7015,7 +7015,7 @@ class TestCmdWrite:
         output = capsys.readouterr().out
         data = json.loads(output)
         assert data["error"]["code"] == "WRITE_ERROR"
-        assert "DOSFALSE" in data["error"]["message"]
+        assert "Partial write: wrote 0 of 5 bytes" in data["error"]["message"]
         assert data["error"]["details"]["bytes_written"] == 0
         assert data["error"]["details"]["expected"] == 5
 
@@ -7023,7 +7023,7 @@ class TestCmdWrite:
         """Partial write includes bytes_written and expected in details."""
         mock_bridge, fuse_fs_mod = mock_bridge_for_write
         mock_bridge.open_file.return_value = (0x1000, 0x2000)
-        mock_bridge.write_handle.return_value = 50
+        mock_bridge.write_handle_reply.return_value = (50, 0)
         mock_bridge.close_file.return_value = None
         mock_bridge.flush_volume.return_value = None
 
@@ -7053,7 +7053,7 @@ class TestCmdWrite:
                                              tmp_path):
         mock_bridge, fuse_fs_mod = mock_bridge_for_write
         mock_bridge.open_file.return_value = (0x1000, 0x2000)
-        mock_bridge.write_handle.return_value = 5
+        mock_bridge.write_handle_reply.return_value = (5, 0)
         mock_bridge.close_file.return_value = None
         mock_bridge.flush_volume.return_value = None
 
@@ -7078,7 +7078,7 @@ class TestCmdWrite:
     def test_write_human_output(self, mock_bridge_for_write, capsys, tmp_path):
         mock_bridge, fuse_fs_mod = mock_bridge_for_write
         mock_bridge.open_file.return_value = (0x1000, 0x2000)
-        mock_bridge.write_handle.return_value = 5
+        mock_bridge.write_handle_reply.return_value = (5, 0)
         mock_bridge.close_file.return_value = None
         mock_bridge.flush_volume.return_value = None
 
@@ -7108,7 +7108,7 @@ class TestCmdWrite:
 
         mock_bridge = _make_mock_bridge()
         mock_bridge.open_file.return_value = (0x1000, 0x2000)
-        mock_bridge.write_handle.return_value = 5
+        mock_bridge.write_handle_reply.return_value = (5, 0)
         mock_bridge.close_file.return_value = None
         mock_bridge.flush_volume.return_value = None
 
@@ -7143,7 +7143,7 @@ class TestCmdWrite:
     def test_write_close_file_on_error(self, mock_bridge_for_write, capsys, tmp_path):
         mock_bridge, fuse_fs_mod = mock_bridge_for_write
         mock_bridge.open_file.return_value = (0x1000, 0x2000)
-        mock_bridge.write_handle.side_effect = RuntimeError("handler crashed")
+        mock_bridge.write_handle_reply.side_effect = RuntimeError("handler crashed")
         mock_bridge.close_file.return_value = None
         mock_bridge.flush_volume.return_value = None
 
@@ -7167,7 +7167,7 @@ class TestCmdWrite:
     def test_write_flush_on_error_path(self, mock_bridge_for_write, capsys, tmp_path):
         mock_bridge, fuse_fs_mod = mock_bridge_for_write
         mock_bridge.open_file.return_value = (0x1000, 0x2000)
-        mock_bridge.write_handle.side_effect = RuntimeError("handler crashed")
+        mock_bridge.write_handle_reply.side_effect = RuntimeError("handler crashed")
         mock_bridge.close_file.return_value = None
         mock_bridge.flush_volume.return_value = None
 
@@ -7204,9 +7204,9 @@ class TestCmdWrite:
 
         def fake_write(fh, data):
             written_data.extend(data)
-            return len(data)
+            return len(data), 0
 
-        mock_bridge.write_handle.side_effect = fake_write
+        mock_bridge.write_handle_reply.side_effect = fake_write
 
         monkeypatch.setattr(
             fuse_fs_mod, "_create_bridge_from_args",

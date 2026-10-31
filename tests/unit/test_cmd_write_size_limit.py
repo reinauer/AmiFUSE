@@ -29,7 +29,7 @@ def write_context(monkeypatch, tmp_path):
     bridge = Mock()
     bridge.is_mounted.return_value = fs.MountState(True, None, None)
     bridge.open_file.return_value = (0x1000, 0x2000)
-    bridge.write_handle.side_effect = lambda fh, data: len(data)
+    bridge.write_handle_reply.side_effect = lambda fh, data: (len(data), 0)
     created = []
 
     def fake_create(*a, **kw):
@@ -79,7 +79,7 @@ def test_source_above_limit_refused_before_bridge(write_context, capsys,
         assert "larger than 2147483647 bytes" in str(caught.value)
     assert created == []
     bridge.open_file.assert_not_called()
-    bridge.write_handle.assert_not_called()
+    bridge.write_handle_reply.assert_not_called()
 
 
 def test_source_at_limit_still_written(write_context, capsys):
@@ -91,7 +91,7 @@ def test_source_at_limit_still_written(write_context, capsys):
     assert result["size"] == 0x7FFFFFFF
     bridge.open_file.assert_called_once_with(
         "/S/file", os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
-    bridge.write_handle.assert_called_once_with(0x1000, b"hello")
+    bridge.write_handle_reply.assert_called_once_with(0x1000, b"hello")
 
 
 def test_source_growing_to_limit_still_written(write_context, monkeypatch,
@@ -106,7 +106,7 @@ def test_source_growing_to_limit_still_written(write_context, monkeypatch,
     result = json.loads(capsys.readouterr().out)
     assert result["status"] == "ok"
     assert result["bytes_written"] == 12
-    assert [c.args[1] for c in bridge.write_handle.call_args_list] == [
+    assert [c.args[1] for c in bridge.write_handle_reply.call_args_list] == [
         b"x" * 8, b"x" * 4]
 
 
@@ -132,6 +132,6 @@ def test_source_growing_past_limit_stops(write_context, monkeypatch, capsys,
     else:
         assert "holds more than 12 bytes" in str(caught.value)
         assert "keeps the first 8 bytes" in str(caught.value)
-    assert [c.args[1] for c in bridge.write_handle.call_args_list] == [b"x" * 8]
+    assert [c.args[1] for c in bridge.write_handle_reply.call_args_list] == [b"x" * 8]
     bridge.close_file.assert_called_once_with(0x1000)
     bridge.flush_volume.assert_called()
