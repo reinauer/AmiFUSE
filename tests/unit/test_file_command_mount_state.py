@@ -49,7 +49,7 @@ def test_unmounted_rejected_before_file_operations(command_context, capsys, comm
     bridge.stat_path.assert_not_called()
     bridge.open_file.assert_not_called()
     bridge.create_dir.assert_not_called()
-    bridge.write_handle.assert_not_called()
+    bridge.write_handle_reply.assert_not_called()
     bridge.flush_volume.assert_not_called()
     bridge.backend.close.assert_called_once()
     assert output.read_bytes() == b"keep existing output"
@@ -105,7 +105,7 @@ def test_unknown_mount_state_does_not_block_success(command_context, capsys, com
     bridge.stat_path.return_value = {"dir_type": -3, "size": 5}
     bridge.open_file.return_value = (123, 0)
     bridge.read_handle.return_value = b"hello"
-    bridge.write_handle.return_value = 5
+    bridge.write_handle_reply.return_value = (5, 0)
     getattr(fs, "cmd_" + command)(args)
     result = json.loads(capsys.readouterr().out)
     assert result["status"] == "ok"
@@ -128,7 +128,7 @@ def test_unknown_write_failure_keeps_context_and_cleanup(command_context, capsys
     if failure != "parent":
         args.file = "file"
     bridge.open_file.return_value = None if failure == "open" else (123, 0)
-    bridge.write_handle.return_value = -1
+    bridge.write_handle_reply.return_value = (-1, 0)
     with pytest.raises(SystemExit):
         fs.cmd_write(args)
     error = json.loads(capsys.readouterr().out)["error"]

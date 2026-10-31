@@ -6228,6 +6228,15 @@ def _open_write_source(host_path: Path, use_json: bool):
         raise
 
 
+# How `amifuse write` names the AmigaDOS error code of a failed write: the
+# codes _WRITE_ERRNOS maps for the FUSE layer.
+_WRITE_ERROR_REASONS = {
+    ERROR_DISK_FULL: "disk full",
+    ERROR_DISK_WRITE_PROTECTED: "disk is write-protected",
+    ERROR_WRITE_PROTECTED: "file is write-protected",
+}
+
+
 def cmd_write(args):
     """Handle the 'write' subcommand."""
     import json
@@ -6237,15 +6246,26 @@ def cmd_write(args):
     amiga_path = args.file
     host_path = Path(args.input)  # --in maps to args.input (dest="input")
 
-    # Validate host source file
-    if not host_path.exists():
+    # Validate host source file. Both checks open the path to stat it, and
+    # can fail: a Windows named pipe with no free instance fails is_dir().
+    try:
+        exists = host_path.exists()
+        is_dir = exists and host_path.is_dir()
+    except OSError as exc:
+        message = f"Cannot read source file: {host_path}: {exc.strerror or exc}"
+        if use_json:
+            print(json.dumps(_json_error("write", "INVALID_ARGUMENT", message)))
+            sys.exit(1)
+        raise SystemExit(f"Error: {message[0].lower()}{message[1:]}")
+
+    if not exists:
         if use_json:
             print(json.dumps(_json_error("write", "SOURCE_NOT_FOUND",
                 f"Source file not found: {host_path}")))
             sys.exit(1)
         raise SystemExit(f"Error: source file not found: {host_path}")
 
-    if host_path.is_dir():
+    if is_dir:
         if use_json:
             print(json.dumps(_json_error("write", "INVALID_ARGUMENT",
                 f"Source is a directory, not a file: {host_path}")))
@@ -6309,7 +6329,7 @@ def cmd_write(args):
             # write loop, the error paths handle it gracefully:
             # - flush_volume() checks state.crashed and returns early (safe)
             # - close_file() sends a packet that gets no reply (harmless)
-            # - write_handle() returning -1 triggers the error path below
+            # - write_handle_reply() returning (-1, 0) triggers the error path below
             chunk_size = IO_CHUNK
             bytes_written = 0
             with source as f:
@@ -6333,50 +6353,52 @@ def cmd_write(args):
                             f"Error: source holds more than {_MAX_FILE_SIZE} "
                             f"bytes, the largest AmigaDOS file; the destination "
                             f"keeps the first {bytes_written} bytes")
-                    n = bridge.write_handle(fh_addr, data)
+                    n, res2 = bridge.write_handle_reply(fh_addr, data)
                     # Distinguish write failure modes:
-                    # n < 0:  No reply from handler (crashed or unresponsive)
-                    # n == 0: Handler returned DOSFALSE (write operation failed)
-                    # 0 < n < len(data): Partial write (likely disk full)
+                    # n < 0, res2 != 0: the handler failed the write with
+                    #   that AmigaDOS error code
+                    # n < 0, res2 == 0: a failure with no error code, which
+                    #   is almost always no reply from the handler (crashed
+                    #   or unresponsive)
+                    # 0 <= n < len(data): Partial write; res2 names why if
+                    #   the handler gave a code (a refusal with DOSFALSE
+                    #   comes as 0 bytes and a code)
                     # n == len(data): Success
                     if n < 0:
-                        # No reply from handler
+                        details = {**mount_details, "bytes_written": bytes_written,
+                                   "expected": host_size}
+                        if res2:
+                            reason = _WRITE_ERROR_REASONS.get(res2, f"error code {res2}")
+                            details["dos_error"] = res2
+                        else:
+                            reason = "no reply from handler"
                         if use_json:
                             print(json.dumps(_json_error("write", "WRITE_ERROR",
-                                f"Write failed at offset {bytes_written}: "
-                                f"no reply from handler",
-                                {**mount_details, "bytes_written": bytes_written,
-                                 "expected": host_size})))
+                                f"Write failed at offset {bytes_written}: {reason}",
+                                details)))
                             sys.exit(1)
                         raise SystemExit(
-                            f"Error: write failed at offset {bytes_written}: "
-                            f"no reply from handler")
-                    if n == 0:
-                        # Handler returned DOSFALSE -- write operation failed
-                        if use_json:
-                            print(json.dumps(_json_error("write", "WRITE_ERROR",
-                                f"Write failed at offset {bytes_written}: "
-                                f"handler returned failure (DOSFALSE)",
-                                {**mount_details, "bytes_written": bytes_written,
-                                 "expected": host_size})))
-                            sys.exit(1)
-                        raise SystemExit(
-                            f"Error: write failed at offset {bytes_written}: "
-                            f"handler returned failure")
+                            f"Error: write failed at offset {bytes_written}: {reason}")
                     if n < len(data):
                         # Partial write -- handler couldn't write all data
                         # (likely disk full). Record what was written then error.
                         bytes_written += n
+                        details = {**mount_details, "bytes_written": bytes_written,
+                                   "expected": host_size}
+                        if res2:
+                            reason = _WRITE_ERROR_REASONS.get(res2, f"error code {res2}")
+                            details["dos_error"] = res2
+                        else:
+                            reason = "disk full?"
                         if use_json:
                             print(json.dumps(_json_error("write", "WRITE_ERROR",
                                 f"Partial write: wrote {bytes_written} of "
-                                f"{host_size} bytes (disk full?)",
-                                {**mount_details, "bytes_written": bytes_written,
-                                 "expected": host_size})))
+                                f"{host_size} bytes ({reason})",
+                                details)))
                             sys.exit(1)
                         raise SystemExit(
                             f"Error: partial write ({bytes_written}/{host_size} "
-                            f"bytes, disk full?)")
+                            f"bytes, {reason})")
                     bytes_written += n
         finally:
             bridge.close_file(fh_addr)
