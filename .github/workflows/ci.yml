@@ -6,6 +6,16 @@ on:
   pull_request:
     branches: [main]
 
+env:
+  # The AmiFUSE-testing commit the fixture clone steps check out, so a push
+  # to that repo can't change this repo's CI results. `git clone --depth 1`
+  # takes a branch or tag, not a SHA, so those steps fetch this commit into
+  # an empty repository and move it into place only once it is checked out.
+  # To move the pin, put the full 40-character SHA of a commit on
+  # reinauer/AmiFUSE-testing's main here in a PR. A failed fetch leaves no
+  # fixtures and the fixture tests skip, so check that the PR's run used them.
+  AMIFUSE_TESTING_SHA: d313203ac20124b004911aeb66f75f15a2eefcb9
+
 jobs:
   package-smoke:
     name: Installed wheel (${{ matrix.os }})
@@ -123,8 +133,13 @@ jobs:
       - name: Clone AmiFUSE-testing fixtures
         # Clones to sibling directory of workspace checkout.
         # Workspace is typically /home/runner/work/<repo>/<repo>.
+        shell: bash
         run: |
-          git clone --depth 1 https://github.com/reinauer/AmiFUSE-testing.git ../AmiFUSE-testing
+          git init --quiet ../AmiFUSE-testing.tmp
+          git -C ../AmiFUSE-testing.tmp remote add origin https://github.com/reinauer/AmiFUSE-testing.git
+          git -C ../AmiFUSE-testing.tmp fetch --depth 1 origin ${{ env.AMIFUSE_TESTING_SHA }}
+          git -C ../AmiFUSE-testing.tmp checkout --quiet FETCH_HEAD
+          mv ../AmiFUSE-testing.tmp ../AmiFUSE-testing
         continue-on-error: true
 
       - name: Install machine68k-amifuse (Windows)
@@ -175,8 +190,13 @@ jobs:
       - name: Clone AmiFUSE-testing fixtures
         # Clones to sibling directory of workspace checkout.
         # Workspace is typically /home/runner/work/<repo>/<repo>.
+        shell: bash
         run: |
-          git clone --depth 1 https://github.com/reinauer/AmiFUSE-testing.git ../AmiFUSE-testing
+          git init --quiet ../AmiFUSE-testing.tmp
+          git -C ../AmiFUSE-testing.tmp remote add origin https://github.com/reinauer/AmiFUSE-testing.git
+          git -C ../AmiFUSE-testing.tmp fetch --depth 1 origin ${{ env.AMIFUSE_TESTING_SHA }}
+          git -C ../AmiFUSE-testing.tmp checkout --quiet FETCH_HEAD
+          mv ../AmiFUSE-testing.tmp ../AmiFUSE-testing
         continue-on-error: true
 
       - name: Install machine68k-amifuse (Windows)
@@ -245,8 +265,13 @@ jobs:
         run: choco install winfsp -y
 
       - name: Clone AmiFUSE-testing fixtures
+        shell: bash
         run: |
-          git clone --depth 1 https://github.com/reinauer/AmiFUSE-testing.git ../AmiFUSE-testing
+          git init --quiet ../AmiFUSE-testing.tmp
+          git -C ../AmiFUSE-testing.tmp remote add origin https://github.com/reinauer/AmiFUSE-testing.git
+          git -C ../AmiFUSE-testing.tmp fetch --depth 1 origin ${{ env.AMIFUSE_TESTING_SHA }}
+          git -C ../AmiFUSE-testing.tmp checkout --quiet FETCH_HEAD
+          mv ../AmiFUSE-testing.tmp ../AmiFUSE-testing
         continue-on-error: true
 
       - name: Install machine68k-amifuse (Windows)
