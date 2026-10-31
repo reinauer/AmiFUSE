@@ -312,6 +312,7 @@ ACTION_FINDOUTPUT = 1006
 ACTION_DELETE_OBJECT = 16
 ACTION_RENAME_OBJECT = 17
 ACTION_CREATE_DIR = 22
+ACTION_SET_DATE = 34
 ACTION_FLUSH = 27
 ACTION_FORMAT = 1020
 ACTION_INHIBIT = 31
@@ -334,6 +335,7 @@ _PACKET_TYPE_NAMES = {
     ACTION_DELETE_OBJECT: "ACTION_DELETE_OBJECT",
     ACTION_RENAME_OBJECT: "ACTION_RENAME_OBJECT",
     ACTION_CREATE_DIR: "ACTION_CREATE_DIR",
+    ACTION_SET_DATE: "ACTION_SET_DATE",
     ACTION_FLUSH: "ACTION_FLUSH",
     ACTION_FORMAT: "ACTION_FORMAT",
     ACTION_INHIBIT: "ACTION_INHIBIT",
@@ -1247,6 +1249,17 @@ class HandlerLauncher:
     def send_create_dir(self, state: HandlerLaunchState, lock_bptr: int, name_bptr: int):
         """ACTION_CREATE_DIR: create a directory, returns new lock in res1."""
         return self.send_packet(state, ACTION_CREATE_DIR, [lock_bptr, name_bptr])
+
+    def send_set_date(
+        self, state: HandlerLaunchState, lock_bptr: int, name_bptr: int, datestamp_addr: int
+    ):
+        """ACTION_SET_DATE: date the object name in directory lock_bptr.
+
+        dp_Arg1 is unused; dp_Arg4 is the address (not a BPTR) of a
+        struct DateStamp.
+        """
+        return self.send_packet(
+            state, ACTION_SET_DATE, [0, lock_bptr, name_bptr, datestamp_addr])
 
     def send_read_handle(
         self, state: HandlerLaunchState, fh_addr: int, buf_addr: int, length_bytes: int
