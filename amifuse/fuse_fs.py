@@ -4906,6 +4906,20 @@ def resolve_driver(
     )
 
 
+def _close_bridge(bridge):
+    """Close the bridge as mount or format ends, reporting a failed close.
+
+    An error from the close goes to stderr instead of being raised, so
+    that it neither replaces the error the command exits with nor turns a
+    finished format or unmount into a traceback. destroy() reports its own
+    shutdown errors the same way.
+    """
+    try:
+        bridge.close()
+    except Exception as exc:
+        print(f"[amifuse] could not close the bridge: {exc}", file=sys.stderr)
+
+
 def mount_fuse(
     image: Path,
     driver: Optional[Path],
@@ -5049,14 +5063,26 @@ def mount_fuse(
                 raise
             raise SystemExit(f"Cannot mount {image}: {exc}") from exc
         if _handler_has_crashed(bridge):
-            bridge.close()
+            _close_bridge(bridge)
             raise SystemExit("Filesystem handler crashed during startup; mount aborted.")
 
         # Let default signal handling work - FUSE will call destroy() on unmount
         volname = volname_opt or bridge.volume_name()
         if _handler_has_crashed(bridge):
-            bridge.close()
+            _close_bridge(bridge)
             raise SystemExit("Filesystem handler crashed during startup; mount aborted.")
+
+        # The bridge has loaded the handler, and nothing reads its file
+        # again. Removing an extracted one now leaves nothing behind when
+        # the process is killed: a handler crash ends a Windows mount by
+        # TerminateProcess, which skips the cleanup below. A failed removal
+        # is left to that cleanup, which reports it.
+        if temp_driver is not None:
+            try:
+                temp_driver.unlink(missing_ok=True)
+                temp_driver = None
+            except OSError:
+                pass
 
         # Pre-generate volume icon if platform requires it at mount time
         temp_volicon = None
@@ -5121,7 +5147,7 @@ def mount_fuse(
             # destroy() stops it, but a mount can end without destroy().
             if operations is not None:
                 operations._stop_timer_thread()
-            bridge.close()
+            _close_bridge(bridge)
             # Clean up temp volume icon file
             if temp_volicon is not None and temp_volicon.exists():
                 temp_volicon.unlink()
@@ -5234,11 +5260,11 @@ def format_volume(
         res1, res2 = reply
         if res1 == 0:
             error_msgs = {
-                205: "Object in use",
-                218: "Not a valid DOS disk",
-                225: "Not a DOS disk",
-                226: "Wrong disk type",
-                232: "Disk is write-protected",
+                ERROR_OBJECT_IN_USE: "Object in use",
+                ERROR_DISK_WRITE_PROTECTED: "Disk is write-protected",
+                ERROR_DEVICE_NOT_MOUNTED: "Device not mounted",
+                ERROR_NOT_A_DOS_DISK: "Not a DOS disk",
+                ERROR_NO_DISK: "No disk in drive",
             }
             error_desc = error_msgs.get(res2, f"error code {res2}")
             raise SystemExit(f"Format failed: {error_desc}")
@@ -5279,7 +5305,9 @@ def format_volume(
     finally:
         try:
             if bridge is not None:
-                bridge.close()
+                # A failed close is reported, not raised. On success the
+                # fsync above has already made the volume durable.
+                _close_bridge(bridge)
         finally:
             # Every exit removes the driver extracted from the RDB, also one
             # whose bridge fails to close. A failed removal is reported, but
