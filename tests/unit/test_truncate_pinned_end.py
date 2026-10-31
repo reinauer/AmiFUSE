@@ -8,8 +8,9 @@ its pinned size counts.
   seeks into them, so a truncate past what the handle wrote and a write
   past it fill the gap from the pinned size, not the handler's end.
 - A shrink that gets no reply in either wait may still be carried out.
-  The handles past 0x7FFFFFFF forget their positions, and a shrink below
-  the pinned size has the pin measured again at the next getattr().
+  After a shrink of an unpinned file, the handles past 0x7FFFFFFF forget
+  their positions; a shrink below the pinned size has the pin measured
+  again at the next getattr().
 """
 
 import errno
@@ -224,6 +225,24 @@ def test_gapped_write_fills_from_what_the_handle_wrote(fuse_mock, written, offse
     assert volume.data == written + bytes(offset - len(written)) + b"abc"
 
 
+def test_truncate_to_zero_after_lost_write_reaches_handler(fuse_mock):
+    """A write that got no reply may still land, so a truncate to 0 is
+    sent even at a pinned size of 0. BFFS refuses it, and the file is
+    emptied by the reopen."""
+    volume = _FakeVolume(CONTENT, bffs=True)
+    fs = _fs(volume)
+    fh = fs.open("/file", os.O_RDWR | os.O_TRUNC)
+    volume.withhold_writes = True
+    _eio(lambda: fs.write("/file", NEW, 0, fh))
+    volume.withhold_writes = False
+
+    assert fs.truncate("/file", 0, fh) == 0
+    assert volume.set_sizes == [0]
+    fs.release("/file", fh)
+
+    assert volume.data == b""
+
+
 def test_fill_over_old_blocks_needs_no_new_space(fuse_mock):
     """A copy that sets the new size first, on a nearly full volume: the
     zeros up to the old file's end go into blocks the file still holds,
@@ -248,8 +267,9 @@ def _open_far(fs):
 
 
 def test_lost_shrink_clears_far_positions(fuse_mock):
-    """pfs3aio may still carry the shrink out, which moves a far handle,
-    so it forgets its cached position without a packet."""
+    """pfs3aio may still carry out the shrink of an unpinned file, which
+    moves a far handle on it, so the far handle forgets its cached
+    position without a packet."""
     volume = _FakeVolume(CONTENT, bffs=False)
     fs = _fs(volume)
     far = _open_far(fs)
@@ -306,18 +326,60 @@ def test_unanswered_measure_is_tried_again(fuse_mock):
     fs.release("/file", fh)
 
 
-def test_lost_grow_leaves_the_pin(fuse_mock):
-    """A grow whose zeros get no reply was shrunk back, so the pin is not
-    measured again; the far handles still forget their positions."""
-    volume = _FakeVolume(b"", bffs=False)
+@pytest.mark.parametrize("pinned, length, withheld", [
+    (False, 5000, "withhold_writes"),
+    (True, 5000, "withhold_writes"),
+    (True, 100, "withhold_sizes"),
+], ids=["unpinned-grow", "pinned-grow", "pinned-shrink"])
+def test_lost_truncate_keeps_far_positions(fuse_mock, pinned, length, withheld):
+    """Only a shrink of an unpinned file can move a far handle: a pinned
+    file is held on an exclusive lock, so no other handle is on it, and a
+    grow moves no handle. The far handle keeps its cached position."""
+    volume = _FakeVolume(b"" if pinned else CONTENT, bffs=False)
     fs = _fs(volume)
     far = _open_far(fs)
+    if pinned:
+        fh = fs.create("/file", 0o644)
+        fs.write("/file", CONTENT, 0, fh)
+    else:
+        fh = fs.open("/file", os.O_RDWR)
+    setattr(volume, withheld, True)
+
+    _eio(lambda: fs.truncate("/file", length, fh))
+    assert fs._fh_cache[far]["pos"] == FAR_POS
+    fs.release("/file", fh)
+
+
+@pytest.mark.parametrize("length", [2000, len(CONTENT)],
+                         ids=["between", "at-pin"])
+def test_truncate_past_handler_end_below_pin_writes_zeros(fuse_mock, length):
+    """The handler finished a shrink the pin does not know of yet. A
+    truncate to a length past the handler's end is a grow, filled with
+    zeros, not an ACTION_SET_FILE_SIZE, which leaves old blocks' bytes in
+    the range it adds."""
+    volume = _FakeVolume(b"", bffs=False)
+    fs = _fs(volume)
+    fh = fs.create("/file", 0o644)
+    fs.write("/file", CONTENT, 0, fh)
+    volume.pending = 100
+    volume.land()
+
+    assert fs.truncate("/file", length, fh) == 0
+    assert volume.set_sizes == []
+    assert volume.data == CONTENT[:100] + bytes(length - 100)
+    fs.release("/file", fh)
+
+
+def test_lost_grow_leaves_the_pin(fuse_mock):
+    """A grow whose zeros get no reply cannot leave the end below the pin,
+    so the pin is not measured again."""
+    volume = _FakeVolume(b"", bffs=False)
+    fs = _fs(volume)
     fh = fs.create("/file", 0o644)
     fs.write("/file", CONTENT, 0, fh)
     volume.withhold_writes = True
 
     _eio(lambda: fs.truncate("/file", 5000, fh))
-    assert fs._fh_cache[far]["pos"] is None
     seeks = len(volume.seeks)
     assert fs.getattr("/file", fh)["st_size"] == len(CONTENT)
     assert len(volume.seeks) == seeks

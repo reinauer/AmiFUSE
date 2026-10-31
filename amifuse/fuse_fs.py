@@ -2601,7 +2601,9 @@ class HandlerBridge:
         end, when given, is the end of file the caller holds for the
         handle, and replaces the measured one, as in write_handle_at():
         a grow writes zeros from it, and a shrink below it goes out as
-        ACTION_SET_FILE_SIZE, which BFFS refuses.
+        ACTION_SET_FILE_SIZE, which BFFS refuses. For a length at or below
+        it the handler's end is measured as well, and a length past that
+        lower end is a grow from it.
 
         SetFileSize() leaves no other handle on the file past its new end.
         FFS stops a shrink at such a handle and replies with the size it
@@ -2624,11 +2626,26 @@ class HandlerBridge:
             # a write that got no reply the file may hold more, and BFFS's
             # refusal then has truncate() empty it (_reopen_for_output).
             if end is not None and length:
-                # The caller's end needs no seeks, and BFFS would refuse a
-                # packet that changes nothing.
-                if end == length:
-                    return length, 0
                 grow = length > end
+                if not grow:
+                    # The caller's end can be above the handler's, as after
+                    # a lost shrink not yet measured: a length past the
+                    # handler's end is then a grow, which
+                    # ACTION_SET_FILE_SIZE would fill with old blocks.
+                    # BFFS's end, which counts its old bytes, is never
+                    # below the caller's.
+                    measured = self._handle_end(fh_addr)
+                    if measured is not None:
+                        grow = length > measured
+                    else:
+                        result, _ = self.seek_handle(fh_addr, length)
+                        if result is SeekResult.FAILED:
+                            return -1, 0
+                        grow = result is SeekResult.PAST_END
+                    if not grow and end == length:
+                        # Nothing to change, and BFFS would refuse the
+                        # packet.
+                        return length, 0
             elif length:
                 # A truncate to 0 cannot grow the file, so it skips the seeks.
                 measured = self._handle_end(fh_addr)
@@ -2643,9 +2660,8 @@ class HandlerBridge:
                         return -1, 0
                     grow = result is SeekResult.PAST_END
             if grow:
-                # Without the caller's end, _write_past_end measures the end
-                # again. Two more seeks cost little next to the zeros it
-                # then writes.
+                # _write_past_end measures the end again. Two more seeks
+                # cost little next to the zeros it then writes.
                 written, res2 = self._write_past_end(fh_addr, length, b"", end)
                 return (length, 0) if written >= 0 else (-1, res2)
             size, res2 = self.set_handle_size_reply(fh_addr, length)
@@ -3713,6 +3729,15 @@ class AmigaFuseFS(_FuseOperations):
             with entry["lock"]:
                 if entry.get("closed"):
                     raise FuseOSError(errno.EIO)
+                # Only a shrink of an unpinned file can move the far
+                # handles: a pinned file is held on an exclusive lock, so
+                # none is on it, and a grow moves no handle. The end is
+                # measured now, since no packet may follow a lost reply; an
+                # end that cannot be measured counts as a shrink.
+                far_may_move = False
+                if far and end is None:
+                    measured = self.bridge._handle_end(fh_addr)
+                    far_may_move = measured is None or length < measured
                 # A shrink that stops short or is refused as in use moves
                 # the other handles and is sent again. Every read and write
                 # carries its offset, so the handler's position for another
@@ -3745,8 +3770,9 @@ class AmigaFuseFS(_FuseOperations):
                     # measured again (_measure_stale_pin). A lost grow is
                     # not marked: it cannot leave the end below the pin,
                     # and the measure only ever lowers it.
-                    for other in far:
-                        other["pos"] = None
+                    if far_may_move:
+                        for other in far:
+                            other["pos"] = None
                     if end is not None and length < end:
                         entry["stale_pin"] = True
                 if size < 0:
