@@ -1,0 +1,121 @@
+name: Bundled FastFileSystem
+
+# Rebuilds the bundled FastFileSystem.OS3 from the tag and commit its
+# provenance file pins, and fails if the build's sha256 differs from the
+# bundled file's or the recorded one. Runs only when the bundled handler,
+# its provenance or this file changes.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - amifuse/drivers/FastFileSystem.OS3
+      - amifuse/drivers/FastFileSystem.OS3.json
+      - .github/workflows/bundled-ffs.yml
+  pull_request:
+    branches: [main]
+    paths:
+      - amifuse/drivers/FastFileSystem.OS3
+      - amifuse/drivers/FastFileSystem.OS3.json
+      - .github/workflows/bundled-ffs.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  rebuild:
+    name: Rebuild and compare checksum
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      BUNDLED: amifuse/drivers/FastFileSystem.OS3
+      PROVENANCE: amifuse/drivers/FastFileSystem.OS3.json
+      # The source, image and build are fixed here rather than taken from
+      # the provenance file, so that a change to that file alone can't
+      # point the check at another build. The file must record the same.
+      FFS_REPO: https://github.com/reinauer/FastFileSystem
+      FFS_IMAGE: stefanreinauer/amiga-gcc:gcc-v13.4
+      FFS_BUILD: make amigaos3
+      FFS_OUTPUT: build/os3/FastFileSystem
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Read the provenance file
+        id: prov
+        run: |
+          fail() { echo "::error file=$PROVENANCE::$1"; exit 1; }
+          get() { jq -r ".$1 // empty" "$PROVENANCE"; }
+          expect() {
+            value=$(get "$1")
+            [ "$value" = "$2" ] || fail "$1 is '$value'; this workflow builds with '$2'"
+          }
+          expect repo "$FFS_REPO"
+          expect build.image "$FFS_IMAGE"
+          expect build.command "$FFS_BUILD"
+          for spec in 'tag ^[A-Za-z0-9._-]+$' 'commit ^[0-9a-f]{40}$' \
+                      'sha256 ^[0-9a-f]{64}$' 'size ^[0-9]+$'; do
+            key=${spec%% *}
+            value=$(get "$key")
+            [[ $value =~ ${spec#* } ]] || fail "$key is missing or malformed: '$value'"
+            echo "$key = $value"
+            echo "$key=$value" >> "$GITHUB_OUTPUT"
+          done
+
+      - name: Check out FastFileSystem at the pinned tag
+        env:
+          TAG: ${{ steps.prov.outputs.tag }}
+          COMMIT: ${{ steps.prov.outputs.commit }}
+        run: |
+          # A full clone: the Makefile takes VERSION from the latest v* tag
+          # and the date from the commit, both through git.
+          git clone --quiet -- "$FFS_REPO" ffs
+          git -C ffs checkout --quiet --detach "refs/tags/$TAG"
+          head=$(git -C ffs rev-parse HEAD)
+          echo "$TAG is $head"
+          if [ "$head" != "$COMMIT" ]; then
+            echo "::error file=$PROVENANCE::tag $TAG is $head, but the provenance file records $COMMIT"
+            exit 1
+          fi
+
+      - name: Build
+        run: |
+          docker pull --quiet "$FFS_IMAGE"
+          docker image inspect --format '{{join .RepoDigests " "}}' "$FFS_IMAGE"
+          # The checkout belongs to the runner user, and the container runs
+          # as root, so git needs the directory marked safe.
+          docker run --rm --network none -v "$PWD/ffs:/ffs" -w /ffs "$FFS_IMAGE" \
+            sh -c "git config --global --add safe.directory /ffs && $FFS_BUILD"
+          cat ffs/build/version.h
+
+      - name: Compare checksums
+        env:
+          RECORDED_SHA256: ${{ steps.prov.outputs.sha256 }}
+          RECORDED_SIZE: ${{ steps.prov.outputs.size }}
+        run: |
+          built=ffs/$FFS_OUTPUT
+          built_sha256=$(sha256sum "$built" | cut -d' ' -f1)
+          built_size=$(stat -c %s "$built")
+          bundled_sha256=$(sha256sum "$BUNDLED" | cut -d' ' -f1)
+          echo "built:    $built_sha256 $built_size bytes"
+          echo "bundled:  $bundled_sha256 $(stat -c %s "$BUNDLED") bytes"
+          echo "recorded: $RECORDED_SHA256 $RECORDED_SIZE bytes"
+          if [ "$built_sha256" != "$bundled_sha256" ]; then
+            echo "::error file=$BUNDLED::the rebuilt handler's sha256 differs from the bundled file's"
+            exit 1
+          fi
+          if [ "$built_sha256" != "$RECORDED_SHA256" ]; then
+            echo "::error file=$PROVENANCE::the rebuilt handler's sha256 differs from the recorded one"
+            exit 1
+          fi
+          if [ "$built_size" != "$RECORDED_SIZE" ]; then
+            echo "::error file=$PROVENANCE::the rebuilt handler's size differs from the recorded one"
+            exit 1
+          fi
+          echo "The rebuilt handler matches the bundled file and its provenance."
