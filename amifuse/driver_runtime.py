@@ -8,6 +8,7 @@ import errno
 import os
 import sys
 import stat
+import struct
 from pathlib import Path
 from typing import Optional
 
@@ -198,6 +199,10 @@ class BlockDeviceBackend:
         # OffsetBlockDevice addresses an RDB within an MBR container. Locks
         # must use absolute host offsets, while handler I/O stays RDB-relative.
         offset = getattr(self.blkdev, "offset", 0)
+        if self.mbr_context is not None:
+            mbr_info = self.mbr_context.mbr_info
+        else:
+            mbr_info = self._mbr_beside_rdb(name)
         if self.mbr_context is not None and self.mbr_context.mbr_partition is not None:
             container = self.mbr_context.mbr_partition
             if end > self.blkdev.num_blocks:
@@ -208,8 +213,10 @@ class BlockDeviceBackend:
                 if (container.start_lba < other.start_lba + other.num_sectors
                         and other.start_lba < container.start_lba + container.num_sectors):
                     raise ValueError("Overlapping MBR containers cannot be shared")
-        elif self.mbr_context is not None:
-            # A Parceiro disk's own RDB lies beside the MBR, so a partition
+            self._check_disk_rdb(container, name)
+        elif mbr_info is not None:
+            # A Parceiro disk's own RDB lies beside the MBR, as does an RDB
+            # at block 0 whose sector also holds an MBR table, so a partition
             # must not reach into an MBR entry. Any other entry starting at
             # the partition's first sector is that entry's Amiga view (a
             # FAT\1 partition over a FAT32 entry), which may run past the
@@ -219,7 +226,7 @@ class BlockDeviceBackend:
             no_view = (MBR_TYPE_AMIGA_RDB, 0x05, 0x0F, 0x85)
             byte_start = (offset + start) * self.block_size
             byte_end = (offset + end) * self.block_size
-            for entry in self.mbr_context.mbr_info.partitions:
+            for entry in mbr_info.partitions:
                 if not entry.num_sectors:
                     continue
                 entry_start = entry.start_lba * MBR_SECTOR_SIZE
@@ -237,6 +244,119 @@ class BlockDeviceBackend:
                 self._raise_if_in_use(exc, name)
                 raise
         self._block_range = (start, end)
+
+    # The two checks below read the disk through the device already open:
+    # another open of a Windows physical disk, outside a mount session,
+    # fails while this one holds it. If a check can't be made, a writable
+    # open is refused and a read-only one goes on without it.
+
+    def _mbr_beside_rdb(self, name):
+        """The MBR table in sector 0 of a disk opened with no MBR context.
+
+        open_rdisk gives an RDB at block 0 no MBR context unless the MBR
+        lists 0x76 entries, though that sector may also hold a table whose
+        entries the RDB's partitions must not reach into.
+        """
+        from .rdb_inspect import MBR_SECTOR_SIZE, parse_mbr
+        try:
+            sector0 = self.blkdev.read_block(0)[:MBR_SECTOR_SIZE]
+        except OSError as exc:
+            if self.read_only:
+                return None
+            raise ValueError(
+                f"Partition {name} is not opened for writing: sector 0 of "
+                f"the disk does not read, so its MBR entries are unknown: {exc}"
+            ) from exc
+        return parse_mbr(sector0)
+
+    def _check_disk_rdb(self, container, name):
+        """Refuse a 0x76 container that overlaps a partition of the disk's
+        own RDB, which lies beside the MBR and lists no MBR entries."""
+        from .rdb_inspect import MBR_SECTOR_SIZE
+        try:
+            ranges = self._disk_rdb_ranges()
+        except OSError as exc:
+            if self.read_only:
+                return
+            raise ValueError(
+                f"Partition {name} is not opened for writing: the disk's own "
+                f"RDB can't be checked against its MBR container: {exc}"
+            ) from exc
+        start = container.start_lba * MBR_SECTOR_SIZE
+        end = start + container.num_sectors * MBR_SECTOR_SIZE
+        if any(start < part_end and part_start < end
+               for part_start, part_end in ranges):
+            raise ValueError("Overlapping MBR containers cannot be shared")
+
+    def _disk_rdb_ranges(self):
+        """Byte ranges of the partitions of the disk's own RDB, if any.
+
+        The RDB is found as open_rdisk finds it: the first valid RDSK block
+        of a size _scan_for_rdb accepts, in 512-byte sectors 0-15, and none
+        if that block lies in a 0x76 entry. The scan steps in sectors, not
+        in blocks of the open device, which has the container RDB's block
+        size. Raises RDBContentError if RDSK blocks outside the 0x76
+        entries are all invalid, or the RDB found does not open on the
+        device; a failing read raises another OSError.
+        """
+        from amitools.fs.block.rdb.RDBlock import RDBlock
+        from .rdb_inspect import (MBR_SECTOR_SIZE, MBR_TYPE_AMIGA_RDB,
+                                  RDBContentError, _parse_rdb)
+        base = self.blkdev.base
+        size = base.block_bytes
+        entries = [p for p in self.mbr_context.mbr_info.partitions
+                   if p.partition_type == MBR_TYPE_AMIGA_RDB]
+
+        def in_entry(sector):
+            return any(p.start_lba <= sector < p.start_lba + p.num_sectors
+                       for p in entries)
+
+        count = min(-(-16 * MBR_SECTOR_SIZE // size), base.num_blocks)
+        data = base.read_block(0, count) if count > 0 else b""
+        found = None
+        invalid = []
+        for sector in range(min(16, len(data) // MBR_SECTOR_SIZE)):
+            block = data[sector * MBR_SECTOR_SIZE:(sector + 1) * MBR_SECTOR_SIZE]
+            if block[:4] != b"RDSK":
+                continue
+            longs = struct.unpack(">128I", block)
+            rdb_size = longs[4]
+            # amitools' checksum holds when the block's longs sum to 0.
+            if (sum(longs) & 0xFFFFFFFF == 0 and 512 <= rdb_size <= 32768
+                    and not rdb_size & (rdb_size - 1)):
+                found = sector
+                break
+            if not in_entry(sector):
+                invalid.append(sector)
+        if found is None:
+            if invalid:
+                raise RDBContentError(
+                    f"no RDSK block in sectors {invalid} is valid")
+            return []
+        if in_entry(found):
+            return []  # A 0x76 entry's own RDB: the disk has none.
+        where = f"its RDSK block at sector {found}"
+        if rdb_size != size:
+            raise RDBContentError(
+                f"{where} uses {rdb_size}-byte blocks, but the disk is open "
+                f"with {size}-byte blocks")
+        if found * MBR_SECTOR_SIZE % size:
+            raise RDBContentError(
+                f"{where} is not on a {size}-byte block boundary")
+        rdb_block = RDBlock(base, found * MBR_SECTOR_SIZE // size)
+        if not rdb_block.read():
+            raise RDBContentError(f"{where} is not valid as a {size}-byte block")
+        rdisk = _parse_rdb(base, rdb_block)
+        try:
+            ranges = []
+            for part in rdisk.parts:
+                env = part.part_blk.dos_env
+                cyl_bytes = env.surfaces * env.blk_per_trk * size
+                ranges.append((env.low_cyl * cyl_bytes,
+                               (env.high_cyl + 1) * cyl_bytes))
+            return ranges
+        finally:
+            rdisk.close()
 
     def _raise_if_in_use(self, exc, partition=None):
         # Physical disks are excluded between AmiFUSE and vamos sessions by

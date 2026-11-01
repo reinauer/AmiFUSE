@@ -137,7 +137,14 @@ def detect_mbr(image: Path) -> Optional[MBRInfo]:
             block0 = f.read(512)
     except OSError:
         return None
+    return parse_mbr(block0)
 
+
+def parse_mbr(block0: bytes) -> Optional[MBRInfo]:
+    """Parse the MBR partition table in sector 0's bytes, as detect_mbr does.
+
+    Returns None if they hold no table with a non-empty entry.
+    """
     if len(block0) < 512:
         return None
 
