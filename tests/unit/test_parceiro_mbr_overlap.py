@@ -145,3 +145,248 @@ def test_rdb_blocks_are_compared_as_512_byte_sectors(tmp_path):
     with pytest.raises(ValueError, match=OVERLAP):
         _open(image, "FAT")
     assert _open(image, "DH0") == (16, 80)
+
+
+# The checks below read the disk through the device the open already holds:
+# a second open of a Windows physical disk fails while it is held.
+
+def _open_as(image, read_only=False, **kwargs):
+    """Open a partition, then close it, returning its 512-byte sector
+    range on the disk."""
+    backend = BlockDeviceBackend(image, read_only=read_only,
+                                 partition_scope=True, **kwargs)
+    backend.open()
+    try:
+        start, end = backend._block_range
+        offset = getattr(backend.blkdev, "offset", 0)
+        scale = backend.block_size // 512
+        return (offset + start) * scale, (offset + end) * scale
+    finally:
+        backend.close()
+
+
+def _no_second_open(monkeypatch):
+    """Fail any open of the image while _lock_partition runs."""
+    from amitools.fs.blkdev.ImageFile import ImageFile
+    from amifuse import rdb_inspect
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("the image was opened a second time")
+
+    lock_partition = BlockDeviceBackend._lock_partition
+
+    def guarded(self, *args, **kwargs):
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(ImageFile, "open", refuse)
+            for name in ("open_image", "open_rdisk", "detect_mbr"):
+                patch.setattr(rdb_inspect, name, refuse)
+            return lock_partition(self, *args, **kwargs)
+
+    monkeypatch.setattr(BlockDeviceBackend, "_lock_partition", guarded)
+
+
+def _rdb0_mbr(tmp_path, partitions, entries):
+    """An RDB with its RDSK block at block 0, whose sector also holds an MBR
+    listing (type, start, sectors) entries. The RDSK checksum covers the
+    whole block, MBR table included, as amitools checks it."""
+    data = bytearray(_rdb(tmp_path, partitions))
+    for index, entry in enumerate(entries):
+        _entry(data, index, *entry)
+    data[510:512] = b"\x55\xaa"
+    struct.pack_into(">I", data, 8, 0)
+    struct.pack_into(">I", data, 8,
+                     -sum(struct.unpack(">128I", data[:512])) & 0xFFFFFFFF)
+    image = tmp_path / "rdb0-mbr.hdf"
+    image.write_bytes(bytes(data))
+    return image
+
+
+def test_rdb_at_block_0_partition_over_an_mbr_entry_is_refused(tmp_path, monkeypatch):
+    # DH1 on blocks 80-159, a FAT32 entry on sectors 96-111 inside it.
+    image = _rdb0_mbr(tmp_path, [("DH0", (1, 4), DOS0), ("DH1", (5, 9), DOS0)],
+                      [(0x0C, 96, 16)])
+    before = image.read_bytes()
+    _no_second_open(monkeypatch)
+    with pytest.raises(ValueError, match=OVERLAP):
+        _open_as(image, partition="DH1")
+    assert _open_as(image, partition="DH0") == (16, 80)
+    assert image.read_bytes() == before
+
+
+def test_rdb_at_block_0_with_an_unreadable_sector_0(tmp_path, monkeypatch):
+    # A writable open does not go on without the MBR check; a read-only
+    # open does.
+    image = _rdb0_mbr(tmp_path, [("DH0", (1, 9), DOS0)], [(0x0C, 64, 64)])
+    open_image = BlockDeviceBackend._open_image
+
+    def failing_reads(self):
+        open_image(self)
+
+        def read_block(*args, **kwargs):
+            raise OSError("media error")
+
+        self.blkdev.read_block = read_block
+
+    monkeypatch.setattr(BlockDeviceBackend, "_open_image", failing_reads)
+    with pytest.raises(ValueError, match="sector 0 .* media error"):
+        _open_as(image, partition="DH0")
+    assert _open_as(image, read_only=True, partition="DH0") == (16, 160)
+
+
+def test_plain_rdb_at_block_0_opens(tmp_path):
+    image = tmp_path / "plain.hdf"
+    image.write_bytes(_rdb(tmp_path, [("DH0", (1, 9), DOS0)]))
+    assert _open_as(image, partition="DH0") == (16, 160)
+
+
+def _rdb_image(path, blocks, name, cyls, block_bytes=512):
+    """The bytes of a blocks-long RDB, 16 blocks to a cylinder, holding one
+    partition on cylinders cyls."""
+    raw = RawBlockDevice(str(path), read_only=False, block_bytes=block_bytes)
+    with ExitStack() as cleanup:
+        raw.create(blocks)
+        cleanup.callback(raw.close)
+        rdisk = RDisk(raw)
+        cleanup.callback(rdisk.close)
+        rdisk.create(DiskGeometry(blocks // 16, 1, 16), rdb_cyls=1)
+        rdisk.add_partition(FSString(name), cyls)
+        raw.flush()
+    return bytearray(path.read_bytes())
+
+
+def _parceiro_76(tmp_path, own_cyls, own_sector=2, own_bytes=512,
+                 inner_bytes=512):
+    """A 640-sector Parceiro disk: its own RDB, with its RDSK block moved to
+    own_sector and DH0 on own_cyls, beside a 0x76 entry on sectors 256-415
+    holding an RDB with DH1 on its cylinders 1-4 (1024-byte blocks) or 1-9."""
+    own_blocks = 640 * 512 // own_bytes
+    data = _rdb_image(tmp_path / "own.hdf", own_blocks, "DH0", own_cyls,
+                      own_bytes)
+    rdsk = bytes(data[:own_bytes])
+    data[:own_bytes] = bytes(own_bytes)
+    data[own_sector * 512:own_sector * 512 + own_bytes] = rdsk
+    inner_blocks = 160 * 512 // inner_bytes
+    inner_cyls = (1, inner_blocks // 16 - 1)
+    data[256 * 512:416 * 512] = _rdb_image(
+        tmp_path / "inner.hdf", inner_blocks, "DH1", inner_cyls, inner_bytes)
+    _entry(data, 0, 0x76, 256, 160)
+    data[510:512] = b"\x55\xaa"
+    image = tmp_path / "parceiro76.hdf"
+    image.write_bytes(bytes(data))
+    return image
+
+
+def test_0x76_entry_inside_an_own_rdb_partition_is_refused(tmp_path, monkeypatch):
+    # DH0 on sectors 16-639 covers the 0x76 entry holding DH1.
+    image = _parceiro_76(tmp_path, (1, 39))
+    before = image.read_bytes()
+    _no_second_open(monkeypatch)
+    with pytest.raises(ValueError, match=OVERLAP):
+        _open_as(image, partition="DH1")
+    with pytest.raises(ValueError, match=OVERLAP):
+        _open_as(image, partition="DH0")
+    assert image.read_bytes() == before
+
+
+def test_0x76_entry_beside_the_own_rdb_partitions_opens(tmp_path, monkeypatch):
+    # DH0 on sectors 16-255 ends where the 0x76 entry starts.
+    image = _parceiro_76(tmp_path, (1, 15))
+    _no_second_open(monkeypatch)
+    assert _open_as(image, partition="DH1") == (272, 416)
+    assert _open_as(image, partition="DH0") == (16, 256)
+
+
+def test_0x76_entry_on_a_disk_without_its_own_rdb_opens(tmp_path):
+    data = bytearray(256 * 512) + _rdb_image(tmp_path / "inner.hdf", 160,
+                                             "DH1", (1, 9))
+    _entry(data, 0, 0x76, 256, 160)
+    data[510:512] = b"\x55\xaa"
+    image = tmp_path / "emu68.hdf"
+    image.write_bytes(bytes(data))
+    assert _open_as(image, partition="DH1") == (272, 416)
+
+
+def test_0x76_entry_rdsk_block_in_sectors_0_to_15_is_not_the_disks_own(tmp_path):
+    # The entry starts at sector 8, so its RDSK block is the first one in
+    # sectors 0-15. It belongs to the entry, and the disk has no own RDB.
+    data = bytearray(8 * 512) + _rdb_image(tmp_path / "inner.hdf", 160,
+                                           "DH1", (1, 9))
+    _entry(data, 0, 0x76, 8, 160)
+    data[510:512] = b"\x55\xaa"
+    image = tmp_path / "emu68.hdf"
+    image.write_bytes(bytes(data))
+    assert _open_as(image, partition="DH1") == (24, 168)
+
+
+def test_0x76_entry_with_a_failing_read_of_the_disk(tmp_path, monkeypatch):
+    # A writable open does not go on without the own-RDB check; a
+    # read-only open does.
+    image = _parceiro_76(tmp_path, (1, 15))
+    open_image = BlockDeviceBackend._open_image
+
+    def failing_reads(self):
+        open_image(self)
+
+        def read_block(*args, **kwargs):
+            raise OSError("media error")
+
+        self.blkdev.base.read_block = read_block
+
+    monkeypatch.setattr(BlockDeviceBackend, "_open_image", failing_reads)
+    with pytest.raises(ValueError, match="own RDB can't be checked.*media error"):
+        _open_as(image, partition="DH1")
+    assert _open_as(image, read_only=True, partition="DH1") == (272, 416)
+
+
+def _select_entry_dh1(monkeypatch):
+    """Have --partition DH1 select entry 0's partition 0 without looking at
+    the disk's own RDB, so that only _lock_partition judges that RDB: a
+    selector may refuse to write beside an RDB that does not open."""
+    from amifuse import rdb_inspect
+
+    def find_partition(*args, **kwargs):
+        return rdb_inspect.PartitionRef(mbr_partition_index=0, number=0,
+                                        name="DH1")
+
+    monkeypatch.setattr(rdb_inspect, "find_partition", find_partition)
+
+
+def test_0x76_entry_beside_an_invalid_own_rdsk_block(tmp_path, monkeypatch):
+    # The own RDSK block's checksum is broken: its partitions are unknown.
+    image = _parceiro_76(tmp_path, (1, 39))
+    data = bytearray(image.read_bytes())
+    data[2 * 512 + 8] ^= 0xFF
+    image.write_bytes(bytes(data))
+    _select_entry_dh1(monkeypatch)
+    with pytest.raises(ValueError, match="own RDB can't be checked.*sectors \\[2\\]"):
+        _open_as(image, partition="DH1")
+    assert _open_as(image, read_only=True, partition="DH1") == (272, 416)
+
+
+def test_own_rdsk_block_is_found_in_512_byte_sectors(tmp_path, monkeypatch):
+    # The entry's RDB has 1024-byte blocks, so the device is open with them,
+    # and the own RDSK block (512-byte blocks) sits at the odd sector 3,
+    # which no 1024-byte block starts with. Its partitions can't be read
+    # through that device.
+    image = _parceiro_76(tmp_path, (1, 39), own_sector=3, inner_bytes=1024)
+    _no_second_open(monkeypatch)
+    with pytest.raises(ValueError,
+                       match="sector 3 uses 512-byte blocks.*1024-byte"):
+        _open_as(image, partition="DH1")
+    assert _open_as(image, read_only=True, partition="DH1") == (288, 416)
+
+
+def test_own_rdb_with_1024_byte_blocks_is_checked(tmp_path, monkeypatch):
+    # Own RDB and entry RDB both have 1024-byte blocks; the own RDSK block
+    # is block 3 (sector 6), and DH0 covers sectors 32-639.
+    image = _parceiro_76(tmp_path, (1, 19), own_sector=6, own_bytes=1024,
+                         inner_bytes=1024)
+    _no_second_open(monkeypatch)
+    with pytest.raises(ValueError, match=OVERLAP):
+        _open_as(image, partition="DH1")
+    # DH0 on sectors 32-255 only.
+    (tmp_path / "beside").mkdir()
+    image = _parceiro_76(tmp_path / "beside", (1, 7), own_sector=6,
+                         own_bytes=1024, inner_bytes=1024)
+    assert _open_as(image, partition="DH1") == (288, 416)
+    assert _open_as(image, partition="DH0") == (32, 256)
