@@ -92,23 +92,41 @@ def _stored_stamp(image: Path, path: str):
     return ts.days, ts.mins, ts.ticks
 
 
+def _image_and_driver(request, tmp_path):
+    """A copy of the param's image (or a generated ADF) and its handler."""
+    image_name, driver_name, _ = request.param
+    if driver_name == BUNDLED:
+        return _bundled_image(tmp_path), BUNDLED_DRIVER
+    fixture_root = request.getfixturevalue("fixture_root")
+    source = fixture_root / "fixtures" / "readonly" / image_name
+    driver = fixture_root / "drivers" / driver_name
+    if not source.exists() or not driver.exists():
+        pytest.skip(f"Missing {image_name} or {driver_name}")
+    image = tmp_path / image_name
+    shutil.copy2(source, image)
+    return image, driver
+
+
 @pytest.fixture(params=HANDLERS)
 def volume(request, tmp_path):
     """(AmigaFuseFS on a writable copy, image, an existing file, handler name)."""
-    image_name, driver_name, existing = request.param
-    if driver_name == BUNDLED:
-        image, driver = _bundled_image(tmp_path), BUNDLED_DRIVER
-    else:
-        fixture_root = request.getfixturevalue("fixture_root")
-        source = fixture_root / "fixtures" / "readonly" / image_name
-        driver = fixture_root / "drivers" / driver_name
-        if not source.exists() or not driver.exists():
-            pytest.skip(f"Missing {image_name} or {driver_name}")
-        image = tmp_path / image_name
-        shutil.copy2(source, image)
+    _, driver_name, existing = request.param
+    image, driver = _image_and_driver(request, tmp_path)
     bridge = HandlerBridge(image, driver, read_only=False, adf_info=detect_adf(image))
     try:
         yield AmigaFuseFS(bridge), image, existing, driver_name
+    finally:
+        bridge.close()
+
+
+@pytest.fixture(params=HANDLERS)
+def read_only_volume(request, tmp_path):
+    """(AmigaFuseFS on a read-only mount of a copy, image, an existing file)."""
+    existing = request.param[2]
+    image, driver = _image_and_driver(request, tmp_path)
+    bridge = HandlerBridge(image, driver, read_only=True, adf_info=detect_adf(image))
+    try:
+        yield AmigaFuseFS(bridge), image, existing
     finally:
         bridge.close()
 
@@ -153,10 +171,35 @@ def test_existing_entry_shows_its_stored_date(volume):
     if image.name == "bundled.adf":
         assert _mtime(ops, existing) == pytest.approx(
             host_time(*OLD_STAMP), abs=0.01)
-    ops.readdir("/", None)
+    stored = _mtime(ops, existing)
+    assert stored < time.time() - 86400
+    # readdir() fills the stat cache with each entry's own date. A
+    # writable mount does not answer getattr() from it; a read-only one does.
+    ops._stat_cache.pop(existing, None)
+    assert existing.lstrip("/") in ops.readdir("/", None)
+    listed = ops._stat_cache[existing][1]
+    assert listed["st_mtime"] == listed["st_ctime"] == listed["st_atime"]
+    assert listed["st_mtime"] == pytest.approx(stored, abs=0.01)
+
+
+def test_read_only_mount_shows_stored_dates(read_only_volume, monkeypatch):
+    """getattr() after readdir(), served from what readdir() read, shows the
+    date on the volume, as xdftool reads it."""
+    ops, image, existing = read_only_volume
+    stored = ops.bridge.stat_path(existing)["mtime"]
+    if image.suffix == ".adf":
+        assert stored == pytest.approx(
+            host_time(*_stored_stamp(image, existing)), abs=0.01)
+    assert stored < time.time() - 86400
+    assert existing.lstrip("/") in ops.readdir("/", None)
+
+    def stat_path(*args, **kwargs):
+        pytest.fail("getattr() asked the handler instead of using readdir()'s date")
+
+    monkeypatch.setattr(ops.bridge, "stat_path", stat_path)
     stat = ops.getattr(existing)
     assert stat["st_mtime"] == stat["st_ctime"] == stat["st_atime"]
-    assert stat["st_mtime"] < time.time() - 86400
+    assert stat["st_mtime"] == pytest.approx(stored, abs=0.01)
 
 
 def test_new_file_reads_back_as_now(volume):
