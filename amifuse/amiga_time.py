@@ -6,10 +6,19 @@ minutes into the day and ticks (1/50 s) into the minute. AmiFUSE answers
 every clock read a handler makes (dos.library's DateStamp, timer.device's
 GetSysTime and TR_GETSYSTIME, intuition.library's CurrentTime) from
 amiga_seconds(), and reads a stored DateStamp back with host_time(), so
-that a date makes the round trip unchanged.
+that a date makes the round trip unchanged, except around a change to or
+from daylight saving time (below).
 
 Each conversion takes the UTC offset in force at the instant converted,
 so a summer date and a winter date each get their own.
+
+A DateStamp has no time zone, so a local time that happens twice, in the
+hour the clocks go back, reads back as its first occurrence. In Los
+Angeles, 2026-11-01 09:30 UTC is stored as 01:30 and reads back as 08:30
+UTC, an hour early, so `rsync -t` copies such a file again on every run.
+A time in the hour the clocks skip when they go forward, which AmiFUSE
+never stores but an Amiga or another tool can, such as 02:30 on
+2026-03-08 there, reads back as 01:30, an hour early too.
 """
 
 import calendar
