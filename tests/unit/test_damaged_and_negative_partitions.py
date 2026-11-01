@@ -152,9 +152,24 @@ def test_inspect_labels_a_damaged_partition_in_a_later_rdb_by_its_rdb(
     assert find_partition(image, None, "0").mbr_partition_index == 0
     lines = _driver_lines(capsys, image)
     assert lines[0].startswith("  DH0: ")
-    assert lines[1] == ("  #0 in MBR partition [1]: "
-                        "damaged drive name: no --partition value selects it")
+    assert lines[1] == ("  #0 in MBR partition [1]: damaged drive name: "
+                        "--partition 0 selects 'DH0' instead")
     assert len(lines) == 2
+
+
+def test_inspect_names_the_damaged_partition_a_number_selects_instead(
+        tmp_path, capsys, user_driver_dir):
+    # Partition 0 of each RDB is damaged: --partition 0 selects the first.
+    first = _damage_first_name(
+        tmp_path, _make_rdb_parts(tmp_path, 512, [("DH0", DOS3)]))
+    second = _damage_first_name(
+        tmp_path, _make_rdb_parts(tmp_path, 512, [("DH1", DOS7)]))
+    image = _make_mbr(tmp_path, [(64, first), (448, second)])
+    lines = _driver_lines(capsys, image)
+    assert lines == [
+        "  #0: damaged drive name: no --partition name selects it",
+        "  #0 in MBR partition [1]: damaged drive name: --partition 0 selects "
+        "#0 in MBR partition [0] instead"]
 
 
 def test_inspect_keeps_the_number_when_it_selects_a_later_rdbs_partition(
@@ -175,8 +190,8 @@ def test_inspect_labels_a_damaged_partition_whose_number_is_a_name(
     # --partition 0 selects the partition named "0": names come first.
     image = _damaged(tmp_path, [("DH0", DOS3), ("0", DOS7)])
     lines = _driver_lines(capsys, image)
-    assert lines[0] == ("  #0 in the first RDB: "
-                        "damaged drive name: no --partition value selects it")
+    assert lines[0] == ("  #0 in the first RDB: damaged drive name: "
+                        "--partition 0 selects '0' instead")
     assert lines[1].startswith("  0: ")
     assert len(lines) == 2
 
@@ -191,7 +206,8 @@ def test_inspect_labels_a_damaged_partition_when_the_lookup_fails(
     monkeypatch.setattr(rdb_inspect, "find_partition", failing_lookup)
     lines = _driver_lines(capsys, image)
     assert lines[0] == ("  #0 in the first RDB: "
-                        "damaged drive name: no --partition value selects it")
+                        "damaged drive name: cannot tell what --partition 0 "
+                        "selects: read error")
     assert lines[1].startswith("  DH1: ")
 
 

@@ -7342,26 +7342,40 @@ def cmd_inspect(args):
     # that number to it: a number selects the first RDB with a partition of
     # that number, which on a disk with more than one RDB may be another,
     # and a partition named as the number comes first on any disk. Otherwise
-    # the line says no value selects the partition: a spelling such as "00",
-    # which --partition may still take as the number, is not offered.
+    # the partition is labelled by its RDB too, and the line says what the
+    # number selects instead.
+    amiga_parts = amiga_rdb_partitions(args.image)
+
+    def rdb_name(rdb_idx):
+        # The RDB yielded with index None comes first on every disk.
+        return ("the first RDB" if rdb_idx is None else
+                rdb_label(amiga_parts, rdb_idx))
+
     for part in list_partitions(args.image, args.block_size).partitions:
         text = _partition_driver(args.image, args.block_size, part.name)[1]
         if part.name is not None:
             print(f"  {part.name}: {text}")
             continue
+        selector = f"--partition {part.index}"
         try:
             ref = find_partition(args.image, args.block_size, str(part.index))
-        except OSError:
-            ref = None
-        if ref is not None and (ref.mbr_partition_index, ref.number) == (
-                part.mbr_partition_index, part.index):
-            print(f"  #{part.index}: {text}")
-            continue
-        where = ("the first RDB" if part.mbr_partition_index is None else
-                 rdb_label(amiga_rdb_partitions(args.image),
-                           part.mbr_partition_index))
-        print(f"  #{part.index} in {where}: "
-              f"damaged drive name: no --partition value selects it")
+        except OSError as exc:
+            note = (f"cannot tell what {selector} selects: "
+                    + " ".join(str(exc).splitlines()))
+        else:
+            if ref is not None and (ref.mbr_partition_index, ref.number) == (
+                    part.mbr_partition_index, part.index):
+                print(f"  #{part.index}: {text}")
+                continue
+            if ref is None:
+                note = f"{selector} selects no partition"
+            elif ref.name is not None:
+                note = f"{selector} selects '{ref.name}' instead"
+            else:
+                note = (f"{selector} selects #{ref.number} in "
+                        f"{rdb_name(ref.mbr_partition_index)} instead")
+        print(f"  #{part.index} in {rdb_name(part.mbr_partition_index)}: "
+              f"damaged drive name: {note}")
 
 
 def cmd_mount(args):
