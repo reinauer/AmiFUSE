@@ -3008,7 +3008,7 @@ class TestFuseTruncateLength:
         bridge.open_file.return_value = (self.FH_ADDR, 0)
         # The handler reaches every length it is sent.
         bridge.truncate_handle.side_effect = (
-            lambda fh_addr, length, others=(), end=None: (length, 0))
+            lambda fh_addr, length, others=(), **kwargs: (length, 0))
         return fs, bridge
 
     @pytest.mark.parametrize("length", [0x80000000, 1 << 32, (1 << 32) + 4])
@@ -3078,7 +3078,7 @@ class TestFuseTruncateLength:
         handle = fs.open("/file", os.O_WRONLY) if use_handle else None
         assert fs.truncate("/file", 0x7FFFFFFF, handle) == 0
         bridge.truncate_handle.assert_called_once_with(
-            self.FH_ADDR, 0x7FFFFFFF, [], end=None)
+            self.FH_ADDR, 0x7FFFFFFF, [], end=None, past_end=False)
 
     def test_read_only_mount_raises_erofs_first(self, fs_with_mock_bridge):
         """A read-only mount reports EROFS whatever the length."""
