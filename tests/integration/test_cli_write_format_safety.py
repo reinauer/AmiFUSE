@@ -171,7 +171,7 @@ def test_format_refuses_a_name_too_long_for_a_bstr(tmp_path, no_user_driver):
     before = _sha1(image)
     proc = subprocess.run(
         [sys.executable, "-m", "amifuse", "format", str(image), "DH0", "A" * 256],
-        capture_output=True, text=True, check=False,
+        capture_output=True, text=True, check=False, timeout=30,
     )
     assert proc.returncode == 1
     assert proc.stderr == "Error: volume name is 256 characters long; at most 255 are allowed.\n"

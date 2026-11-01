@@ -9,6 +9,8 @@
   answers the flush after a format with ERROR_ACTION_NOT_KNOWN; that passes.
 - format removes the handler it extracted from the RDB on every exit, and a
   failed removal does not replace the error the format exits with.
+- format refuses a volume name too long for a BSTR before it looks at the
+  image.
 """
 
 import errno
@@ -410,3 +412,23 @@ def test_failed_removal_after_a_format_is_reported(format_context, unremovable_h
     out = capsys.readouterr()
     assert "Format complete." in out.out
     assert f"could not remove {unremovable_handler}" in out.err
+
+
+# ---------------------------------------------------------------------------
+# format: the volume name is checked before the image
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("length, message", [
+    (256, "Error: volume name is 256 characters long; at most 255 are allowed."),
+    (255, "Error: image file not found: {image}"),
+], ids=["256", "255"])
+def test_format_checks_the_volume_name_before_the_image(tmp_path, length, message):
+    """A BSTR's length is one byte. The image does not exist, so the first
+    error says which check came first."""
+    image = tmp_path / "missing.hdf"
+    args = SimpleNamespace(image=image, partition="DH0", volname="A" * length,
+                           driver=None, block_size=None, debug=False)
+    with pytest.raises(SystemExit) as caught:
+        fs.cmd_format(args)
+    assert str(caught.value) == message.format(image=image)
