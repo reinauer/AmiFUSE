@@ -1985,7 +1985,8 @@ class HandlerBridge:
         return mem_obj.addr
 
     def _free_fh(self, fh_addr: int):
-        if fh_addr in self._fh_mem:
+        # Pooled twice, one FileHandle would go to two opens at once.
+        if fh_addr in self._fh_mem and fh_addr not in self._fh_pool:
             self._fh_pool.append(fh_addr)
 
     def _is_neg_cached(self, path: str) -> bool:
@@ -3909,28 +3910,33 @@ class AmigaFuseFS(_FuseOperations):
         that got no reply, the entry keeps the new handle. After an open
         that got no reply, which the handler may still hold, or a refused
         open again, the entry is left closed with no handle: its reads,
-        writes and truncates fail with EIO, and release() ends nothing.
+        writes and truncates fail with EIO, and release() ends nothing. So
+        is it after an open that raises, as one past _RETIRED_MAX does with
+        EIO, and the error goes on to the caller: the old FileHandle is
+        back in the pool, and the next open can take it.
         """
         bridge = self.bridge
         bridge.close_file(entry["fh_addr"])
-        opened, res2 = bridge.open_file_reply(path, os.O_RDWR | os.O_TRUNC)
-        emptied = False
-        if opened is not None:
-            written, res2 = bridge.write_empty_reply(opened[0])
-            emptied = written == 0
-            if not emptied and res2:
-                bridge.close_file(opened[0])
-                if opened[1]:
-                    bridge.free_lock(opened[1])
-                opened = None
-        if opened is None and res2:
-            opened = bridge.open_file(path, os.O_RDWR)
-        if entry.get("parent_lock"):
-            bridge.free_lock(entry["parent_lock"])
-        if opened is None:
-            entry.update(fh_addr=0, parent_lock=0, closed=True)
-        else:
-            entry["fh_addr"], entry["parent_lock"] = opened
+        opened, res2, emptied = None, 0, False
+        try:
+            opened, res2 = bridge.open_file_reply(path, os.O_RDWR | os.O_TRUNC)
+            if opened is not None:
+                written, res2 = bridge.write_empty_reply(opened[0])
+                emptied = written == 0
+                if not emptied and res2:
+                    bridge.close_file(opened[0])
+                    if opened[1]:
+                        bridge.free_lock(opened[1])
+                    opened = None
+            if opened is None and res2:
+                opened = bridge.open_file(path, os.O_RDWR)
+        finally:
+            if entry.get("parent_lock"):
+                bridge.free_lock(entry["parent_lock"])
+            if opened is None:
+                entry.update(fh_addr=0, parent_lock=0, closed=True)
+            else:
+                entry["fh_addr"], entry["parent_lock"] = opened
         if not emptied:
             return -1, res2
         self._pin_stat(path, 0)
@@ -4406,15 +4412,20 @@ class AmigaFuseFS(_FuseOperations):
         open() keeps a lock on the directory a file was opened in until
         release(). Left on the directory the file was renamed out of, it
         keeps the handler from deleting that directory once it is empty.
-        The entry keeps the old lock if dir_path can't be locked.
+        The entry keeps the old lock if dir_path can't be locked, also when
+        the lookup raises, as one past _RETIRED_MAX does with EIO: the
+        rename is done, and must not be reported as failed.
         """
         with entry["lock"]:
             # release() marks the entry closed before it frees the lock.
             if entry.get("closed") or not entry.get("parent_lock"):
                 return
-            lock, _, _ = self.bridge.locate_path(dir_path)
-            if dir_path == "/" and lock == 0:
-                lock, _ = self.bridge.locate(0, "")
+            try:
+                lock, _, _ = self.bridge.locate_path(dir_path)
+                if dir_path == "/" and lock == 0:
+                    lock, _ = self.bridge.locate(0, "")
+            except FuseOSError:
+                lock = 0
             if lock == 0:
                 self._log_op("rename", dir_path, "could not lock the new directory")
                 return

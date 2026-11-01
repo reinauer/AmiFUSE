@@ -29,11 +29,13 @@ from amifuse import fuse_fs as fs
 from amifuse.startup_runner import (
     ACTION_END,
     ACTION_FINDINPUT,
+    ACTION_FINDOUTPUT,
     ACTION_FINDUPDATE,
     ACTION_FLUSH,
     ACTION_FREE_LOCK,
     ACTION_LOCATE_OBJECT,
     ACTION_READ,
+    ACTION_RENAME_OBJECT,
     ACTION_SET_FILE_SIZE,
     ACTION_WRITE,
     HandlerLauncher,
@@ -309,6 +311,88 @@ def test_io_fails_once_too_much_memory_is_held(bridge, monkeypatch):
     assert b._retired == []
     handler.delay = lambda pkt_type, name: 0
     assert b.read_handle(fh, 1000) == bytes(1000)
+
+
+def test_a_truncate_failing_at_the_cap_leaves_its_handle_closed(bridge, monkeypatch):
+    # BFFS's truncate to 0 ends the handle, then opens the file again
+    # (_reopen_for_output), and that open fails at the cap.
+    b, handler = bridge
+    monkeypatch.setattr(fs.HandlerBridge, "_RETIRED_MAX", 3 * 1000)
+    file_ids = {"file": 0x5550, "other": 0x6660}
+    held = {f"h{i}" for i in range(8)}
+    handler.delay = lambda pkt_type, name: (
+        NEVER if pkt_type == ACTION_READ or name in held else 0)
+
+    def answer(pkt_type, args, name):
+        if pkt_type in (ACTION_FINDUPDATE, ACTION_FINDOUTPUT):
+            handler.mem.w32((args[0] << 2) + FH_ARGS, file_ids.get(name, 0x8880))
+            return -1, 0
+        if pkt_type == ACTION_LOCATE_OBJECT:
+            return 0x400, 0
+        return (args[2], 0) if pkt_type == ACTION_READ else (-1, 0)
+    handler.answer = answer
+
+    ops = fs.AmigaFuseFS(b)
+    handle = ops.open("/file", os.O_RDWR)
+    entry = ops._fh_cache[handle]
+    fh = entry["fh_addr"]
+    # Lookups never answered hold every name BSTR, and reads fill the cap.
+    for name in sorted(held):
+        b.locate(0, name)
+    for _ in range(4):
+        b.read_handle(fh, 1000)
+    monkeypatch.setattr(b, "truncate_handle", lambda fh, length, others=(): (
+        -1, fs.ERROR_OBJECT_NOT_FOUND))
+
+    with pytest.raises(OSError) as exc:
+        ops.truncate("/file", 0, handle)
+    assert exc.value.errno == errno.EIO
+    assert entry["closed"] and entry["fh_addr"] == 0
+    assert b._fh_pool == [fh]
+
+    # Once the handler answers, another file gets the FileHandle, and the
+    # closed entry's release does not end that file's handle.
+    handler.answer_now(ACTION_READ)
+    handler.answer_now(ACTION_LOCATE_OBJECT)
+    assert b.wait_for_pending(timeout=5.0) == []
+    other = ops.open("/other", os.O_RDWR)
+    assert ops._fh_cache[other]["fh_addr"] == fh
+    ops.release("/file", handle)
+    ended = [args[0] for _, _, _, args, _ in handler.taken(ACTION_END)]
+    assert ended == [file_ids["file"]]
+    assert b._fh_pool == []
+
+
+def test_a_file_handle_goes_back_to_the_pool_once(bridge):
+    b, handler = bridge
+    fh = _open(b, handler, "/file", 0x5550)
+
+    b._free_fh(fh)
+    b._free_fh(fh)
+
+    assert b._fh_pool == [fh]
+
+
+def test_a_rename_done_stands_when_the_lock_move_fails_at_the_cap(bridge, monkeypatch):
+    # The open file's lock on its directory follows it once the rename is
+    # done (_move_parent_lock); that lookup fails at the cap.
+    b, handler = bridge
+    handler.answer = lambda pkt_type, args, name: (
+        (0x400, 0) if pkt_type == ACTION_LOCATE_OBJECT else (-1, 0))
+    ops = fs.AmigaFuseFS(b)
+    handle = ops.open("/a/file", os.O_RDWR)
+    entry = ops._fh_cache[handle]
+    locate_path = b.locate_path
+
+    def locate_path_at_the_cap(path):
+        if handler.taken(ACTION_RENAME_OBJECT):
+            raise fs.FuseOSError(errno.EIO)
+        return locate_path(path)
+    monkeypatch.setattr(b, "locate_path", locate_path_at_the_cap)
+
+    assert ops.rename("/a/file", "/b/file") == 0
+    assert entry["path"] == "/b/file"
+    assert entry["parent_lock"] == 0x400
 
 
 def test_an_open_still_out_keeps_its_file_handle(bridge):
