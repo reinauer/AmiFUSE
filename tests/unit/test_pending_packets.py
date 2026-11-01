@@ -19,6 +19,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from amitools.vamos.error import VamosInternalError
 from amitools.vamos.lib.lexec.signalfunc import SignalFunc
 from amitools.vamos.libstructs.dos import DosPacketStruct, FileHandleStruct
 from amitools.vamos.libstructs.exec_ import MsgPortStruct
@@ -27,7 +28,9 @@ from amitools.vamos.mem.alloc import MemoryAlloc
 
 from amifuse import fuse_fs as fs
 from amifuse.startup_runner import (
+    ACTION_DELETE_OBJECT,
     ACTION_END,
+    ACTION_EXAMINE_OBJECT,
     ACTION_FINDINPUT,
     ACTION_FINDOUTPUT,
     ACTION_FINDUPDATE,
@@ -278,7 +281,7 @@ def test_a_late_reply_frees_the_buffer_it_held(bridge):
     assert b.locate(0, "next") == (0x400, 0)
 
     assert write_args[1] not in b.vh.alloc.mem_objs
-    assert b._retired == []
+    assert b._retired_data == []
 
 
 def test_io_fails_once_too_much_memory_is_held(bridge, monkeypatch):
@@ -294,7 +297,7 @@ def test_io_fails_once_too_much_memory_is_held(bridge, monkeypatch):
     for _ in range(4):
         assert b.read_handle(fh, 1000) is None
     assert len(handler.taken(ACTION_READ)) == 4
-    assert sum(m.size for m in b._retired) == 3 * 1000
+    assert sum(m.size for m in b._retired_data) == 3 * 1000
 
     # The fourth buffer would pass the cap: the I/O fails, and sends nothing.
     assert b.read_handle(fh, 1000) is None
@@ -308,53 +311,196 @@ def test_io_fails_once_too_much_memory_is_held(bridge, monkeypatch):
     # Once the handler answers them, I/O works again.
     handler.answer_now(ACTION_READ)
     assert b.locate(0, "next") == (0x400, 0)
-    assert b._retired == []
+    assert b._retired_data == []
     handler.delay = lambda pkt_type, name: 0
     assert b.read_handle(fh, 1000) == bytes(1000)
 
 
-def test_a_truncate_failing_at_the_cap_leaves_its_handle_closed(bridge, monkeypatch):
-    # BFFS's truncate to 0 ends the handle, then opens the file again
-    # (_reopen_for_output), and that open fails at the cap.
-    b, handler = bridge
+def _at_the_cap(b, handler, monkeypatch):
+    """Fill the cap with reads never answered, and hold every small buffer.
+
+    Lookups never answered hold every name BSTR, and an examine never
+    answered the FIB, so that the requests after them set those aside.
+    The handler answers every other packet at once: a lookup with lock
+    0x400, an examine as a file. Returns the FileHandle of /file.
+    """
     monkeypatch.setattr(fs.HandlerBridge, "_RETIRED_MAX", 3 * 1000)
-    file_ids = {"file": 0x5550, "other": 0x6660}
     held = {f"h{i}" for i in range(8)}
-    handler.delay = lambda pkt_type, name: (
-        NEVER if pkt_type == ACTION_READ or name in held else 0)
+    examine_held = [True]
+
+    def delay(pkt_type, name):
+        if pkt_type == ACTION_EXAMINE_OBJECT and examine_held:
+            examine_held.clear()
+            return NEVER
+        return NEVER if pkt_type == ACTION_READ or name in held else 0
+    handler.delay = delay
+
+    def answer(pkt_type, args, name):
+        if pkt_type in (ACTION_FINDINPUT, ACTION_FINDUPDATE, ACTION_FINDOUTPUT):
+            handler.mem.w32((args[0] << 2) + FH_ARGS, 0x5550)
+            return -1, 0
+        if pkt_type == ACTION_LOCATE_OBJECT:
+            return 0x400, 0
+        if pkt_type == ACTION_EXAMINE_OBJECT:
+            handler.mem.w32((args[1] << 2) + 4, -3 & 0xFFFFFFFF)  # ST_FILE
+            return -1, 0
+        if pkt_type in (ACTION_READ, ACTION_WRITE):
+            return args[2], 0
+        return -1, 0
+    handler.answer = answer
+
+    fh, _ = b.open_file("/file", os.O_RDWR)
+    for _ in range(4):
+        assert b.read_handle(fh, 1000) is None
+    for name in sorted(held):
+        assert b.locate(0, name) == (0, -1)
+    assert b.list_dir(0x400) == []
+    # The reads fill the cap; nothing small has been set aside yet.
+    assert sum(m.size for m in b._retired_data) == 3 * 1000
+    assert not b._retired
+    return fh
+
+
+def _locks_out(handler):
+    """Locks the handler granted that have not been freed."""
+    granted = [e for e in handler.events
+               if e[0] == "answer" and e[1] == ACTION_LOCATE_OBJECT]
+    return len(granted) - len(handler.taken(ACTION_FREE_LOCK))
+
+
+def _data_still_capped(b, handler, fh):
+    """A read or write past the cap fails, and sends nothing."""
+    reads = len(handler.taken(ACTION_READ))
+    writes = len(handler.taken(ACTION_WRITE))
+    assert b.read_handle(fh, 1000) is None
+    assert b._write_packets(fh, b"A" * 1000) == (-1, 0)
+    assert len(handler.taken(ACTION_READ)) == reads
+    assert len(handler.taken(ACTION_WRITE)) == writes
+    assert sum(m.size for m in b._retired_data) == 3 * 1000
+
+
+def test_at_the_cap_a_lookup_and_an_open_still_work(bridge, monkeypatch):
+    b, handler = bridge
+    fh = _at_the_cap(b, handler, monkeypatch)
+    ops = fs.AmigaFuseFS(b)
+    out = _locks_out(handler)
+
+    lock, res2, locks = b.locate_path("/a/b/c")
+    assert (lock, res2, locks) == (0x400, 0, [0x400])
+    b.free_lock(lock)
+    assert b.list_dir_path("/a") == []
+    handle = ops.open("/a/file", os.O_RDWR)
+    assert ops._fh_cache[handle]["fh_addr"]
+    ops.release("/a/file", handle)
+
+    assert _locks_out(handler) == out
+    # The name BSTRs and the FIB those requests needed were set aside.
+    assert b._retired
+    _data_still_capped(b, handler, fh)
+
+
+def test_at_the_cap_an_unlink_still_works(bridge, monkeypatch):
+    b, handler = bridge
+    fh = _at_the_cap(b, handler, monkeypatch)
+    ops = fs.AmigaFuseFS(b)
+    out = _locks_out(handler)
+
+    assert ops.unlink("/a/gone") == 0
+
+    (_, _, _, args, _), = handler.taken(ACTION_DELETE_OBJECT)
+    assert _bstr(b.mem, args[1]) == "gone"
+    assert _locks_out(handler) == out
+    _data_still_capped(b, handler, fh)
+
+
+def test_at_the_cap_a_rename_replace_still_works(bridge, monkeypatch):
+    b, handler = bridge
+    fh = _at_the_cap(b, handler, monkeypatch)
+    ops = fs.AmigaFuseFS(b)
+    out = _locks_out(handler)
+    answer = handler.answer
+    renames, deletes = [], []
+
+    def exists_once(pkt_type, args, name):
+        # Names are read as the packet is answered: later packets reuse
+        # the BSTRs.
+        if pkt_type == ACTION_RENAME_OBJECT:
+            renames.append((_bstr(b.mem, args[1]), _bstr(b.mem, args[3])))
+            # The first rename finds the target there: rename() replaces it.
+            if len(renames) == 1:
+                return 0, fs.ERROR_OBJECT_EXISTS
+        if pkt_type == ACTION_DELETE_OBJECT:
+            deletes.append(_bstr(b.mem, args[1]))
+        return answer(pkt_type, args, name)
+    handler.answer = exists_once
+
+    assert ops.rename("/a/new", "/a/old") == 0
+
+    temp = renames[1][1]
+    assert renames == [("new", "old"), ("old", temp), ("new", "old")]
+    assert temp.startswith(".amifuse-")
+    assert deletes == [temp]
+    assert _locks_out(handler) == out
+    _data_still_capped(b, handler, fh)
+
+
+def test_at_the_cap_an_unwritten_truncating_open_still_empties_the_file(
+        bridge, monkeypatch):
+    # BFFS empties a file opened with ACTION_FINDOUTPUT only once its
+    # handle has written; close_file() sends a write of no bytes for that.
+    b, handler = bridge
+    fh = _at_the_cap(b, handler, monkeypatch)
+    writes = len(handler.taken(ACTION_WRITE))
+
+    (out_fh, lock), res2 = b.open_file_reply("/a/t", os.O_RDWR | os.O_TRUNC)
+    assert res2 == 0
+    b.close_file(out_fh)
+    b.free_lock(lock)
+
+    (_, _, _, args, _), = handler.taken(ACTION_WRITE)[writes:]
+    assert args[2] == 0
+    kinds = [(kind, pkt_type) for kind, pkt_type, *_ in handler.events]
+    assert kinds.index(("answer", ACTION_WRITE)) < kinds.index(("take", ACTION_END))
+    _data_still_capped(b, handler, fh)
+
+
+def test_a_truncate_whose_reopen_raises_leaves_its_handle_closed(bridge, monkeypatch):
+    # BFFS's truncate to 0 ends the handle, then opens the file again
+    # (_reopen_for_output), and that open raises, as one does when the
+    # emulated RAM runs out.
+    b, handler = bridge
+    file_ids = {"file": 0x5550, "other": 0x6660}
 
     def answer(pkt_type, args, name):
         if pkt_type in (ACTION_FINDUPDATE, ACTION_FINDOUTPUT):
             handler.mem.w32((args[0] << 2) + FH_ARGS, file_ids.get(name, 0x8880))
             return -1, 0
-        if pkt_type == ACTION_LOCATE_OBJECT:
-            return 0x400, 0
-        return (args[2], 0) if pkt_type == ACTION_READ else (-1, 0)
+        return (0x400, 0) if pkt_type == ACTION_LOCATE_OBJECT else (-1, 0)
     handler.answer = answer
 
     ops = fs.AmigaFuseFS(b)
     handle = ops.open("/file", os.O_RDWR)
     entry = ops._fh_cache[handle]
     fh = entry["fh_addr"]
-    # Lookups never answered hold every name BSTR, and reads fill the cap.
-    for name in sorted(held):
-        b.locate(0, name)
-    for _ in range(4):
-        b.read_handle(fh, 1000)
     monkeypatch.setattr(b, "truncate_handle", lambda fh, length, others=(): (
         -1, fs.ERROR_OBJECT_NOT_FOUND))
+    open_file_reply = b.open_file_reply
+    no_memory = [True]
 
-    with pytest.raises(OSError) as exc:
+    def open_file_reply_once_out_of_memory(path, flags=os.O_RDONLY):
+        if no_memory:
+            no_memory.clear()
+            raise VamosInternalError("[alloc: NO MEMORY for 000100 bytes]")
+        return open_file_reply(path, flags)
+    monkeypatch.setattr(b, "open_file_reply", open_file_reply_once_out_of_memory)
+
+    with pytest.raises(VamosInternalError):
         ops.truncate("/file", 0, handle)
-    assert exc.value.errno == errno.EIO
     assert entry["closed"] and entry["fh_addr"] == 0
     assert b._fh_pool == [fh]
 
-    # Once the handler answers, another file gets the FileHandle, and the
-    # closed entry's release does not end that file's handle.
-    handler.answer_now(ACTION_READ)
-    handler.answer_now(ACTION_LOCATE_OBJECT)
-    assert b.wait_for_pending(timeout=5.0) == []
+    # Another file gets the FileHandle, and the closed entry's release
+    # does not end that file's handle.
     other = ops.open("/other", os.O_RDWR)
     assert ops._fh_cache[other]["fh_addr"] == fh
     ops.release("/file", handle)
@@ -371,28 +517,6 @@ def test_a_file_handle_goes_back_to_the_pool_once(bridge):
     b._free_fh(fh)
 
     assert b._fh_pool == [fh]
-
-
-def test_a_rename_done_stands_when_the_lock_move_fails_at_the_cap(bridge, monkeypatch):
-    # The open file's lock on its directory follows it once the rename is
-    # done (_move_parent_lock); that lookup fails at the cap.
-    b, handler = bridge
-    handler.answer = lambda pkt_type, args, name: (
-        (0x400, 0) if pkt_type == ACTION_LOCATE_OBJECT else (-1, 0))
-    ops = fs.AmigaFuseFS(b)
-    handle = ops.open("/a/file", os.O_RDWR)
-    entry = ops._fh_cache[handle]
-    locate_path = b.locate_path
-
-    def locate_path_at_the_cap(path):
-        if handler.taken(ACTION_RENAME_OBJECT):
-            raise fs.FuseOSError(errno.EIO)
-        return locate_path(path)
-    monkeypatch.setattr(b, "locate_path", locate_path_at_the_cap)
-
-    assert ops.rename("/a/file", "/b/file") == 0
-    assert entry["path"] == "/b/file"
-    assert entry["parent_lock"] == 0x400
 
 
 def test_an_open_still_out_keeps_its_file_handle(bridge):
