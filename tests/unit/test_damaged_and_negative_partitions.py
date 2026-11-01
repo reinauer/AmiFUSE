@@ -38,11 +38,11 @@ def test_damaged_name_is_listed_without_a_name(tmp_path):
     # number.
     for selector in ("DH1", "dh1", "1"):
         assert get_partition_info(image, None, selector) == {
-            "name": "DH1", "dostype": DOS7}
+            "name": "DH1", "dostype": DOS7, "block_size": 512}
     # The damaged partition still opens by number, named by it.
     for selector in ("0", None):
         assert get_partition_info(image, None, selector) == {
-            "name": "#0", "dostype": DOS3}
+            "name": "#0", "dostype": DOS3, "block_size": 512}
     assert find_partition(image, None, "None") is None
 
 
@@ -125,7 +125,8 @@ def test_negative_number_selects_no_partition(tmp_path, selector):
                                       [("DH0", DOS3), ("DH1", DOS7)]))
     assert find_partition(image, None, selector) is None
     assert get_partition_info(image, None, selector) == {"name": "AmigaFS",
-                                                         "dostype": None}
+                                                         "dostype": None,
+                                                         "block_size": None}
     backend = BlockDeviceBackend(image, partition_scope=True,
                                  partition=selector)
     with pytest.raises(ValueError) as caught:

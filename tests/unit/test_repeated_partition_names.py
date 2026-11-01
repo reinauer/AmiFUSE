@@ -83,7 +83,8 @@ def test_each_name_selects_its_partition(tmp_path):
     assert find_partition(image, None, "1") == PartitionRef(None, 1, "DH0.1")
     assert find_partition(image, None, "DH0.2") is None
     assert get_partition_info(image, None, "DH0.1") == {"name": "DH0.1",
-                                                        "dostype": DOS7}
+                                                        "dostype": DOS7,
+                                                        "block_size": 512}
 
     backend = BlockDeviceBackend(image, partition_scope=True,
                                  partition="DH0.1")
@@ -104,7 +105,8 @@ def test_a_name_taken_by_a_rename_is_renamed_too(tmp_path):
         "DH0", "DH0.1", "DH0.2"]
     assert find_partition(image, None, "DH0.1").number == 1
     assert get_partition_info(image, None, "DH0.2") == {"name": "DH0.2",
-                                                        "dostype": DOS7}
+                                                        "dostype": DOS7,
+                                                        "block_size": 512}
 
 
 @pytest.mark.parametrize("selector,low_cyl", [("DH0", 1), ("dh0.1", 3),
