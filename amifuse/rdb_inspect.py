@@ -905,13 +905,16 @@ def mount_names(rdb_parts: list) -> List[List[Optional[str]]]:
 
 def _disk_names(
     image: Path, block_size: Optional[int],
-) -> List[Tuple[Optional[int], int, List[Optional[str]]]]:
-    """(mbr_partition_index, RDB offset, mount_names) per RDB that opens."""
+) -> Tuple[List[Tuple[Optional[int], int, List[Optional[str]]]], bool]:
+    """(mbr_partition_index, RDB offset, mount_names) per RDB that opens,
+    and whether the disk's own RDB beside the MBR fails (DiskRDBError)."""
     rdbs = []
     rdb_parts = []
+    disk_rdb_fails = False
     count = len(amiga_rdb_partitions(image))
     for rdb_idx, opened in open_each_rdb(image, block_size, count):
         if isinstance(opened, IOError):
+            disk_rdb_fails = disk_rdb_fails or isinstance(opened, DiskRDBError)
             continue
         blkdev, rdisk, mbr_ctx = opened
         try:
@@ -921,7 +924,7 @@ def _disk_names(
             rdisk.close()
             blkdev.close()
     return [(rdb_idx, offset, names) for (rdb_idx, offset), names
-            in zip(rdbs, mount_names(rdb_parts))]
+            in zip(rdbs, mount_names(rdb_parts))], disk_rdb_fails
 
 
 def _find_in(rdbs, partition: str):
@@ -947,7 +950,7 @@ def _find_in(rdbs, partition: str):
 
 
 def find_partition(
-    image: Path, block_size: Optional[int], partition: str
+    image: Path, block_size: Optional[int], partition: str, write: bool = False
 ) -> Optional[PartitionRef]:
     """Find the partition that ``--partition`` names, or None.
 
@@ -961,14 +964,28 @@ def find_partition(
     partition.
 
     Raises IOError if a forced block_size rules out an RDB, so that the
-    partition found differs from the one auto-detection finds.
+    partition found differs from the one auto-detection finds. With write,
+    raises IOError too if the disk's own RDB beside the MBR does not open:
+    its partitions, which come first, are unknown, so any name or number
+    may select another partition than with that RDB intact.
     """
     partition = str(partition)
-    rdbs = _disk_names(image, block_size)
+    rdbs, disk_rdb_fails = _disk_names(image, block_size)
+    auto_rdbs = rdbs
+    if block_size is not None:
+        # The forced size can fail the disk's own RDB; the shift that
+        # causes is refused below, against the auto-detected RDBs.
+        auto_rdbs, disk_rdb_fails = _disk_names(image, None)
+    if write and disk_rdb_fails:
+        raise IOError(
+            f"Partition {partition} is not opened for writing: the RDB beside "
+            f"the MBR on this disk does not open, so partition names and "
+            f"numbers may select another partition"
+        )
     found = _find_in(rdbs, partition)
     if block_size is None:
         return None if found is None else found[0]
-    auto = _find_in(_disk_names(image, None), partition)
+    auto = _find_in(auto_rdbs, partition)
     # Tell the RDBs apart by offset: the default open, index None, can
     # reach a different RDB at the forced size.
     if auto is None or (found is not None and
