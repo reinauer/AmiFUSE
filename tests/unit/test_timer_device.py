@@ -337,67 +337,6 @@ class TestTimerDevice:
         assert timer.exec.port_mgr.ports[PORT].queue == [IO]
         assert _m68k_list(timer.mem) == [IO]
 
-    def _waitport_frame(self, timer, waitpkt=False):
-        """The resume frame of a process parked in WaitPort() (or WaitPkt()) on PORT."""
-        from amifuse.startup_runner import _build_resume_frame
-
-        sp = 0x4000
-        timer.mem.w32(sp, 0x5000)  # WaitPort's return address
-        block = {"waitport_blocked_sp": sp, "waitport_blocked_port": PORT,
-                 "waitport_blocked_ret": 0x5000, "waitpkt_blocked": waitpkt}
-        return _build_resume_frame(
-            block, default_port_addr=PORT, mem=timer.mem,
-            port_mgr=timer.exec.port_mgr,
-            compute_pending_signals=lambda mask: 0,
-            clear_signals_from_task=lambda signals: None,
-            leave_queued=timer.device.delays)
-
-    def parked(self, timer, monkeypatch):
-        """No live Exec/DOS block state; the resumes below clear it."""
-        from amitools.vamos.lib.DosLibrary import DosLibrary
-        from amitools.vamos.lib.ExecLibrary import ExecLibrary
-
-        for name in ("waitport_blocked_sp", "waitport_blocked_port",
-                     "waitport_blocked_ret", "wait_blocked_mask",
-                     "wait_blocked_sp", "wait_blocked_ret"):
-            monkeypatch.setattr(ExecLibrary, f"_{name}", None)
-        monkeypatch.setattr(DosLibrary, "_waitpkt_blocked", False)
-        timer.mem.w32(0x4000, 0x5000)  # WaitPort's return address
-        return {"waitport_blocked_sp": 0x4000, "waitport_blocked_port": PORT,
-                "waitport_blocked_ret": 0x5000, "waitpkt_blocked": False}
-
-    def _launcher(self, timer):
-        from amifuse.startup_runner import HandlerLauncher
-
-        launcher = HandlerLauncher.__new__(HandlerLauncher)
-        launcher.mem = timer.mem
-        launcher.exec_impl = timer.exec
-        launcher._debug = False
-        launcher._warned_tc_sigrecvd = False
-        cpu = SimpleNamespace(regs={})
-        cpu.w_reg = cpu.regs.__setitem__
-        launcher.vh = SimpleNamespace(
-            timer_device=timer.device, machine=SimpleNamespace(cpu=cpu),
-            alloc=SimpleNamespace(get_mem=lambda: timer.mem))
-        return launcher
-
-    def _state(self, block, port_addr=PORT):
-        return SimpleNamespace(
-            port_addr=port_addr, block_state=dict(block), pc=0x7000, sp=0x7800,
-            regs=[0] * 16, initialized=True, main_loop_pc=0x5000,
-            main_loop_sp=0x4004, wait_mask=0)
-
-    def _deliver(self, timer):
-        timer.send(micro=100_000)
-        timer.clock.now = 100.1
-        timer.device.deliver()
-        assert timer.exec.port_mgr.ports[PORT].queue == [IO]
-
-    def _assert_reply_left_queued(self, timer, pc, d0):
-        assert (pc, d0) == (0x5000, IO)
-        assert timer.exec.port_mgr.ports[PORT].queue == [IO]
-        assert _m68k_list(timer.mem) == [IO]
-
     def test_bad_reply_port_is_replied_as_sendio_does(self, timer):
         """A reply port outside memory gets no link and no signal, and raises nothing.
 
@@ -473,6 +412,102 @@ class TestTimerDevice:
         timer.mem.w16(IO + 28, TR_ADDREQUEST)
         assert not timer.device.delays(IO)
 
+class TestDelays:
+    """The device ends the Delay() of a task when its time has passed."""
+
+    OTHER_TASK = TASK + 0x100
+
+    def test_delays_end_in_order_with_sigf_single(self, timer):
+        from amifuse.timer_device import SIGF_SINGLE
+
+        timer.device.add_delay(TASK, 101.0)
+        timer.device.add_delay(self.OTHER_TASK, 102.0)
+        assert timer.device.next_deadline() == 101.0
+        assert timer.device.next_delay() == 101.0
+        timer.clock.now = 101.0
+        assert timer.device.deliver() == {TASK: SIGF_SINGLE}
+        assert timer.exec.signal_func.sent == [(TASK, SIGF_SINGLE)]
+        assert timer.device.delays_ended == 1
+        # the other task's delay is the next deadline
+        assert timer.device.next_deadline() == 102.0
+        assert timer.device.deliver() == {}
+        timer.clock.now = 102.0
+        assert timer.device.deliver() == {self.OTHER_TASK: SIGF_SINGLE}
+        assert timer.device.delays_ended == 2
+        assert timer.device.next_delay() == float("inf")
+
+    def test_fast_forward_ends_every_delay(self, timer):
+        from amifuse.timer_device import SIGF_SINGLE
+
+        timer.device.add_delay(TASK, 105.0)
+        timer.device.add_delay(self.OTHER_TASK, 160.0)
+        assert timer.device.deliver(fast_forward=True) == {
+            TASK: SIGF_SINGLE, self.OTHER_TASK: SIGF_SINGLE}
+        assert timer.device.delays_ended == 2
+        assert timer.device.next_deadline() == float("inf")
+
+    def test_a_new_delay_replaces_the_tasks_earlier_one(self, timer):
+        timer.device.add_delay(TASK, 105.0)
+        timer.device.add_delay(TASK, 101.0)
+        assert timer.device.next_delay() == 101.0
+        timer.clock.now = 101.0
+        timer.device.deliver()
+        assert timer.device.delays_ended == 1
+        assert timer.device.next_delay() == float("inf")
+
+    def test_an_earlier_delay_sets_the_event(self, timer):
+        timer.send(IO, secs=5)
+        timer.device.event.clear()
+        timer.device.add_delay(TASK, 110.0)
+        assert not timer.device.event.is_set()
+        timer.device.add_delay(self.OTHER_TASK, 101.0)
+        assert timer.device.event.is_set()
+
+    def test_a_delay_of_a_task_that_cannot_be_signalled_is_dropped(self, timer):
+        def fail(task, bits):
+            raise RuntimeError("no such task")
+
+        timer.exec.signal_func.signal = fail
+        timer.device.add_delay(TASK, 101.0)
+        timer.clock.now = 101.0
+        assert timer.device.deliver() == {}
+        assert timer.device.delays_ended == 1
+        assert timer.device.next_delay() == float("inf")
+
+    def _dos(self, timer, ticks, task=TASK):
+        from amifuse.clock_libraries import AmiFuseDosLibrary
+
+        waits = []
+        lib = AmiFuseDosLibrary.__new__(AmiFuseDosLibrary)
+        lib.delay_timer = timer.device
+        ctx = SimpleNamespace(
+            cpu=SimpleNamespace(r_reg=lambda reg: ticks),
+            exec_lib=SimpleNamespace(
+                exec_lib=SimpleNamespace(this_task=SimpleNamespace(aptr=task)),
+                signal_func=SimpleNamespace(wait=waits.append)))
+        return lib, ctx, waits
+
+    def test_dos_delay_notes_the_deadline_and_waits_on_sigf_single(self, timer):
+        from amifuse.timer_device import SIGF_SINGLE
+
+        lib, ctx, waits = self._dos(timer, ticks=50)
+        assert lib.Delay(ctx) == 0
+        assert timer.device.next_delay() == 101.0
+        assert waits == [SIGF_SINGLE]
+
+    def test_dos_delay_of_zero_ticks_adds_nothing(self, timer, monkeypatch):
+        from amitools.vamos.lib.DosLibrary import DosLibrary
+
+        slept = []
+        monkeypatch.setattr(DosLibrary, "Delay", lambda self, ctx: slept.append(1) or 0)
+        lib, ctx, waits = self._dos(timer, ticks=0)
+        lib.Delay(ctx)
+        assert timer.device.next_delay() == float("inf")
+        assert waits == []
+        # amitools' Delay() takes it
+        assert slept == [1]
+
+
 class _Timer:
     """The bridge's view of AmiFuseTimerDevice."""
 
@@ -502,6 +537,9 @@ class _Timer:
 
     def next_deadline(self):
         return self.deadline
+
+    def next_delay(self):
+        return float("inf")
 
     def clock(self):
         return time.monotonic()
