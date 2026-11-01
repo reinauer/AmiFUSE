@@ -497,6 +497,10 @@ The `mount-tests` job installs a platform-specific FUSE backend:
 - **macOS:** FUSE-T (user-space, no kext required) with libfuse compatibility symlink
 - **Windows:** WinFSP via chocolatey
 
+On Windows, `tools-smoke` also installs WinFSP before `image_format_smoke.py`:
+the tool fakes the mount, but the mount path still checks that WinFSP is
+installed.
+
 The Windows integration, tools-smoke and mount-tests jobs use the
 `machine68k-amifuse` fork, which includes pre-built wheels with fixes for
 opcode table over-read
