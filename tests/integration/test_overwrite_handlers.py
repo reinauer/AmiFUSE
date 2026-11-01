@@ -169,3 +169,33 @@ def test_truncate_by_path_beside_a_writer(ops):
             assert ops.truncate("/w.bin", 10) == 0
     finally:
         ops.release("/w.bin", fh)
+
+
+@pytest.mark.parametrize("opener", ["create", "O_TRUNC-open"])
+def test_unlinked_file_held_by_its_writer(ops, opener):
+    """Every handler refuses to delete a file a create() or O_TRUNC handle
+    holds (ERROR_OBJECT_IN_USE), and cannot examine it, so unlink() defers
+    the delete to release() and the handle's pinned entry describes the
+    file until then (#263)."""
+    _write_file(ops, "/u.bin", OLD)
+    if opener == "create":
+        fh = ops.create("/u.bin", 0o644)
+    else:
+        fh = ops.open("/u.bin", os.O_RDWR | os.O_TRUNC)
+    try:
+        assert ops.write("/u.bin", NEW, 0, fh) == len(NEW)
+        assert ops.unlink("/u.bin") == 0
+        assert ops.getattr("/u.bin", fh)["st_size"] == len(NEW)
+        assert ops.read("/u.bin", 1 << 16, 0, fh) == NEW
+        assert ops.truncate("/u.bin", 9, fh) == 0
+        assert ops.getattr("/u.bin", fh)["st_size"] == 9
+        with pytest.raises(FuseOSError) as exc_info:
+            ops.getattr("/u.bin")
+        assert exc_info.value.args[0] == errno.ENOENT
+    finally:
+        ops.release("/u.bin", fh)
+
+    with pytest.raises(FuseOSError) as exc_info:
+        ops.getattr("/u.bin")
+    assert exc_info.value.args[0] == errno.ENOENT
+    assert "u.bin" not in ops.readdir("/", None)
