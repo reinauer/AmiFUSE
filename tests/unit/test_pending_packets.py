@@ -509,6 +509,53 @@ def test_a_truncate_whose_reopen_raises_leaves_its_handle_closed(bridge, monkeyp
     assert b._fh_pool == []
 
 
+@pytest.mark.parametrize("failing", [1, 2], ids=["new-lock", "old-lock"])
+def test_a_truncate_whose_lock_free_raises_keeps_no_pooled_handle(
+        bridge, monkeypatch, failing):
+    # BFFS's truncate to 0 ends the handle and opens the file again
+    # (_reopen_for_output). The write that empties it is refused, so the
+    # new handle ends too, and the file is opened for update. Freeing the
+    # new handle's lock, or the old one's, raises, as it does when the
+    # emulated RAM runs out.
+    b, handler = bridge
+    locks = iter(range(0x400, 0x500))
+
+    def answer(pkt_type, args, name):
+        if pkt_type in (ACTION_FINDUPDATE, ACTION_FINDOUTPUT):
+            handler.mem.w32((args[0] << 2) + FH_ARGS, 0x5550)
+            return -1, 0
+        if pkt_type == ACTION_WRITE:
+            return -1, fs.ERROR_DISK_FULL
+        return (next(locks), 0) if pkt_type == ACTION_LOCATE_OBJECT else (-1, 0)
+    handler.answer = answer
+
+    ops = fs.AmigaFuseFS(b)
+    handle = ops.open("/file", os.O_RDWR)
+    entry = ops._fh_cache[handle]
+    monkeypatch.setattr(b, "truncate_handle", lambda fh, length, others=(): (
+        -1, fs.ERROR_OBJECT_NOT_FOUND))
+    free_lock = b.free_lock
+    freed = []
+
+    def free_lock_failing_once(lock):
+        freed.append(lock)
+        if len(freed) == failing:
+            raise VamosInternalError("[alloc: NO MEMORY for 000100 bytes]")
+        free_lock(lock)
+    monkeypatch.setattr(b, "free_lock", free_lock_failing_once)
+
+    with pytest.raises(VamosInternalError):
+        ops.truncate("/file", 0, handle)
+    assert len(freed) == 2 and len(set(freed)) == 2
+    # The entry names neither a FileHandle the next open can take nor a
+    # lock already freed: closed after the new lock's failure, before the
+    # file was opened for update, and holding that update handle after
+    # the old lock's.
+    assert entry["fh_addr"] not in b._fh_pool
+    assert entry["parent_lock"] not in freed
+    assert entry["closed"] == (failing == 1)
+
+
 def test_a_file_handle_goes_back_to_the_pool_once(bridge):
     b, handler = bridge
     fh = _open(b, handler, "/file", 0x5550)
