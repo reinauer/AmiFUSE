@@ -84,6 +84,23 @@ def test_a_driver_without_version_is_refused(monkeypatch, tmp_path, ver,
     assert "pfs3aio 20.0 or later" in message
 
 
+def test_an_older_pfs3_name_is_refused(monkeypatch, tmp_path):
+    message, started = _format(
+        monkeypatch, tmp_path,
+        _driver(tmp_path, b"$VER: PFS-III 18.5 (1.1.2000)"), DOS3, 2048)
+    assert not started
+    assert "the driver is version 18.5" in message
+
+
+def test_an_unreadable_driver_is_an_error(monkeypatch, tmp_path):
+    """The error from reading the driver is reported; the bridge never starts."""
+    message, started = _format(monkeypatch, tmp_path, tmp_path / "missing",
+                               PFS3, 2048)
+    assert not started
+    assert message.startswith("Error: ")
+    assert "missing" in message
+
+
 @pytest.mark.parametrize("ver,dostype,block_size", [
     (VER_20, PFS3, 2048),
     (VER_20, PFS3, 4096),
