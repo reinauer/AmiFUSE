@@ -32,7 +32,9 @@ classifiers = [
 
 dependencies = [
     "fusepy>=3.0",
-    "amitools-amifuse[vamos]>=0.8.0.post10",
+    "amitools-amifuse[vamos]>=0.8.0.post11",
+    # the handler's tasks are greenlets (emu_thread.py, startup_runner.py)
+    "greenlet>=3.0",
 ]
 
 [project.scripts]
