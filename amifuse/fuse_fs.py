@@ -12,6 +12,7 @@ import itertools
 import math
 import operator
 import os
+import shlex
 import signal
 import subprocess
 import sys
@@ -5712,7 +5713,6 @@ def mount_fuse(
 
     try:
         # Auto-create mountpoint on macOS/Windows if not specified
-        default_mountpoint = mountpoint is None
         if mountpoint is None:
             mountpoint = plat.get_default_mountpoint(volname_opt or part_name)
             if mountpoint is None:
@@ -5771,11 +5771,12 @@ def mount_fuse(
             print("[amifuse] global drive; unmount from an Administrator shell")
         if foreground:
             print("[amifuse] interactive mode; press Ctrl+C to unmount")
-        elif sys.platform.startswith("darwin") and default_mountpoint:
-            # On FUSE-T, `amifuse unmount` can't tie a mount to this process
-            # without --mountpoint and refuses it; `umount` works on both
-            # macOS backends.
-            print(f"[amifuse] daemon mode; unmount with: umount {mountpoint}")
+        elif sys.platform.startswith("darwin"):
+            # On FUSE-T, `amifuse unmount` refuses a mount it can't tie to
+            # this process (no --mountpoint, or one with a space, which `ps`
+            # doesn't keep whole); `umount` works on both macOS backends.
+            print("[amifuse] daemon mode; unmount with: umount "
+                  + shlex.quote(str(mountpoint)))
         else:
             print(f"[amifuse] daemon mode; unmount with: amifuse unmount {mountpoint}")
 
