@@ -122,9 +122,10 @@ class PartitionList:
     partition; it sets this only when an RDB of the disk fails to open, the
     disk's own beside its MBR or a 0x76 entry's, naming each one that fails.
 
-    ``default_open_fails`` is True when the open without ``--partition``
-    fails, as beside a disk's own RDB that fails: then even a lone partition
-    opens only by name.
+    ``default_open_fails`` is True when the disk's own RDB beside the MBR
+    fails (DiskRDBError), which ends the open without ``--partition``: then
+    even a lone partition opens only by name. A read error in an entry
+    ends that open too, but also every lookup by name, so it is not flagged.
     """
     partitions: List[PartInfo]
     fallback_reason: Optional[str] = None
