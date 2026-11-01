@@ -235,3 +235,54 @@ def test_launcher_names_an_entry_rdb_that_fails(tmp_path):
     assert [p.name for p in listed.partitions] == ["PI0"]
     assert listed.fallback_reason == (
         f"RDB beside the MBR: {_disk_error(image)}\n{_entry_error(image)}")
+
+
+def _write_refused(selector):
+    return (f"Partition {selector} is not opened for writing: the RDB beside "
+            f"the MBR on this disk does not open, so partition names and "
+            f"numbers may select another partition")
+
+
+@pytest.mark.parametrize("selector", ["DH0", "0"])
+def test_write_refuses_a_selector_beside_a_disk_rdb_that_fails(tmp_path,
+                                                                selector):
+    from amifuse.rdb_inspect import find_partition
+
+    # Intact, the disk's own RDB holds DH0 and DH1, and entry 0's DH0 is
+    # DH0.1; with the disk's RDB failing, "DH0" and "0" select entry 0's.
+    image = _broken_disk_rdb(tmp_path, ("DH0", "PI1"))
+    backend = BlockDeviceBackend(image, partition_scope=True,
+                                 partition=selector, read_only=False)
+    with pytest.raises(OSError) as caught:
+        backend.open()
+    assert str(caught.value) == _write_refused(selector)
+    assert backend.blkdev is None
+    with pytest.raises(OSError) as caught:
+        find_partition(image, 512, selector, write=True)
+    assert str(caught.value) == _write_refused(selector)
+
+    # Read-only, the entry's partition still opens.
+    backend = BlockDeviceBackend(image, partition_scope=True,
+                                 partition=selector)
+    backend.open()
+    try:
+        assert backend.mbr_partition_index == 0
+        assert str(backend.rdb.get_partition(
+            backend.partition_number).get_drive_name()) == "DH0"
+    finally:
+        backend.close()
+
+
+def test_write_opens_a_selector_beside_a_disk_rdb_that_opens(tmp_path):
+    from amifuse.rdb_inspect import find_partition
+
+    image = _disk_rdb(tmp_path, ("DH0", "PI1"), 2)
+    assert find_partition(image, None, "DH0", write=True).mbr_partition_index is None
+    backend = BlockDeviceBackend(image, partition_scope=True,
+                                 partition="DH0.1", read_only=False)
+    backend.open()
+    try:
+        assert backend.mbr_partition_index == 0
+        assert backend.partition_number == 0
+    finally:
+        backend.close()

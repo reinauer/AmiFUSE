@@ -157,7 +157,8 @@ class BlockDeviceBackend:
             if self.partition_scope and self.partition is not None:
                 from .rdb_inspect import find_partition
                 ref = find_partition(
-                    self.image, self._requested_block_size, self.partition)
+                    self.image, self._requested_block_size, self.partition,
+                    write=not self.read_only)
                 self.mbr_partition_index = ref.mbr_partition_index if ref else None
                 self.partition_number = ref.number if ref else None
             self._open_image()
