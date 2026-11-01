@@ -212,6 +212,14 @@ class NoEntryRDBError(OSError):
     """
 
 
+class EntryRDBError(OSError):
+    """The selected 0x76 entry's RDB is found but its contents do not open.
+
+    A block carrying the RDSK id with a bad checksum counts as found. A
+    device or media error is not this error: it propagates as it is.
+    """
+
+
 class OffsetBlockDevice:
     """Block device wrapper that adds an offset to all block operations.
 
@@ -240,6 +248,12 @@ class OffsetBlockDevice:
             # outside it.
             raise RDBContentError(
                 f"Read beyond partition: {blk_num}+{num_blks} > {self.num_blocks}")
+        if self.offset + blk_num + num_blks > self.base.num_blocks:
+            # The image ends inside the partition: its contents, not a
+            # failing read, rule the blocks out.
+            raise RDBContentError(
+                f"Read beyond image end: {self.offset + blk_num}+{num_blks} "
+                f"> {self.base.num_blocks}")
         return self.base.read_block(self.offset + blk_num, num_blks)
 
     def write_block(self, blk_num: int, data: bytes, num_blks: int = 1):
@@ -378,28 +392,45 @@ def detect_iso(image: Path) -> Optional[ISOInfo]:
 def _scan_for_rdb(blkdev, block_size: Optional[int] = None):
     """Scan blocks 0-15 for RDB signature.
 
-    Returns (rdb_block, new_block_size) where:
+    Returns (rdb_block, new_block_size, bad_checksum_blk) where:
     - rdb_block: The RDBlock object if found, None otherwise
     - new_block_size: If non-None, caller must reopen device with this block size
                       and call _scan_for_rdb again
+    - bad_checksum_blk: The first block scanned that carries the RDSK id but
+                        fails its checksum, None if none: with no rdb_block,
+                        a damaged RDB rather than none
     """
     from amitools.fs.block.rdb.RDBlock import RDBlock
 
+    bad_checksum_blk = None
     for blk_num in range(16):
         rdb = RDBlock(blkdev, blk_num)
         if rdb.read():
             # Skip an RDSK block declaring a block size other than a power of
-            # two from 512 to 32768, as for a bad checksum. Other sizes do not
-            # map onto 512-byte MBR sectors, and 0 or huge ones cannot be read.
+            # two from 512 to 32768, as if it held no RDSK id. Other sizes do
+            # not map onto 512-byte MBR sectors, and 0 or huge ones cannot be
+            # read.
             size = rdb.block_size
             if not 512 <= size <= 32768 or size & (size - 1):
                 continue
             # Check if we need to adjust block size
             if block_size is None and rdb.block_size != blkdev.block_bytes:
                 # Need to reopen with correct block size
-                return None, rdb.block_size
-            return rdb, None
-    return None, None
+                return None, rdb.block_size, bad_checksum_blk
+            return rdb, None, bad_checksum_blk
+        if bad_checksum_blk is None and rdb.valid_types:
+            bad_checksum_blk = blk_num
+    return None, None, bad_checksum_blk
+
+
+def _bad_checksum(blk_num: int, block_size: Optional[int]) -> str:
+    """Describe the RDSK block _scan_for_rdb found with a bad checksum.
+
+    A forced block size is named: the checksum covers the whole block, so
+    a size other than the RDB's own can fail it on an intact RDB.
+    """
+    forced = f" with {block_size}-byte blocks" if block_size else ""
+    return f"RDSK block at block {blk_num} has a bad checksum{forced}"
 
 
 def _is_parceiro_checksum(block) -> bool:
@@ -698,7 +729,9 @@ def open_rdisk(
             RDB without parsing it. A 0x76 partition is skipped only for
             RDBContentError; any other OSError in it, such as a device or
             media error, ends the open. A selected partition with no RDSK
-            block raises NoEntryRDBError.
+            block raises NoEntryRDBError, and one whose RDB is found but
+            does not open EntryRDBError. A block carrying the RDSK id with
+            a bad checksum is an RDB that does not open, not none.
     """
     # Read the MBR first: a Windows physical disk opened outside a mount
     # session is locked against other readers until blkdev closes.
@@ -740,29 +773,41 @@ def _locate_rdisk(image, block_size, mbr_partition_index, mbr_info, open_at):
     blkdev = open_at(initial_block_size)
 
     # First try direct RDB scan
-    rdb_block, new_block_size = _scan_for_rdb(blkdev, block_size)
+    rdb_block, new_block_size, bad_blk = _scan_for_rdb(blkdev, block_size)
 
     if new_block_size is not None:
         # Need to reopen with correct block size and rescan
         blkdev = open_at(new_block_size)
-        rdb_block, _ = _scan_for_rdb(blkdev, block_size)
+        rdb_block, _, bad_blk = _scan_for_rdb(blkdev, block_size)
 
-    if rdb_block is not None and mbr_info is not None:
-        # The scan can reach the RDB of a 0x76 partition (block 8 of a
-        # forced 4096-byte size is LBA 64). Its block numbers are relative
-        # to that partition, so leave it to the MBR path below even if it
-        # would parse here. That path reuses blkdev or reopens it.
-        offset = rdb_block.blk_num * blkdev.block_bytes
-        if any(p.partition_type == MBR_TYPE_AMIGA_RDB
-               and p.start_lba * MBR_SECTOR_SIZE <= offset
-               < (p.start_lba + p.num_sectors) * MBR_SECTOR_SIZE
-               for p in mbr_info.partitions):
-            rdb_block = None
+    def in_amiga_partition(blk_num):
+        offset = blk_num * blkdev.block_bytes
+        return mbr_info is not None and any(
+            p.partition_type == MBR_TYPE_AMIGA_RDB
+            and p.start_lba * MBR_SECTOR_SIZE <= offset
+            < (p.start_lba + p.num_sectors) * MBR_SECTOR_SIZE
+            for p in mbr_info.partitions)
+
+    # The scan can reach the RDB of a 0x76 partition (block 8 of a forced
+    # 4096-byte size is LBA 64). Its block numbers are relative to that
+    # partition, so leave it, intact or not, to the MBR path below even if
+    # it would parse here. That path reuses blkdev or reopens it.
+    if rdb_block is not None and in_amiga_partition(rdb_block.blk_num):
+        rdb_block = None
+    if bad_blk is not None and in_amiga_partition(bad_blk):
+        bad_blk = None
 
     # A selected 0x76 partition holds its own RDB, if any, beside this one,
     # so this one is not parsed: its failure must not end that open.
-    if rdb_block is not None and (mbr_partition_index is None
-                                  or not _amiga_partitions(mbr_info)):
+    parse_direct = (mbr_partition_index is None
+                    or not _amiga_partitions(mbr_info))
+    if rdb_block is None and bad_blk is not None and parse_direct:
+        # An RDSK block with a bad checksum is a damaged RDB, not none: the
+        # 0x76 partitions are not tried in its place.
+        error = DiskRDBError if _amiga_partitions(mbr_info) else IOError
+        raise error(f"Failed to parse RDB at {image}: "
+                    f"{_bad_checksum(bad_blk, block_size)}")
+    if rdb_block is not None and parse_direct:
         try:
             rdisk = _parse_rdb(blkdev, rdb_block)
         except IOError as e:
@@ -813,11 +858,13 @@ def _locate_rdisk(image, block_size, mbr_partition_index, mbr_info, open_at):
             # reason; any other OSError ends the open. Leave blkdev open:
             # closing offset_dev closes it, and the next entry may reuse it.
             try:
-                rdb_block, new_block_size = _scan_for_rdb(offset_dev, block_size)
+                rdb_block, new_block_size, bad_blk = _scan_for_rdb(
+                    offset_dev, block_size)
             except RDBContentError as e:
                 skipped.append((mbr_part, f": {e}"))
                 continue
-            holds_rdb = holds_rdb or rdb_block is not None or new_block_size is not None
+            holds_rdb = (holds_rdb or rdb_block is not None
+                         or new_block_size is not None or bad_blk is not None)
 
             if new_block_size is not None:
                 # Need to reopen base device with new block size and rescan
@@ -828,10 +875,15 @@ def _locate_rdisk(image, block_size, mbr_partition_index, mbr_info, open_at):
                                               f"{new_block_size}-byte blocks"))
                     continue
                 try:
-                    rdb_block, _ = _scan_for_rdb(offset_dev, block_size)
+                    rdb_block, _, bad_blk = _scan_for_rdb(offset_dev, block_size)
                 except RDBContentError as e:
                     skipped.append((mbr_part, f": {e}"))
                     continue
+
+            if rdb_block is None and bad_blk is not None:
+                skipped.append((mbr_part,
+                                f": {_bad_checksum(bad_blk, block_size)}"))
+                continue
 
             if rdb_block is not None:
                 # Found RDB in this partition
@@ -857,8 +909,7 @@ def _locate_rdisk(image, block_size, mbr_partition_index, mbr_info, open_at):
         if mbr_partition_index is not None:
             found = (f"MBR partition {amiga_parts[0].index} does not contain "
                      f"a valid RDB: {image}")
-            if not holds_rdb:
-                error = NoEntryRDBError
+            error = EntryRDBError if holds_rdb else NoEntryRDBError
         else:
             found = _no_valid_rdb_message(image, len(amiga_parts))
         raise error(f"{found}{reasons}")
@@ -928,16 +979,28 @@ def mount_names(rdb_parts: list) -> List[List[Optional[str]]]:
 
 def _disk_names(
     image: Path, block_size: Optional[int],
-) -> Tuple[List[Tuple[Optional[int], int, List[Optional[str]]]], bool]:
+) -> Tuple[List[Tuple[Optional[int], int, List[Optional[str]]]], List[str]]:
     """(mbr_partition_index, RDB offset, mount_names) per RDB that opens,
-    and whether the disk's own RDB beside the MBR fails (DiskRDBError)."""
+    and each RDB that is found but does not open, named for a message.
+
+    Those RDBs are the disk's own beside the MBR (DiskRDBError) and an
+    entry's (EntryRDBError); the names of the RDBs after them shift. An
+    entry that holds no RDB (NoEntryRDBError) shifts none. Any other
+    OSError in an entry, such as a device or media error, ends the lookup,
+    as it ends open_rdisk. The default open's other errors leave no RDB
+    open whose names could shift.
+    """
     rdbs = []
     rdb_parts = []
-    disk_rdb_fails = False
-    count = len(amiga_rdb_partitions(image))
-    for rdb_idx, opened in open_each_rdb(image, block_size, count):
+    failed = []
+    amiga_parts = amiga_rdb_partitions(image)
+    for rdb_idx, opened in open_each_rdb(image, block_size, len(amiga_parts)):
         if isinstance(opened, IOError):
-            disk_rdb_fails = disk_rdb_fails or isinstance(opened, DiskRDBError)
+            if isinstance(opened, (DiskRDBError, EntryRDBError)):
+                failed.append("the RDB beside the MBR" if rdb_idx is None else
+                              f"the RDB in {rdb_label(amiga_parts, rdb_idx)}")
+            elif rdb_idx is not None and not isinstance(opened, NoEntryRDBError):
+                raise opened
             continue
         blkdev, rdisk, mbr_ctx = opened
         try:
@@ -947,7 +1010,16 @@ def _disk_names(
             rdisk.close()
             blkdev.close()
     return [(rdb_idx, offset, names) for (rdb_idx, offset), names
-            in zip(rdbs, mount_names(rdb_parts))], disk_rdb_fails
+            in zip(rdbs, mount_names(rdb_parts))], failed
+
+
+def _refuse_write(refusal: str, failed: List[str], shift: str) -> None:
+    """Raise IOError for a writable open if an RDB in failed does not open."""
+    if failed:
+        verb = "does" if len(failed) == 1 else "do"
+        raise IOError(f"{refusal}: "
+                      f"{' and '.join(failed)} on this disk {verb} not open, "
+                      f"so {shift}")
 
 
 def _find_in(rdbs, partition: str):
@@ -988,24 +1060,24 @@ def find_partition(
 
     Raises IOError if a forced block_size rules out an RDB, so that the
     partition found differs from the one auto-detection finds. With write,
-    raises IOError too if the disk's own RDB beside the MBR does not open:
-    its partitions, which come first, are unknown, so any name or number
-    may select another partition than with that RDB intact.
+    raises IOError too if an RDB on the disk is found but does not open,
+    the disk's own beside the MBR or an entry's: its partitions are
+    unknown, so any name or number may select another partition than with
+    that RDB intact. A device or media error in an entry's RDB ends the
+    lookup, read-only too (_disk_names).
     """
     partition = str(partition)
-    rdbs, disk_rdb_fails = _disk_names(image, block_size)
+    rdbs, failed = _disk_names(image, block_size)
     auto_rdbs = rdbs
     if block_size is not None:
-        # The forced size can fail the disk's own RDB; the shift that
-        # causes is refused below, against the auto-detected RDBs. Only
-        # the auto-detected open decides whether that RDB fails.
-        auto_rdbs, disk_rdb_fails = _disk_names(image, None)
-    if write and disk_rdb_fails:
-        raise IOError(
-            f"Partition {partition} is not opened for writing: the RDB beside "
-            f"the MBR on this disk does not open, so partition names and "
-            f"numbers may select another partition"
-        )
+        # The forced size can fail an RDB; the shift that causes is refused
+        # below, against the auto-detected RDBs. Only the auto-detected
+        # open decides whether an RDB fails.
+        auto_rdbs, failed = _disk_names(image, None)
+    if write:
+        _refuse_write(
+            f"Partition {partition} is not opened for writing", failed,
+            "partition names and numbers may select another partition")
     found = _find_in(rdbs, partition)
     if block_size is None:
         return None if found is None else found[0]
@@ -1029,6 +1101,19 @@ def find_partition(
         f"Partition {partition} names another partition with {block_size}-byte "
         f"blocks, as an RDB on this disk does not open with them"
     )
+
+
+def check_default_write(image: Path) -> None:
+    """Refuse a writable open without ``--partition`` as find_partition does.
+
+    The open without it reaches partition 0 of the first RDB that opens
+    (open_rdisk), so an RDB that is found but does not open may move it
+    onto another RDB's partition. Raises IOError then; like find_partition,
+    only the auto-detected open decides whether an RDB fails.
+    """
+    _rdbs, failed = _disk_names(image, None)
+    _refuse_write("No partition is opened for writing without --partition",
+                  failed, "the partition opened may be another one")
 
 
 def find_partition_mbr_index(
@@ -1203,8 +1288,10 @@ def open_each_rdb(
     MBR order. opened is open_rdisk's (blkdev, rdisk, mbr_ctx), which the
     caller closes, or the IOError the RDB failed with. The disk's own RDB
     that does not open gives its DiskRDBError once, with index None, and
-    the entries are still opened. Beside the disk's own RDB, entries that
-    hold no RDB (NoEntryRDBError) are skipped. An RDB already yielded, as
+    the entries are still opened. An entry whose RDB is found but does not
+    open gives EntryRDBError; a device or media error in it, that error.
+    Beside the disk's own RDB, entries that hold no RDB (NoEntryRDBError)
+    are skipped. An RDB already yielded, as
     by two entries starting at the same sector, is skipped too. With fewer
     than two entries, yields the default open, or its error, with index
     None, then beside the disk's own RDB a single entry's own.
