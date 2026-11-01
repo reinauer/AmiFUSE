@@ -5,6 +5,7 @@ traceback. The image is built here with amitools' rdbtool, so these tests
 need no AmiFUSE-testing checkout.
 """
 
+import os
 import random
 import struct
 import subprocess
@@ -131,3 +132,19 @@ def test_unreadable_handler_keeps_its_os_error(runtime, tmp_path, monkeypatch):
     with pytest.raises(PermissionError) as caught:
         runtime.load_handler(path)
     assert caught.value is failure
+
+
+@pytest.mark.skipif(sys.platform == "win32" or os.geteuid() == 0,
+                    reason="needs POSIX permissions that bind the user")
+def test_handler_in_unreadable_folder_is_not_missing(runtime, tmp_path):
+    folder = tmp_path / "locked"
+    folder.mkdir()
+    path = folder / "drv.handler"
+    path.write_bytes(DRIVERS["random"])
+    folder.chmod(0)
+    try:
+        with pytest.raises(PermissionError) as caught:
+            runtime.load_handler(path)
+    finally:
+        folder.chmod(0o755)
+    assert str(caught.value.filename) == str(path)

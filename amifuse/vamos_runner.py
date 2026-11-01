@@ -284,9 +284,12 @@ class VamosHandlerRuntime:
         # A bad handler file is a user error: raise OSError or ValueError,
         # which mount and format report in one line. The loader returns 0
         # both for a missing file and for one in no format it knows.
-        if not os.path.exists(handler_path):
+        try:
+            os.stat(handler_path)
+        except FileNotFoundError:
             raise FileNotFoundError(
-                f"Failed to load handler {handler_path}: no such file")
+                f"Failed to load handler {handler_path}: no such file") from None
+        # Any other stat error (e.g. an unreadable folder) names the path.
         if not os.path.isfile(handler_path):
             raise ValueError(
                 f"Failed to load handler {handler_path}: not a regular file")
