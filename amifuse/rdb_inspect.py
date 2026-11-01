@@ -974,7 +974,8 @@ def find_partition(
     auto_rdbs = rdbs
     if block_size is not None:
         # The forced size can fail the disk's own RDB; the shift that
-        # causes is refused below, against the auto-detected RDBs.
+        # causes is refused below, against the auto-detected RDBs. Only
+        # the auto-detected open decides whether that RDB fails.
         auto_rdbs, disk_rdb_fails = _disk_names(image, None)
     if write and disk_rdb_fails:
         raise IOError(
@@ -1081,7 +1082,8 @@ def list_partitions(
         A :class:`PartitionList`. ``.partitions`` is in stable RDB order
         (normally >= 1 entry); ``.fallback_reason`` is ``None`` unless an
         RDB failed to open: the disk's own RDB beside the MBR or a 0x76
-        entry's, each named on its own line with its error.
+        entry's, each named on its own line with its error. An entry that
+        holds no RDB is not named.
     """
     amiga_parts = amiga_rdb_partitions(image)
 
@@ -1091,13 +1093,14 @@ def list_partitions(
     rdb_parts = []
     default_error = None
     # Each RDB that fails, named as inspect names it: its partitions are
-    # missing from the list.
+    # missing from the list. An entry holding no RDB misses none.
     failures = []
     for rdb_idx, opened in open_each_rdb(image, block_size, len(amiga_parts)):
         if isinstance(opened, IOError):
             if rdb_idx is None:
                 default_error = opened
-            failures.append(f"{rdb_label(amiga_parts, rdb_idx)}: {opened}")
+            if not isinstance(opened, NoEntryRDBError):
+                failures.append(f"{rdb_label(amiga_parts, rdb_idx)}: {opened}")
             continue
         blkdev, rdisk, _mbr_ctx = opened
         try:
