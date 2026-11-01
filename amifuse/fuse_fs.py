@@ -7138,7 +7138,7 @@ def cmd_unmount(args):
         raise SystemExit(
             f"Mountpoint {mountpoint} is not a mount AmiFUSE can identify as "
             f"its own, so amifuse unmount leaves it alone. If it is an "
-            f"AmiFUSE mount, stop its amifuse process (Ctrl+C) or run "
+            f"AmiFUSE mount, stop its amifuse process or run "
             f"umount {mountpoint}."
         )
 

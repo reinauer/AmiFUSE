@@ -45,10 +45,17 @@ def test_macos_mount_is_identified_as_amifuse(pfs3_mount):
 
     _proc, mountpoint = pfs3_mount
     table = plat._macos_mount_table()
+    listing = "\n".join(table)
+    # The real `mount` line for the path is found and parsed, and its source
+    # is one the check knows: AmiFUSE's fsname (macFUSE) or FUSE-T's.
+    source = plat._mount_source(mountpoint, table)
+    assert source is not None, (
+        f"{mountpoint} not found in the mount table:\n{listing}")
+    assert (source.startswith("amifuse:")
+            or plat._is_fuse_t_source(source)), (
+        f"unexpected source {source!r}; mount table:\n{listing}")
     assert plat.is_amifuse_mount_macos(mountpoint, mount_table=table), (
-        f"{mountpoint} not identified as AmiFUSE's; mount table:\n"
-        + "\n".join(table)
-    )
+        f"{mountpoint} not identified as AmiFUSE's; mount table:\n{listing}")
 
 
 def test_mount_visible_in_status(pfs3_mount, pfs3_image):

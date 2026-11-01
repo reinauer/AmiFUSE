@@ -1124,6 +1124,32 @@ class TestUnmountMacosOnlyAmifuseMounts:
 
         assert events[0] == ("run", ["umount", "-f", "/tmp/mnt_0"])
 
+    def test_unmounts_dead_fuse_t_mount(self, monkeypatch, fuse_mock):
+        """A FUSE-T mount left behind by a dead process."""
+        fuse_fs_mod, PurePosixPath, events = self._setup(
+            monkeypatch, ["fuse-t:/Work on /tmp/mnt_0"],
+            mounted=False, stale=True, processes=[])
+
+        with pytest.raises(SystemExit):  # the stubbed umount -f fails
+            fuse_fs_mod.cmd_unmount(
+                argparse.Namespace(mountpoint=PurePosixPath("/tmp/mnt_0")))
+
+        assert events[0] == ("run", ["umount", "-f", "/tmp/mnt_0"])
+
+    def test_refuses_share_named_by_lingering_amifuse_process(
+            self, monkeypatch, fuse_mock):
+        """An AmiFUSE process outlived its mount at P; a share now sits at P."""
+        fuse_fs_mod, PurePosixPath, events = self._setup(
+            monkeypatch, ["//me@nas/Share on /Users/me/mnt"],
+            processes=[{"mountpoint": "/Users/me/mnt", "pid": 4242}])
+
+        with pytest.raises(SystemExit) as exc_info:
+            fuse_fs_mod.cmd_unmount(
+                argparse.Namespace(mountpoint=PurePosixPath("/Users/me/mnt")))
+
+        assert "not a mount AmiFUSE can identify" in str(exc_info.value)
+        assert events == []
+
     def test_unmounts_stale_amifuse_mountpoint(self, monkeypatch, fuse_mock):
         """A dead AmiFUSE mount stays in the table and is still unmounted."""
         fuse_fs_mod, PurePosixPath, events = self._setup(
