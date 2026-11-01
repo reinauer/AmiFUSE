@@ -2847,7 +2847,8 @@ class HandlerBridge:
 
     def truncate_handle(self, fh_addr: int, length: int,
                         others: Sequence[int] = (),
-                        end: Optional[int] = None) -> Tuple[int, int]:
+                        end: Optional[int] = None,
+                        past_end: bool = False) -> Tuple[int, int]:
         """Make the file length bytes long, as POSIX ftruncate() does.
 
         Returns (new size, 0), or (-1, error) when the change fails: a
@@ -2885,6 +2886,12 @@ class HandlerBridge:
         to end the handler's end is measured too, and a length past that
         lower end is a grow from it.
 
+        past_end says the file may hold data past end, from a write that
+        failed (AmigaFuseFS._pinned_end). The handler's end, which counts
+        that data, then decides for any length from 1: a length below it
+        is a shrink, and any other a grow that writes zeros from end, so
+        the file ends at length.
+
         SetFileSize() leaves no other handle on the file past its new end.
         FFS stops a shrink at such a handle and replies with the size it
         reached, SFS refuses it with ERROR_OBJECT_IN_USE, and AROS afs with
@@ -2906,7 +2913,7 @@ class HandlerBridge:
             # a write that got no reply the file may hold more, and BFFS's
             # refusal then has truncate() empty it (_reopen_for_output).
             if end is not None and length:
-                grow = length > end
+                grow = length > end and not past_end
                 if not grow:
                     # The caller's end can be above the handler's, as after
                     # a lost shrink not yet measured: a length past the
@@ -2916,13 +2923,17 @@ class HandlerBridge:
                     # below the caller's.
                     measured = self._handle_end(fh_addr)
                     if measured is not None:
-                        grow = length > measured
+                        # At the handler's end, past_end's zeros replace the
+                        # failed write's data, and on BFFS the old bytes,
+                        # and BFFS's end then stays at length.
+                        grow = (length >= measured if past_end
+                                else length > measured)
                     else:
                         result, _ = self.seek_handle(fh_addr, length)
                         if result is SeekResult.FAILED:
                             return -1, 0
                         grow = result is SeekResult.PAST_END
-                    if not grow and end == length:
+                    if not grow and end == length and not past_end:
                         # Nothing to change, and BFFS would refuse the
                         # packet.
                         return length, 0
@@ -3651,9 +3662,10 @@ class AmigaFuseFS(_FuseOperations):
         A failed write, or a failed grow in truncate(), can leave data past
         the pin, which does not count it: BFFS refuses the shrink back, and
         a packet that got no reply may land later. It marks the handle
-        (past_pin), and truncate() then takes the handler's end. A write
-        still fills from the pin, as the bytes past it are from a write
-        that failed.
+        (past_pin), and truncate() then has the handler's end decide
+        between a shrink and a grow (truncate_handle's past_end). A grow,
+        and a write past the pin, still fill with zeros from the pin, as
+        the bytes past it are from a write that failed.
 
         A stale pin is measured first (_measure_stale_pin), so the caller
         must not hold the handle's lock.
@@ -4044,10 +4056,6 @@ class AmigaFuseFS(_FuseOperations):
                 raise FuseOSError(errno.EIO)
             fh_addr = entry["fh_addr"]
             end = self._pinned_end(entry, path)
-            if entry.get("past_pin"):
-                # A failed write or grow may have left data past the pin
-                # (_pinned_end), which the handler's end counts.
-                end = None
             with entry["lock"]:
                 if entry.get("closed"):
                     raise FuseOSError(errno.EIO)
@@ -4065,7 +4073,8 @@ class AmigaFuseFS(_FuseOperations):
                 # carries its offset, so the handler's position for another
                 # handle is only a cache.
                 size, res2 = self.bridge.truncate_handle(
-                    fh_addr, length, [e["fh_addr"] for e in others], end=end)
+                    fh_addr, length, [e["fh_addr"] for e in others], end=end,
+                    past_end=bool(entry.get("past_pin")))
                 # truncate_handle moves the handle, and handlers differ in
                 # where a size change leaves it, so the next read or write
                 # seeks. The retry moves the others, and a pfs3aio shrink

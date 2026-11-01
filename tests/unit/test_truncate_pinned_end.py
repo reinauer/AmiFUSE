@@ -419,19 +419,22 @@ PIN = 1000
 DISK_FULL = _reply(-1, fuse_fs.ERROR_DISK_FULL)
 
 
-@pytest.mark.parametrize("length", [PIN, 1500], ids=["at-pin", "between"])
+@pytest.mark.parametrize("length", [PIN, 1500, len(CONTENT), 4000],
+                         ids=["at-pin", "between", "at-old-end", "past-old-end"])
 @pytest.mark.parametrize("call, reply", [
     ("write", NO_REPLY), ("grow", NO_REPLY), ("write", DISK_FULL),
 ], ids=["lost-write", "lost-grow", "refused-write"])
 @pytest.mark.parametrize("bffs", [False, True], ids=["ffs", "bffs"])
-def test_truncate_after_failed_write_takes_handler_end(fuse_mock, bffs, call,
-                                                       reply, length):
+def test_truncate_after_failed_write_measures_end(fuse_mock, bffs, call,
+                                                  reply, length):
     """A failed write, or a grow's zeros, can leave data past the pin,
     which does not count it: a write that got no reply may land later, and
-    a handler can keep what it wrote of a failed packet. The handle's
-    truncates then take the handler's end, as for an unpinned file: a
-    shrink goes out, and on BFFS, which refuses it, the truncate fails
-    with EIO rather than report a size the file does not have.
+    a handler can keep what it wrote of a failed packet. The handler's
+    end, which counts that data, then decides: a length below it is a
+    shrink, and on BFFS, which refuses it, the truncate fails with EIO
+    rather than report a size the file does not have. A length at or past
+    it is a grow with zeros from the pin, over the failed write's data and
+    BFFS's old bytes.
 
     BFFS refuses the write's own undo, a shrink back to the pin. Elsewhere
     the undo would cut the data, so here it gets no reply and is never
@@ -452,17 +455,24 @@ def test_truncate_after_failed_write_takes_handler_end(fuse_mock, bffs, call,
     volume.landed_write_reply = None
     volume.withhold_sizes = False
     sizes = len(volume.set_sizes)
+    handler_end = len(volume.data)  # 3072 on BFFS, 2000 elsewhere
 
-    if bffs:
-        _eio(lambda: fs.truncate("/file", length, fh))
+    if length < handler_end:
+        if bffs:
+            _eio(lambda: fs.truncate("/file", length, fh))
+            assert volume.set_sizes[sizes:] == [length]
+            fs.release("/file", fh)
+            return
+        assert fs.truncate("/file", length, fh) == 0
         assert volume.set_sizes[sizes:] == [length]
-        fs.release("/file", fh)
-        return
-    assert fs.truncate("/file", length, fh) == 0
-    assert volume.set_sizes[sizes:] == [length]
-    assert volume.data == (b"w" * PIN + landed)[:length]
+        expected = (b"w" * PIN + landed)[:length]
+    else:
+        assert fs.truncate("/file", length, fh) == 0
+        assert volume.set_sizes[sizes:] == []
+        expected = b"w" * PIN + bytes(length - PIN)
     assert fs.getattr("/file", fh)["st_size"] == length
     fs.release("/file", fh)
+    assert volume.data == expected
 
 
 def test_gapped_write_after_lost_write_fills_from_pin(fuse_mock):
