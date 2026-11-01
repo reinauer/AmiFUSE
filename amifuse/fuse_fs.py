@@ -1847,8 +1847,9 @@ class HandlerBridge:
                     for pkt_type, _ in self._pending_packets().values()]
 
     # Bridge memory taken out of use while a packet still out points to it;
-    # see _free_retired. The small buffers: the FIB, the BSTRs and the
-    # buffer of the write of no bytes, at most 260 bytes each.
+    # see _free_retired. The small buffers: the FIB, the BSTRs, the
+    # buffer of the write of no bytes and the DateStamp, at most 260 bytes
+    # each.
     _retired = ()
     # The read and write buffers, up to IO_CHUNK each.
     _retired_data = ()
@@ -1966,6 +1967,20 @@ class HandlerBridge:
         if self._empty_buf_mem is None:
             self._empty_buf_mem = self.vh.alloc.alloc_memory(4, label="FUSE_EMPTYBUF")
         return self._empty_buf_mem
+
+    def _alloc_datestamp(self):
+        """The struct DateStamp for set_date's ACTION_SET_DATE.
+
+        One that a SET_DATE still out names stays where it is, so that a
+        later set_date cannot change the date the handler has yet to set.
+        """
+        held = self._held_args()
+        self._free_retired(held)
+        if self._retire_if_held(self._datestamp_mem, held):
+            self._datestamp_mem = None
+        if self._datestamp_mem is None:
+            self._datestamp_mem = self.vh.alloc.alloc_memory(12, label="FUSE_DATESTAMP")
+        return self._datestamp_mem
 
     def _alloc_bstr(self, text: str):
         encoded = text.encode("latin-1", errors="replace")
@@ -2999,9 +3014,7 @@ class HandlerBridge:
         Returns (dp_Res1, dp_Res2), or (0, -1) when no reply comes.
         """
         with self._lock:
-            if self._datestamp_mem is None:
-                self._datestamp_mem = self.vh.alloc.alloc_memory(12, label="FUSE_DATESTAMP")
-            ds_addr = self._datestamp_mem.addr
+            ds_addr = self._alloc_datestamp().addr
             for offset, value in zip((0, 4, 8), to_datestamp(when)):
                 self.mem.w32(ds_addr + offset, value)
             _, name_bptr = self._alloc_bstr(name)
