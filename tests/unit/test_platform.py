@@ -11,6 +11,7 @@ Mock targets are patched at the module level where they are looked up:
 """
 
 import errno
+import posixpath
 import signal
 import sys
 import types
@@ -72,6 +73,24 @@ class TestGetDefaultMountpoint:
         result = get_default_mountpoint("TestVol")
         assert result == Path("/Volumes/TestVol")
 
+    @pytest.mark.parametrize("volname, expected", [
+        ("../../tmp", "/Volumes/.._.._tmp"),
+        ("a/b", "/Volumes/a_b"),
+        ("a\0b", "/Volumes/a_b"),
+        ("..", "/Volumes/_.."),
+        (".", "/Volumes/_."),
+        ("", "/Volumes/_"),
+    ])
+    def test_default_mountpoint_darwin_single_component(
+            self, monkeypatch, volname, expected):
+        """On macOS, a drive name from the image stays one component under /Volumes."""
+        monkeypatch.setattr("sys.platform", "darwin")
+        from amifuse.platform import get_default_mountpoint
+
+        result = get_default_mountpoint(volname).as_posix()
+        assert result == expected
+        assert posixpath.dirname(posixpath.normpath(result)) == "/Volumes"
+
     def test_default_mountpoint_linux(self, monkeypatch):
         """On Linux, returns None (explicit mountpoint required)."""
         monkeypatch.setattr("sys.platform", "linux")
@@ -105,12 +124,31 @@ class TestShouldAutoCreateMountpoint:
         """macOS with /Volumes/X path returns True (macFUSE creates it).
 
         Uses PurePosixPath to avoid Windows path normalization converting
-        forward slashes to backslashes (which would break the startswith check).
+        forward slashes to backslashes (which would break the /Volumes check).
         """
         monkeypatch.setattr("sys.platform", "darwin")
         from amifuse.platform import should_auto_create_mountpoint
 
         assert should_auto_create_mountpoint(PurePosixPath("/Volumes/MyDisk")) is True
+
+    @pytest.mark.parametrize("mountpoint, expected", [
+        ("/Volumes/MyDisk", True),
+        ("/Volumes/MyDisk/", True),
+        ("/Volumes/.._.._tmp", True),
+        ("/Volumes/a/b", False),
+        ("/Volumes/../x", False),
+        ("/Volumes/../../tmp", False),
+        ("/Volumes/x/..", False),
+        ("/Volumes/", False),
+        ("/Volumes", False),
+    ])
+    def test_auto_create_darwin_only_direct_children(
+            self, monkeypatch, mountpoint, expected):
+        """macOS leaves only a direct child of /Volumes for macFUSE to create."""
+        monkeypatch.setattr("sys.platform", "darwin")
+        from amifuse.platform import should_auto_create_mountpoint
+
+        assert should_auto_create_mountpoint(mountpoint) is expected
 
     def test_auto_create_linux(self, monkeypatch):
         """Linux returns False for any path."""
