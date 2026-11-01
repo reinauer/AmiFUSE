@@ -103,6 +103,15 @@ class TestParseMountTokens:
         ("amifuse mount img.hdf --mountpoint /Volumes/Games --help", None),
         # A real "--" before the image.
         ("amifuse mount --mountpoint /V/W -- img.hdf", "/V/W"),
+        # A switch or "--" piece doesn't end the mountpoint's pieces: the
+        # shortened readings are command lines argparse would refuse.
+        ("amifuse mount img.hdf --mountpoint /Volumes/Games --", None),
+        ("amifuse mount img.hdf --mountpoint /Volumes/Games --write WHD", None),
+        ("amifuse mount img.hdf --mountpoint /Volumes/Games -- --write", None),
+        ("amifuse mount img.hdf --mountpoint /Volumes/Games --write=1", None),
+        # Real switches and a spaced --volname after it leave it alone.
+        ("amifuse mount img.hdf --mountpoint /V/W --daemon --volname My Disk",
+         "/V/W"),
         # Abbreviated and "=" value options take their value with them.
         ("amifuse mount --vol Work --part DH1 --mountpoint /V/W img.hdf", "/V/W"),
         ("amifuse mount --volname=Work --mountpoint /V/W img.hdf", "/V/W"),
