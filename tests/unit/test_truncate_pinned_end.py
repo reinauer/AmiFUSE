@@ -52,8 +52,9 @@ class _FakeVolume:
     With withhold_sizes, withhold_writes or withhold_seeks set,
     ACTION_SET_FILE_SIZE, ACTION_WRITE or ACTION_SEEK gets no reply; land()
     carries out the withheld size change, as a handler that finishes it
-    late does. With lose_write_replies set, ACTION_WRITE is carried out but
-    gets no reply, as a write the handler finishes late.
+    late does. With landed_write_reply set, ACTION_WRITE is carried out and
+    gets that reply: NO_REPLY for a write the handler finishes late, or a
+    failure for a handler that keeps what it wrote of a failed packet.
     """
 
     def __init__(self, data, bffs):
@@ -66,7 +67,7 @@ class _FakeVolume:
         self.withhold_sizes = False
         self.withhold_writes = False
         self.withhold_seeks = False
-        self.lose_write_replies = False
+        self.landed_write_reply = None
         self.pending = None
         self.buf = b""
         self.reply = NO_REPLY
@@ -121,7 +122,8 @@ class _FakeVolume:
         self.data[h["pos"]:h["pos"] + size] = self.buf[:size]
         h["pos"] += size
         h["max"] = max(h["max"], h["pos"])
-        self.reply = NO_REPLY if self.lose_write_replies else _reply(size)
+        self.reply = (_reply(size) if self.landed_write_reply is None
+                      else self.landed_write_reply)
         return PKT, 0
 
     def set_size(self, state, fh_addr, size, mode):
@@ -411,39 +413,43 @@ def test_measured_pin_never_rises(fuse_mock):
     assert volume.data == data + bytes(500) + b"abc"
 
 
-# --- a write that got no reply but landed ----------------------------------
+# --- a failed write that left data past the pin ----------------------------
 
 PIN = 1000
+DISK_FULL = _reply(-1, fuse_fs.ERROR_DISK_FULL)
 
 
 @pytest.mark.parametrize("length", [PIN, 1500], ids=["at-pin", "between"])
-@pytest.mark.parametrize("lost", ["write", "grow"])
+@pytest.mark.parametrize("call, reply", [
+    ("write", NO_REPLY), ("grow", NO_REPLY), ("write", DISK_FULL),
+], ids=["lost-write", "lost-grow", "refused-write"])
 @pytest.mark.parametrize("bffs", [False, True], ids=["ffs", "bffs"])
-def test_truncate_after_lost_write_takes_handler_end(fuse_mock, bffs, lost,
-                                                     length):
-    """A write that got no reply, or a grow's zeros, may land past the pin,
-    which does not count them. The handle's truncates then take the
-    handler's end, as for an unpinned file: a shrink goes out, and
-    on BFFS, which refuses it, the truncate fails with EIO rather than
-    report a size the file does not have.
+def test_truncate_after_failed_write_takes_handler_end(fuse_mock, bffs, call,
+                                                       reply, length):
+    """A failed write, or a grow's zeros, can leave data past the pin,
+    which does not count it: a write that got no reply may land later, and
+    a handler can keep what it wrote of a failed packet. The handle's
+    truncates then take the handler's end, as for an unpinned file: a
+    shrink goes out, and on BFFS, which refuses it, the truncate fails
+    with EIO rather than report a size the file does not have.
 
     BFFS refuses the write's own undo, a shrink back to the pin. Elsewhere
-    the undo would cut the late write, so here it is lost as well and
-    never carried out."""
+    the undo would cut the data, so here it gets no reply and is never
+    carried out."""
     volume = _FakeVolume(CONTENT if bffs else b"", bffs=bffs)
     fs = _fs(volume)
     fh = (fs.open("/file", os.O_RDWR | os.O_TRUNC) if bffs
           else fs.create("/file", 0o644))
     fs.write("/file", b"w" * PIN, 0, fh)
-    volume.lose_write_replies = True
+    volume.landed_write_reply = reply
     volume.withhold_sizes = True
-    if lost == "write":
-        _eio(lambda: fs.write("/file", b"x" * PIN, PIN, fh))
-        landed = b"x" * PIN
-    else:
-        _eio(lambda: fs.truncate("/file", 2 * PIN, fh))
-        landed = bytes(PIN)
-    volume.lose_write_replies = False
+    with pytest.raises(fuse_fs.FuseOSError):
+        if call == "write":
+            fs.write("/file", b"x" * PIN, PIN, fh)
+        else:
+            fs.truncate("/file", 2 * PIN, fh)
+    landed = b"x" * PIN if call == "write" else bytes(PIN)
+    volume.landed_write_reply = None
     volume.withhold_sizes = False
     sizes = len(volume.set_sizes)
 
@@ -457,3 +463,39 @@ def test_truncate_after_lost_write_takes_handler_end(fuse_mock, bffs, lost,
     assert volume.data == (b"w" * PIN + landed)[:length]
     assert fs.getattr("/file", fh)["st_size"] == length
     fs.release("/file", fh)
+
+
+def test_gapped_write_after_lost_write_fills_from_pin(fuse_mock):
+    """A write after a lost one still fills its gap with zeros from the
+    pin, over the lost write's bytes, not with BFFS's old bytes."""
+    volume = _FakeVolume(CONTENT, bffs=True)
+    fs = _fs(volume)
+    fh = fs.open("/file", os.O_RDWR | os.O_TRUNC)
+    fs.write("/file", NEW, 0, fh)
+    volume.landed_write_reply = NO_REPLY
+    _eio(lambda: fs.write("/file", b"x" * 100, len(NEW), fh))
+    volume.landed_write_reply = None
+
+    assert fs.write("/file", b"abc", 500, fh) == 3
+    fs.release("/file", fh)
+
+    assert volume.data == NEW + bytes(500 - len(NEW)) + b"abc"
+
+
+def test_reopen_after_lost_write_pins_zero(fuse_mock):
+    """A truncate that reaches its length leaves the handler's end at the
+    pin again. After BFFS's reopen for a truncate to 0, a grow fills with
+    zeros from 0, not a shrink of the old file, which BFFS refuses."""
+    volume = _FakeVolume(CONTENT, bffs=True)
+    fs = _fs(volume)
+    fh = fs.open("/file", os.O_RDWR)
+    volume.landed_write_reply = NO_REPLY
+    _eio(lambda: fs.write("/file", NEW, 0, fh))
+    volume.landed_write_reply = None
+
+    assert fs.truncate("/file", 0, fh) == 0
+    assert fs.truncate("/file", 100, fh) == 0
+    assert fs.getattr("/file", fh)["st_size"] == 100
+    fs.release("/file", fh)
+
+    assert volume.data == bytes(100)

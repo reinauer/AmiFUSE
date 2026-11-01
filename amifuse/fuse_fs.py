@@ -3338,18 +3338,16 @@ class AmigaFuseFS(_FuseOperations):
         truncate() and write() take the pinned size as the end of file,
         not the handler's. On the other handlers the two agree.
 
-        A write that got no reply, or a truncate's zeros that got none,
-        marks the handle (lost_write): the pin does not count it, and if
-        the handler carried it out, the file reaches past the pin. Such a
-        handle gets None, so its truncates and writes take the handler's
-        end, as for an unpinned file. On BFFS a truncate below that end,
-        other than to 0, is then refused and fails with EIO.
+        A failed write, or a failed grow in truncate(), can leave data past
+        the pin, which does not count it: BFFS refuses the shrink back, and
+        a packet that got no reply may land later. It marks the handle
+        (past_pin), and truncate() then takes the handler's end. A write
+        still fills from the pin, as the bytes past it are from a write
+        that failed.
 
         A stale pin is measured first (_measure_stale_pin), so the caller
         must not hold the handle's lock.
         """
-        if entry.get("lost_write"):
-            return None
         path = _handle_path(entry, path)
         if path not in self._pinned_stats:
             return None
@@ -3639,10 +3637,8 @@ class AmigaFuseFS(_FuseOperations):
                 # The handler's position is unknown after a failed write or
                 # seek, so the next write must seek explicitly.
                 entry["pos"] = None
-                if not res2:
-                    # A write with no reply may still land, past the
-                    # pinned size (_pinned_end).
-                    entry["lost_write"] = True
+                # It may have left data past the pinned size (_pinned_end).
+                entry["past_pin"] = True
                 raise FuseOSError(_WRITE_ERRNOS.get(res2, errno.EIO))
             entry["pos"] = offset + written
             entry["dirty"] = True  # Mark as needing flush on close
@@ -3738,6 +3734,10 @@ class AmigaFuseFS(_FuseOperations):
                 raise FuseOSError(errno.EIO)
             fh_addr = entry["fh_addr"]
             end = self._pinned_end(entry, path)
+            if entry.get("past_pin"):
+                # A failed write or grow may have left data past the pin
+                # (_pinned_end), which the handler's end counts.
+                end = None
             with entry["lock"]:
                 if entry.get("closed"):
                     raise FuseOSError(errno.EIO)
@@ -3779,21 +3779,25 @@ class AmigaFuseFS(_FuseOperations):
                     # pfs3aio shrink would move the far handles, so they
                     # forget their positions, as a moved one does in
                     # _settle_handles. A shrink below the pin has the pin
-                    # measured again (_measure_stale_pin). A grow from the
-                    # pin cannot leave the end below it, but its zeros may
-                    # land past it, as a lost write's data may
-                    # (_pinned_end).
+                    # measured again (_measure_stale_pin). A change to a
+                    # length at or past the pin is not marked: from a pin
+                    # that agrees with the handler, a lost grow cannot
+                    # leave the end below it.
                     if far_may_move:
                         for other in far:
                             other["pos"] = None
                     if end is not None and length < end:
                         entry["stale_pin"] = True
-                    elif end is not None and length > end:
-                        entry["lost_write"] = True
+                if size < 0 and end is not None and length > end:
+                    # A failed grow's zeros may stay past the pin
+                    # (_pinned_end).
+                    entry["past_pin"] = True
                 if size < 0:
                     raise FuseOSError(_WRITE_ERRNOS.get(res2, errno.EIO))
                 entry["dirty"] = True  # Truncate modifies the file
                 if size == length:
+                    # The handler's end is now length, as the pin is.
+                    entry.pop("past_pin", None)
                     self._settle_handles(entry, far,
                                          seek=length > 0 and not temp_handle)
             # A pinned size is all getattr reports until release, and
