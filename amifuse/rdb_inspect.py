@@ -470,7 +470,8 @@ def _lenient_rdisk_open(rdisk) -> List[str]:
 
     Returns a list of warning strings (empty if everything parsed cleanly).
     Each filesystem entry it drops is also recorded in rdisk.damaged_fs as
-    (DOS type, warning); the DOS type is None when the header is unreadable.
+    (DOS type, warning); the DOS type is None when the header is unreadable
+    or the list loops, hiding the entries after it.
     """
     from amitools.fs.block.Block import Block
     from amitools.fs.block.rdb.PartitionBlock import PartitionBlock
@@ -507,11 +508,13 @@ def _lenient_rdisk_open(rdisk) -> List[str]:
     seen = set()
     while fs_blk != PartitionBlock.no_blk:
         if fs_blk in seen:
-            # Every entry of the loop has been read: nothing is skipped.
+            # A broken link, like a corrupt header: whatever it should
+            # point to can't be reached.
             warnings.append(
                 f"Filesystem list loops back to block {fs_blk} "
-                f"(list ends there)"
+                f"(remaining filesystem entries skipped)"
             )
+            rdisk.damaged_fs.append((None, warnings[-1]))
             break
         seen.add(fs_blk)
         # Not FileSystem.read(): its LSEG walk has no bound.

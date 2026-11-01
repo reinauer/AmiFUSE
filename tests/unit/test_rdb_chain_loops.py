@@ -76,7 +76,7 @@ def _open(image):
     blkdev, rdisk, _ = open_rdisk(image)
     try:
         return ([str(p.get_drive_name()) for p in rdisk.parts], rdisk.fs,
-                rdisk.rdb_warnings, rdisk.damaged_fs)
+                rdisk.rdb_warnings, getattr(rdisk, "damaged_fs", []))
     finally:
         rdisk.close()
         blkdev.close()
@@ -84,15 +84,18 @@ def _open(image):
 
 @pytest.mark.timeout(10)
 def test_filesystem_list_loop_ends_the_list(tmp_path):
+    """The loop is a broken link, so it may hide entries, as a corrupt
+    header does."""
     parts, fs, warnings, damaged = _open(_fs_list_loop(tmp_path))
     assert parts == ["DH0"]
     assert fs == []
     assert warnings == [
         "Filesystem #0 (DOS3/0x444f5303): corrupt data block in LSEG chain "
         "(driver data unavailable)",
-        "Filesystem list loops back to block 2 (list ends there)",
+        "Filesystem list loops back to block 2 "
+        "(remaining filesystem entries skipped)",
     ]
-    assert [dos_type for dos_type, _ in damaged] == [DOS3]
+    assert damaged == [(DOS3, warnings[0]), (None, warnings[1])]
 
 
 @pytest.mark.timeout(10)
@@ -139,4 +142,23 @@ def test_inspect_reports_the_loop(tmp_path, capsys):
     print_inspect_report(_fs_list_loop(tmp_path), None, False)
     out = capsys.readouterr().out
     assert "DH0" in out
-    assert "Filesystem list loops back to block 2 (list ends there)" in out
+    assert ("Filesystem list loops back to block 2 "
+            "(remaining filesystem entries skipped)") in out
+
+
+def test_parceiro_lseg_block_is_accepted(tmp_path):
+    """A Parceiro checksum without a loop still gives the driver, with
+    the first LSEG block's data cut to its size field."""
+    image = _rdb(tmp_path)
+    _, clean, _, _ = _open(image)
+    data = bytes(clean[0].get_data())
+    _edit(image, LSEG, {1: 64}, summed=64)
+    parts, fs, warnings, damaged = _open(image)
+    assert parts == ["DH0"]
+    assert [entry.fshd.dos_type for entry in fs] == [DOS3]
+    assert bytes(fs[0].get_data()) == data[:(64 - 5) * 4] + data[123 * 4:]
+    assert warnings == [
+        "Filesystem #0 (DOS3/0x444f5303): Parceiro checksum in 1 LSEG "
+        "block(s) (accepted)",
+    ]
+    assert damaged == []
