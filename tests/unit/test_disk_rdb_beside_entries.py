@@ -208,3 +208,30 @@ def test_single_entry_rdb_that_fails_is_reported_beside_the_disk_rdb(
     env = json.loads(capsys.readouterr().out)
     assert [p["name"] for p in env["partitions"]] == ["DH0", "DH1"]
     assert env["notes"] == [f"MBR partition [0]: {error}"]
+
+
+def _entry_error(image):
+    return (f"MBR partition [1]: MBR partition 1 does not contain a valid "
+            f"RDB: {image}; partition 1 at LBA 400: Corrupt partition block "
+            f"at block 1")
+
+
+def test_launcher_names_an_entry_rdb_that_fails(tmp_path):
+    from amifuse.launcher import _enumerate_mount_units
+
+    # The #206 layout: PI1's PART block, block 1 of entry 1, is corrupt.
+    image = _disk_rdb(tmp_path, ("PI0", "PI1"), 2)
+    _corrupt(image, 401)
+    listed = list_partitions(image)
+    assert [p.name for p in listed.partitions] == ["DH0", "DH1", "PI0"]
+    assert listed.fallback_reason == _entry_error(image)
+    units, fallback_reason = _enumerate_mount_units(str(image))
+    assert [u.name for u in units] == ["DH0", "DH1", "PI0"]
+    assert fallback_reason == _entry_error(image)
+
+    # With the disk's own RDB failing too, each RDB has its own line.
+    _corrupt(image, 4)
+    listed = list_partitions(image)
+    assert [p.name for p in listed.partitions] == ["PI0"]
+    assert listed.fallback_reason == (
+        f"RDB beside the MBR: {_disk_error(image)}\n{_entry_error(image)}")

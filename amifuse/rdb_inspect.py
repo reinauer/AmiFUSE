@@ -114,8 +114,8 @@ class PartitionList:
     ``partitions`` holds fewer than every partition. The caller is responsible
     for logging it and naming it in the summary dialog. ``list_partitions``
     renames a repeated drive name instead of falling back to the first
-    partition; it sets this only when a disk's own RDB beside its MBR fails
-    to open while a 0x76 entry's RDB opens.
+    partition; it sets this only when an RDB of the disk fails to open, the
+    disk's own beside its MBR or a 0x76 entry's, naming each one that fails.
     """
     partitions: List[PartInfo]
     fallback_reason: Optional[str] = None
@@ -1048,8 +1048,9 @@ def list_partitions(
 
     Returns:
         A :class:`PartitionList`. ``.partitions`` is in stable RDB order
-        (normally >= 1 entry); ``.fallback_reason`` is ``None`` unless the
-        disk's own RDB beside the MBR failed to open, which it then names.
+        (normally >= 1 entry); ``.fallback_reason`` is ``None`` unless an
+        RDB failed to open: the disk's own RDB beside the MBR or a 0x76
+        entry's, each named on its own line with its error.
     """
     amiga_parts = amiga_rdb_partitions(image)
 
@@ -1058,10 +1059,14 @@ def list_partitions(
     # handles leak.
     rdb_parts = []
     default_error = None
+    # Each RDB that fails, named as inspect names it: its partitions are
+    # missing from the list.
+    failures = []
     for rdb_idx, opened in open_each_rdb(image, block_size, len(amiga_parts)):
         if isinstance(opened, IOError):
             if rdb_idx is None:
                 default_error = opened
+            failures.append(f"{rdb_label(amiga_parts, rdb_idx)}: {opened}")
             continue
         blkdev, rdisk, _mbr_ctx = opened
         try:
@@ -1082,11 +1087,8 @@ def list_partitions(
             if name is not None:
                 info.name = name
             all_parts.append(info)
-    # The disk's own RDB failed beside entries that opened: its partitions
-    # are missing from the list.
-    fallback_reason = (None if default_error is None
-                       else f"{rdb_label(amiga_parts, None)}: {default_error}")
-    return PartitionList(partitions=all_parts, fallback_reason=fallback_reason)
+    return PartitionList(partitions=all_parts,
+                         fallback_reason="\n".join(failures) or None)
 
 
 def format_fs_summary(rdisk: RDisk):
