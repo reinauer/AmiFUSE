@@ -7,6 +7,7 @@
 """
 
 import errno
+import io
 import json
 import tempfile
 from types import SimpleNamespace
@@ -130,6 +131,75 @@ def test_temporary_copy_failing_leaves_image_untouched(write_context, monkeypatc
         assert error["message"] == message
     else:
         assert str(caught.value) == f"Error: w{message[1:]}"
+    assert created == []
+
+
+class _FullDiskRaw(io.RawIOBase):
+    """A raw file that holds `room` bytes, then fails every write with ENOSPC."""
+
+    def __init__(self, room):
+        self.room = room
+        self.data = bytearray()
+        self.pos = 0
+
+    def readable(self):
+        return True
+
+    def writable(self):
+        return True
+
+    def seekable(self):
+        return True
+
+    def write(self, b):
+        b = bytes(b)
+        if self.pos + len(b) > self.room:
+            raise OSError(errno.ENOSPC, "No space left on device")
+        self.data[self.pos:self.pos + len(b)] = b
+        self.pos += len(b)
+        return len(b)
+
+    def readinto(self, b):
+        chunk = self.data[self.pos:self.pos + len(b)]
+        b[:len(chunk)] = chunk
+        self.pos += len(chunk)
+        return len(chunk)
+
+    def seek(self, pos, whence=0):
+        self.pos = {0: pos, 1: self.pos + pos, 2: len(self.data) + pos}[whence]
+        return self.pos
+
+    def tell(self):
+        return self.pos
+
+
+@pytest.mark.parametrize("use_json", [True, False], ids=["json", "text"])
+@pytest.mark.parametrize("room", [0, 8], ids=["rollover", "seek"])
+def test_full_disk_temporary_copy_fails_cleanly(write_context, monkeypatch, capsys,
+                                                use_json, room):
+    # On a real full disk the failed bytes stay buffered, and closing the
+    # temporary file fails flushing them again.
+    args, bridge, created, _ = write_context
+    args.json = use_json
+    monkeypatch.setattr(fs, "_WRITE_SPOOL_MAX", 3)
+    raws = []
+
+    def temporary_file(*a, **kw):
+        raws.append(_FullDiskRaw(room))
+        return io.BufferedRandom(raws[-1])
+
+    monkeypatch.setattr(tempfile, "TemporaryFile", temporary_file)
+    with pytest.raises(SystemExit) as caught:
+        fs.cmd_write(args)
+    message = ("Write operation failed: cannot copy the source to a temporary "
+               "file: No space left on device")
+    if use_json:
+        error = json.loads(capsys.readouterr().out)["error"]
+        assert error["code"] == "HANDLER_ERROR"
+        assert error["message"] == message
+    else:
+        assert str(caught.value) == f"Error: w{message[1:]}"
+    assert [raw.closed for raw in raws] == [True]
     assert created == []
 
 

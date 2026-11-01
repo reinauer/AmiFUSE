@@ -6462,6 +6462,7 @@ def _spool_write_source(source, host_path: Path, host_size: int, use_json: bool)
     Closes source, and returns the copy positioned at its start, or exits
     with an error.
     """
+    import contextlib
     import json
     import tempfile
 
@@ -6507,7 +6508,10 @@ def _spool_write_source(source, host_path: Path, host_size: int, use_json: bool)
             unspoolable(exc)
         return spool
     except BaseException:
-        spool.close()
+        # A full disk leaves the failed bytes buffered, and close() fails
+        # flushing them again; that must not replace the error above.
+        with contextlib.suppress(OSError):
+            spool.close()
         raise
 
 
