@@ -452,6 +452,69 @@ def test_listing_keeps_the_pinned_size(fuse_mock, truncate):
     assert volume.files["file"] == NEW
 
 
+def _unlinked_while_held(opener):
+    """/file held by a create() handle, an O_TRUNC handle or one truncate()
+    reopened, which wrote NEW, then unlinked. BFFS refuses to delete a
+    file a handle holds (ERROR_OBJECT_IN_USE), so unlink() defers the
+    delete to release()."""
+    volume = _FakeBFFS({"file": ORIGINAL})
+    fs = _bffs_fs(volume)
+
+    def delete_object(lock, name, **kwargs):
+        if any(h["name"] == name for h in volume.handles.values()):
+            return 0, fuse_fs.ERROR_OBJECT_IN_USE
+        del volume.files[name]
+        return -1, 0
+
+    fs.bridge.delete_object = MagicMock(side_effect=delete_object)
+    if opener == "create":
+        fh = fs.create("/file", 0o644)
+    elif opener == "reopen":
+        fh = fs.open("/file", os.O_RDWR)
+        fs.truncate("/file", 0, fh)
+    else:
+        fh = fs.open("/file", os.O_RDWR | os.O_TRUNC)
+    fs.write("/file", NEW, 0, fh)
+    assert fs.unlink("/file") == 0
+    return volume, fs, fh
+
+
+@pytest.mark.parametrize("opener", ["create", "O_TRUNC-open", "reopen"])
+def test_unlinked_file_reads_stop_at_what_the_handle_wrote(fuse_mock, opener):
+    """BFFS still serves the old data past what the handle wrote until
+    release(), so a read stops at the pinned size there too (#263)."""
+    volume, fs, fh = _unlinked_while_held(opener)
+
+    assert fs.read("/file", 4096, 0, fh) == NEW
+    assert fs.write("/file", NEW, len(NEW), fh) == len(NEW)
+    assert fs.read("/file", 4096, 0, fh) == NEW + NEW
+    fs.release("/file", fh)
+
+    assert "file" not in volume.files
+
+
+@pytest.mark.parametrize("opener", ["create", "O_TRUNC-open", "reopen"])
+def test_unlinked_file_keeps_the_pinned_size(fuse_mock, opener):
+    """Until release(), fstat through the handle gives what it wrote, as
+    write() moves it on, while a lookup by name finds nothing (#263)."""
+    volume, fs, fh = _unlinked_while_held(opener)
+
+    assert fs.getattr("/file", fh)["st_size"] == len(NEW)
+    assert fs.write("/file", NEW, len(NEW), fh) == len(NEW)
+    assert fs.getattr("/file", fh)["st_size"] == 2 * len(NEW)
+    with pytest.raises(fuse_fs.FuseOSError) as exc_info:
+        fs.getattr("/file")
+    assert exc_info.value.args[0] == errno.ENOENT
+    fs.release("/file", fh)
+
+    assert "file" not in volume.files
+    assert "/file" not in fs._pinned_stats
+    assert "/file" not in fs._stat_cache
+    with pytest.raises(fuse_fs.FuseOSError) as exc_info:
+        fs.getattr("/file")
+    assert exc_info.value.args[0] == errno.ENOENT
+
+
 def test_unanswered_write_gets_no_zero_length_write(fuse_mock):
     """The handler may still carry the write out, so no other write
     follows it."""

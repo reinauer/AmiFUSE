@@ -3845,7 +3845,12 @@ class AmigaFuseFS(_FuseOperations):
                         self._pending_deletes.add(path)
                 if has_handle:
                     with self._cache_lock:
-                        self._stat_cache.pop(path, None)
+                        # A file held on an exclusive lock keeps its pinned
+                        # entry: getattr() reports it through the handle,
+                        # and read() stops at its size, until release()
+                        # (#263).
+                        if path not in self._pinned_stats:
+                            self._stat_cache.pop(path, None)
                         self._dir_cache.pop(dir_path, None)
                     for l in reversed(locks):
                         self.bridge.free_lock(l)
