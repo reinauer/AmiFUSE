@@ -163,7 +163,8 @@ def test_clock_reads_tell_local_time():
 
 
 def test_existing_entry_shows_its_stored_date(volume):
-    """getattr() and readdir() report the date on the volume, as xdftool reads it."""
+    """getattr() and readdir() report the date on the volume, as the handler
+    (and, on an ADF, xdftool) reads it."""
     ops, image, existing, _ = volume
     if image.suffix == ".adf":
         expected = host_time(*_stored_stamp(image, existing))
