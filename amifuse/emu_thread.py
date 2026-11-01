@@ -10,12 +10,20 @@ the caller.
 While no call is pending the thread runs an idle hook: the bridge replies
 to timer.device requests there and runs the handler on, which the mount's
 own timer thread did before. The hook returns how long to wait for the
-next call before it runs again, or None to wait for a call.
+next call before it runs again, or None to wait for a call. With calls
+queued the hook runs only once that time has passed, so that the calls
+are not held up by it; after the last queued call it runs in any case.
+
+A caller waits in short slices, so that it notices when the thread has
+ended (its call then fails with RuntimeError), and so that Ctrl+C reaches
+it on Windows, where a wait without a timeout cannot be interrupted.
 """
 
 import functools
+import math
 import queue
 import threading
+import time
 from typing import Any, Callable, Optional
 
 
@@ -24,16 +32,20 @@ class _Done(Exception):
 
 
 class EmuThread:
-    # The longest the thread waits for a call at once. A handler that arms
-    # a timer does so from a call on this thread, so the idle hook is asked
-    # again after every call; this only bounds a sleep with nothing pending.
+    # The longest the thread waits for a call at once; it only bounds a
+    # sleep with nothing pending.
     MAX_IDLE_WAIT = 3600.0
+    # How long a caller waits at once before it looks whether the thread
+    # still lives.
+    WAIT_SLICE = 0.1
 
     def __init__(self, name: str = "amifuse-emu"):
         self._queue: "queue.Queue" = queue.Queue()
         self._thread = threading.Thread(target=self._loop, name=name, daemon=True)
         self._idle: Optional[Callable[[], Optional[float]]] = None
         self._idle_lock = threading.Lock()
+        # When the idle hook asked to run again; -inf runs it next.
+        self._idle_due = -math.inf
         self._stopped = False
 
     def start(self):
@@ -51,7 +63,8 @@ class EmuThread:
         """Run fn(*args, **kwargs) on the thread and return its result.
 
         On the thread itself the call runs directly. An exception fn raises
-        is raised here instead, SystemExit included.
+        is raised here instead, SystemExit included. A call the thread
+        ends without serving raises RuntimeError.
         """
         if self.owns_current_thread:
             return fn(*args, **kwargs)
@@ -60,7 +73,9 @@ class EmuThread:
         done = threading.Event()
         box: list = []
         self._queue.put((fn, args, kwargs, done, box))
-        done.wait()
+        while not done.wait(self.WAIT_SLICE):
+            if not self._thread.is_alive() and not done.is_set():
+                raise RuntimeError("the emulation thread has stopped")
         ok, value = box[0]
         if ok:
             return value
@@ -70,12 +85,14 @@ class EmuThread:
         """Set the idle hook, or None for none; wakes the thread to use it."""
         with self._idle_lock:
             self._idle = hook
+            self._idle_due = -math.inf
         self._queue.put(None)
 
     def stop(self, timeout: Optional[float] = 5.0):
         """End the thread once the calls queued so far are done.
 
         From the thread itself, it ends after the current call returns.
+        A call queued after this fails.
         """
         self._stopped = True
         self._queue.put(_Done)
@@ -84,31 +101,60 @@ class EmuThread:
 
     def _loop(self):
         timeout = None
+        try:
+            while True:
+                try:
+                    item = self._queue.get(timeout=timeout)
+                except queue.Empty:
+                    item = None
+                if item is _Done:
+                    return
+                if item is not None:
+                    self._serve(item)
+                with self._idle_lock:
+                    hook = self._idle
+                    due = self._idle_due
+                if hook is None:
+                    timeout = None
+                    continue
+                if not self._queue.empty() and time.monotonic() < due:
+                    # calls are waiting and the hook is not due: serve them
+                    timeout = 0
+                    continue
+                try:
+                    timeout = hook()
+                except Exception:
+                    timeout = None
+                if timeout is not None:
+                    timeout = min(max(timeout, 0.0), self.MAX_IDLE_WAIT)
+                with self._idle_lock:
+                    self._idle_due = (
+                        math.inf if timeout is None else time.monotonic() + timeout
+                    )
+        finally:
+            # whatever ended the thread: the calls still queued fail
+            self._fail_queued()
+
+    @staticmethod
+    def _serve(item):
+        fn, args, kwargs, done, box = item
+        try:
+            box.append((True, fn(*args, **kwargs)))
+        except BaseException as exc:  # handed to the caller
+            box.append((False, exc))
+        done.set()
+
+    def _fail_queued(self):
         while True:
             try:
-                item = self._queue.get(timeout=timeout)
+                item = self._queue.get_nowait()
             except queue.Empty:
-                item = None
-            if item is _Done:
                 return
-            if item is not None:
-                fn, args, kwargs, done, box = item
-                try:
-                    box.append((True, fn(*args, **kwargs)))
-                except BaseException as exc:  # handed to the caller
-                    box.append((False, exc))
-                done.set()
-            with self._idle_lock:
-                hook = self._idle
-            if hook is None:
-                timeout = None
+            if item is None or item is _Done:
                 continue
-            try:
-                timeout = hook()
-            except Exception:
-                timeout = None
-            if timeout is not None:
-                timeout = min(max(timeout, 0.0), self.MAX_IDLE_WAIT)
+            _, _, _, done, box = item
+            box.append((False, RuntimeError("the emulation thread has stopped")))
+            done.set()
 
 
 def on_emu_thread(method):

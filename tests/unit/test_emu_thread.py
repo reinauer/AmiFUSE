@@ -90,6 +90,131 @@ def test_stop_ends_the_thread_and_later_calls_fail():
         emu.call(lambda: 1)
 
 
+def test_a_call_queued_behind_stop_fails_instead_of_hanging():
+    """A call that passed the stopped check as stop() ran is failed by the thread."""
+    emu = EmuThread()
+    emu.start()
+    gate = threading.Event()
+    busy = threading.Thread(target=lambda: emu.call(gate.wait, 5))
+    busy.start()
+    # stop() posts its end marker while the thread is busy, and a call
+    # that passed the stopped check just before lands behind it
+    emu._queue.put(emu_thread_done())
+    errors = []
+
+    def late():
+        try:
+            emu.call(lambda: 1)
+        except RuntimeError as exc:
+            errors.append(exc)
+
+    late_thread = threading.Thread(target=late)
+    late_thread.start()
+    deadline = time.monotonic() + 2
+    while emu._queue.qsize() < 2 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    gate.set()
+    late_thread.join(3)
+    busy.join(3)
+    assert not late_thread.is_alive()
+    assert len(errors) == 1
+    assert "stopped" in str(errors[0])
+    assert not emu.alive
+
+
+def emu_thread_done():
+    from amifuse.emu_thread import _Done
+
+    return _Done
+
+
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
+def test_a_call_waiting_on_a_dead_thread_fails():
+    """A thread that dies with a call queued fails the call."""
+    emu = EmuThread()
+    emu.start()
+    gate = threading.Event()
+    busy = threading.Thread(target=lambda: emu.call(gate.wait, 5))
+    busy.start()
+
+    class Die(BaseException):
+        pass
+
+    def die():
+        raise Die()
+
+    emu.set_idle(die)  # a BaseException the loop does not catch ends it
+    errors = []
+
+    def late():
+        try:
+            emu.call(lambda: 1)
+        except RuntimeError as exc:
+            errors.append(exc)
+
+    late_thread = threading.Thread(target=late)
+    late_thread.start()
+    deadline = time.monotonic() + 2
+    while emu._queue.qsize() < 2 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    gate.set()
+    late_thread.join(3)
+    busy.join(3)
+    assert not late_thread.is_alive()
+    assert len(errors) == 1
+    emu._thread.join(3)
+    assert not emu.alive
+
+
+def test_ctrl_c_reaches_a_waiting_caller_soon(emu):
+    """The caller waits in slices, so a SIGINT interrupts it within one."""
+    import signal
+
+    # Python's own handler, whatever another test or plugin installed
+    previous = signal.signal(signal.SIGINT, signal.default_int_handler)
+    gate = threading.Event()
+    start = time.monotonic()
+    threading.Timer(0.05, signal.raise_signal, [signal.SIGINT]).start()
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            emu.call(gate.wait, 5)
+        assert time.monotonic() - start < 1.0
+    finally:
+        gate.set()
+        signal.signal(signal.SIGINT, previous)
+
+
+def test_idle_hook_waits_while_calls_are_queued(emu):
+    """With calls queued the hook runs only once its own delay has passed."""
+    ticks = []
+
+    def idle():
+        ticks.append(1)
+        return 3600.0
+
+    emu.set_idle(idle)
+    deadline = time.monotonic() + 2
+    while not ticks and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert ticks == [1]
+    gate = threading.Event()
+    threads = [threading.Thread(target=lambda: emu.call(gate.wait, 5))]
+    threads += [threading.Thread(target=lambda: emu.call(lambda: None)) for _ in range(5)]
+    threads[0].start()
+    while emu._queue.qsize() < 1 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    for thread in threads[1:]:
+        thread.start()
+    while emu._queue.qsize() < 5 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    gate.set()
+    for thread in threads:
+        thread.join(3)
+    time.sleep(0.05)
+    # once after the last call, not after each of the six
+    assert ticks == [1, 1]
+
+
 def test_stop_from_the_thread_ends_it_after_the_call():
     emu = EmuThread()
     emu.start()
