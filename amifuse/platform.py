@@ -580,6 +580,32 @@ def _strip_matched_quotes(value):
     return value
 
 
+# The `mount` subcommand's options (fuse_fs.main's mount parser).
+_MOUNT_VALUE_OPTIONS = (
+    "--driver", "--mountpoint", "--partition", "--block-size", "--volname",
+)
+_MOUNT_SWITCHES = (
+    "--daemon", "--interactive", "--foreground", "--debug", "--trace",
+    "--profile", "--write", "--icons", "--help",
+)
+
+
+def _mount_option(name):
+    """Return the `mount` option ``name`` stands for, or None.
+
+    argparse takes an option's full name or any unambiguous prefix of it, so
+    anything else that starts with "-" can't be an option of a running
+    mount: it is a piece of a value `ps` split at its spaces.
+    """
+    options = _MOUNT_VALUE_OPTIONS + _MOUNT_SWITCHES
+    if name in options or name in ("-h", "--"):
+        return name
+    if len(name) < 3 or not name.startswith("--"):
+        return None
+    matches = [option for option in options if option.startswith(name)]
+    return matches[0] if len(matches) == 1 else None
+
+
 def _parse_mount_tokens(tokens):
     """Extract image path and --mountpoint value from amifuse command tokens.
 
@@ -609,45 +635,39 @@ def _parse_mount_tokens(tokens):
     i = mount_idx + 1
     while i < len(tokens):
         tok = tokens[i]
-        # argparse also takes "--mountpoint=PATH" and any unambiguous
-        # prefix ("--mount PATH"); no other mount option starts with "--m".
-        # A Windows command line may quote the whole token
+        # argparse also takes "--option=VALUE" and any unambiguous prefix
+        # ("--mount PATH"). A Windows command line may quote the whole token
         # ("--mountpoint=C:\a b"), which the Windows tokenizer keeps as one.
-        option, eq, value = _strip_matched_quotes(tok).partition("=")
-        if len(option) >= 3 and "--mountpoint".startswith(option):
-            if eq:
-                i += 1
-                if value.count('"') % 2:
-                    # cmd.exe passes --mountpoint="C:\a b" on as typed, and
-                    # the Windows tokenizer splits it at each run of spaces,
-                    # so the path can't be rebuilt exactly. Skip its pieces
-                    # and report no mountpoint rather than part of one.
-                    while i < len(tokens) and not tokens[i].count('"') % 2:
-                        i += 1
+        name, eq, value = _strip_matched_quotes(tok).partition("=")
+        option = _mount_option(name)
+        if option is not None:
+            in_run = False
+            i += 1
+            if eq and value.count('"') % 2:
+                # cmd.exe passes --mountpoint="C:\a b" on as typed, and the
+                # Windows tokenizer splits it at each run of spaces, so the
+                # value can't be rebuilt exactly. Skip its pieces; for the
+                # mountpoint, report none rather than part of one.
+                while i < len(tokens) and not tokens[i].count('"') % 2:
                     i += 1
-                    mountpoint, in_run = None, False
-                else:
-                    mountpoint = value
-                    run = after = 0
-                    in_run, image_first = True, image is not None
+                i += 1
+                if option == "--mountpoint":
+                    mountpoint = None
                 continue
-            if i + 1 < len(tokens):
-                mountpoint = tokens[i + 1]
+            if option in _MOUNT_VALUE_OPTIONS and not eq:
+                if i >= len(tokens):
+                    break
+                value = tokens[i]
+                i += 1
+            if option == "--mountpoint":
+                mountpoint = value
                 run = after = 0
                 in_run, image_first = True, image is not None
-                i += 2
-                continue
-        if tok.startswith("-"):
-            in_run = False
-            # Skip flags; if flag takes a value, skip next token too
-            # Known value-taking flags in mount subcommand
-            value_flags = {"--driver", "--partition", "--block-size", "--volname"}
-            if tok in value_flags and i + 1 < len(tokens):
-                i += 2
-            else:
-                i += 1
             continue
-        if image is None:
+        # A positional, or a piece of a value `ps` split at its spaces: a
+        # piece that starts with "-" names no option, and argparse would
+        # have refused it as the image.
+        if image is None and not tok.startswith("-"):
             image = tok
         if mountpoint is not None:
             after += 1

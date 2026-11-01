@@ -64,6 +64,14 @@ class TestParseMountTokens:
         ('amifuse mount C:\\img.hdf "--mountpoint=C:\\a b"', "C:\\a b"),
         ('amifuse mount C:\\img.hdf --mountpoint="C:\\ab"', "C:\\ab"),
         ('amifuse mount C:\\img.hdf --mountpoint "C:\\a b"', "C:\\a b"),
+        # A quote inside the value splits it too.
+        ('amifuse mount C:\\img.hdf --mountpoint=C:\\Users\\"My Mounts"\\x',
+         None),
+        # Another option's split or quoted value leaves the mountpoint alone.
+        ('amifuse mount --mountpoint E: --volname="Work Disk" C:\\img.hdf',
+         "E:"),
+        ('amifuse mount --mountpoint E: "--volname=Work Disk" C:\\img.hdf',
+         "E:"),
     ])
     def test_windows_quoted_mountpoint(self, cmdline, expected):
         """Windows discovery tokenizes with shlex.split(posix=False)."""
@@ -86,6 +94,13 @@ class TestParseMountTokens:
         ("amifuse mount img.hdf --mountpoint /Volumes/Work --volname Work Disk",
          "/Volumes/Work"),
         ("amifuse mount --mountpoint /Volumes/Work img.hdf", "/Volumes/Work"),
+        # A piece starting with "-" is no option.
+        ("amifuse mount img.hdf --mountpoint=/Volumes/Games - WHD", None),
+        ("amifuse mount img.hdf --mountpoint /Volumes/Games -WHD --write", None),
+        ("amifuse mount --mount=/Volumes/A -B img.hdf", None),
+        # Abbreviated and "=" value options take their value with them.
+        ("amifuse mount --vol Work --part DH1 --mountpoint /V/W img.hdf", "/V/W"),
+        ("amifuse mount --volname=Work --mountpoint /V/W img.hdf", "/V/W"),
     ])
     def test_unix_ps_command_with_split_mountpoint(self, command, expected):
         """Unix discovery splits `ps` output with posix shlex."""
@@ -94,6 +109,18 @@ class TestParseMountTokens:
 
         _image, mp = _parse_mount_tokens(shlex.split(command))
         assert mp == expected
+
+    def test_option_lists_match_the_mount_parser(self, capsys, fuse_mock):
+        """Discovery tells options from split values by these lists."""
+        import re
+        from amifuse import fuse_fs, platform as plat
+
+        with pytest.raises(SystemExit):
+            fuse_fs.main(["mount", "--help"])
+        options = set(re.findall(r"(?<![\w-])--[a-z][a-z-]*",
+                                 capsys.readouterr().out))
+        assert options == set(plat._MOUNT_VALUE_OPTIONS
+                              + plat._MOUNT_SWITCHES)
 
     def test_no_mount_subcommand(self):
         from amifuse.platform import _parse_mount_tokens
