@@ -306,6 +306,24 @@ def test_0x76_entry_on_a_disk_without_its_own_rdb_opens(tmp_path):
     assert _open_as(image, partition="DH1") == (272, 416)
 
 
+def test_rdsk_block_with_a_size_open_rdisk_skips_is_no_own_rdb(tmp_path):
+    # Sector 2 holds an RDSK block with a valid checksum declaring 520-byte
+    # blocks, which open_rdisk skips as if it held no RDSK id.
+    data = bytearray(256 * 512) + _rdb_image(tmp_path / "inner.hdf", 160,
+                                             "DH1", (1, 9))
+    rdsk = bytearray(data[256 * 512:257 * 512])
+    struct.pack_into(">I", rdsk, 16, 520)
+    struct.pack_into(">I", rdsk, 8, 0)
+    struct.pack_into(">I", rdsk, 8,
+                     -sum(struct.unpack(">128I", rdsk)) & 0xFFFFFFFF)
+    data[2 * 512:3 * 512] = rdsk
+    _entry(data, 0, 0x76, 256, 160)
+    data[510:512] = b"\x55\xaa"
+    image = tmp_path / "emu68.hdf"
+    image.write_bytes(bytes(data))
+    assert _open_as(image, partition="DH1") == (272, 416)
+
+
 def test_0x76_entry_rdsk_block_in_sectors_0_to_15_is_not_the_disks_own(tmp_path):
     # The entry starts at sector 8, so its RDSK block is the first one in
     # sectors 0-15. It belongs to the entry, and the disk has no own RDB.
@@ -361,6 +379,24 @@ def test_0x76_entry_beside_an_invalid_own_rdsk_block(tmp_path, monkeypatch):
     with pytest.raises(ValueError, match="own RDB can't be checked.*sectors \\[2\\]"):
         _open_as(image, partition="DH1")
     assert _open_as(image, read_only=True, partition="DH1") == (272, 416)
+
+
+def test_invalid_own_rdsk_block_before_a_0x76_entry_rdsk_block(tmp_path, monkeypatch):
+    # The entry starts at sector 8, and sector 3 holds an RDSK block with a
+    # broken checksum: the first valid RDSK block is the entry's, but the
+    # disk's own RDB is still unknown.
+    data = bytearray(8 * 512) + _rdb_image(tmp_path / "inner.hdf", 160,
+                                           "DH1", (1, 9))
+    data[3 * 512:4 * 512] = data[8 * 512:9 * 512]
+    data[3 * 512 + 8] ^= 0xFF
+    _entry(data, 0, 0x76, 8, 160)
+    data[510:512] = b"\x55\xaa"
+    image = tmp_path / "emu68.hdf"
+    image.write_bytes(bytes(data))
+    _select_entry_dh1(monkeypatch)
+    with pytest.raises(ValueError, match="own RDB can't be checked.*sectors \\[3\\]"):
+        _open_as(image, partition="DH1")
+    assert _open_as(image, read_only=True, partition="DH1") == (24, 168)
 
 
 def test_own_rdsk_block_is_found_in_512_byte_sectors(tmp_path, monkeypatch):
