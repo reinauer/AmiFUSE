@@ -5127,7 +5127,16 @@ class AmigaFuseFS(_FuseOperations):
                 if _handler_has_crashed(self.bridge):
                     raise RuntimeError("handler crashed before volume flush")
                 unanswered = self.bridge.wait_for_pending()
-                self.bridge.flush_volume()
+                flush_error = None
+                try:
+                    self.bridge.flush_volume()
+                except Exception as e:
+                    # A handler that takes packets in order, still at work
+                    # on one, does not answer the flush: the packets still
+                    # out are named all the same.
+                    if not unanswered:
+                        raise
+                    flush_error = e
                 if unanswered:
                     # A handler may answer only once a packet wakes it, so
                     # the flush may have brought the replies; the work they
@@ -5135,11 +5144,14 @@ class AmigaFuseFS(_FuseOperations):
                     unanswered = self.bridge.wait_for_pending(timeout=1.0)
                     if not unanswered:
                         self.bridge.flush_volume()
+                        flush_error = None
                 if unanswered:
                     success = False
                     print(f"[amifuse] WARNING: the handler has not answered "
                           f"{', '.join(unanswered)}; the volume may be left "
                           f"half changed", flush=True)
+                if flush_error is not None:
+                    raise flush_error
         except Exception as e:
             success = False
             print(f"[amifuse] WARNING: flush failed: {e}", flush=True)

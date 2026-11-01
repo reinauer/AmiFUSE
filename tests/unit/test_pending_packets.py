@@ -84,6 +84,7 @@ class Handler:
     an answer is still to come, as for a handler growing a file, which
     still answers other packets at once. answer(pkt_type, args, name)
     gives (res1, res2), and may write into the memory the args name.
+    With in_order, it takes no packet while one it took is unanswered.
     """
 
     def __init__(self, launcher, mem, ports, state):
@@ -93,6 +94,7 @@ class Handler:
         self.state = state
         self.delay = lambda pkt_type, name: 0
         self.answer = lambda pkt_type, args, name: (-1, 0)
+        self.in_order = False
         self.waiting = []   # [bursts to go, msg, pkt, pkt_type, args, name]
         self.events = []    # ("take" | "answer", pkt_type, pkt, args, name)
 
@@ -104,7 +106,7 @@ class Handler:
 
     def run_burst(self, state, max_cycles=200000, debug=False):
         port = self.state.port_addr
-        while self.ports.has_msg(port):
+        while self.ports.has_msg(port) and not (self.in_order and self.waiting):
             msg = self.ports.get_msg(port)
             pkt = msg + self.launcher._msg_size
             pkt_type = self.mem.r32(pkt + self.launcher._dp_type_offset)
@@ -790,9 +792,12 @@ def test_unmount_flush_after_the_deadline_gets_the_short_limit(
 
     _mount(b).destroy(None)
 
-    # 15 s of waiting for the grow, then 10 bursts for the flush.
-    assert now[0] - 1000.0 == 25.0
-    assert "Unmount completed with errors." in capsys.readouterr().out
+    # 15 s of waiting for the grow, 10 bursts for the flush, then 1 s more
+    # for the packets still out, which are named.
+    assert now[0] - 1000.0 == 26.0
+    out = capsys.readouterr().out
+    assert "has not answered" in out
+    assert "Unmount completed with errors." in out
 
 
 def _io_reply_port(b, handler):
@@ -856,3 +861,23 @@ def test_unmount_wait_drains_io_replies_once_the_handler_is_at_its_main_loop(
 
     assert b.wait_for_pending() == []
     assert not handler.ports.has_msg(io_port)
+
+
+def test_unmount_names_the_packets_still_out_when_the_flush_fails(
+        bridge, short_limits, capsys):
+    # Still at work on the grow, a handler that takes packets in order
+    # does not take the flush.
+    b, handler = bridge
+    fh = _open(b, handler, "/grow", 0x5550)
+    handler.delay = lambda pkt_type, name: NEVER if pkt_type == ACTION_SET_FILE_SIZE else 0
+    assert b.set_handle_size(fh, 0x7FFFFFFF) == -1
+    handler.in_order = True
+
+    _mount(b).destroy(None)
+
+    out = capsys.readouterr().out
+    assert not handler.taken(ACTION_FLUSH)
+    warning, = [line for line in out.splitlines() if "has not answered" in line]
+    assert "ACTION_SET_FILE_SIZE" in warning and "ACTION_FLUSH" in warning
+    assert "flush failed" in out
+    assert "Unmount completed with errors." in out
