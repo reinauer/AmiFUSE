@@ -5911,6 +5911,21 @@ def _ver_number(ver: Optional[str]) -> Optional[Tuple[int, str]]:
     return None
 
 
+def _is_pfs3_driver(dostype: int, ver: Optional[str]) -> bool:
+    """Return whether format takes the driver for pfs3aio.
+
+    PFS3 names itself in its $VER, whatever the partition's DOS type. A
+    driver without $VER is taken for PFS3 on a PFS partition, since it may
+    be one; a $VER naming another filesystem is not PFS3.
+    """
+    if ver is None:
+        # "PFS\x", "PDS\x", "muPF", "muAF" and "AFS\1".
+        return (dostype & 0xFFFFFF00 in (0x50465300, 0x50445300)
+                or dostype in (0x6D755046, 0x6D754146, 0x41465301))
+    return any(name in ver.upper()
+               for name in ("PROFESSIONAL-FILE-SYSTEM", "PFS-III", "PFS3"))
+
+
 def _pfs3_format_refusal(dostype: int, block_bytes: Optional[int], driver: Path,
                          partition: str) -> Optional[str]:
     """Return why format refuses pfs3aio on a partition with large blocks, or None.
@@ -5925,13 +5940,7 @@ def _pfs3_format_refusal(dostype: int, block_bytes: Optional[int], driver: Path,
     if block_bytes is None or block_bytes <= 1024:
         return None
     ver = driver_resolver.find_version(Path(driver).read_bytes())
-    if ver is None:
-        # "PFS\x", "PDS\x", "muPF", "muAF" and "AFS\1".
-        if (dostype & 0xFFFFFF00 not in (0x50465300, 0x50445300)
-                and dostype not in (0x6D755046, 0x6D754146, 0x41465301)):
-            return None
-    elif not any(name in ver.upper()
-                 for name in ("PROFESSIONAL-FILE-SYSTEM", "PFS-III", "PFS3")):
+    if not _is_pfs3_driver(dostype, ver):
         return None
     number = _ver_number(ver)
     if number is not None and number[0] >= 20:
@@ -5945,6 +5954,28 @@ def _pfs3_format_refusal(dostype: int, block_bytes: Optional[int], driver: Path,
         f"pfs3aio before 20.0 cannot format, and {found}. Use 512- or "
         "1024-byte blocks, or pfs3aio 20.0 or later."
     )
+
+
+def _pfs3_volume_name_refusal(dostype: int, driver: Path,
+                              volname: str) -> Optional[str]:
+    """Return why format refuses a volume name too long for pfs3aio, or None.
+
+    PFS3's root block holds at most 31 characters of volume name. pfs3aio
+    answers success for a longer one, but stores the length asked for with
+    only the first 31 characters: the name then reads wrong, and with 40,
+    107 or 255 characters (19.2 tested) the handler crashes at every later
+    open. The root block's layout does not change with the version, so
+    every version is refused. The length is counted as cmd_format counts it.
+    Raises OSError when the driver cannot be read.
+    """
+    length = len(volname.encode("latin-1", errors="replace"))
+    if length <= 31:
+        return None
+    ver = driver_resolver.find_version(Path(driver).read_bytes())
+    if not _is_pfs3_driver(dostype, ver):
+        return None
+    return (f"Error: volume name is {length} characters long; pfs3aio "
+            "stores at most 31. Use a shorter name.")
 
 
 def format_volume(
@@ -6001,8 +6032,9 @@ def format_volume(
 
         # Refuse before the handler starts, so the image is not touched.
         try:
-            refusal = _pfs3_format_refusal(
+            refusal = (_pfs3_format_refusal(
                 dostype, part_info.get("block_size"), driver, partition)
+                or _pfs3_volume_name_refusal(dostype, driver, volname))
         except OSError as exc:
             if debug:
                 raise
@@ -7621,9 +7653,11 @@ def cmd_format(args):
     # The handler gets the name as a BSTR, whose length is a single byte, so
     # a longer name cannot be sent: refuse it before the image is opened.
     # The length is counted as the BSTR encodes it, one byte per character.
-    # Shorter names are the handler's to judge, and handlers differ:
-    # FastFileSystem refuses more than 30 characters, PFS3 stores the first
-    # 31 and SmartFilesystem stores all 255.
+    # Shorter names are mostly the handler's to judge, and handlers differ:
+    # FastFileSystem refuses more than 30 characters and SmartFilesystem
+    # stores all 255. pfs3aio holds 31 but answers success for more and
+    # leaves a damaged volume, so format_volume refuses a longer name once
+    # it knows the driver.
     length = len(args.volname.encode("latin-1", errors="replace"))
     if length > 255:
         raise SystemExit(
