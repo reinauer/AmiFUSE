@@ -107,7 +107,12 @@ def get_default_mountpoint(volname: str) -> Optional[Path]:
         Default mountpoint path, or None if platform requires explicit mountpoint
     """
     if sys.platform.startswith("darwin"):
-        return Path(f"/Volumes/{volname}")
+        # The name comes from the image: keep it a single path component so
+        # the mountpoint is always a direct child of /Volumes.
+        name = volname.replace("/", "_").replace("\0", "_")
+        if name in ("", ".", ".."):
+            name = "_" + name
+        return Path(f"/Volumes/{name}")
     elif sys.platform.startswith("win"):
         # Find first unallocated drive letter (skip A/B floppy and C system).
         # Use the GetLogicalDrives bitmask, not os.path.exists: the latter
@@ -173,8 +178,13 @@ def should_auto_create_mountpoint(mountpoint: Path) -> bool:
         True if FUSE will create it automatically, False if we need to create it
     """
     if sys.platform.startswith("darwin"):
-        # macFUSE will create mount points in /Volumes automatically
-        return str(mountpoint).startswith("/Volumes/")
+        import posixpath
+
+        # macFUSE creates mount points directly in /Volumes automatically.
+        # Compare the normalized parent, so /Volumes/a/b and /Volumes/../x
+        # are created and checked here instead.
+        path = posixpath.normpath(str(mountpoint))
+        return posixpath.dirname(path) == "/Volumes"
     if sys.platform.startswith("win"):
         # WinFSP handles drive letter mountpoints; don't mkdir them.
         # Directory mountpoints (e.g. C:\mnt\amiga) still need mkdir.
