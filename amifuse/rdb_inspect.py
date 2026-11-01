@@ -1338,6 +1338,26 @@ def extract_fs(rdisk: RDisk, index: int, out_path: Path) -> Path:
     return out_path
 
 
+def block_size_arg(text: str) -> int:
+    """argparse type for --block-size: a power of two from 512 to 32768.
+
+    The rule _scan_for_rdb applies to a block size an RDB declares. 0 is
+    refused rather than read as "auto-detect": leaving the option out
+    detects the size.
+    """
+    try:
+        size = int(text)
+    except ValueError:
+        size = None
+    if size == 0:
+        raise argparse.ArgumentTypeError(
+            "0 is not a block size; leave the option out to detect it")
+    if size is None or not 512 <= size <= 32768 or size & (size - 1):
+        raise argparse.ArgumentTypeError(
+            f"must be a power of two from 512 to 32768, not {text!r}")
+    return size
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Inspect an RDB image and optionally extract filesystem drivers."
@@ -1345,7 +1365,7 @@ def main(argv=None):
     parser.add_argument("image", type=Path, help="Path to the RDB image (raw file)")
     parser.add_argument(
         "--block-size",
-        type=int,
+        type=block_size_arg,
         help="Block size in bytes (defaults to auto/512).",
     )
     parser.add_argument(

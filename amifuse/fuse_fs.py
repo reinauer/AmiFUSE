@@ -7235,6 +7235,7 @@ commands:
         version=__banner__,
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
+    from .rdb_inspect import block_size_arg
 
     # inspect subcommand
     inspect_parser = subparsers.add_parser(
@@ -7242,7 +7243,7 @@ commands:
     )
     inspect_parser.add_argument("image", type=Path, help="Disk image file or physical disk device")
     inspect_parser.add_argument(
-        "--block-size", type=int, help="Override block size (defaults to auto/512)."
+        "--block-size", type=block_size_arg, help="Override block size (defaults to auto/512)."
     )
     inspect_parser.add_argument(
         "--full", action="store_true", help="Show full partition details."
@@ -7263,7 +7264,7 @@ commands:
         "--partition", type=str, help="Partition name (e.g. DH0) or index (defaults to first)."
     )
     mount_parser.add_argument(
-        "--block-size", type=int, help="Override block size (defaults to auto/512)."
+        "--block-size", type=block_size_arg, help="Override block size (defaults to auto/512)."
     )
     mount_parser.add_argument(
         "--volname", type=str, help="Override volume name displayed by the OS (defaults to partition name)."
@@ -7355,7 +7356,7 @@ commands:
     format_parser.add_argument("volname", nargs="?", default="Empty", help="Volume name (default: Empty)")
     format_parser.add_argument("--driver", type=Path, help="Filesystem binary (default: RDB, your drivers folder, then the bundled FastFileSystem for DOS0-7)")
     format_parser.add_argument(
-        "--block-size", type=int, help="Override block size (defaults to auto/512)."
+        "--block-size", type=block_size_arg, help="Override block size (defaults to auto/512)."
     )
     format_parser.add_argument(
         "--debug", action="store_true", help="Enable debug logging."
@@ -7381,7 +7382,7 @@ commands:
              "then the bundled FastFileSystem for DOS0-7).",
     )
     ls_parser.add_argument(
-        "--block-size", type=int,
+        "--block-size", type=block_size_arg,
         help="Override block size (defaults to auto/512).",
     )
     ls_parser.add_argument(
@@ -7421,7 +7422,7 @@ commands:
              "then the bundled FastFileSystem for DOS0-7).",
     )
     verify_parser.add_argument(
-        "--block-size", type=int,
+        "--block-size", type=block_size_arg,
         help="Override block size (defaults to auto/512).",
     )
     verify_parser.add_argument(
@@ -7458,7 +7459,7 @@ commands:
              "then the bundled FastFileSystem for DOS0-7).",
     )
     hash_parser.add_argument(
-        "--block-size", type=int,
+        "--block-size", type=block_size_arg,
         help="Override block size (defaults to auto/512).",
     )
     hash_parser.add_argument(
@@ -7495,7 +7496,7 @@ commands:
              "then the bundled FastFileSystem for DOS0-7).",
     )
     read_parser.add_argument(
-        "--block-size", type=int,
+        "--block-size", type=block_size_arg,
         help="Override block size (defaults to auto/512).",
     )
     read_parser.add_argument(
@@ -7531,7 +7532,7 @@ commands:
              "then the bundled FastFileSystem for DOS0-7).",
     )
     write_parser.add_argument(
-        "--block-size", type=int,
+        "--block-size", type=block_size_arg,
         help="Override block size (defaults to auto/512).",
     )
     write_parser.add_argument(

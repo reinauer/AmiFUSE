@@ -33,6 +33,9 @@ def fuse_mock(monkeypatch):
     # Keep the real, platform-neutral disk helpers available when the root
     # amitools package below is stubbed (also when this file is run alone).
     import amitools.util.Win32Disk
+    # fuse_fs.main() takes --block-size's type from rdb_inspect, which needs
+    # the real amitools.fs; load it before amitools is stubbed.
+    import amifuse.rdb_inspect
 
     fake_fuse = types.ModuleType("fuse")
 
