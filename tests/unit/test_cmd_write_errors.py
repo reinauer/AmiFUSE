@@ -29,6 +29,8 @@ def write_context(monkeypatch, tmp_path):
                            input=str(source), json=True, debug=False)
     bridge = Mock()
     bridge.is_mounted.return_value = fs.MountState(True, None, None)
+    bridge.locate_path.return_value = (0, fs.ERROR_OBJECT_NOT_FOUND, [])  # a new name
+    bridge.delete_object.return_value = (-1, 0)
     bridge.open_file.return_value = (0x1000, 0x2000)
     created = []
 
