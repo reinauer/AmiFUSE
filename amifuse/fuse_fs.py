@@ -7687,6 +7687,15 @@ def cmd_unmount(args):
         is_mounted = False
     if not is_mounted and not plat.is_stale_mountpoint(mountpoint):
         raise SystemExit(f"Mountpoint {mountpoint} is not currently mounted.")
+    # On macOS, `umount -f` unmounts any volume, and the fallback below kills
+    # an AmiFUSE process: refuse a mount that isn't AmiFUSE's before either.
+    if sys.platform.startswith("darwin") and not plat.is_amifuse_mount_macos(mountpoint):
+        raise SystemExit(
+            f"Mountpoint {mountpoint} is not a mount AmiFUSE can identify as "
+            f"its own, so amifuse unmount leaves it alone. If it is an "
+            f"AmiFUSE mount, stop its amifuse process (Ctrl+C) or run "
+            f"umount {mountpoint}."
+        )
 
     cmd = plat.get_unmount_command(mountpoint)
     _no_window = {"creationflags": 0x08000000} if sys.platform.startswith("win") else {}

@@ -37,6 +37,20 @@ def test_mount_creates_mountpoint(pfs3_mount):
     assert proc.poll() is None, "Mount process should still be running"
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS mount table")
+def test_macos_mount_is_identified_as_amifuse(pfs3_mount):
+    """`amifuse unmount` acts only on a mount it can tie to AmiFUSE, by its
+    `mount` source (macFUSE) or by the process serving it (FUSE-T)."""
+    from amifuse import platform as plat
+
+    _proc, mountpoint = pfs3_mount
+    table = plat._macos_mount_table()
+    assert plat.is_amifuse_mount_macos(mountpoint, mount_table=table), (
+        f"{mountpoint} not identified as AmiFUSE's; mount table:\n"
+        + "\n".join(table)
+    )
+
+
 def test_mount_visible_in_status(pfs3_mount, pfs3_image):
     """Mount PFS3 image and verify it appears in `amifuse status --json`."""
     proc, mountpoint = pfs3_mount

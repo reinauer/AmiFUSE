@@ -883,6 +883,11 @@ class TestUnmountCommand:
 
     def test_unmount_runs_platform_command(self, monkeypatch, fuse_mock):
         monkeypatch.setattr("os.path.ismount", lambda path: True)
+        # On a macOS host, /mnt/amiga is not in the real mount table.
+        monkeypatch.setattr(
+            "amifuse.platform.is_amifuse_mount_macos",
+            lambda mountpoint, **kwargs: True,
+        )
         monkeypatch.setattr(
             "amifuse.platform.get_unmount_command",
             lambda mountpoint: ["umount", "-f", str(mountpoint)],
@@ -959,6 +964,11 @@ class TestUnmountCommand:
             "amifuse.platform.is_stale_mountpoint",
             lambda mountpoint: True,
         )
+        # On a macOS host, /mnt/broken is not in the real mount table.
+        monkeypatch.setattr(
+            "amifuse.platform.is_amifuse_mount_macos",
+            lambda mountpoint, **kwargs: True,
+        )
         monkeypatch.setattr(
             "amifuse.platform.get_unmount_command",
             lambda mountpoint: ["umount", "-f", str(mountpoint)],
@@ -1020,6 +1030,121 @@ class TestUnmountCommand:
 
         assert run_calls["unmount"] == 2
         assert (123, signal.SIGTERM) in killed
+
+
+class TestUnmountMacosOnlyAmifuseMounts:
+    """#296: on macOS, `amifuse unmount` touches only AmiFUSE's own mounts.
+
+    /Volumes/Backup is the user's USB stick; /Volumes/Work is served by an
+    AmiFUSE process (pid 4242) started without --mountpoint.
+    """
+
+    MOUNT_TABLE = [
+        "/dev/disk3s1s1 on /",
+        "/dev/disk4s1 on /Volumes/Backup",
+        "amifuse:Work on /Volumes/Work",
+    ]
+
+    PROCESSES = [{"mountpoint": "/Volumes/Work", "pid": 4242}]
+
+    def _setup(self, monkeypatch, mount_table, mounted=True, stale=False,
+               processes=PROCESSES):
+        import amifuse.fuse_fs as fuse_fs_mod
+        import amifuse.platform as plat_mod
+        from pathlib import PurePosixPath
+
+        monkeypatch.setattr("sys.platform", "darwin")
+        monkeypatch.setattr("os.path.ismount", lambda path: mounted)
+        monkeypatch.setattr(plat_mod, "is_stale_mountpoint",
+                            lambda mountpoint: stale)
+        monkeypatch.setattr(plat_mod, "_macos_mount_table",
+                            lambda **kwargs: mount_table)
+        # Process discovery, as `status` reports it.
+        monkeypatch.setattr(plat_mod, "find_amifuse_mounts",
+                            lambda **kwargs: [dict(p) for p in processes])
+        monkeypatch.setattr(plat_mod.os, "getppid", lambda: 1)
+        events = []
+
+        def fake_run(cmd, check=False, **kwargs):
+            events.append(("run", list(cmd)))
+            return argparse.Namespace(returncode=1)
+
+        def fake_kill(mountpoint, **kwargs):
+            events.append(("kill", str(mountpoint)))
+            return [4242]
+
+        monkeypatch.setattr(fuse_fs_mod.subprocess, "run", fake_run)
+        monkeypatch.setattr(fuse_fs_mod, "kill_mount_owner_processes", fake_kill)
+        return fuse_fs_mod, PurePosixPath, events
+
+    def test_refuses_another_disk_before_umount_or_kill(self, monkeypatch, fuse_mock):
+        fuse_fs_mod, PurePosixPath, events = self._setup(
+            monkeypatch, self.MOUNT_TABLE)
+
+        with pytest.raises(SystemExit) as exc_info:
+            fuse_fs_mod.cmd_unmount(
+                argparse.Namespace(mountpoint=PurePosixPath("/Volumes/Backup")))
+
+        assert "not a mount AmiFUSE can identify" in str(exc_info.value)
+        assert events == []
+
+    def test_refuses_when_nothing_ties_the_mount_to_amifuse(self, monkeypatch, fuse_mock):
+        """No mount table and no AmiFUSE process: refuse, don't guess."""
+        fuse_fs_mod, PurePosixPath, events = self._setup(
+            monkeypatch, [], processes=[])
+
+        with pytest.raises(SystemExit) as exc_info:
+            fuse_fs_mod.cmd_unmount(
+                argparse.Namespace(mountpoint=PurePosixPath("/Volumes/Work")))
+
+        assert "not a mount AmiFUSE can identify" in str(exc_info.value)
+        assert events == []
+
+    def test_unmounts_amifuse_volume(self, monkeypatch, fuse_mock):
+        fuse_fs_mod, PurePosixPath, events = self._setup(
+            monkeypatch, self.MOUNT_TABLE)
+
+        with pytest.raises(SystemExit):  # the stubbed umount -f fails
+            fuse_fs_mod.cmd_unmount(
+                argparse.Namespace(mountpoint=PurePosixPath("/Volumes/Work")))
+
+        assert events[0] == ("run", ["umount", "-f", "/Volumes/Work"])
+        assert ("kill", "/Volumes/Work") in events
+
+    def test_unmounts_fuse_t_mount_served_by_amifuse(self, monkeypatch, fuse_mock):
+        """FUSE-T's NFS source doesn't name AmiFUSE; the process ties it."""
+        fuse_fs_mod, PurePosixPath, events = self._setup(
+            monkeypatch,
+            ["/dev/disk4s1 on /Volumes/Backup", "fuse-t:/Work on /tmp/mnt_0"],
+            processes=[{"mountpoint": "/tmp/mnt_0", "pid": 4242}])
+
+        with pytest.raises(SystemExit):  # the stubbed umount -f fails
+            fuse_fs_mod.cmd_unmount(
+                argparse.Namespace(mountpoint=PurePosixPath("/tmp/mnt_0")))
+
+        assert events[0] == ("run", ["umount", "-f", "/tmp/mnt_0"])
+
+    def test_unmounts_stale_amifuse_mountpoint(self, monkeypatch, fuse_mock):
+        """A dead AmiFUSE mount stays in the table and is still unmounted."""
+        fuse_fs_mod, PurePosixPath, events = self._setup(
+            monkeypatch, self.MOUNT_TABLE, mounted=False, stale=True)
+
+        with pytest.raises(SystemExit):  # the stubbed umount -f fails
+            fuse_fs_mod.cmd_unmount(
+                argparse.Namespace(mountpoint=PurePosixPath("/Volumes/Work")))
+
+        assert events[0] == ("run", ["umount", "-f", "/Volumes/Work"])
+
+    def test_refuses_stale_mountpoint_that_is_not_amifuse(self, monkeypatch, fuse_mock):
+        fuse_fs_mod, PurePosixPath, events = self._setup(
+            monkeypatch, self.MOUNT_TABLE, mounted=False, stale=True)
+
+        with pytest.raises(SystemExit) as exc_info:
+            fuse_fs_mod.cmd_unmount(
+                argparse.Namespace(mountpoint=PurePosixPath("/Volumes/Backup")))
+
+        assert "not a mount AmiFUSE can identify" in str(exc_info.value)
+        assert events == []
 
 
 class TestPidExists:
