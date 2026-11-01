@@ -300,3 +300,65 @@ def test_file_moved_out_while_open_leaves_its_directory_removable(open_rename):
     assert ops.release("/x", fh) == 0
     assert _read(ops, "/x") == b"x" * 100
     assert _on_disk(ops, "/n") == {"m"}
+
+
+@pytest.fixture
+def winfsp_rename(ops, request, monkeypatch):
+    """ops, called as WinFsp calls it, on a handler that renames a file open
+    from create(). WinFsp passes each handle's open-time name to unlink()
+    and release(), also after a rename through that handle."""
+    if request.node.callspec.params["ops"][1] not in ("pfs3aio", "SmartFilesystem"):
+        pytest.skip("FastFileSystem refuses to rename a file open from create()")
+    monkeypatch.setattr(AmigaFuseFS, "_winfsp", True)
+    return ops
+
+
+DOOMED = b"renamed, then deleted on close\n"
+KEEP = b"another file, keep me\n"
+
+
+def _create_renamed(ops, old, new):
+    """A file created as old, then renamed to new while its handle is open."""
+    fh = ops.create(old, 0o644)
+    assert ops.write(old, DOOMED, 0, fh) == len(DOOMED)
+    assert ops.rename(old, new) == 0
+    return fh
+
+
+@pytest.mark.parametrize("file_at_old_name", [False, True],
+                         ids=["old-name-free", "new-file-at-old-name"])
+def test_delete_on_close_after_rename_through_the_handle(winfsp_rename, file_at_old_name):
+    """A file renamed through its handle and then deleted on close is deleted,
+    under its new name, and a file created at its old name meanwhile stays
+    (#290). The calls are WinFsp's, from the issue's log."""
+    ops = winfsp_rename
+    fh = _create_renamed(ops, "/b-old.txt", "/b-new.txt")
+    if file_at_old_name:
+        _write(ops, "/b-old.txt", KEEP)
+
+    assert ops.unlink("/b-old.txt") == 0
+    assert ops.release("/b-old.txt", fh) == 0
+
+    assert "b-new.txt" not in _on_disk(ops)
+    if file_at_old_name:
+        assert _read(ops, "/b-old.txt") == KEEP
+    else:
+        assert "b-old.txt" not in _on_disk(ops)
+    assert ops._pending_deletes == set()
+
+
+def test_delete_file_at_the_old_name_while_the_renamed_file_is_open(winfsp_rename):
+    """DeleteFile() of a file at the old name holds its own handle there when
+    its unlink() comes: that file is deleted, and the renamed one stays."""
+    ops = winfsp_rename
+    fh = _create_renamed(ops, "/b-old.txt", "/b-new.txt")
+    _write(ops, "/b-old.txt", KEEP)
+    dh = ops.open("/b-old.txt", os.O_RDONLY)
+
+    assert ops.unlink("/b-old.txt") == 0
+    assert ops.release("/b-old.txt", dh) == 0
+    assert "b-old.txt" not in _on_disk(ops)
+    assert ops.release("/b-old.txt", fh) == 0
+
+    assert _read(ops, "/b-new.txt") == DOOMED
+    assert ops._pending_deletes == set()
