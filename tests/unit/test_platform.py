@@ -831,9 +831,12 @@ class TestIsAmifuseMountMacos:
         "journaled, noowners)\n"
         "amifuse:Work on Mars on /Volumes/Work on Mars (macfuse, nodev, "
         "nosuid, synchronous, mounted by me)\n"
+        "amifuse:Work on /Volumes/Work (2) (macfuse, nodev, nosuid, "
+        "synchronous, mounted by me)\n"
     )
 
-    def _stub_mount(self, monkeypatch, stdout, returncode=0, processes=()):
+    def _stub_mount(self, monkeypatch, stdout, returncode=0, processes=(),
+                    stale=False):
         import amifuse.platform as plat
 
         calls = []
@@ -849,6 +852,8 @@ class TestIsAmifuseMountMacos:
         monkeypatch.setattr(plat, "find_amifuse_mounts",
                             lambda **kwargs: [dict(p) for p in processes])
         monkeypatch.setattr(plat.os, "getppid", lambda: 1)
+        monkeypatch.setattr(plat, "is_stale_mountpoint",
+                            lambda mountpoint: stale)
         return calls
 
     def test_amifuse_volume_is_recognised(self, monkeypatch):
@@ -858,7 +863,20 @@ class TestIsAmifuseMountMacos:
         assert is_amifuse_mount_macos(PurePosixPath("/Volumes/Work"))
         assert is_amifuse_mount_macos("/Volumes/Work/")
         assert is_amifuse_mount_macos("/Volumes/Work on Mars")
-        assert calls == [["/sbin/mount"]] * 3
+        assert is_amifuse_mount_macos("/Volumes/Work (2)")
+        assert calls == [["/sbin/mount"]] * 4
+
+    def test_path_ending_in_another_mountpoint_is_not_taken_for_it(
+            self, monkeypatch):
+        """A mountpoint `/private/tmp/x on /Volumes/Backup` ends with the
+        stick's " on /Volumes/Backup"; the stick isn't read as AmiFUSE's."""
+        from amifuse.platform import is_amifuse_mount_macos
+
+        self._stub_mount(monkeypatch,
+                         "/dev/disk4s1 on /Volumes/Backup (msdos, local)\n"
+                         "amifuse:W on /private/tmp/x on /Volumes/Backup "
+                         "(macfuse, nodev)\n")
+        assert not is_amifuse_mount_macos(PurePosixPath("/Volumes/Backup"))
 
     @pytest.mark.parametrize("path", [
         "/Volumes/Backup", "/Volumes/Disk (1)", "/", "/Volumes/Mars",
@@ -889,50 +907,68 @@ class TestIsAmifuseMountMacos:
         monkeypatch.setattr(plat.subprocess, "run", fail)
         assert not plat.is_amifuse_mount_macos("/Volumes/Work")
 
-    # FUSE-T mounts over NFS and drops the fsname: its source names no
-    # AmiFUSE volume.
+    # FUSE-T doesn't pass the fsname on: its NFS mounts are listed as
+    # "fuse-t:/<volume name>", its SMB mounts as a fuse-t._smb._tcp share.
     NFS_OUTPUT = (
         "/dev/disk4s1 on /Volumes/Backup (msdos, local, nodev, nosuid)\n"
+        "//me@nas/Share on /Volumes/Share (smbfs, nodev, nosuid)\n"
         "fuse-t:/Work on /tmp/mnt_0 (nfs, nodev, nosuid, mounted by me)\n"
+        "//Guest@fuse-t._smb._tcp.local/Work on /tmp/mnt_1 (smbfs, nodev, "
+        "nosuid, mounted by me)\n"
     )
 
-    def test_nfs_mount_served_by_amifuse_process_is_amifuse(self, monkeypatch):
+    @pytest.mark.parametrize("path", ["/tmp/mnt_0", "/tmp/mnt_1"])
+    def test_fuse_t_mount_served_by_amifuse_process_is_amifuse(
+            self, monkeypatch, path):
         """On FUSE-T, the AmiFUSE process given the mountpoint ties it."""
         from amifuse.platform import is_amifuse_mount_macos
 
         self._stub_mount(monkeypatch, self.NFS_OUTPUT, processes=[
-            {"mountpoint": "/tmp/mnt_0", "pid": 4242}])
-        assert is_amifuse_mount_macos(PurePosixPath("/tmp/mnt_0"))
+            {"mountpoint": path, "pid": 4242}])
+        assert is_amifuse_mount_macos(PurePosixPath(path))
         assert not is_amifuse_mount_macos(PurePosixPath("/Volumes/Backup"))
 
-    def test_nfs_mount_without_amifuse_process_is_not_amifuse(self, monkeypatch):
+    def test_fuse_t_mount_without_amifuse_process_is_not_amifuse(
+            self, monkeypatch):
+        """Another program's live FUSE-T mount."""
         from amifuse.platform import is_amifuse_mount_macos
 
         self._stub_mount(monkeypatch, self.NFS_OUTPUT)
         assert not is_amifuse_mount_macos(PurePosixPath("/tmp/mnt_0"))
 
-    def test_disk_is_not_amifuse_while_a_process_names_its_path(self, monkeypatch):
-        """An `amifuse mount --mountpoint /Volumes/Backup` still starting up
-        doesn't make the USB stick there AmiFUSE's."""
+    def test_dead_fuse_t_mount_is_amifuse(self, monkeypatch):
+        """A FUSE-T mount whose process died can still be unmounted."""
+        from amifuse.platform import is_amifuse_mount_macos
+
+        self._stub_mount(monkeypatch, self.NFS_OUTPUT, stale=True)
+        assert is_amifuse_mount_macos(PurePosixPath("/tmp/mnt_0"))
+        # A dead disk or share is still not AmiFUSE's.
+        assert not is_amifuse_mount_macos(PurePosixPath("/Volumes/Backup"))
+        assert not is_amifuse_mount_macos(PurePosixPath("/Volumes/Share"))
+
+    @pytest.mark.parametrize("path", ["/Volumes/Backup", "/Volumes/Share"])
+    def test_disk_or_share_is_not_amifuse_while_a_process_names_its_path(
+            self, monkeypatch, path):
+        """An AmiFUSE process given the path (still starting up, or left
+        behind by its own mount) doesn't make a USB stick or a network share
+        mounted there AmiFUSE's."""
         from amifuse.platform import is_amifuse_mount_macos
 
         self._stub_mount(monkeypatch, self.NFS_OUTPUT, processes=[
-            {"mountpoint": "/Volumes/Backup", "pid": 4242}])
-        assert not is_amifuse_mount_macos(PurePosixPath("/Volumes/Backup"))
+            {"mountpoint": path, "pid": 4242}])
+        assert not is_amifuse_mount_macos(PurePosixPath(path))
 
     def test_callers_parent_does_not_count(self, monkeypatch):
         """`sudo amifuse mount --mountpoint P` checking P: the `sudo` parent
         repeats the command line but serves no mount."""
         import amifuse.platform as plat
 
-        self._stub_mount(monkeypatch,
-                         "//me@nas/Share on /Volumes/Share (smbfs, nodev)\n",
-                         processes=[{"mountpoint": "/Volumes/Share",
-                                     "pid": 4242}])
+        self._stub_mount(monkeypatch, self.NFS_OUTPUT, processes=[
+            {"mountpoint": "/tmp/mnt_0", "pid": 4242}])
         monkeypatch.setattr(plat.os, "getppid", lambda: 4242)
-        assert not plat.is_amifuse_mount_macos(PurePosixPath("/Volumes/Share"))
+        assert not plat.is_amifuse_mount_macos(PurePosixPath("/tmp/mnt_0"))
         monkeypatch.setattr(plat.os, "getppid", lambda: 1)
-        assert plat.is_amifuse_mount_macos(PurePosixPath("/Volumes/Share"))
+        assert plat.is_amifuse_mount_macos(PurePosixPath("/tmp/mnt_0"))
 
 
 # ---------------------------------------------------------------------------

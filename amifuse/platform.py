@@ -329,7 +329,8 @@ def validate_mountpoint(mountpoint: Path) -> Optional[str]:
                     return (
                         f"Mountpoint {mountpoint} is already a mount, not one "
                         f"AmiFUSE can identify as its own; choose another with "
-                        f"--mountpoint, or another volume name with --volname."
+                        f"--mountpoint (or, for the default mountpoint, "
+                        f"another volume name with --volname)."
                     )
                 if get_unmount_command(mountpoint):
                     return (
@@ -370,7 +371,8 @@ def format_stale_mountpoint_error(mountpoint: Path) -> str:
         return (
             f"Mountpoint {mountpoint} looks like a stale or broken mount, not "
             f"one AmiFUSE can identify as its own; choose another with "
-            f"--mountpoint, or another volume name with --volname."
+            f"--mountpoint (or, for the default mountpoint, another "
+            f"volume name with --volname)."
         )
     if get_unmount_command(mountpoint):
         return (
@@ -602,10 +604,18 @@ def _parse_mount_tokens(tokens):
     i = mount_idx + 1
     while i < len(tokens):
         tok = tokens[i]
-        if tok == "--mountpoint" and i + 1 < len(tokens):
-            mountpoint = tokens[i + 1]
-            i += 2
-            continue
+        # argparse also takes "--mountpoint=PATH" and any unambiguous
+        # prefix ("--mount PATH"); no other mount option starts with "--m".
+        option, eq, value = tok.partition("=")
+        if len(option) >= 3 and "--mountpoint".startswith(option):
+            if eq:
+                mountpoint = value
+                i += 1
+                continue
+            if i + 1 < len(tokens):
+                mountpoint = tokens[i + 1]
+                i += 2
+                continue
         if tok.startswith("-"):
             # Skip flags; if flag takes a value, skip next token too
             # Known value-taking flags in mount subcommand
@@ -1278,9 +1288,8 @@ def _macos_mount_table() -> List[str]:
     """Return macOS `mount` entries as "<source> on <mountpoint>" strings.
 
     Each line of `mount` reads "<source> on <mountpoint> (<options>)"; the
-    options are dropped. `mount` reads the table without waiting on any
-    filesystem, so a hung mount can't stall it. Returns an empty list when
-    the table can't be read.
+    options are dropped. A hung mount can make `mount` wait, so it gets a
+    timeout. Returns an empty list when the table can't be read.
     """
     try:
         # Decode paths as os.fsdecode does, so they compare with os paths.
@@ -1303,39 +1312,51 @@ def _macos_mount_table() -> List[str]:
 def _mount_source(mountpoint, mount_table) -> Optional[str]:
     """Return the source `mount` lists for ``mountpoint``, or None.
 
-    With mounts stacked on one path, the last entry is the one on top.
+    None also when entries for the path disagree: a stack of different
+    mounts, or another mountpoint whose own path ends in " on <mountpoint>".
     """
     raw = os.fspath(mountpoint)
     # `mount` lists real paths: resolve symlinks (/var -> /private/var) and
     # relative paths, and keep the lexical form for the unresolved spelling.
     targets = {posixpath.normpath(raw), os.path.realpath(raw)}
-    found = None
+    sources = set()
     for entry in mount_table:
         for target in targets:
             suffix = " on " + target
             if entry.endswith(suffix):
-                found = entry[:-len(suffix)]
-    return found
+                sources.add(entry[:-len(suffix)])
+    return sources.pop() if len(sources) == 1 else None
 
 
 def _has_amifuse_mount_source(mountpoint, mount_table) -> bool:
     """Tell whether `mount` lists ``mountpoint`` with AmiFUSE's source.
 
-    macFUSE lists the fsname as the source. FUSE-T doesn't: it mounts over
-    NFS and gives its server no fsname, so its mounts never match here.
+    macFUSE lists the fsname as the source. FUSE-T doesn't (see
+    ``_is_fuse_t_source``), so its mounts never match here.
     """
     source = _mount_source(mountpoint, mount_table)
     return source is not None and source.startswith(_AMIFUSE_MOUNT_SOURCE_PREFIX)
 
 
+def _is_fuse_t_source(source: str) -> bool:
+    """Tell whether a mount source is FUSE-T's.
+
+    FUSE-T serves a mount over NFS (source "fuse-t:/<volume name>") or SMB
+    ("//Guest@fuse-t._smb._tcp.local/<share>") and never passes the fsname
+    on, so its source doesn't say which program the mount belongs to.
+    """
+    return source.startswith("fuse-t:/") or "@fuse-t._smb._tcp.local/" in source
+
+
 def is_amifuse_mount_macos(mountpoint, mount_table=None) -> bool:
     """Tell whether ``mountpoint`` is an AmiFUSE mount on macOS.
 
-    It is when `mount` lists it with the source AmiFUSE sets (macFUSE), or
-    when a running AmiFUSE process serves it (FUSE-T, whose mount source
-    doesn't name AmiFUSE). Anything else (another disk under /Volumes, or a
-    path AmiFUSE can't tie to itself) is not, so no caller mistakes the
-    user's own volume for an AmiFUSE mount.
+    It is when `mount` lists it with the source AmiFUSE sets (macFUSE). A
+    FUSE-T mount, whose source doesn't name AmiFUSE, is when a running
+    AmiFUSE process was given its path, or when it is dead and nothing
+    serves it any more. Anything else (another disk or share, or a path the
+    table doesn't list) is not, so no caller mistakes the user's own volume
+    for an AmiFUSE mount.
 
     Args:
         mountpoint: The path to check.
@@ -1345,21 +1366,23 @@ def is_amifuse_mount_macos(mountpoint, mount_table=None) -> bool:
     if mount_table is None:
         mount_table = _macos_mount_table()
     source = _mount_source(mountpoint, mount_table)
-    if source is not None:
-        if source.startswith(_AMIFUSE_MOUNT_SOURCE_PREFIX):
-            return True
-        # A disk (a USB stick, an internal volume) is never AmiFUSE's, even
-        # while an AmiFUSE process that was given its path is starting up.
-        if source.startswith("/dev/"):
-            return False
+    if source is None:
+        return False
+    if source.startswith(_AMIFUSE_MOUNT_SOURCE_PREFIX):
+        return True
+    if not _is_fuse_t_source(source):
+        return False
+    path = Path(os.fspath(mountpoint))
     # Process discovery pairs a mount started without --mountpoint only with
-    # a volume the mount table names as AmiFUSE's, so this adds just the
-    # mountpoints AmiFUSE processes were given on their command lines. The
-    # caller's parent is left out: a wrapper such as `sudo` or `uv run`
-    # repeats the command line of the `amifuse mount` checking its own path.
+    # a volume the table names as AmiFUSE's, so this finds just the processes
+    # given this path on their command lines. The caller's parent is left
+    # out: a wrapper such as `sudo` or `uv run` repeats the command line of
+    # the `amifuse mount` checking its own path.
     parent = os.getppid()
-    return any(pid != parent
-               for pid in _find_mount_owner_pids(Path(os.fspath(mountpoint))))
+    if any(pid != parent for pid in _find_mount_owner_pids(path)):
+        return True
+    # A dead FUSE-T mount: unmounting it can't disturb a working filesystem.
+    return is_stale_mountpoint(path)
 
 
 def _enrich_mountpoints_macos(null_mounts, all_mounts):
@@ -1387,8 +1410,14 @@ def _enrich_mountpoints_macos(null_mounts, all_mounts):
         vol_path = volumes_dir + "/" + entry
         if vol_path in claimed:
             continue
-        if _has_amifuse_mount_source(vol_path, mount_table):
-            amifuse_volumes.append(vol_path)
+        try:
+            # A dead AmiFUSE mount keeps its entry in the table, but it
+            # isn't a mount any more and has no process to pair with.
+            if (os.path.ismount(vol_path)
+                    and _has_amifuse_mount_source(vol_path, mount_table)):
+                amifuse_volumes.append(vol_path)
+        except OSError:
+            continue
 
     # Match null-mountpoint processes to discovered volumes.
     # Non-deterministic for multiple mounts -- best-effort pairing.

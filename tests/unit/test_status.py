@@ -41,6 +41,20 @@ class TestParseMountTokens:
         assert image == "C:/images/test.hdf"
         assert mp == "D:"
 
+    @pytest.mark.parametrize("args", [
+        ["--mountpoint=/Users/me/mnt"],
+        ["--mount", "/Users/me/mnt"],
+        ["--m=/Users/me/mnt"],
+    ])
+    def test_mountpoint_forms_argparse_accepts(self, args):
+        """`amifuse unmount` on FUSE-T ties a mount to its process by this."""
+        from amifuse.platform import _parse_mount_tokens
+
+        tokens = ["amifuse", "mount", "/images/test.hdf", *args, "--write"]
+        image, mp = _parse_mount_tokens(tokens)
+        assert image == "/images/test.hdf"
+        assert mp == "/Users/me/mnt"
+
     def test_no_mount_subcommand(self):
         from amifuse.platform import _parse_mount_tokens
 
@@ -652,6 +666,25 @@ class TestEnrichNullMountpoints:
         mounts = [{"mountpoint": None, "pid": 4242}]
         _enrich_mountpoints_macos(mounts, mounts)
         assert mounts[0]["mountpoint"] is None
+
+    def test_enrich_macos_skips_dead_amifuse_mount(self, monkeypatch):
+        """A crashed mount's /Volumes/Alpha keeps its table entry; the live
+        mount is paired with its own /Volumes/Work, not with Alpha."""
+        from amifuse.platform import _enrich_mountpoints_macos
+
+        monkeypatch.setattr("os.path.isdir", lambda p: p == "/Volumes")
+        monkeypatch.setattr("os.listdir", lambda p: ["Alpha", "Work"])
+        # ismount() is False on a dead FUSE mount: lstat fails.
+        monkeypatch.setattr("os.path.ismount", lambda p: p == "/Volumes/Work")
+        monkeypatch.setattr(
+            "amifuse.platform._macos_mount_table",
+            lambda **kwargs: ["amifuse:Alpha on /Volumes/Alpha",
+                              "amifuse:Work on /Volumes/Work"],
+        )
+
+        mounts = [{"mountpoint": None, "pid": 4242}]
+        _enrich_mountpoints_macos(mounts, mounts)
+        assert mounts[0]["mountpoint"] == "/Volumes/Work"
 
     def test_text_output_uses_truncation(self, monkeypatch, capsys):
         from amifuse.fuse_fs import cmd_status
