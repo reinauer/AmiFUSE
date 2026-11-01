@@ -243,6 +243,16 @@ class VamosHandlerRuntime:
 
     def shutdown(self):
         first_error = None
+        # The handler, and any child it created, is still suspended in a
+        # wait. A greenlet suspended in a frame that refers back to it is
+        # never collected, so every task is ended first; the scheduler, its
+        # tasks and what they reference can then go.
+        scheduler, self.scheduler = self.scheduler, None
+        if scheduler is not None:
+            try:
+                self._stop_tasks(scheduler)
+            except BaseException as exc:
+                first_error = exc
         # Handlers may leave internal library/device state in a partially
         # torn-down state by the time AmiFuse unmounts. Calling
         # close_base_libs() here can end up touching stale Library structs
@@ -273,3 +283,21 @@ class VamosHandlerRuntime:
         self.timer_device = None
         if first_error is not None:
             raise first_error
+
+    @staticmethod
+    def _stop_tasks(scheduler):
+        """End every task the scheduler still has, the current one included.
+
+        rem_task() throws TaskStop into the task's greenlet, which unwinds
+        its wait and the library call it waits in, and the task takes
+        itself out of the scheduler.
+        """
+        from amitools.vamos.schedule import TaskState  # type: ignore
+
+        tasks = list(scheduler.ready_tasks) + list(scheduler.waiting_tasks)
+        current = scheduler.get_cur_task()
+        if current is not None and current not in tasks:
+            tasks.append(current)
+        for task in tasks:
+            if task.get_state() != TaskState.TS_REMOVED:
+                scheduler.rem_task(task)
