@@ -163,7 +163,7 @@ class BlockDeviceBackend:
                 self.partition_number = ref.number if ref else None
             elif self.partition_scope and not self.read_only:
                 from .rdb_inspect import check_default_write
-                check_default_write(self.image)
+                check_default_write(self.image, self._requested_block_size)
             self._open_image()
             if self.partition_scope:
                 self._lock_partition()

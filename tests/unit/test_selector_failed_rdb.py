@@ -2,7 +2,7 @@
 
 The names and numbers of the RDBs after it shift, so a writable open by
 name, by number or without --partition is refused (#304), a disk RDSK
-block with a bad checksum counts as such an RDB (#305), and a device or
+block failing its checksum counts as such an RDB (#305), and a device or
 media error in an entry's RDB ends the lookup (#267). Read-only opens of
 the RDBs that open are unchanged.
 """
@@ -146,9 +146,13 @@ def _bad_disk_rdsk(tmp_path, entries=("DH0", "PI1")):
     return image
 
 
+def _bad(block, size=512):
+    return (f"RDSK block at block {block} fails its checksum over the whole "
+            f"{size}-byte block")
+
+
 def _bad_disk_rdsk_error(image):
-    return (f"Failed to parse RDB at {image}: RDSK block at block 2 has a "
-            f"bad checksum")
+    return f"Failed to parse RDB at {image}: {_bad(2)}"
 
 
 @pytest.mark.parametrize("selector", ["DH0", "0"])
@@ -192,7 +196,7 @@ def test_entry_rdsk_with_a_bad_checksum_is_an_rdb_that_fails(tmp_path):
         open_rdisk(image, mbr_partition_index=0)
     assert str(caught.value) == (
         f"MBR partition 0 does not contain a valid RDB: {image}; partition 0 "
-        f"at LBA 200: RDSK block at block 0 has a bad checksum")
+        f"at LBA 200: {_bad(0)}")
     assert isinstance(caught.value, rdb_inspect.EntryRDBError)
     assert _refused(image, "DH0") == _selector_refused("DH0", ENTRY_0)
     assert _open(image, "DH0") == (1, "DH0")
@@ -205,13 +209,12 @@ def test_plain_rdsk_with_a_bad_checksum_names_the_block(tmp_path):
     with pytest.raises(OSError) as caught:
         open_rdisk(image)
     assert not isinstance(caught.value, DiskRDBError)
-    assert str(caught.value) == (
-        f"Failed to parse RDB at {image}: RDSK block at block 0 has a bad "
-        f"checksum")
-    # A forced size other than the RDB's own can fail an intact checksum.
+    assert str(caught.value) == f"Failed to parse RDB at {image}: {_bad(0)}"
+    # The message names the size the block was summed over.
     with pytest.raises(OSError) as caught:
-        open_rdisk(image, block_size=512)
-    assert str(caught.value).endswith("has a bad checksum with 512-byte blocks")
+        open_rdisk(image, block_size=1024)
+    assert str(caught.value) == (
+        f"Failed to parse RDB at {image}: {_bad(0, 1024)}")
 
 
 def test_bad_rdsk_inside_an_entry_is_that_entry_s(tmp_path):
@@ -224,8 +227,7 @@ def test_bad_rdsk_inside_an_entry_is_that_entry_s(tmp_path):
     assert [p.name for p in listed.partitions] == ["WORK"]
     assert listed.fallback_reason == (
         f"MBR partition [0]: MBR partition 0 does not contain a valid RDB: "
-        f"{image}; partition 0 at LBA 2: RDSK block at block 0 has a bad "
-        f"checksum")
+        f"{image}; partition 0 at LBA 2: {_bad(0)}")
     assert _refused(image, "WORK") == _selector_refused("WORK", ENTRY_0)
 
 
@@ -239,12 +241,60 @@ def test_image_ending_inside_an_entry_rdb_is_an_rdb_that_fails(tmp_path):
     with pytest.raises(rdb_inspect.EntryRDBError):
         open_rdisk(image, mbr_partition_index=1)
 
-    # Read-only, entry 0's partition opens by name, also from the launcher.
+    # Read-only, entry 0's partition opens by name, and the launcher's lone
+    # unit without --partition reaches it too.
     from amifuse.launcher import _enumerate_mount_units
 
     assert _open(image, "DH0") == (0, "DH0")
     units, _reason = _enumerate_mount_units(str(image))
-    assert [u.name for u in units] == ["DH0"]
+    assert [u.name for u in units] == [None]
+    assert _open(image) == (0, "DH0")
+
+
+def test_damaged_rdsk_where_the_image_ends_is_an_rdb_that_fails(tmp_path):
+    # Entry 0 lies last on the disk; its RDSK block is damaged and the image
+    # ends 5 sectors into it, inside the scan of its first 16 blocks.
+    image = _make_mbr(tmp_path, [(400, _make_rdb(tmp_path, 512, "DH0")),
+                                 (200, _make_rdb(tmp_path, 512, "DH0"))])
+    _flip(image, 400)
+    image.write_bytes(image.read_bytes()[:405 * 512])
+    assert _refused(image, "DH0") == _selector_refused("DH0", ENTRY_0)
+    assert list_partitions(image).fallback_reason.endswith(
+        f"partition 0 at LBA 400: {_bad(0)}")
+    assert _open(image, "DH0") == (1, "DH0")
+
+
+def test_default_write_opens_before_an_rdb_that_fails(tmp_path):
+    # Entry 1's RDB fails after entry 0's, which the open without
+    # --partition reaches either way; a selector is still refused.
+    image = _two_dh0_entries(tmp_path)
+    _flip(image, 401)  # entry 1's PART block
+    assert _open(image, read_only=False) == (0, "DH0")
+    entry_1 = "the RDB in MBR partition [1]"
+    assert _refused(image, "DH0") == _selector_refused("DH0", entry_1)
+
+
+def test_default_write_with_a_forced_size_reaching_another_rdb(tmp_path):
+    # Entry 0's RDB uses 512-byte blocks, entry 1's 1024: with 1024 forced,
+    # the open without --partition passes over entry 0 to entry 1.
+    image = _make_mbr(tmp_path, [(200, _make_rdb(tmp_path, 512, "DH0")),
+                                 (400, _make_rdb(tmp_path, 1024, "WORK"))])
+    backend = BlockDeviceBackend(image, 1024, partition_scope=True,
+                                 read_only=False)
+    with pytest.raises(OSError) as caught:
+        backend.open()
+    assert str(caught.value) == (
+        "No partition is opened for writing without --partition with "
+        "1024-byte blocks: an RDB on this disk does not open with them, so "
+        "the partition opened is another one")
+    assert backend.blkdev is None
+    backend = BlockDeviceBackend(image, 1024, partition_scope=True)
+    backend.open()
+    try:
+        assert str(backend.rdb.get_partition(0).get_drive_name()) == "WORK"
+    finally:
+        backend.close()
+    assert _open(image, read_only=False) == (0, "DH0")
 
 
 def test_launcher_names_a_lone_partition_beside_an_rdb_that_fails(tmp_path):
@@ -257,3 +307,25 @@ def test_launcher_names_a_lone_partition_beside_an_rdb_that_fails(tmp_path):
     assert fallback_reason == (
         f"RDB beside the MBR: {_bad_disk_rdsk_error(image)}")
     assert _open(image, "PI0") == (0, "PI0")
+
+
+def test_launcher_mounts_a_lone_partition_before_a_read_error(tmp_path,
+                                                              monkeypatch):
+    from amifuse.launcher import _enumerate_mount_units
+
+    # Entry 1's blocks fail to read; the open without --partition reaches
+    # entry 0's DH0 first, so the launcher still mounts it that way.
+    image = _make_mbr(tmp_path, [(200, _make_rdb(tmp_path, 512, "DH0")),
+                                 (400, _make_rdb(tmp_path, 512, "WORK"))])
+    read_block = RawBlockDevice.read_block
+
+    def failing(self, blk_num, num_blks=1, **kwargs):
+        if (blk_num + num_blks) * self.block_bytes > 400 * 512:
+            raise OSError(errno.EIO, "Input/output error")
+        return read_block(self, blk_num, num_blks, **kwargs)
+
+    monkeypatch.setattr(RawBlockDevice, "read_block", failing)
+    units, fallback_reason = _enumerate_mount_units(str(image))
+    assert [u.name for u in units] == [None]
+    assert fallback_reason.startswith("MBR partition [1]: ")
+    assert _open(image, read_only=False) == (0, "DH0")

@@ -296,7 +296,8 @@ def _enumerate_mount_units(image: str) -> tuple[list[_MountUnit], Optional[str]]
 
     A lone partition (single-partition RDB) collapses to a single
     ``_MountUnit`` with ``name=None`` so the spawn is byte-for-byte the legacy
-    single-partition command, unless an RDB on the disk failed to open.
+    single-partition command, unless that command fails
+    (``default_open_fails``).
 
     A partition whose drive name is damaged has no name to pass as
     ``--partition``: it is skipped, and ``fallback_reason`` says so. With no
@@ -325,9 +326,9 @@ def _enumerate_mount_units(image: str) -> tuple[list[_MountUnit], Optional[str]]
 
     parts = result.partitions
     named = [p for p in parts if p.name is not None]
-    # Beside an RDB that fails, a mount without --partition can stop on that
-    # RDB or reach another one, so a lone named partition keeps its name.
-    if (len(parts) <= 1 and not result.fallback_reason) or not named:
+    # Where a mount without --partition fails, as beside a disk's own RDB
+    # that fails, a lone named partition keeps its name.
+    if (len(parts) <= 1 and not result.default_open_fails) or not named:
         # The mount opens partition 0, whatever its drive name.
         label = parts[0].name if parts and parts[0].name else "disk image"
         units = [_MountUnit(name=None, label=label)]

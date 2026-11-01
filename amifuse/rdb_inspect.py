@@ -121,9 +121,14 @@ class PartitionList:
     renames a repeated drive name instead of falling back to the first
     partition; it sets this only when an RDB of the disk fails to open, the
     disk's own beside its MBR or a 0x76 entry's, naming each one that fails.
+
+    ``default_open_fails`` is True when the open without ``--partition``
+    fails, as beside a disk's own RDB that fails: then even a lone partition
+    opens only by name.
     """
     partitions: List[PartInfo]
     fallback_reason: Optional[str] = None
+    default_open_fails: bool = False
 
 
 def detect_mbr(image: Path) -> Optional[MBRInfo]:
@@ -405,7 +410,15 @@ def _scan_for_rdb(blkdev, block_size: Optional[int] = None):
     bad_checksum_blk = None
     for blk_num in range(16):
         rdb = RDBlock(blkdev, blk_num)
-        if rdb.read():
+        try:
+            valid = rdb.read()
+        except RDBContentError:
+            # The partition or the image ends within the scan. A damaged
+            # RDSK block before that end is still a damaged RDB.
+            if bad_checksum_blk is None:
+                raise
+            break
+        if valid:
             # Skip an RDSK block declaring a block size other than a power of
             # two from 512 to 32768, as if it held no RDSK id. Other sizes do
             # not map onto 512-byte MBR sectors, and 0 or huge ones cannot be
@@ -423,14 +436,16 @@ def _scan_for_rdb(blkdev, block_size: Optional[int] = None):
     return None, None, bad_checksum_blk
 
 
-def _bad_checksum(blk_num: int, block_size: Optional[int]) -> str:
+def _bad_checksum(blk_num: int, block_bytes: int) -> str:
     """Describe the RDSK block _scan_for_rdb found with a bad checksum.
 
-    A forced block size is named: the checksum covers the whole block, so
-    a size other than the RDB's own can fail it on an intact RDB.
+    amitools sums the whole block, while AmigaOS sums only rdb_SummedLongs
+    longs, so the message says which: an RDB that AmigaOS reads, with other
+    data after those longs, fails here too, as one read with a forced block
+    size other than its own can.
     """
-    forced = f" with {block_size}-byte blocks" if block_size else ""
-    return f"RDSK block at block {blk_num} has a bad checksum{forced}"
+    return (f"RDSK block at block {blk_num} fails its checksum over the "
+            f"whole {block_bytes}-byte block")
 
 
 def _is_parceiro_checksum(block) -> bool:
@@ -806,7 +821,7 @@ def _locate_rdisk(image, block_size, mbr_partition_index, mbr_info, open_at):
         # 0x76 partitions are not tried in its place.
         error = DiskRDBError if _amiga_partitions(mbr_info) else IOError
         raise error(f"Failed to parse RDB at {image}: "
-                    f"{_bad_checksum(bad_blk, block_size)}")
+                    f"{_bad_checksum(bad_blk, blkdev.block_bytes)}")
     if rdb_block is not None and parse_direct:
         try:
             rdisk = _parse_rdb(blkdev, rdb_block)
@@ -881,8 +896,8 @@ def _locate_rdisk(image, block_size, mbr_partition_index, mbr_info, open_at):
                     continue
 
             if rdb_block is None and bad_blk is not None:
-                skipped.append((mbr_part,
-                                f": {_bad_checksum(bad_blk, block_size)}"))
+                reason = _bad_checksum(bad_blk, offset_dev.block_bytes)
+                skipped.append((mbr_part, f": {reason}"))
                 continue
 
             if rdb_block is not None:
@@ -977,30 +992,40 @@ def mount_names(rdb_parts: list) -> List[List[Optional[str]]]:
     return names
 
 
+def _failed_rdb(amiga_parts: List[MBRPartition], rdb_idx: Optional[int],
+                error: OSError) -> Optional[str]:
+    """Name an RDB that open_each_rdb yields as failing, for a message.
+
+    Returns None if it shifts no names. An RDB found but not opening, the
+    disk's own beside the MBR (DiskRDBError) or an entry's (EntryRDBError),
+    shifts the names of the RDBs after it; an entry holding no RDB
+    (NoEntryRDBError) shifts none. Raises any other OSError in an entry,
+    such as a device or media error, as it ends open_rdisk. The default
+    open's other errors leave no RDB open whose names could shift.
+    """
+    if isinstance(error, (DiskRDBError, EntryRDBError)):
+        return ("the RDB beside the MBR" if rdb_idx is None else
+                f"the RDB in {rdb_label(amiga_parts, rdb_idx)}")
+    if rdb_idx is not None and not isinstance(error, NoEntryRDBError):
+        raise error
+    return None
+
+
 def _disk_names(
     image: Path, block_size: Optional[int],
 ) -> Tuple[List[Tuple[Optional[int], int, List[Optional[str]]]], List[str]]:
     """(mbr_partition_index, RDB offset, mount_names) per RDB that opens,
-    and each RDB that is found but does not open, named for a message.
-
-    Those RDBs are the disk's own beside the MBR (DiskRDBError) and an
-    entry's (EntryRDBError); the names of the RDBs after them shift. An
-    entry that holds no RDB (NoEntryRDBError) shifts none. Any other
-    OSError in an entry, such as a device or media error, ends the lookup,
-    as it ends open_rdisk. The default open's other errors leave no RDB
-    open whose names could shift.
-    """
+    and each RDB that is found but does not open, named for a message
+    (_failed_rdb, which also raises a device or media error)."""
     rdbs = []
     rdb_parts = []
     failed = []
     amiga_parts = amiga_rdb_partitions(image)
     for rdb_idx, opened in open_each_rdb(image, block_size, len(amiga_parts)):
         if isinstance(opened, IOError):
-            if isinstance(opened, (DiskRDBError, EntryRDBError)):
-                failed.append("the RDB beside the MBR" if rdb_idx is None else
-                              f"the RDB in {rdb_label(amiga_parts, rdb_idx)}")
-            elif rdb_idx is not None and not isinstance(opened, NoEntryRDBError):
-                raise opened
+            name = _failed_rdb(amiga_parts, rdb_idx, opened)
+            if name is not None:
+                failed.append(name)
             continue
         blkdev, rdisk, mbr_ctx = opened
         try:
@@ -1103,17 +1128,53 @@ def find_partition(
     )
 
 
-def check_default_write(image: Path) -> None:
+def _default_rdb(
+    image: Path, block_size: Optional[int],
+) -> Tuple[Optional[int], List[str]]:
+    """(RDB offset, or None) of the first RDB that opens, which the open
+    without --partition reaches, and each RDB before it that is found but
+    does not open (_failed_rdb, which also raises a device or media
+    error). An RDB after it cannot move that open. The disk's own RDB
+    failing (DiskRDBError) ends that open, so no RDB is reached."""
+    amiga_parts = amiga_rdb_partitions(image)
+    failed = []
+    for rdb_idx, opened in open_each_rdb(image, block_size, len(amiga_parts)):
+        if isinstance(opened, IOError):
+            name = _failed_rdb(amiga_parts, rdb_idx, opened)
+            if name is not None:
+                failed.append(name)
+            if isinstance(opened, DiskRDBError):
+                return None, failed
+            continue
+        blkdev, rdisk, mbr_ctx = opened
+        try:
+            return _rdb_offset(blkdev, rdisk, mbr_ctx), failed
+        finally:
+            rdisk.close()
+            blkdev.close()
+    return None, failed
+
+
+def check_default_write(image: Path, block_size: Optional[int] = None) -> None:
     """Refuse a writable open without ``--partition`` as find_partition does.
 
     The open without it reaches partition 0 of the first RDB that opens
-    (open_rdisk), so an RDB that is found but does not open may move it
-    onto another RDB's partition. Raises IOError then; like find_partition,
-    only the auto-detected open decides whether an RDB fails.
+    (open_rdisk). Raises IOError if an RDB before that one is found but
+    does not open, so that it may be another RDB's partition than with
+    that RDB intact; like find_partition, only the auto-detected open
+    decides whether an RDB fails. With a forced block_size, raises IOError
+    too if the open reaches another RDB than the auto-detected one.
     """
-    _rdbs, failed = _disk_names(image, None)
+    offset, failed = _default_rdb(image, None)
     _refuse_write("No partition is opened for writing without --partition",
                   failed, "the partition opened may be another one")
+    if block_size is not None:
+        forced, _failed = _default_rdb(image, block_size)
+        if None not in (offset, forced) and forced != offset:
+            raise IOError(
+                f"No partition is opened for writing without --partition with "
+                f"{block_size}-byte blocks: an RDB on this disk does not open "
+                f"with them, so the partition opened is another one")
 
 
 def find_partition_mbr_index(
@@ -1234,7 +1295,8 @@ def list_partitions(
                 info.name = name
             all_parts.append(info)
     return PartitionList(partitions=all_parts,
-                         fallback_reason="\n".join(failures) or None)
+                         fallback_reason="\n".join(failures) or None,
+                         default_open_fails=default_error is not None)
 
 
 def format_fs_summary(rdisk: RDisk):
