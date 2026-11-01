@@ -651,8 +651,11 @@ def _parse_mount_tokens(tokens):
             # counts as one. What `ps` can't settle: a mountpoint like
             # "/Volumes/Games --write" looks exactly like a real --write.
             # Only the exact argv (/proc/<pid>/cmdline, sysctl
-            # KERN_PROCARGS2) would; a wrong reading matters only when
-            # another program's FUSE-T mount sits at the shortened path.
+            # KERN_PROCARGS2) would. A wrong reading shows the shorter path
+            # in `status`, and `amifuse unmount` of that path can take
+            # another program's FUSE-T mount for AmiFUSE's or, in its kill
+            # fallback on Linux/macOS, pick the wrong AmiFUSE process (as
+            # `main` already could for the `--mountpoint X` form).
             in_run = in_run and option not in _MOUNT_VALUE_OPTIONS
             if option == "--" and mountpoint is not None:
                 run += in_run
@@ -689,12 +692,12 @@ def _parse_mount_tokens(tokens):
         i += 1
 
     # `ps` joins a Unix process's arguments with spaces and no quotes, so a
-    # mountpoint with a space arrives split, its rest as positionals right
-    # after it. `mount` takes one positional, the image. With the image
-    # read first, a positional right after the mountpoint is its rest (a
-    # split --volname value comes after its own flag). With the image after
-    # it, more than one positional is ambiguous. Part of a path is worse
-    # than none.
+    # mountpoint with a space arrives split, its rest as positionals after
+    # it. `mount` takes one positional, the image. With the image read
+    # first, a positional after the mountpoint and before the next value
+    # option is its rest (a split --volname value comes after its own
+    # option). With the image after it, more than one positional is
+    # ambiguous. Part of a path is worse than none.
     if mountpoint is not None and (run if image_first else after > 1):
         mountpoint = None
     return _strip_matched_quotes(image), _strip_matched_quotes(mountpoint)
