@@ -3336,13 +3336,20 @@ class AmigaFuseFS(_FuseOperations):
         which its pinned size counts (_pin_stat). BFFS keeps an existing
         file's old bytes until such a handle ends, and seeks into them, so
         truncate() and write() take the pinned size as the end of file,
-        not the handler's. On the other handlers the two agree, except
-        after a write that got no reply, which write() does not count:
-        if the handler carried it out, the file reaches past the pin, and
-        a truncate to a length between the two leaves it longer. A stale
-        pin is measured first (_measure_stale_pin), so the caller must not
-        hold the handle's lock.
+        not the handler's. On the other handlers the two agree.
+
+        A write that got no reply, or a truncate's zeros that got none,
+        marks the handle (lost_write): the pin does not count it, and if
+        the handler carried it out, the file reaches past the pin. Such a
+        handle gets None, so its truncates and writes take the handler's
+        end, as for an unpinned file. On BFFS a truncate below that end,
+        other than to 0, is then refused and fails with EIO.
+
+        A stale pin is measured first (_measure_stale_pin), so the caller
+        must not hold the handle's lock.
         """
+        if entry.get("lost_write"):
+            return None
         path = _handle_path(entry, path)
         if path not in self._pinned_stats:
             return None
@@ -3632,6 +3639,10 @@ class AmigaFuseFS(_FuseOperations):
                 # The handler's position is unknown after a failed write or
                 # seek, so the next write must seek explicitly.
                 entry["pos"] = None
+                if not res2:
+                    # A write with no reply may still land, past the
+                    # pinned size (_pinned_end).
+                    entry["lost_write"] = True
                 raise FuseOSError(_WRITE_ERRNOS.get(res2, errno.EIO))
             entry["pos"] = offset + written
             entry["dirty"] = True  # Mark as needing flush on close
@@ -3768,15 +3779,17 @@ class AmigaFuseFS(_FuseOperations):
                     # pfs3aio shrink would move the far handles, so they
                     # forget their positions, as a moved one does in
                     # _settle_handles. A shrink below the pin has the pin
-                    # measured again (_measure_stale_pin). A change to a
-                    # length at or past the pin is not marked: from a pin
-                    # that agrees with the handler, a lost grow cannot
-                    # leave the end below it.
+                    # measured again (_measure_stale_pin). A grow from the
+                    # pin cannot leave the end below it, but its zeros may
+                    # land past it, as a lost write's data may
+                    # (_pinned_end).
                     if far_may_move:
                         for other in far:
                             other["pos"] = None
                     if end is not None and length < end:
                         entry["stale_pin"] = True
+                    elif end is not None and length > end:
+                        entry["lost_write"] = True
                 if size < 0:
                     raise FuseOSError(_WRITE_ERRNOS.get(res2, errno.EIO))
                 entry["dirty"] = True  # Truncate modifies the file

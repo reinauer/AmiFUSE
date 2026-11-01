@@ -52,7 +52,8 @@ class _FakeVolume:
     With withhold_sizes, withhold_writes or withhold_seeks set,
     ACTION_SET_FILE_SIZE, ACTION_WRITE or ACTION_SEEK gets no reply; land()
     carries out the withheld size change, as a handler that finishes it
-    late does.
+    late does. With lose_write_replies set, ACTION_WRITE is carried out but
+    gets no reply, as a write the handler finishes late.
     """
 
     def __init__(self, data, bffs):
@@ -65,6 +66,7 @@ class _FakeVolume:
         self.withhold_sizes = False
         self.withhold_writes = False
         self.withhold_seeks = False
+        self.lose_write_replies = False
         self.pending = None
         self.buf = b""
         self.reply = NO_REPLY
@@ -119,7 +121,7 @@ class _FakeVolume:
         self.data[h["pos"]:h["pos"] + size] = self.buf[:size]
         h["pos"] += size
         h["max"] = max(h["max"], h["pos"])
-        self.reply = _reply(size)
+        self.reply = NO_REPLY if self.lose_write_replies else _reply(size)
         return PKT, 0
 
     def set_size(self, state, fh_addr, size, mode):
@@ -407,3 +409,51 @@ def test_measured_pin_never_rises(fuse_mock):
     fs.release("/file", fh)
 
     assert volume.data == data + bytes(500) + b"abc"
+
+
+# --- a write that got no reply but landed ----------------------------------
+
+PIN = 1000
+
+
+@pytest.mark.parametrize("length", [PIN, 1500], ids=["at-pin", "between"])
+@pytest.mark.parametrize("lost", ["write", "grow"])
+@pytest.mark.parametrize("bffs", [False, True], ids=["ffs", "bffs"])
+def test_truncate_after_lost_write_takes_handler_end(fuse_mock, bffs, lost,
+                                                     length):
+    """A write that got no reply, or a grow's zeros, may land past the pin,
+    which does not count them. The handle's truncates then take the
+    handler's end, as for an unpinned file: a shrink goes out, and
+    on BFFS, which refuses it, the truncate fails with EIO rather than
+    report a size the file does not have.
+
+    BFFS refuses the write's own undo, a shrink back to the pin. Elsewhere
+    the undo would cut the late write, so here it is lost as well and
+    never carried out."""
+    volume = _FakeVolume(CONTENT if bffs else b"", bffs=bffs)
+    fs = _fs(volume)
+    fh = (fs.open("/file", os.O_RDWR | os.O_TRUNC) if bffs
+          else fs.create("/file", 0o644))
+    fs.write("/file", b"w" * PIN, 0, fh)
+    volume.lose_write_replies = True
+    volume.withhold_sizes = True
+    if lost == "write":
+        _eio(lambda: fs.write("/file", b"x" * PIN, PIN, fh))
+        landed = b"x" * PIN
+    else:
+        _eio(lambda: fs.truncate("/file", 2 * PIN, fh))
+        landed = bytes(PIN)
+    volume.lose_write_replies = False
+    volume.withhold_sizes = False
+    sizes = len(volume.set_sizes)
+
+    if bffs:
+        _eio(lambda: fs.truncate("/file", length, fh))
+        assert volume.set_sizes[sizes:] == [length]
+        fs.release("/file", fh)
+        return
+    assert fs.truncate("/file", length, fh) == 0
+    assert volume.set_sizes[sizes:] == [length]
+    assert volume.data == (b"w" * PIN + landed)[:length]
+    assert fs.getattr("/file", fh)["st_size"] == length
+    fs.release("/file", fh)
