@@ -207,6 +207,25 @@ class BlockDeviceBackend:
                 if (container.start_lba < other.start_lba + other.num_sectors
                         and other.start_lba < container.start_lba + container.num_sectors):
                     raise ValueError("Overlapping MBR containers cannot be shared")
+        elif self.mbr_context is not None:
+            # A Parceiro disk's own RDB lies beside the MBR, so a partition
+            # must not reach into an MBR entry. A non-0x76 entry starting at
+            # the partition's first sector is that entry's Amiga view (a
+            # FAT\1 partition over a FAT32 entry), which may run past the
+            # entry's end. A 0x76 entry starts with its own RDB.
+            from .rdb_inspect import MBR_SECTOR_SIZE, MBR_TYPE_AMIGA_RDB
+            byte_start = (offset + start) * self.block_size
+            byte_end = (offset + end) * self.block_size
+            for entry in self.mbr_context.mbr_info.partitions:
+                if not entry.num_sectors:
+                    continue
+                entry_start = entry.start_lba * MBR_SECTOR_SIZE
+                entry_end = entry_start + entry.num_sectors * MBR_SECTOR_SIZE
+                if (entry.partition_type != MBR_TYPE_AMIGA_RDB
+                        and entry_start == byte_start):
+                    continue
+                if byte_start < entry_end and entry_start < byte_end:
+                    raise ValueError("Overlapping MBR containers cannot be shared")
         if isinstance(self.host_lock, PartitionFileLock):
             try:
                 self.host_lock.lock_range((offset + start) * self.block_size,
