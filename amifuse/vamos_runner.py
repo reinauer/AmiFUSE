@@ -288,23 +288,31 @@ class VamosHandlerRuntime:
         # A bad handler file is a user error: raise OSError or ValueError,
         # which mount and format report in one line. The loader returns 0
         # both for a missing file and for one in no format it knows.
-        if not os.path.isfile(handler_path):
+        if not os.path.exists(handler_path):
             raise FileNotFoundError(
                 f"Failed to load handler {handler_path}: no such file")
+        if not os.path.isfile(handler_path):
+            raise ValueError(
+                f"Failed to load handler {handler_path}: not a regular file")
         try:
             seg_baddr = self.slm.seg_loader.load_sys_seglist(str(handler_path))
+        except OSError:
+            # The file could not be read: already a reported refusal.
+            raise
         except Exception as exc:
             # The file is the loader's only input. Its parsers fail on a
             # damaged file with assorted errors (HunkParseError, IndexError,
-            # struct.error, ...); --debug still shows the original.
+            # struct.error, ...), and so can vamos itself, e.g. when a
+            # segment does not fit in memory. --debug still shows the
+            # original.
             raise ValueError(
-                f"Failed to load handler {handler_path}: damaged Amiga "
-                f"executable ({type(exc).__name__}: {exc})"
+                f"Failed to load handler {handler_path}: "
+                f"{type(exc).__name__}: {exc}"
             ) from exc
         if seg_baddr == 0:
             raise ValueError(
-                f"Failed to load handler {handler_path}: not an Amiga "
-                f"executable (HUNK or ELF)"
+                f"Failed to load handler {handler_path}: not a loadable "
+                f"Amiga executable (HUNK or ELF)"
             )
         self.seglist_baddr = seg_baddr
         return seg_baddr

@@ -93,17 +93,41 @@ def test_ls(image, driver):
     _assert_clean_error(_amifuse("ls", str(image), "--driver", str(driver)), driver)
 
 
-def test_missing_handler_file(tmp_path):
-    # The commands refuse a missing --driver before loading it; a direct
-    # caller of the runtime gets an OSError naming the file.
+@pytest.fixture
+def runtime():
     from amifuse.vamos_runner import VamosHandlerRuntime
 
-    missing = tmp_path / "missing.handler"
     runtime = VamosHandlerRuntime()
     runtime.setup(cpu="68020")
-    try:
-        with pytest.raises(FileNotFoundError) as caught:
-            runtime.load_handler(missing)
-    finally:
-        runtime.shutdown()
-    assert str(caught.value) == f"Failed to load handler {missing}: no such file"
+    yield runtime
+    runtime.shutdown()
+
+
+@pytest.mark.parametrize("kind,error,reason", [
+    ("missing", FileNotFoundError, "no such file"),
+    ("directory", ValueError, "not a regular file"),
+])
+def test_handler_path_not_a_file(runtime, tmp_path, kind, error, reason):
+    # mount and format refuse such a --driver before loading it; the file
+    # commands reach load_handler with it.
+    path = tmp_path / "drv.handler"
+    if kind == "directory":
+        path.mkdir()
+    with pytest.raises(error) as caught:
+        runtime.load_handler(path)
+    assert str(caught.value) == f"Failed to load handler {path}: {reason}"
+
+
+def test_unreadable_handler_keeps_its_os_error(runtime, tmp_path, monkeypatch):
+    # A read error is not a bad file: it reaches the commands as it was.
+    path = tmp_path / "drv.handler"
+    path.write_bytes(DRIVERS["random"])
+    failure = PermissionError(13, "Permission denied", str(path))
+
+    def load_sys_seglist(*args, **kwargs):
+        raise failure
+
+    monkeypatch.setattr(runtime.slm.seg_loader, "load_sys_seglist", load_sys_seglist)
+    with pytest.raises(PermissionError) as caught:
+        runtime.load_handler(path)
+    assert caught.value is failure
