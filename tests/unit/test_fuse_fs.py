@@ -2088,6 +2088,7 @@ def _fake_write_bridge(fuse_fs_mod, handler, free_blocks=2048):
     bridge.mem.w_block.side_effect = handler.w_block
     bridge.mem.r_block.side_effect = handler.r_block
     bridge._alloc_read_buf = MagicMock(return_value=SimpleNamespace(addr=0x2000))
+    bridge._alloc_empty_buf = MagicMock(return_value=SimpleNamespace(addr=0x2000))
     bridge._run_until_replies = MagicMock(side_effect=lambda: handler.reply)
     info = None
     if free_blocks is not None:

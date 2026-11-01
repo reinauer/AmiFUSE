@@ -1846,12 +1846,22 @@ class HandlerBridge:
             return [_packet_type_name(pkt_type)
                     for pkt_type, _ in self._pending_packets().values()]
 
-    # Bridge memory taken out of use while a packet still out points to it:
-    # the FIB, read buffers and BSTRs; see _free_retired.
+    # Bridge memory taken out of use while a packet still out points to it;
+    # see _free_retired. The small buffers: the FIB, the BSTRs and the
+    # buffer of the write of no bytes, at most 260 bytes each.
     _retired = ()
-    # The most of it at once: 16 full read buffers, an eighth of the 8 MiB
-    # the handler and the bridge share (VamosHandlerRuntime's ram_size).
+    # The read and write buffers, up to IO_CHUNK each.
+    _retired_data = ()
+    # The most of those at once: 16 full read buffers, an eighth of the
+    # 8 MiB the handler and the bridge share (VamosHandlerRuntime's
+    # ram_size). The small ones have no cap: each packet still out holds
+    # at most two, so tens of thousands of packets would have to go
+    # unanswered, each after a full wait, before they took that much. And a
+    # cap on them would fail a lookup halfway through a path, or the undo
+    # of a rename, with the locks it took still held.
     _RETIRED_MAX = 16 * IO_CHUNK
+    # write_empty_reply's buffer; see _alloc_empty_buf.
+    _empty_buf_mem = None
 
     def _pending_packets(self) -> Dict[int, Tuple[int, Tuple[int, ...]]]:
         """The launcher's packets with no reply yet, packet -> (type, args)."""
@@ -1877,27 +1887,34 @@ class HandlerBridge:
 
     def _free_retired(self, held: Set[int]) -> None:
         """Free retired memory that no packet still out points to."""
-        keep = []
-        for mem_obj in self._retired:
-            if self._is_held(mem_obj.addr, held):
-                keep.append(mem_obj)
-            else:
-                self.vh.alloc.free_memory(mem_obj)
-        self._retired = keep
+        def keep(retired):
+            kept = []
+            for mem_obj in retired:
+                if self._is_held(mem_obj.addr, held):
+                    kept.append(mem_obj)
+                else:
+                    self.vh.alloc.free_memory(mem_obj)
+            return kept
+        self._retired = keep(self._retired)
+        self._retired_data = keep(self._retired_data)
 
-    def _retire_if_held(self, mem_obj, held: Set[int]) -> bool:
+    def _retire_if_held(self, mem_obj, held: Set[int], data: bool = False) -> bool:
         """Retire mem_obj if a packet still out points to it; say whether.
 
-        Past _RETIRED_MAX it stays where it is, out of use, and the request
-        fails with EIO instead, so that a handler which leaves packet after
-        packet unanswered cannot run the emulated RAM out. Requests work
-        again once late replies free enough of it.
+        A read or write buffer (data) past _RETIRED_MAX stays where it is,
+        out of use, and the request fails with EIO instead, so that a
+        handler which leaves read after read unanswered cannot run the
+        emulated RAM out. Reads and writes work again once late replies
+        free enough of it. A small buffer is always retired.
         """
         if mem_obj is None or not self._is_held(mem_obj.addr, held):
             return False
-        if sum(m.size for m in self._retired) + mem_obj.size > self._RETIRED_MAX:
+        if not data:
+            self._retired = [*self._retired, mem_obj]
+            return True
+        if sum(m.size for m in self._retired_data) + mem_obj.size > self._RETIRED_MAX:
             raise FuseOSError(errno.EIO)
-        self._retired = [*self._retired, mem_obj]
+        self._retired_data = [*self._retired_data, mem_obj]
         return True
 
     def _alloc_fib(self):
@@ -1918,7 +1935,7 @@ class HandlerBridge:
     def _alloc_read_buf(self, size: int):
         held = self._held_args()
         self._free_retired(held)
-        if self._retire_if_held(self._read_buf_mem, held):
+        if self._retire_if_held(self._read_buf_mem, held, data=True):
             # A READ or WRITE still out may yet use it: this one gets its own.
             self._read_buf_mem = None
         if self._read_buf_mem is None:
@@ -1931,6 +1948,20 @@ class HandlerBridge:
             self.vh.alloc.free_memory(old_mem)
         self.mem.w_block(self._read_buf_mem.addr, b"\x00" * size)
         return self._read_buf_mem
+
+    def _alloc_empty_buf(self):
+        """The buffer for write_empty_reply's write of no bytes.
+
+        A small buffer of its own, not the read buffer, so that the write
+        never fails at _RETIRED_MAX.
+        """
+        held = self._held_args()
+        self._free_retired(held)
+        if self._retire_if_held(self._empty_buf_mem, held):
+            self._empty_buf_mem = None
+        if self._empty_buf_mem is None:
+            self._empty_buf_mem = self.vh.alloc.alloc_memory(4, label="FUSE_EMPTYBUF")
+        return self._empty_buf_mem
 
     def _alloc_bstr(self, text: str):
         encoded = text.encode("latin-1", errors="replace")
@@ -2988,10 +3019,7 @@ class HandlerBridge:
         """
         with self._lock:
             self._unwritten_outputs.discard(fh_addr)
-            try:
-                buf_mem = self._alloc_read_buf(1)
-            except FuseOSError:
-                return -1, 0  # past _RETIRED_MAX; nothing was sent
+            buf_mem = self._alloc_empty_buf()
             pkt_addr, _ = self.launcher.send_write_handle(
                 self.state, fh_addr, buf_mem.addr, 0)
             reply = self._run_until_reply(pkt_addr, "write")
@@ -3910,9 +3938,9 @@ class AmigaFuseFS(_FuseOperations):
         that got no reply, which the handler may still hold, or a refused
         open again, the entry is left closed with no handle: its reads,
         writes and truncates fail with EIO, and release() ends nothing. So
-        is it after an open that raises, as one past _RETIRED_MAX does with
-        EIO, and the error goes on to the caller: the old FileHandle is
-        back in the pool, and the next open can take it.
+        is it after an open or a write that raises, as one does when the
+        emulated RAM runs out, and the error goes on to the caller: the old
+        FileHandle is back in the pool, and the next open can take it.
         """
         bridge = self.bridge
         bridge.close_file(entry["fh_addr"])
@@ -4378,20 +4406,15 @@ class AmigaFuseFS(_FuseOperations):
         open() keeps a lock on the directory a file was opened in until
         release(). Left on the directory the file was renamed out of, it
         keeps the handler from deleting that directory once it is empty.
-        The entry keeps the old lock if dir_path can't be locked, also when
-        the lookup raises, as one past _RETIRED_MAX does with EIO: the
-        rename is done, and must not be reported as failed.
+        The entry keeps the old lock if dir_path can't be locked.
         """
         with entry["lock"]:
             # release() marks the entry closed before it frees the lock.
             if entry.get("closed") or not entry.get("parent_lock"):
                 return
-            try:
-                lock, _, _ = self.bridge.locate_path(dir_path)
-                if dir_path == "/" and lock == 0:
-                    lock, _ = self.bridge.locate(0, "")
-            except FuseOSError:
-                lock = 0
+            lock, _, _ = self.bridge.locate_path(dir_path)
+            if dir_path == "/" and lock == 0:
+                lock, _ = self.bridge.locate(0, "")
             if lock == 0:
                 self._log_op("rename", dir_path, "could not lock the new directory")
                 return
