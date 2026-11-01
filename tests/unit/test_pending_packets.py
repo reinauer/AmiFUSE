@@ -482,7 +482,7 @@ def test_a_truncate_whose_reopen_raises_leaves_its_handle_closed(bridge, monkeyp
     handle = ops.open("/file", os.O_RDWR)
     entry = ops._fh_cache[handle]
     fh = entry["fh_addr"]
-    monkeypatch.setattr(b, "truncate_handle", lambda fh, length, others=(): (
+    monkeypatch.setattr(b, "truncate_handle", lambda fh, length, others=(), **_: (
         -1, fs.ERROR_OBJECT_NOT_FOUND))
     open_file_reply = b.open_file_reply
     no_memory = [True]
@@ -532,7 +532,7 @@ def test_a_truncate_whose_lock_free_raises_keeps_no_pooled_handle(
     ops = fs.AmigaFuseFS(b)
     handle = ops.open("/file", os.O_RDWR)
     entry = ops._fh_cache[handle]
-    monkeypatch.setattr(b, "truncate_handle", lambda fh, length, others=(): (
+    monkeypatch.setattr(b, "truncate_handle", lambda fh, length, others=(), **_: (
         -1, fs.ERROR_OBJECT_NOT_FOUND))
     free_lock = b.free_lock
     freed = []
