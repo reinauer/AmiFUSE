@@ -12,6 +12,9 @@
   stores differently, and fails with EBUSY, leaving the directory visible,
   when a lock that an open file keeps on the directory it was renamed out
   of refuses it.
+- A deferred file delete that the handler refuses at the last release(),
+  for a second handle under another letter case, leaves the file visible,
+  and rmdir() of its directory then fails with ENOTEMPTY (#222).
 
 The tests call the AmigaFuseFS callbacks directly, as a mount would, on
 copies of the fixture images or on an FFS floppy made with xdftool for the
@@ -217,3 +220,26 @@ def test_rmdir_refused_by_a_lock_an_open_file_holds_is_busy(open_ops, handler, m
     ops.release("/x", hx)
     assert ops.rmdir("/d") == 0
     assert "d" not in _listed(ops, "/")
+
+
+@pytest.mark.parametrize("handler", [_fixture(OFS), _fixture(PFS), _fixture(SFS)])
+def test_deferred_delete_refused_at_release_leaves_the_file_visible(open_ops, handler):
+    ops = open_ops(handler)
+    ops.mkdir("/d", 0o755)
+    _make(ops, "/d/x", b"x" * 100)
+    h1 = ops.open("/d/x", os.O_RDONLY)
+    h2 = ops.open("/d/X", os.O_RDONLY)  # the same file, in another letter case
+    assert ops.unlink("/d/x") == 0
+
+    ops.release("/d/x", h1)  # the handle on /d/X keeps the file in use
+    ops.release("/d/X", h2)
+
+    assert ops._pending_deletes == set()
+    assert _listed(ops, "/d") == ["x"]
+    assert "x" in ops.readdir("/d", None)
+    assert ops.getattr("/d/x")["st_size"] == 100
+
+    assert _errno_of(ops.rmdir, "/d") == errno.ENOTEMPTY
+    assert ops._pending_deletes == set()
+    assert ops._pending_dir_deletes == {}
+    assert _shown(ops, "/d")

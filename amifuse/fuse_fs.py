@@ -3932,12 +3932,21 @@ class AmigaFuseFS(_FuseOperations):
         return 0
 
     def _pending_children(self, path: str) -> set:
-        """Direct children of path with a pending delete. Caller holds _fh_lock.
+        """Direct children of path with a pending delete that a retry will
+        send. Caller holds _fh_lock.
+
+        A file child counts only while a FUSE handle with an AmigaDOS
+        FileHandle is open on it, whose release() sends the delete (#222).
+        A directory child counts while it waits on children of its own or
+        on a directory handle, as _drop_failed_dir_delete keeps it.
 
         Direct children only: _resolve_pending_dir_deletes strikes a deleted
         path off its parent's set and no other.
         """
-        children = {p for p in self._pending_deletes if p.rsplit("/", 1)[0] == path}
+        held = {v.get("path") for v in self._fh_cache.values()
+                if "fh_addr" in v or v.get("dir_handle")}
+        children = {p for p in self._pending_deletes
+                    if p.rsplit("/", 1)[0] == path and p in held}
         children.update(d for d in self._pending_dir_deletes if d.rsplit("/", 1)[0] == path)
         return children
 
@@ -3960,6 +3969,8 @@ class AmigaFuseFS(_FuseOperations):
         _pending_dir_deletes) or the releasedir() of a FUSE directory handle
         open on path. Otherwise the directory shows again, and so does each
         deferred parent waiting on it, which can now never be emptied.
+        release() passes a file whose deferred delete was refused, which no
+        retry waits on either.
         """
         while True:
             if path in self._pending_dir_deletes or any(
@@ -4685,22 +4696,26 @@ class AmigaFuseFS(_FuseOperations):
             delete_succeeded = False
             try:
                 dir_path, name = self._split_path(resolved_path)
-                lock_bptr, _, locks = self.bridge.locate_path(dir_path)
+                lock_bptr, res2, locks = self.bridge.locate_path(dir_path)
                 if dir_path == "/" and lock_bptr == 0:
-                    lock_bptr, _ = self.bridge.locate(0, "")
+                    lock_bptr, res2 = self.bridge.locate(0, "")
                     if lock_bptr:
                         locks.append(lock_bptr)
                 if lock_bptr != 0:
                     res1, res2 = self.bridge.delete_object(lock_bptr, name)
                     self._log_op("release", resolved_path, f"deferred delete res1={res1} res2={res2}")
-                    if res1 != 0:
-                        delete_succeeded = True
-                    else:
-                        with self._fh_lock:
-                            self._pending_deletes.add(resolved_path)
-                else:
+                    delete_succeeded = res1 != 0
+                if not delete_succeeded:
                     with self._fh_lock:
-                        self._pending_deletes.add(resolved_path)
+                        if res2 == -1:
+                            # No reply: the delete may still happen.
+                            self._pending_deletes.add(resolved_path)
+                        else:
+                            # Refused, with no handle left on the path to
+                            # send it again (#222). The file shows again,
+                            # and so does a deferred parent waiting on it,
+                            # which can now never be emptied.
+                            self._drop_failed_dir_delete(resolved_path)
                 for l in reversed(locks):
                     self.bridge.free_lock(l)
                 if delete_succeeded:
