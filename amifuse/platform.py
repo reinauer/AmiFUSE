@@ -601,6 +601,11 @@ def _parse_mount_tokens(tokens):
     # Image is the first positional arg after 'mount' (not starting with '-')
     image = None
     mountpoint = None
+    # Positional tokens after the mountpoint value: those right after it
+    # (`run`), and all of them (`after`); see the check after the loop.
+    run = after = 0
+    in_run = False
+    image_first = False
     i = mount_idx + 1
     while i < len(tokens):
         tok = tokens[i]
@@ -612,23 +617,28 @@ def _parse_mount_tokens(tokens):
         if len(option) >= 3 and "--mountpoint".startswith(option):
             if eq:
                 i += 1
-                if value.startswith('"') and (len(value) < 2
-                                              or not value.endswith('"')):
+                if value.count('"') % 2:
                     # cmd.exe passes --mountpoint="C:\a b" on as typed, and
                     # the Windows tokenizer splits it at each run of spaces,
                     # so the path can't be rebuilt exactly. Skip its pieces
                     # and report no mountpoint rather than part of one.
-                    while i < len(tokens) and not tokens[i].endswith('"'):
+                    while i < len(tokens) and not tokens[i].count('"') % 2:
                         i += 1
                     i += 1
+                    mountpoint, in_run = None, False
                 else:
                     mountpoint = value
+                    run = after = 0
+                    in_run, image_first = True, image is not None
                 continue
             if i + 1 < len(tokens):
                 mountpoint = tokens[i + 1]
+                run = after = 0
+                in_run, image_first = True, image is not None
                 i += 2
                 continue
         if tok.startswith("-"):
+            in_run = False
             # Skip flags; if flag takes a value, skip next token too
             # Known value-taking flags in mount subcommand
             value_flags = {"--driver", "--partition", "--block-size", "--volname"}
@@ -639,8 +649,20 @@ def _parse_mount_tokens(tokens):
             continue
         if image is None:
             image = tok
+        if mountpoint is not None:
+            after += 1
+            run += in_run
         i += 1
 
+    # `ps` joins a Unix process's arguments with spaces and no quotes, so a
+    # mountpoint with a space arrives split, its rest as positionals right
+    # after it. `mount` takes one positional, the image. With the image
+    # read first, a positional right after the mountpoint is its rest (a
+    # split --volname value comes after its own flag). With the image after
+    # it, more than one positional is ambiguous. Part of a path is worse
+    # than none.
+    if mountpoint is not None and (run if image_first else after > 1):
+        mountpoint = None
     return _strip_matched_quotes(image), _strip_matched_quotes(mountpoint)
 
 

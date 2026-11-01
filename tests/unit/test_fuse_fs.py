@@ -413,30 +413,32 @@ class TestMountFuseOptions:
         assert kwargs is not None, "FUSE was not called"
         assert kwargs["foreground"] is False
 
-    @pytest.mark.parametrize("mountpoint, hint", [
-        # On FUSE-T, `amifuse unmount` can't identify a mount started
-        # without --mountpoint, so the banner doesn't offer it there.
-        (None, f"unmount with: umount {Path('/mnt/test')}"),
-        (Path("/Users/me/mnt"), "unmount with: amifuse unmount "),
+    @pytest.mark.parametrize("mountpoint, shown", [
+        (None, "/mnt/test"),
+        ("/Users/me/mnt", "/Users/me/mnt"),
+        ("/Volumes/Work Disk", "'/Volumes/Work Disk'"),
     ])
-    def test_darwin_daemon_banner_offers_an_unmount_that_works(
-            self, monkeypatch, mock_mount_fuse_deps, capsys, mountpoint, hint):
+    def test_darwin_daemon_banner_offers_umount(
+            self, monkeypatch, mock_mount_fuse_deps, capsys, mountpoint, shown):
+        """On FUSE-T, `amifuse unmount` refuses a mount it can't tie to its
+        process (no --mountpoint, or one with a space); `umount` works."""
+        from pathlib import PurePosixPath
         monkeypatch.setattr("sys.platform", "darwin")
         import amifuse.platform as plat_mod
-        monkeypatch.setattr(plat_mod, "validate_mountpoint", lambda mp: None)
+        monkeypatch.setattr(plat_mod, "get_default_mountpoint",
+                            lambda v: PurePosixPath("/mnt/test"))
         from amifuse.fuse_fs import mount_fuse
 
         mount_fuse(
             image=Path("/tmp/test.hdf"),
             driver=None,
-            mountpoint=mountpoint,
+            mountpoint=PurePosixPath(mountpoint) if mountpoint else None,
             block_size=None,
         )
 
         out = capsys.readouterr().out
-        assert hint in out
-        if mountpoint is None:
-            assert "amifuse unmount" not in out
+        assert f"daemon mode; unmount with: umount {shown}\n" in out
+        assert "amifuse unmount" not in out
 
     def test_mount_defaults_to_daemon_on_windows(self, monkeypatch, mock_mount_fuse_deps):
         """Windows defaults to daemon mode now that unmount is available."""

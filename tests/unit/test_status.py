@@ -74,6 +74,27 @@ class TestParseMountTokens:
         assert image == "C:\\img.hdf"
         assert mp == expected
 
+    @pytest.mark.parametrize("command, expected", [
+        # `ps` shows a Unix process's arguments joined with spaces and no
+        # quotes, so a mountpoint with a space arrives split.
+        ("amifuse mount img.hdf --mountpoint=/Volumes/Work Disk", None),
+        ("amifuse mount img.hdf --mountpoint /Volumes/Work Disk --write", None),
+        ("amifuse mount --mountpoint /Volumes/Work Disk --driver D img.hdf",
+         None),
+        # Split values elsewhere leave the mountpoint alone.
+        ("amifuse mount My Disk.hdf --mountpoint /Volumes/Work", "/Volumes/Work"),
+        ("amifuse mount img.hdf --mountpoint /Volumes/Work --volname Work Disk",
+         "/Volumes/Work"),
+        ("amifuse mount --mountpoint /Volumes/Work img.hdf", "/Volumes/Work"),
+    ])
+    def test_unix_ps_command_with_split_mountpoint(self, command, expected):
+        """Unix discovery splits `ps` output with posix shlex."""
+        import shlex
+        from amifuse.platform import _parse_mount_tokens
+
+        _image, mp = _parse_mount_tokens(shlex.split(command))
+        assert mp == expected
+
     def test_no_mount_subcommand(self):
         from amifuse.platform import _parse_mount_tokens
 
