@@ -586,6 +586,11 @@ class TestEnrichNullMountpoints:
         monkeypatch.setattr("os.path.isdir", lambda p: p == "/Volumes")
         monkeypatch.setattr("os.listdir", lambda p: ["DH0", "Macintosh HD"])
         monkeypatch.setattr("os.path.ismount", lambda p: True)
+        monkeypatch.setattr(
+            "amifuse.platform._macos_mount_table",
+            lambda **kwargs: ["/dev/disk3s1s1 on /",
+                              "amifuse:DH0 on /Volumes/DH0"],
+        )
 
         mounts = [{"mountpoint": None, "pid": 456}]
         all_mounts = mounts[:]
@@ -598,12 +603,55 @@ class TestEnrichNullMountpoints:
         monkeypatch.setattr("os.path.isdir", lambda p: p == "/Volumes")
         monkeypatch.setattr("os.listdir", lambda p: ["DH0", "DH1"])
         monkeypatch.setattr("os.path.ismount", lambda p: True)
+        monkeypatch.setattr(
+            "amifuse.platform._macos_mount_table",
+            lambda **kwargs: ["amifuse:DH0 on /Volumes/DH0",
+                              "amifuse:DH1 on /Volumes/DH1"],
+        )
 
         null_mount = {"mountpoint": None, "pid": 456}
         claimed_mount = {"mountpoint": "/Volumes/DH0", "pid": 789}
         all_mounts = [claimed_mount, null_mount]
         _enrich_mountpoints_macos([null_mount], all_mounts)
         assert null_mount["mountpoint"] == "/Volumes/DH1"
+
+    def test_enrich_macos_skips_volume_that_is_not_amifuse(self, monkeypatch):
+        """#296: a USB stick that sorts first is not paired with the mount."""
+        from amifuse.platform import _enrich_mountpoints_macos
+
+        monkeypatch.setattr("os.path.isdir", lambda p: p == "/Volumes")
+        monkeypatch.setattr(
+            "os.listdir", lambda p: ["Macintosh HD", "Work", "Backup"])
+        monkeypatch.setattr("os.path.ismount", lambda p: True)
+        monkeypatch.setattr(
+            "amifuse.platform._macos_mount_table",
+            lambda **kwargs: ["/dev/disk3s1s1 on /",
+                              "/dev/disk4s1 on /Volumes/Backup",
+                              "amifuse:Work on /Volumes/Work"],
+        )
+
+        mounts = [{"mountpoint": None, "image": "/Users/me/work.hdf",
+                   "pid": 4242}]
+        _enrich_mountpoints_macos(mounts, mounts)
+        assert mounts[0]["mountpoint"] == "/Volumes/Work"
+
+    def test_enrich_macos_leaves_mount_unpaired_without_amifuse_volume(
+            self, monkeypatch):
+        """With only the user's own disks in /Volumes, nothing is paired."""
+        from amifuse.platform import _enrich_mountpoints_macos
+
+        monkeypatch.setattr("os.path.isdir", lambda p: p == "/Volumes")
+        monkeypatch.setattr("os.listdir", lambda p: ["Macintosh HD", "Backup"])
+        monkeypatch.setattr("os.path.ismount", lambda p: True)
+        monkeypatch.setattr(
+            "amifuse.platform._macos_mount_table",
+            lambda **kwargs: ["/dev/disk3s1s1 on /",
+                              "/dev/disk4s1 on /Volumes/Backup"],
+        )
+
+        mounts = [{"mountpoint": None, "pid": 4242}]
+        _enrich_mountpoints_macos(mounts, mounts)
+        assert mounts[0]["mountpoint"] is None
 
     def test_text_output_uses_truncation(self, monkeypatch, capsys):
         from amifuse.fuse_fs import cmd_status

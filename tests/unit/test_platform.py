@@ -728,11 +728,211 @@ class TestValidateMountpoint:
             "amifuse.platform.shutil.which",
             lambda cmd: "/sbin/umount" if cmd == "umount" else None,
         )
+        # Keep the host's mount table and processes out of it.
+        monkeypatch.setattr("amifuse.platform._macos_mount_table",
+                            lambda **kwargs: [])
+        monkeypatch.setattr("amifuse.platform.find_amifuse_mounts",
+                            lambda **kwargs: [])
         from amifuse.platform import validate_mountpoint
 
         result = validate_mountpoint(PurePosixPath("/mnt/amiga"))
         assert result is not None
         assert "stale or broken mount" in result
+
+    @staticmethod
+    def _darwin_mounted(monkeypatch, mount_table, stale=False):
+        monkeypatch.setattr("sys.platform", "darwin")
+        # A stale mount reads as missing; is_stale_mountpoint then says so.
+        monkeypatch.setattr("amifuse.platform.os.path.exists",
+                            lambda path: not stale)
+        monkeypatch.setattr("amifuse.platform.os.path.ismount",
+                            lambda path: not stale)
+        monkeypatch.setattr("amifuse.platform.is_stale_mountpoint",
+                            lambda mountpoint: stale)
+        monkeypatch.setattr(
+            "amifuse.platform._macos_mount_table",
+            lambda **kwargs: mount_table,
+        )
+        # The AmiFUSE process serving /Volumes/Work, paired by `status`.
+        monkeypatch.setattr(
+            "amifuse.platform.find_amifuse_mounts",
+            lambda **kwargs: [{"mountpoint": "/Volumes/Work", "pid": 4242}],
+        )
+        monkeypatch.setattr("amifuse.platform.os.getppid", lambda: 1)
+
+    def test_validate_darwin_stale_mount_of_another_disk_suggests_no_unmount(
+            self, monkeypatch):
+        """A stale share at /Volumes/Backup isn't AmiFUSE's either."""
+        self._darwin_mounted(monkeypatch, [
+            "//me@nas/Backup on /Volumes/Backup",
+            "amifuse:Work on /Volumes/Work",
+        ], stale=True)
+        from amifuse.platform import validate_mountpoint
+
+        result = validate_mountpoint(PurePosixPath("/Volumes/Backup"))
+        assert result is not None
+        assert "stale or broken mount" in result
+        assert "amifuse unmount" not in result
+        assert "--mountpoint" in result
+
+    def test_validate_darwin_stale_amifuse_mount_suggests_unmount(
+            self, monkeypatch):
+        self._darwin_mounted(monkeypatch, [
+            "amifuse:Work on /Volumes/Work",
+        ], stale=True)
+        from amifuse.platform import validate_mountpoint
+
+        result = validate_mountpoint(PurePosixPath("/Volumes/Work"))
+        assert result is not None
+        assert "stale or broken mount" in result
+        assert "amifuse unmount /Volumes/Work" in result
+
+    def test_validate_darwin_mount_of_another_disk_suggests_no_unmount(
+            self, monkeypatch):
+        """#296: /Volumes/Backup is the user's USB stick; never suggest
+        `amifuse unmount` for it."""
+        self._darwin_mounted(monkeypatch, [
+            "/dev/disk4s1 on /Volumes/Backup",
+            "amifuse:Work on /Volumes/Work",
+        ])
+        from amifuse.platform import validate_mountpoint
+
+        result = validate_mountpoint(PurePosixPath("/Volumes/Backup"))
+        assert result is not None
+        assert "already a mount" in result
+        assert "amifuse unmount" not in result
+        assert "--mountpoint" in result
+        assert "--volname" in result
+
+    def test_validate_darwin_amifuse_mount_suggests_unmount(self, monkeypatch):
+        """An AmiFUSE mount in the way still gets the unmount hint."""
+        self._darwin_mounted(monkeypatch, [
+            "/dev/disk4s1 on /Volumes/Backup",
+            "amifuse:Work on /Volumes/Work",
+        ])
+        from amifuse.platform import validate_mountpoint
+
+        result = validate_mountpoint(PurePosixPath("/Volumes/Work"))
+        assert result is not None
+        assert "amifuse unmount /Volumes/Work" in result
+
+
+class TestIsAmifuseMountMacos:
+    """is_amifuse_mount_macos(): the source `mount` lists, or the AmiFUSE
+    process serving the path."""
+
+    MOUNT_OUTPUT = (
+        "/dev/disk3s1s1 on / (apfs, sealed, local, read-only, journaled)\n"
+        "devfs on /dev (devfs, local, nobrowse)\n"
+        "/dev/disk4s1 on /Volumes/Backup (msdos, local, nodev, nosuid, noowners)\n"
+        "amifuse:Work on /Volumes/Work (macfuse, nodev, nosuid, synchronous, "
+        "mounted by me)\n"
+        "/dev/disk5s1 on /Volumes/Disk (1) (apfs, local, nodev, nosuid, "
+        "journaled, noowners)\n"
+        "amifuse:Work on Mars on /Volumes/Work on Mars (macfuse, nodev, "
+        "nosuid, synchronous, mounted by me)\n"
+    )
+
+    def _stub_mount(self, monkeypatch, stdout, returncode=0, processes=()):
+        import amifuse.platform as plat
+
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            return types.SimpleNamespace(returncode=returncode, stdout=stdout,
+                                         stderr="")
+
+        monkeypatch.setattr("sys.platform", "darwin")
+        monkeypatch.setattr(plat.subprocess, "run", fake_run)
+        # Running AmiFUSE processes as process discovery reports them.
+        monkeypatch.setattr(plat, "find_amifuse_mounts",
+                            lambda **kwargs: [dict(p) for p in processes])
+        monkeypatch.setattr(plat.os, "getppid", lambda: 1)
+        return calls
+
+    def test_amifuse_volume_is_recognised(self, monkeypatch):
+        from amifuse.platform import is_amifuse_mount_macos
+
+        calls = self._stub_mount(monkeypatch, self.MOUNT_OUTPUT)
+        assert is_amifuse_mount_macos(PurePosixPath("/Volumes/Work"))
+        assert is_amifuse_mount_macos("/Volumes/Work/")
+        assert is_amifuse_mount_macos("/Volumes/Work on Mars")
+        assert calls == [["/sbin/mount"]] * 3
+
+    @pytest.mark.parametrize("path", [
+        "/Volumes/Backup", "/Volumes/Disk (1)", "/", "/Volumes/Mars",
+        "/Volumes/Missing",
+    ])
+    def test_other_volume_is_not_amifuse(self, monkeypatch, path):
+        from amifuse.platform import is_amifuse_mount_macos
+
+        # An AmiFUSE process runs, for another mountpoint.
+        self._stub_mount(monkeypatch, self.MOUNT_OUTPUT, processes=[
+            {"mountpoint": "/Volumes/Work", "pid": 4242}])
+        assert not is_amifuse_mount_macos(PurePosixPath(path))
+
+    def test_unreadable_table_is_not_amifuse(self, monkeypatch):
+        from amifuse.platform import is_amifuse_mount_macos
+
+        self._stub_mount(monkeypatch, self.MOUNT_OUTPUT, returncode=1)
+        assert not is_amifuse_mount_macos("/Volumes/Work")
+
+    def test_missing_mount_command_is_not_amifuse(self, monkeypatch):
+        import amifuse.platform as plat
+
+        self._stub_mount(monkeypatch, "")
+
+        def fail(cmd, **kwargs):
+            raise FileNotFoundError(cmd[0])
+
+        monkeypatch.setattr(plat.subprocess, "run", fail)
+        assert not plat.is_amifuse_mount_macos("/Volumes/Work")
+
+    # FUSE-T mounts over NFS and drops the fsname: its source names no
+    # AmiFUSE volume.
+    NFS_OUTPUT = (
+        "/dev/disk4s1 on /Volumes/Backup (msdos, local, nodev, nosuid)\n"
+        "fuse-t:/Work on /tmp/mnt_0 (nfs, nodev, nosuid, mounted by me)\n"
+    )
+
+    def test_nfs_mount_served_by_amifuse_process_is_amifuse(self, monkeypatch):
+        """On FUSE-T, the AmiFUSE process given the mountpoint ties it."""
+        from amifuse.platform import is_amifuse_mount_macos
+
+        self._stub_mount(monkeypatch, self.NFS_OUTPUT, processes=[
+            {"mountpoint": "/tmp/mnt_0", "pid": 4242}])
+        assert is_amifuse_mount_macos(PurePosixPath("/tmp/mnt_0"))
+        assert not is_amifuse_mount_macos(PurePosixPath("/Volumes/Backup"))
+
+    def test_nfs_mount_without_amifuse_process_is_not_amifuse(self, monkeypatch):
+        from amifuse.platform import is_amifuse_mount_macos
+
+        self._stub_mount(monkeypatch, self.NFS_OUTPUT)
+        assert not is_amifuse_mount_macos(PurePosixPath("/tmp/mnt_0"))
+
+    def test_disk_is_not_amifuse_while_a_process_names_its_path(self, monkeypatch):
+        """An `amifuse mount --mountpoint /Volumes/Backup` still starting up
+        doesn't make the USB stick there AmiFUSE's."""
+        from amifuse.platform import is_amifuse_mount_macos
+
+        self._stub_mount(monkeypatch, self.NFS_OUTPUT, processes=[
+            {"mountpoint": "/Volumes/Backup", "pid": 4242}])
+        assert not is_amifuse_mount_macos(PurePosixPath("/Volumes/Backup"))
+
+    def test_callers_parent_does_not_count(self, monkeypatch):
+        """`sudo amifuse mount --mountpoint P` checking P: the `sudo` parent
+        repeats the command line but serves no mount."""
+        import amifuse.platform as plat
+
+        self._stub_mount(monkeypatch,
+                         "//me@nas/Share on /Volumes/Share (smbfs, nodev)\n",
+                         processes=[{"mountpoint": "/Volumes/Share",
+                                     "pid": 4242}])
+        monkeypatch.setattr(plat.os, "getppid", lambda: 4242)
+        assert not plat.is_amifuse_mount_macos(PurePosixPath("/Volumes/Share"))
+        monkeypatch.setattr(plat.os, "getppid", lambda: 1)
+        assert plat.is_amifuse_mount_macos(PurePosixPath("/Volumes/Share"))
 
 
 # ---------------------------------------------------------------------------

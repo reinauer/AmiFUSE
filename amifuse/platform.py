@@ -14,6 +14,7 @@ Platform-specific implementations:
 import errno
 import logging
 import os
+import posixpath
 import signal
 import shlex
 import shutil
@@ -321,6 +322,15 @@ def validate_mountpoint(mountpoint: Path) -> Optional[str]:
             return format_stale_mountpoint_error(mountpoint)
         try:
             if os.path.ismount(mp_str):
+                if (sys.platform.startswith("darwin")
+                        and not is_amifuse_mount_macos(mountpoint)):
+                    # Not known to be AmiFUSE's (say, the user's own disk):
+                    # unmounting it is not the way to free the path.
+                    return (
+                        f"Mountpoint {mountpoint} is already a mount, not one "
+                        f"AmiFUSE can identify as its own; choose another with "
+                        f"--mountpoint, or another volume name with --volname."
+                    )
                 if get_unmount_command(mountpoint):
                     return (
                         f"Mountpoint {mountpoint} is already a mount; unmount it first "
@@ -354,6 +364,14 @@ def is_stale_mountpoint(mountpoint: Path) -> bool:
 
 
 def format_stale_mountpoint_error(mountpoint: Path) -> str:
+    if (sys.platform.startswith("darwin")
+            and not is_amifuse_mount_macos(mountpoint)):
+        # `amifuse unmount` refuses a mount it can't tie to AmiFUSE.
+        return (
+            f"Mountpoint {mountpoint} looks like a stale or broken mount, not "
+            f"one AmiFUSE can identify as its own; choose another with "
+            f"--mountpoint, or another volume name with --volname."
+        )
     if get_unmount_command(mountpoint):
         return (
             f"Mountpoint {mountpoint} looks like a stale or broken mount; "
@@ -1251,10 +1269,104 @@ def _enrich_mountpoints_windows(null_mounts, all_mounts):
         mount["mountpoint"] = drive
 
 
+# mount_fuse() sets the FUSE fsname to "amifuse:<volume name>", which macOS
+# lists as the mount's source.
+_AMIFUSE_MOUNT_SOURCE_PREFIX = "amifuse:"
+
+
+def _macos_mount_table() -> List[str]:
+    """Return macOS `mount` entries as "<source> on <mountpoint>" strings.
+
+    Each line of `mount` reads "<source> on <mountpoint> (<options>)"; the
+    options are dropped. `mount` reads the table without waiting on any
+    filesystem, so a hung mount can't stall it. Returns an empty list when
+    the table can't be read.
+    """
+    try:
+        # Decode paths as os.fsdecode does, so they compare with os paths.
+        result = subprocess.run(
+            ["/sbin/mount"], capture_output=True, encoding="utf-8",
+            errors="surrogateescape", timeout=10, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if result.returncode != 0:
+        return []
+    entries = []
+    for line in result.stdout.splitlines():
+        entry, sep, _options = line.rpartition(" (")
+        if sep:
+            entries.append(entry)
+    return entries
+
+
+def _mount_source(mountpoint, mount_table) -> Optional[str]:
+    """Return the source `mount` lists for ``mountpoint``, or None.
+
+    With mounts stacked on one path, the last entry is the one on top.
+    """
+    raw = os.fspath(mountpoint)
+    # `mount` lists real paths: resolve symlinks (/var -> /private/var) and
+    # relative paths, and keep the lexical form for the unresolved spelling.
+    targets = {posixpath.normpath(raw), os.path.realpath(raw)}
+    found = None
+    for entry in mount_table:
+        for target in targets:
+            suffix = " on " + target
+            if entry.endswith(suffix):
+                found = entry[:-len(suffix)]
+    return found
+
+
+def _has_amifuse_mount_source(mountpoint, mount_table) -> bool:
+    """Tell whether `mount` lists ``mountpoint`` with AmiFUSE's source.
+
+    macFUSE lists the fsname as the source. FUSE-T doesn't: it mounts over
+    NFS and gives its server no fsname, so its mounts never match here.
+    """
+    source = _mount_source(mountpoint, mount_table)
+    return source is not None and source.startswith(_AMIFUSE_MOUNT_SOURCE_PREFIX)
+
+
+def is_amifuse_mount_macos(mountpoint, mount_table=None) -> bool:
+    """Tell whether ``mountpoint`` is an AmiFUSE mount on macOS.
+
+    It is when `mount` lists it with the source AmiFUSE sets (macFUSE), or
+    when a running AmiFUSE process serves it (FUSE-T, whose mount source
+    doesn't name AmiFUSE). Anything else (another disk under /Volumes, or a
+    path AmiFUSE can't tie to itself) is not, so no caller mistakes the
+    user's own volume for an AmiFUSE mount.
+
+    Args:
+        mountpoint: The path to check.
+        mount_table: Entries from ``_macos_mount_table()``; read afresh when
+            None.
+    """
+    if mount_table is None:
+        mount_table = _macos_mount_table()
+    source = _mount_source(mountpoint, mount_table)
+    if source is not None:
+        if source.startswith(_AMIFUSE_MOUNT_SOURCE_PREFIX):
+            return True
+        # A disk (a USB stick, an internal volume) is never AmiFUSE's, even
+        # while an AmiFUSE process that was given its path is starting up.
+        if source.startswith("/dev/"):
+            return False
+    # Process discovery pairs a mount started without --mountpoint only with
+    # a volume the mount table names as AmiFUSE's, so this adds just the
+    # mountpoints AmiFUSE processes were given on their command lines. The
+    # caller's parent is left out: a wrapper such as `sudo` or `uv run`
+    # repeats the command line of the `amifuse mount` checking its own path.
+    parent = os.getppid()
+    return any(pid != parent
+               for pid in _find_mount_owner_pids(Path(os.fspath(mountpoint))))
+
+
 def _enrich_mountpoints_macos(null_mounts, all_mounts):
     """Scan /Volumes/ for amifuse mount points and assign to null mounts.
 
-    Checks entries in /Volumes/ that are actual mount points.
+    Takes only the entries in /Volumes/ that `mount` lists as AmiFUSE mounts,
+    so on FUSE-T a mount started without --mountpoint stays unpaired.
     """
     volumes_dir = "/Volumes"
     if not os.path.isdir(volumes_dir):
@@ -1268,15 +1380,15 @@ def _enrich_mountpoints_macos(null_mounts, all_mounts):
     except OSError:
         return
 
+    # Only AmiFUSE's own volumes: another disk in /Volumes (a USB stick, the
+    # system volume) must never be paired with an AmiFUSE process.
+    mount_table = _macos_mount_table()
     for entry in sorted(entries):
         vol_path = volumes_dir + "/" + entry
         if vol_path in claimed:
             continue
-        try:
-            if os.path.ismount(vol_path):
-                amifuse_volumes.append(vol_path)
-        except OSError:
-            continue
+        if _has_amifuse_mount_source(vol_path, mount_table):
+            amifuse_volumes.append(vol_path)
 
     # Match null-mountpoint processes to discovered volumes.
     # Non-deterministic for multiple mounts -- best-effort pairing.
