@@ -8,7 +8,9 @@ unmount runs the handler until every packet has its reply before it
 flushes the volume (#118).
 
 A scripted handler on the real HandlerLauncher, in MockMemory, takes each
-packet the bridge queues and answers it at once, later, or never.
+packet the bridge queues and answers it at once, later, or never. It
+stands in for the scheduler: each run takes the queued packets and ends
+BUSY while an answer is still to come, IDLE once the handler waits.
 """
 
 import errno
@@ -20,11 +22,11 @@ from types import SimpleNamespace
 import pytest
 
 from amitools.vamos.error import VamosInternalError
-from amitools.vamos.lib.lexec.signalfunc import SignalFunc
 from amitools.vamos.libstructs.dos import DosPacketStruct, FileHandleStruct
 from amitools.vamos.libstructs.exec_ import MsgPortStruct
 from amitools.vamos.machine.mock.mem import MockMemory
 from amitools.vamos.mem.alloc import MemoryAlloc
+from amitools.vamos.schedule import RunResult
 
 from amifuse import fuse_fs as fs
 from amifuse.startup_runner import (
@@ -45,9 +47,9 @@ from amifuse.startup_runner import (
     HandlerLauncher,
 )
 
-# How HandlerLauncher.run_burst reports a burst that ended:
-BUSY = SimpleNamespace(done=False, error=False)   # at its cycle limit
-PARKED = SimpleNamespace(done=False, error=True)  # in Wait(), nothing pending
+# How HandlerLauncher.run reports a run that ended:
+BUSY = RunResult.BUSY   # the handler still works
+PARKED = RunResult.IDLE  # in Wait(), nothing pending
 
 NEVER = math.inf
 DP_RES1 = DosPacketStruct.sdef.find_field_def_by_name("dp_Res1").offset
@@ -77,10 +79,10 @@ class Ports:
 
 
 class Handler:
-    """Takes every queued packet in a burst and answers it as scripted.
+    """Takes every queued packet in a run and answers it as scripted.
 
-    delay(pkt_type, name) gives the bursts until the answer: 0 answers
-    in the burst that takes it, NEVER not at all. A burst is busy while
+    delay(pkt_type, name) gives the runs until the answer: 0 answers
+    in the run that takes it, NEVER not at all. A run is busy while
     an answer is still to come, as for a handler growing a file, which
     still answers other packets at once. answer(pkt_type, args, name)
     gives (res1, res2), and may write into the memory the args name.
@@ -95,7 +97,7 @@ class Handler:
         self.delay = lambda pkt_type, name: 0
         self.answer = lambda pkt_type, args, name: (-1, 0)
         self.in_order = False
-        self.waiting = []   # [bursts to go, msg, pkt, pkt_type, args, name]
+        self.waiting = []   # [runs to go, msg, pkt, pkt_type, args, name]
         self.events = []    # ("take" | "answer", pkt_type, pkt, args, name)
 
     def name(self, pkt_type, args):
@@ -104,7 +106,7 @@ class Handler:
         addr = args[NAME_ARG[pkt_type]] << 2
         return bytes(self.mem.r_block(addr + 1, self.mem.r8(addr))).decode()
 
-    def run_burst(self, state, max_cycles=200000, debug=False):
+    def run(self, max_cycles=None):
         port = self.state.port_addr
         while self.ports.has_msg(port) and not (self.in_order and self.waiting):
             msg = self.ports.get_msg(port)
@@ -127,26 +129,16 @@ class Handler:
             self.ports.put_msg(self.state.reply_port_addr, msg)
             self.events.append(("answer", pkt_type, pkt, args, name))
         busy = any(e[0] != NEVER and e[0] >= 0 for e in self.waiting)
-        state.run_state = BUSY if busy else PARKED
-        return state.run_state
+        return BUSY if busy else PARKED
 
     def answer_now(self, pkt_type):
-        """Answer the waiting packets of pkt_type in the next burst."""
+        """Answer the waiting packets of pkt_type in the next run."""
         for entry in self.waiting:
             if entry[3] == pkt_type:
                 entry[0] = 0
 
     def taken(self, pkt_type):
         return [e for e in self.events if e[0] == "take" and e[1] == pkt_type]
-
-
-@pytest.fixture(autouse=True)
-def _keep_exec_state(monkeypatch):
-    # Without a ProcessManager, a parked burst clears the Exec blocking
-    # state, which lives on the ExecLibrary class. Leave the real one
-    # alone, and the signals the launcher sets on each packet too.
-    monkeypatch.setattr(fs, "_clear_all_block_state", lambda: None)
-    monkeypatch.setattr(SignalFunc, "_fallback_signals", SignalFunc._fallback_signals)
 
 
 @pytest.fixture
@@ -156,25 +148,24 @@ def bridge():
     alloc = MemoryAlloc(mem, addr=0x1000)
     ports = Ports()
     vh = SimpleNamespace(
-        alloc=alloc, slm=SimpleNamespace(exec_impl=SimpleNamespace(port_mgr=ports)))
+        alloc=alloc, scheduler=None, timer_device=None,
+        slm=SimpleNamespace(exec_impl=SimpleNamespace(port_mgr=ports)))
     launcher = HandlerLauncher(vh, {}, 0)
     state = SimpleNamespace(
         port_addr=alloc.alloc_struct(MsgPortStruct, label="port").addr,
         reply_port_addr=alloc.alloc_struct(MsgPortStruct, label="reply").addr,
-        crashed=False, pc=0x4000, main_loop_pc=0, initialized=True,
-        run_state=None, block_state=None)
+        crashed=False, exited=False, initialized=True)
     ports.ports[state.port_addr] = []
     ports.ports[state.reply_port_addr] = []
     handler = Handler(launcher, mem, ports, state)
-    launcher.run_burst = handler.run_burst
+    # the scripted handler stands in for the scheduler's run
+    launcher.run = handler.run
 
     b = fs.HandlerBridge.__new__(fs.HandlerBridge)
     b._lock = threading.RLock()
     b._debug = False
     b._closed = False
     b._busy_ran_out = False
-    b._idle_unfinished = False
-    b._idle_busy_cycles = 0
     b.vh, b.mem, b.launcher, b.state = vh, mem, launcher, state
     b.backend = SimpleNamespace(sync=lambda: None, fsync=lambda: None,
                                 close=lambda: None)
@@ -355,10 +346,10 @@ def test_io_at_the_cap_takes_the_replies_already_queued(bridge, monkeypatch):
         assert b.read_handle(fh, 1000) is None
     assert len(handler.taken(ACTION_READ)) == 4  # the fifth was past the cap
 
-    # The handler answers them while the mount idles: the timer thread
-    # runs it on, and takes no replies.
+    # The handler answers them while the mount idles: the idle timers
+    # run it on, and take no replies.
     handler.answer_now(ACTION_READ)
-    handler.run_burst(b.state)
+    handler.run()
     events = len(handler.events)
 
     # The next read recovers by itself: no other packet goes out first.
@@ -712,15 +703,16 @@ def _mount(b):
 
 @pytest.fixture
 def short_limits(monkeypatch):
-    # A wait gives up after 60 busy bursts, or 10 once one has run out.
-    monkeypatch.setattr(fs.HandlerBridge, "_MAX_BUSY_CYCLES", 60 * 200_000)
-    monkeypatch.setattr(fs.HandlerBridge, "_SHORT_BUSY_CYCLES", 10 * 200_000)
+    # A wait gives up after 60 busy runs, or 10 once one has run out.
+    chunk = fs.HandlerBridge._RUN_CHUNK_CYCLES
+    monkeypatch.setattr(fs.HandlerBridge, "_MAX_BUSY_CYCLES", 60 * chunk)
+    monkeypatch.setattr(fs.HandlerBridge, "_SHORT_BUSY_CYCLES", 10 * chunk)
 
 
 def test_unmount_waits_for_a_packet_still_out_before_the_flush(bridge, short_limits, capsys):
     b, handler = bridge
     fh = _open(b, handler, "/grow", 0x5550)
-    # A grow that outlasts both waits of set_handle_size: 100 bursts.
+    # A grow that outlasts both waits of set_handle_size: 100 runs.
     handler.delay = lambda pkt_type, name: 100 if pkt_type == ACTION_SET_FILE_SIZE else 0
     assert b.set_handle_size(fh, 0x7FFFFFFF) == -1
 
@@ -747,12 +739,11 @@ def test_unmount_reports_a_packet_never_answered(bridge, short_limits, capsys):
     assert handler.taken(ACTION_FLUSH)
 
 
-def _busy_for_good(b, handler, monkeypatch, parks_once, never=(ACTION_SET_FILE_SIZE,)):
-    """Leave a packet out with a handler still at work on it, 1 s a burst.
+def _busy_for_good(b, handler, monkeypatch, parks_once=False, never=(ACTION_SET_FILE_SIZE,)):
+    """Leave a packet out with a handler still at work on it, 1 s a run.
 
-    One that waits once (in Wait() within the packet) has the full busy
-    limit for the rest of that wait, 60 bursts here. Returns the fake
-    clock, a list holding the time.monotonic() value.
+    With parks_once the first run finds it waiting instead. Returns the
+    fake clock, a list holding the time.monotonic() value.
     """
     fh = _open(b, handler, "/grow", 0x5550)
     handler.delay = lambda pkt_type, name: NEVER if pkt_type in never else 0
@@ -760,39 +751,47 @@ def _busy_for_good(b, handler, monkeypatch, parks_once, never=(ACTION_SET_FILE_S
 
     now = [1000.0]
     monkeypatch.setattr(fs.time, "monotonic", lambda: now[0])
-    bursts = []
+    runs = []
 
-    def run_burst(state, max_cycles=200000, debug=False):
-        handler.run_burst(state, max_cycles, debug)
+    def run(max_cycles=None):
+        handler.run(max_cycles)
         now[0] += 1.0
-        bursts.append(state)
-        state.run_state = PARKED if parks_once and len(bursts) == 1 else BUSY
-        return state.run_state
-    b.launcher.run_burst = run_burst
+        runs.append(1)
+        return PARKED if parks_once and len(runs) == 1 else BUSY
+    b.launcher.run = run
     return now
 
 
-@pytest.mark.parametrize("parks_once", [False, True], ids=["busy", "parks-once"])
-def test_unmount_wait_ends_at_its_deadline(bridge, short_limits, monkeypatch, parks_once):
+def test_unmount_wait_ends_at_its_deadline(bridge, short_limits, monkeypatch):
     b, handler = bridge
-    now = _busy_for_good(b, handler, monkeypatch, parks_once)
+    now = _busy_for_good(b, handler, monkeypatch)
 
     unanswered = b.wait_for_pending(timeout=15.0)
     assert now[0] - 1000.0 == 15.0
     assert unanswered == [fs._packet_type_name(ACTION_SET_FILE_SIZE)]
 
 
-@pytest.mark.parametrize("parks_once", [False, True], ids=["busy", "parks-once"])
+def test_unmount_wait_ends_when_the_handler_waits(bridge, short_limits, monkeypatch):
+    # Every task waits and no timer is pending: nothing more comes, so
+    # the wait does not run to its deadline.
+    b, handler = bridge
+    now = _busy_for_good(b, handler, monkeypatch, parks_once=True)
+
+    unanswered = b.wait_for_pending(timeout=15.0)
+    assert now[0] - 1000.0 == 1.0
+    assert unanswered == [fs._packet_type_name(ACTION_SET_FILE_SIZE)]
+
+
 def test_unmount_flush_after_the_deadline_gets_the_short_limit(
-        bridge, short_limits, monkeypatch, capsys, parks_once):
+        bridge, short_limits, monkeypatch, capsys):
     # Still at work on the grow, the handler takes no ACTION_FLUSH either.
     b, handler = bridge
-    now = _busy_for_good(b, handler, monkeypatch, parks_once,
+    now = _busy_for_good(b, handler, monkeypatch,
                          never=(ACTION_SET_FILE_SIZE, ACTION_FLUSH))
 
     _mount(b).destroy(None)
 
-    # 15 s of waiting for the grow, 10 bursts for the flush, then 1 s more
+    # 15 s of waiting for the grow, 10 runs for the flush, then 1 s more
     # for the packets still out, which are named.
     assert now[0] - 1000.0 == 26.0
     out = capsys.readouterr().out
@@ -812,7 +811,7 @@ def test_unmount_wait_leaves_a_handler_at_work_its_io_reply(
         bridge, short_limits, monkeypatch):
     # #240: at work on a packet, the handler sends an IO request whose
     # reply comes at once, and takes it with GetMsg() only after the wait
-    # that queued it has ended at the short limit, 10 bursts.
+    # that queued it has ended at the short limit, 10 runs.
     b, handler = bridge
     fh = _open(b, handler, "/grow", 0x5550)
     handler.delay = lambda pkt_type, name: NEVER if pkt_type == ACTION_SET_FILE_SIZE else 0
@@ -821,43 +820,38 @@ def test_unmount_wait_leaves_a_handler_at_work_its_io_reply(
     ports = handler.ports
     now = [1000.0]
     monkeypatch.setattr(fs.time, "monotonic", lambda: now[0])
-    bursts, got = [0], []
+    runs, got = [0], []
 
-    def run_burst(state, max_cycles=200000, debug=False):
+    def run(max_cycles=None):
         now[0] += 1.0
-        bursts[0] += 1
-        if bursts[0] == 1:
+        runs[0] += 1
+        if runs[0] == 1:
             ports.put_msg(io_port, io_msg)  # SendIO()
-        elif bursts[0] == 12 and ports.has_msg(io_port):
+        elif runs[0] == 12 and ports.has_msg(io_port):
             got.append(ports.get_msg(io_port))  # GetMsg(), then the answer
             handler.answer_now(ACTION_SET_FILE_SIZE)
-        handler.run_burst(state, max_cycles, debug)
-        if not got:
-            state.run_state = BUSY
-        return state.run_state
-    b.launcher.run_burst = run_burst
+        result = handler.run(max_cycles)
+        return BUSY if not got else result
+    b.launcher.run = run
 
     assert b.wait_for_pending(timeout=15.0) == []
     assert got == [io_msg]
 
 
-def test_unmount_wait_drains_io_replies_once_the_handler_is_at_its_main_loop(
+def test_unmount_wait_drains_io_replies_once_the_handler_waits(
         bridge, short_limits):
     b, handler = bridge
     fh = _open(b, handler, "/grow", 0x5550)
     handler.delay = lambda pkt_type, name: NEVER if pkt_type == ACTION_SET_FILE_SIZE else 0
     assert b.set_handle_size(fh, 0x7FFFFFFF) == -1
     io_port, io_msg = _io_reply_port(b, handler)
-    b.state.main_loop_pc, b.state.main_loop_sp, b.state.sp = 0x5000, 0x8000, 0x8000
 
-    def run_burst(state, max_cycles=200000, debug=False):
-        # A reply it will not take, then the answer and back to its main loop.
+    def run(max_cycles=None):
+        # A reply it will not take, then the answer, and it waits again.
         handler.ports.put_msg(io_port, io_msg)
         handler.answer_now(ACTION_SET_FILE_SIZE)
-        handler.run_burst(state, max_cycles, debug)
-        state.pc = state.main_loop_pc
-        return state.run_state
-    b.launcher.run_burst = run_burst
+        return handler.run(max_cycles)
+    b.launcher.run = run
 
     assert b.wait_for_pending() == []
     assert not handler.ports.has_msg(io_port)
