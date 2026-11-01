@@ -331,7 +331,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(json.dumps(result.__dict__, indent=2))
         else:
             print(_render_markdown([result]), end="")
-        return 0
+        return 0 if result.status == "ok" else 1
 
     results = _run_cases(CASES)
     if args.json:

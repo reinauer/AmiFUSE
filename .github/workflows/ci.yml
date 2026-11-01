@@ -198,6 +198,12 @@ jobs:
           AMIFUSE_FIXTURE_ROOT: ${{ github.workspace }}/../AmiFUSE-testing
         run: python tools/amifuse_matrix.py --fixtures pfs3 sfs ofs --runs 1 --json
 
+      - name: Install FUSE backend (Windows)
+        # image_format_smoke fakes the FUSE mount, but mount_fuse still
+        # checks that WinFsp is installed and fails the case without it.
+        if: runner.os == 'Windows'
+        run: choco install winfsp -y
+
       - name: Run image_format_smoke
         env:
           AMIFUSE_FIXTURE_ROOT: ${{ github.workspace }}/../AmiFUSE-testing
