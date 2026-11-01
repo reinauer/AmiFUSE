@@ -68,24 +68,37 @@ class FakeTimer:
 
     MIN_DELAY = 0.02
 
-    def __init__(self, deadline=math.inf):
+    def __init__(self, deadline=math.inf, delay=math.inf):
         self.now = 100.0
+        # the deadline of a timer request, and the end of a task's Delay()
         self.deadline = deadline
+        self.delay = delay
         self.deliveries = 0
+        self.delays_ended = 0
         self.event = threading.Event()
 
     def clock(self):
         return self.now
 
     def next_deadline(self):
-        return self.deadline
+        return min(self.deadline, self.delay)
+
+    def next_delay(self):
+        return self.delay
 
     def deliver(self, fast_forward=False):
+        signals = {}
+        if fast_forward or self.delay <= self.now:
+            if self.delay != math.inf:
+                self.delays_ended += 1
+                signals[0x3000] = 0x10
+            self.delay = math.inf
         if fast_forward or self.deadline <= self.now:
+            if self.deadline != math.inf:
+                self.deliveries += 1
+                signals[0x3000] = signals.get(0x3000, 0) | 0x10000
             self.deadline = math.inf
-            self.deliveries += 1
-            return {0x3000: 0x10000}
-        return {}
+        return signals
 
 
 class Sleeps(list):
@@ -117,6 +130,7 @@ def _bridge(launcher, timer=None):
     bridge = fs.HandlerBridge.__new__(fs.HandlerBridge)
     bridge._debug = False
     bridge._busy_ran_out = False
+    bridge._idle_busy_cycles = 0
     bridge._lock = threading.RLock()
     bridge.launcher = launcher
     bridge.backend = SimpleNamespace(sync=lambda: None, fsync=lambda: None)
@@ -353,3 +367,139 @@ def test_due_timer_is_replied_before_the_run(sleeps):
     assert _bridge(launcher, timer)._run_until_replies() == [REPLY]
     assert timer.deliveries == 1
     assert launcher.runs == 1
+
+
+@pytest.mark.parametrize("ticks", [10, 100, 250])
+def test_a_delay_beyond_the_wait_is_slept_to(sleeps, ticks):
+    # The handler calls Delay() while it serves the packet: a Delay()
+    # always ends, so the wait sleeps to it however long it is, and the
+    # reply comes afterwards.
+    timer = FakeTimer(delay=100.0 + ticks / 50)
+    sleeps.timers.append(timer)
+    launcher = ScriptedLauncher(repeat(IDLE), reply_in=2)
+    assert _bridge(launcher, timer)._run_until_replies() == [REPLY]
+    assert launcher.runs == 2
+    assert sleeps == [pytest.approx(ticks / 50)]
+    assert timer.delays_ended == 1
+    assert timer.deliveries == 0
+
+
+def test_a_poll_loop_of_short_delays_is_not_counted_as_idle(sleeps):
+    # SmartFilesystem polls for its helper with short Delay()s: each one
+    # is slept to, and none of them counts against the idle iterations.
+    timer = FakeTimer(delay=100.02)
+    sleeps.timers.append(timer)
+    runs = 80
+
+    class Polling(ScriptedLauncher):
+        def run(self, max_cycles=None):
+            result = super().run(max_cycles)
+            if self.runs < runs:
+                timer.delay = timer.now + 0.02  # the next Delay(1)
+            return result
+
+    launcher = Polling(repeat(IDLE), reply_in=runs)
+    assert _bridge(launcher, timer)._run_until_replies(max_iters=50) == [REPLY]
+    assert launcher.runs == runs
+    assert len(sleeps) == runs - 1
+    assert sum(sleeps) == pytest.approx(0.02 * (runs - 1))
+
+
+def test_a_timer_due_before_the_delay_is_replied_first(sleeps):
+    # A child waits on a timer request while the handler delays: the wait
+    # sleeps to the request, replies to it and runs on, then to the delay.
+    timer = FakeTimer(deadline=100.3, delay=102.0)
+    sleeps.timers.append(timer)
+    launcher = ScriptedLauncher(repeat(IDLE), reply_in=3)
+    assert _bridge(launcher, timer)._run_until_replies() == [REPLY]
+    assert launcher.runs == 3
+    assert sleeps == [pytest.approx(0.3), pytest.approx(1.7)]
+    assert timer.deliveries == 1
+    assert timer.delays_ended == 1
+
+
+def test_a_deadline_cuts_the_sleep_to_a_delay_short(sleeps, monkeypatch):
+    # The wait's deadline, on the monotonic clock, still ends it.
+    timer = FakeTimer(delay=105.0)
+    sleeps.timers.append(timer)
+    now = [100.0]
+    monkeypatch.setattr(fs.time, "monotonic", lambda: now[0])
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        now[0] += seconds
+        timer.now += seconds
+
+    monkeypatch.setattr(fs.time, "sleep", sleep)
+    launcher = ScriptedLauncher(repeat(IDLE), reply_in=2)
+    bridge = _bridge(launcher, timer)
+    assert bridge._run_until_replies(deadline=101.0) == []
+    assert launcher.runs == 1
+    assert sleeps == [pytest.approx(1.0)]
+    assert timer.delays_ended == 0
+    # the handler waits, so it is not taken for busy
+    assert not bridge._busy_ran_out
+
+
+# ---------------------------------------------------------------------------
+# The idle hook runs a handler whose wait ran out (run_due_timers)
+# ---------------------------------------------------------------------------
+
+
+def test_idle_hook_runs_a_busy_handler_on_until_it_waits(sleeps):
+    timer = FakeTimer()
+    launcher = ScriptedLauncher([BUSY, BUSY, IDLE])
+    bridge = _bridge(launcher, timer)
+    bridge._busy_ran_out = True
+    assert bridge.run_due_timers() == FakeTimer.MIN_DELAY
+    assert bridge.run_due_timers() == FakeTimer.MIN_DELAY
+    assert bridge.run_due_timers() is None
+    assert launcher.runs == 3
+    assert launcher.cycles == [fs.HandlerBridge._SHORT_BUSY_CYCLES] * 3
+    # it waited: the next packet gets the full limit again
+    assert not bridge._busy_ran_out
+    assert bridge._idle_busy_cycles == 0
+
+
+def test_handler_caught_in_a_loop_is_left_after_the_busy_limit(sleeps, monkeypatch):
+    """After _MAX_BUSY_CYCLES of idle runs it waits for the next packet."""
+    monkeypatch.setattr(fs.HandlerBridge, "_SHORT_BUSY_CYCLES", 2 * CHUNK)
+    monkeypatch.setattr(fs.HandlerBridge, "_MAX_BUSY_CYCLES", 4 * CHUNK)
+    timer = FakeTimer()
+    launcher = ScriptedLauncher(repeat(BUSY))
+    bridge = _bridge(launcher, timer)
+    bridge._busy_ran_out = True
+    assert bridge.run_due_timers() == FakeTimer.MIN_DELAY
+    assert bridge.run_due_timers() == FakeTimer.MIN_DELAY
+    assert launcher.runs == 2
+    # the limit is reached: no more runs while the mount idles
+    assert bridge.run_due_timers() is None
+    assert bridge.run_due_timers() is None
+    assert launcher.runs == 2
+    assert bridge._busy_ran_out
+    # a pending timer request makes the hook look again later
+    timer.deadline = timer.now + 5
+    assert bridge.run_due_timers() == fs.HandlerBridge._TIMER_RETRY
+    assert launcher.runs == 2
+    # a packet wait that gets a reply lifts the limit
+    launcher.outcomes = iter([IDLE])
+    launcher.replies[3] = REPLY
+    assert bridge._run_until_replies() == [REPLY]
+    assert bridge._idle_busy_cycles == 0
+    assert not bridge._busy_ran_out
+
+
+def test_a_packet_wait_that_runs_out_counts_toward_the_idle_limit(sleeps, monkeypatch):
+    """The idle runs after a timer reply count as well."""
+    monkeypatch.setattr(fs.HandlerBridge, "_SHORT_BUSY_CYCLES", CHUNK)
+    monkeypatch.setattr(fs.HandlerBridge, "_MAX_BUSY_CYCLES", 2 * CHUNK)
+    timer = FakeTimer(deadline=99.0)
+    launcher = ScriptedLauncher(repeat(BUSY))
+    bridge = _bridge(launcher, timer)
+    # a due timer reply runs the handler, which stays busy
+    assert bridge.run_due_timers() == FakeTimer.MIN_DELAY
+    assert bridge._busy_ran_out
+    assert bridge._idle_busy_cycles == CHUNK
+    assert bridge.run_due_timers() == FakeTimer.MIN_DELAY
+    assert bridge.run_due_timers() is None
+    assert launcher.runs == 2

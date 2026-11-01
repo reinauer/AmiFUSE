@@ -399,6 +399,9 @@ class HandlerBridge:
         self._closed = False
         # Set when a wait runs out of busy cycles; see _run_until_replies.
         self._busy_ran_out = False
+        # Cycles the idle hook has run such a handler on without it waiting
+        # or replying; see run_due_timers.
+        self._idle_busy_cycles = 0
         # Called from the idle hook once the handler is found crashed.
         self._on_crash = None
         # The emulation runs on this thread: the machine and the scheduler
@@ -797,6 +800,35 @@ class HandlerBridge:
         self._deliver_timers()
         return True
 
+    def _sleep_to_delay(self, deadline: Optional[float]) -> bool:
+        """Sleep until a pending Delay() ends, for a wait in which every task waits.
+
+        A timer request may never fall due within the wait, but a Delay()
+        always ends: a handler that calls Delay() while it serves a packet,
+        or polls a child with short ones, replies afterwards. So while a
+        task delays, the wait sleeps to the earliest deadline, the delay's
+        or a timer request's, however far off, replies to what fell due and
+        runs on. A deadline, on the time.monotonic() clock, cuts the sleep
+        short; the wait then ends at its top. Returns whether a task was
+        delaying.
+        """
+        timer = self._timer_device()
+        if timer is None or timer.next_delay() == math.inf:
+            return False
+        until = timer.next_deadline()
+        while True:
+            left = until - timer.clock()
+            if left <= 0:
+                break
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return True
+                left = min(left, remaining)
+            time.sleep(left)
+        self._deliver_timers()
+        return True
+
     def _run(self, max_cycles: Optional[int] = None) -> RunResult:
         """Run the handler and its children; see HandlerLauncher.run."""
         return self.launcher.run(max_cycles)
@@ -815,8 +847,11 @@ class HandlerBridge:
         FUSE operations get the lock in between, and asks for the next
         call a tick later while it stays busy. Due timer requests are then
         replied and the handler runs until it waits again; stray replies
-        it left are drained then, as after a packet wait. Returns the
-        seconds until the next call is due, or None when nothing is pending.
+        it left are drained then, as after a packet wait. Once it has run
+        the handler _MAX_BUSY_CYCLES this way without it waiting or
+        replying, it is caught in a loop and is left alone until the next
+        packet's wait. Returns the seconds until the next call is due, or
+        None when nothing is pending.
         """
         with self._lock:
             timer = self._timer_device()
@@ -824,14 +859,23 @@ class HandlerBridge:
                 return None
             pmgr = self.vh.slm.exec_impl.port_mgr
             if self._busy_ran_out:
+                if self._idle_busy_cycles >= self._MAX_BUSY_CYCLES:
+                    # Caught in a loop. A pending timer request may still
+                    # want its reply once the handler waits again.
+                    if timer.next_deadline() == math.inf:
+                        return None
+                    return self._TIMER_RETRY
                 if self._run(self._SHORT_BUSY_CYCLES) == RunResult.BUSY:
+                    self._idle_busy_cycles += self._SHORT_BUSY_CYCLES
                     return timer.MIN_DELAY
                 # It waited or exited, so it is not caught in a loop.
                 self._busy_ran_out = False
+                self._idle_busy_cycles = 0
                 self._drain_non_essential_ports(pmgr)
             if self._deliver_timers():
                 if self._run(self._SHORT_BUSY_CYCLES) == RunResult.BUSY:
                     self._busy_ran_out = True
+                    self._idle_busy_cycles += self._SHORT_BUSY_CYCLES
                     return timer.MIN_DELAY
                 self._drain_non_essential_ports(pmgr)
             deadline = timer.next_deadline()
@@ -921,8 +965,10 @@ class HandlerBridge:
         task waits without a reply, the wait sleeps to the next timer
         deadline if it comes within _PACKET_TIMER_WAIT of the wait's start,
         replies to it and runs on: a handler may reply only once its own
-        timer fires, or a child may wait on one. Between packets, a mount's
-        timer thread replies to them (run_due_timers). The limits count
+        timer fires, or a child may wait on one. A Delay() always ends, so
+        while a task delays the wait sleeps to the next deadline however
+        far off (_sleep_to_delay). Between packets, a mount's timer thread
+        replies to them (run_due_timers). The limits count
         cycles, not time: Delay() waits as a task and spends no cycles. A
         deadline, on the time.monotonic() clock, also ends the wait before
         the next run once it has passed, whatever limit the handler has
@@ -1008,10 +1054,15 @@ class HandlerBridge:
                 continue
             # It waited or exited, so it is not caught in a loop.
             self._busy_ran_out = False
+            self._idle_busy_cycles = 0
             if result == RunResult.DONE:
                 break
+            # Every task waits: only time can bring the reply now. A Delay()
+            # always ends: the wait sleeps to it, however far off.
+            if self._sleep_to_delay(deadline):
+                continue
             idle_iters += 1
-            # Every task waits: only time can bring the reply now.
+            # A timer request is slept to only within the wait's window.
             if self._sleep_to_timer_in_packet_wait(timer_wait_until):
                 continue
             break
@@ -1024,6 +1075,7 @@ class HandlerBridge:
             # It answered a packet, so it is not caught in a loop, even if it
             # went on to the next packet without waiting.
             self._busy_ran_out = False
+            self._idle_busy_cycles = 0
         elif busy_cycles >= busy_limit or (timed_out and busy):
             # A wait that ends at its deadline in the middle of the
             # handler's work leaves it running, as one that runs out does.

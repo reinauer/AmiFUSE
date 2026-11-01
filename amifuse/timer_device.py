@@ -277,6 +277,14 @@ class AmiFuseTimerDevice(TimerDevice):
         deadlines.extend(self._delays.values())
         return min(deadlines) if deadlines else math.inf
 
+    def next_delay(self) -> float:
+        """The earliest end of a pending Delay() on the device clock, or inf.
+
+        Unlike a timer request, a Delay() always ends: the bridge sleeps to
+        it however far off it is (HandlerBridge._sleep_to_delay).
+        """
+        return min(self._delays.values(), default=math.inf)
+
     def deliver(self, fast_forward: bool = False) -> Dict[int, int]:
         """Reply to every request whose deadline has passed.
 
