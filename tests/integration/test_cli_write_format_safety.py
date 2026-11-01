@@ -5,8 +5,11 @@ tests need no AmiFUSE-testing checkout, and run wherever machine68k works.
 
 - write with a source it cannot read leaves the destination's old contents.
 - format fsyncs the image before it reports "Format complete".
+- format refuses a volume name too long for a BSTR before it opens the
+  image; a name of 255 characters still reaches the handler.
 """
 
+import hashlib
 import os
 import subprocess
 import sys
@@ -146,3 +149,41 @@ def test_format_fsyncs_the_image_before_complete(tmp_path, no_user_driver,
     listing = _amitool("amitools.tools.xdftool", str(image), "open", "part=DH0",
                        "+", "list")
     assert "Fresh" in listing
+
+
+def _rdb_image(tmp_path: Path) -> Path:
+    image = tmp_path / "disk.hdf"
+    _amitool(
+        "amitools.tools.rdbtool", str(image),
+        "create", "size=8Mi", "+", "init", "rdb_cyls=2",
+        "+", "add", "size=6MiB", "name=DH0", "fs=DOS3",
+    )
+    return image
+
+
+def _sha1(path: Path) -> str:
+    return hashlib.sha1(path.read_bytes()).hexdigest()
+
+
+def test_format_refuses_a_name_too_long_for_a_bstr(tmp_path, no_user_driver):
+    """The BSTR's length is one byte: 256 characters cannot be sent."""
+    image = _rdb_image(tmp_path)
+    before = _sha1(image)
+    proc = subprocess.run(
+        [sys.executable, "-m", "amifuse", "format", str(image), "DH0", "A" * 256],
+        capture_output=True, text=True, check=False,
+    )
+    assert proc.returncode == 1
+    assert proc.stderr == "Error: volume name is 256 characters long; at most 255 are allowed.\n"
+    assert proc.stdout == ""
+    assert _sha1(image) == before
+
+
+def test_format_sends_a_255_character_name_to_the_handler(tmp_path, no_user_driver):
+    """FastFileSystem refuses it itself, with ERROR_INVALID_COMPONENT_NAME."""
+    image = _rdb_image(tmp_path)
+    args = SimpleNamespace(image=image, partition="DH0", volname="A" * 255,
+                           driver=None, block_size=None, debug=False)
+    with pytest.raises(SystemExit) as caught:
+        fs.cmd_format(args)
+    assert str(caught.value) == "Format failed: error code 210"
