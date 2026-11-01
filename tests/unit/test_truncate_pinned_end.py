@@ -509,3 +509,23 @@ def test_reopen_after_lost_write_pins_zero(fuse_mock):
     fs.release("/file", fh)
 
     assert volume.data == bytes(100)
+
+
+def test_failed_write_below_pin_keeps_truncate_to_pin(fuse_mock):
+    """A failed write that ends at or below the pin leaves nothing past it,
+    so a truncate to the pin still changes nothing, which BFFS would
+    refuse as a shrink."""
+    volume = _FakeVolume(CONTENT, bffs=True)
+    fs = _fs(volume)
+    fh = fs.open("/file", os.O_RDWR | os.O_TRUNC)
+    fs.write("/file", b"w" * PIN, 0, fh)
+    volume.landed_write_reply = DISK_FULL
+    with pytest.raises(fuse_fs.FuseOSError):
+        fs.write("/file", b"y" * 100, 0, fh)
+    volume.landed_write_reply = None
+
+    assert fs.truncate("/file", PIN, fh) == 0
+    assert volume.set_sizes == []
+    fs.release("/file", fh)
+
+    assert volume.data == b"y" * 100 + b"w" * (PIN - 100)

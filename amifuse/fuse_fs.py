@@ -3650,7 +3650,8 @@ class AmigaFuseFS(_FuseOperations):
                 # seek, so the next write must seek explicitly.
                 entry["pos"] = None
                 # It may have left data past the pinned size (_pinned_end).
-                entry["past_pin"] = True
+                if end is None or offset + len(data) > end:
+                    entry["past_pin"] = True
                 raise FuseOSError(_WRITE_ERRNOS.get(res2, errno.EIO))
             entry["pos"] = offset + written
             entry["dirty"] = True  # Mark as needing flush on close
