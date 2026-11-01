@@ -342,6 +342,31 @@ def test_io_fails_once_too_much_memory_is_held(bridge, monkeypatch):
     assert b.read_handle(fh, 1000) == bytes(1000)
 
 
+def test_io_at_the_cap_takes_the_replies_already_queued(bridge, monkeypatch):
+    b, handler = bridge
+    monkeypatch.setattr(fs.HandlerBridge, "_RETIRED_MAX", 3 * 1000)
+    fh = _open(b, handler, "/file", 0x5550)
+    handler.delay = lambda pkt_type, name: NEVER if pkt_type == ACTION_READ else 0
+    handler.answer = lambda pkt_type, args, name: (
+        (args[2], 0) if pkt_type == ACTION_READ else (0x400, 0))
+    for _ in range(5):
+        assert b.read_handle(fh, 1000) is None
+    assert len(handler.taken(ACTION_READ)) == 4  # the fifth was past the cap
+
+    # The handler answers them while the mount idles: the timer thread
+    # runs it on, and takes no replies.
+    handler.answer_now(ACTION_READ)
+    handler.run_burst(b.state)
+    events = len(handler.events)
+
+    # The next read recovers by itself: no other packet goes out first.
+    handler.delay = lambda pkt_type, name: 0
+    assert b.read_handle(fh, 1000) == bytes(1000)
+    assert [(kind, pkt_type) for kind, pkt_type, *_ in handler.events[events:]] == [
+        ("take", ACTION_READ), ("answer", ACTION_READ)]
+    assert b._retired_data == []
+
+
 def _at_the_cap(b, handler, monkeypatch):
     """Fill the cap with reads never answered, and hold every small buffer.
 
