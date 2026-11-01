@@ -1,4 +1,4 @@
 [submodule "amitools"]
 	path = amitools
 	url = ../amitools.git
-	branch = Drop_AccessStruct
+	branch = amifuse-0.6.0
