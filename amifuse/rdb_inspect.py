@@ -430,6 +430,8 @@ def _read_fs_parceiro(blkdev, fs_blk_num, fs_num):
     LSEG block instead of the full block.  This function accepts such
     blocks as valid, producing usable filesystem driver data.
 
+    An LSEG link past the end of blkdev is a problem too, and is not read.
+
     Returns (FileSystem, parceiro_count, problem). fs.fshd is the header
     block, valid or not. problem is None when the whole entry reads, and
     parceiro_count is then the number of LSEG blocks with Parceiro
@@ -454,6 +456,10 @@ def _read_fs_parceiro(blkdev, fs_blk_num, fs_num):
     while lseg_blk != 0xFFFFFFFF:
         if lseg_blk in seen:
             return fs, 0, f"LSEG chain loops back to block {lseg_blk}"
+        if lseg_blk >= blkdev.num_blocks:
+            # Reading it would raise the IOError of a failing read.
+            return fs, 0, (f"LSEG chain links to block {lseg_blk}, "
+                           f"past the end of the device")
         seen.add(lseg_blk)
         ls = LoadSegBlock(blkdev, lseg_blk)
         Block.read(ls)  # Load data, validate type and checksum
@@ -493,12 +499,13 @@ def _lenient_rdisk_open(rdisk) -> List[str]:
     accepted and the filesystem driver data is made available.
 
     A filesystem list or LSEG chain that links back to a block it has
-    already read ends there, with a warning.
+    already read, or past the end of the device, ends there, with a
+    warning; the link is not read.
 
     Returns a list of warning strings (empty if everything parsed cleanly).
     Each filesystem entry it drops is also recorded in rdisk.damaged_fs as
     (DOS type, warning); the DOS type is None when the header is unreadable
-    or the list loops, hiding the entries after it.
+    or the list loops or links past the end, hiding the entries after it.
     """
     from amitools.fs.block.Block import Block
     from amitools.fs.block.rdb.PartitionBlock import PartitionBlock
@@ -543,6 +550,14 @@ def _lenient_rdisk_open(rdisk) -> List[str]:
             )
             rdisk.damaged_fs.append((None, warnings[-1]))
             break
+        if fs_blk >= rdisk.rawblk.num_blocks:
+            # Not read: it would raise the IOError of a failing read.
+            warnings.append(
+                f"Filesystem list links to block {fs_blk}, past the end of "
+                f"the device (remaining filesystem entries skipped)"
+            )
+            rdisk.damaged_fs.append((None, warnings[-1]))
+            break
         seen.add(fs_blk)
         # Not FileSystem.read(): its LSEG walk has no bound.
         fs, parceiro_count, problem = _read_fs_parceiro(rdisk.rawblk, fs_blk, num)
@@ -582,9 +597,10 @@ def _parse_rdb(dev, rdb_block) -> RDisk:
     """Parse the RDB that _scan_for_rdb found on dev.
 
     Tries the strict RDisk.open() first, then the lenient parse that
-    tolerates corrupt filesystem blocks. Raises RDBContentError, saying
-    why, if neither works or the RDB uses another block size than dev.
-    Other OSErrors, such as a failing read, propagate.
+    tolerates corrupt filesystem blocks, when the strict open fails or
+    raises OSError. Raises RDBContentError, saying why, if neither works
+    or the RDB uses another block size than dev. Other OSErrors, such as
+    a failing read, propagate.
     """
     if rdb_block.block_size != dev.block_bytes:
         # Only a forced block size gets here: otherwise _scan_for_rdb has
@@ -597,7 +613,15 @@ def _parse_rdb(dev, rdb_block) -> RDisk:
     rdisk = RDisk(dev)
     rdisk.rdb = rdb_block
     rdisk.rdb_warnings = []
-    if not rdisk.open():
+    try:
+        opened = rdisk.open()
+    except OSError:
+        # amitools raises the same IOError for a link past the device's end
+        # as for a failing read (OffsetBlockDevice an RDBContentError). The
+        # lenient parse never reads such a filesystem link, and a failing
+        # read fails there again.
+        opened = False
+    if not opened:
         # Strict open failed - try lenient parse (tolerates corrupt FS blocks)
         rdisk = RDisk(dev)
         rdisk.rdb = rdb_block
