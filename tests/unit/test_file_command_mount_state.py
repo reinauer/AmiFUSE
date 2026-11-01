@@ -1,6 +1,7 @@
 """File commands must diagnose mount failure before resolving a path."""
 
 import json
+import threading
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -143,3 +144,64 @@ def test_unknown_write_failure_keeps_context_and_cleanup(command_context, capsys
         assert error["details"]["expected"] == 5
     bridge.flush_volume.assert_called_once()
     bridge.backend.close.assert_called_once()
+
+
+def _crash(bridge):
+    bridge.state.crashed = True
+
+
+@pytest.mark.parametrize("command", ["ls", "verify", "hash", "read", "write"])
+@pytest.mark.parametrize("use_json", [True, False])
+@pytest.mark.parametrize("when", ["startup", "disk-info"])
+def test_crashed_handler_rejected_before_file_operations(command_context, capsys, command, use_json, when):
+    """A crash is an error, not an empty volume or a missing file."""
+    args, bridge, output = command_context
+    args.json = use_json
+    if command == "verify":
+        args.file, args.expect_size = None, None
+    bridge.is_mounted.return_value = fs.MountState(
+        None, None, "handler did not report disk info")
+    if when == "startup":
+        _crash(bridge)
+    else:
+        def is_mounted(**kwargs):
+            _crash(bridge)
+            return fs.MountState(None, None, "handler did not report disk info")
+        bridge.is_mounted.side_effect = is_mounted
+    with pytest.raises(SystemExit) as caught:
+        getattr(fs, "cmd_" + command)(args)
+    captured = capsys.readouterr()
+    if use_json:
+        assert caught.value.code == 1
+        result = json.loads(captured.out)
+        assert result["command"] == command
+        assert result["error"]["code"] == "HANDLER_ERROR"
+        assert "handler crashed" in result["error"]["message"]
+    else:
+        assert str(caught.value) == "Error: filesystem handler crashed"
+        assert captured.out == ""
+    bridge.list_dir_path.assert_not_called()
+    bridge.stat_path.assert_not_called()
+    bridge.open_file.assert_not_called()
+    bridge.create_dir.assert_not_called()
+    bridge.write_handle_reply.assert_not_called()
+    bridge.flush_volume.assert_not_called()
+    bridge.volume_name.assert_not_called()
+    bridge.backend.close.assert_called_once()
+    assert output.read_bytes() == b"keep existing output"
+
+
+def test_volume_name_from_the_rdb_is_a_str():
+    """verify --json serializes the name; an FSString fails json.dumps."""
+    from amitools.fs.FSString import FSString
+
+    bridge = object.__new__(fs.HandlerBridge)
+    bridge._lock = threading.RLock()
+    bridge._volname = None
+    bridge._alloc_fib = Mock(side_effect=RuntimeError("no reply"))
+    part = SimpleNamespace(part_blk=SimpleNamespace(drv_name=FSString("DH0")))
+    bridge.backend = SimpleNamespace(rdb=SimpleNamespace(parts=[part]))
+    name = bridge.volume_name()
+    assert type(name) is str
+    assert json.dumps(name) == '"DH0"'
+    assert bridge.volume_name() is name

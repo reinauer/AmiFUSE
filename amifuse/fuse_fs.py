@@ -2435,8 +2435,10 @@ class HandlerBridge:
                 if self.backend.rdb and self.backend.rdb.parts:
                     name = self.backend.rdb.parts[0].part_blk.drv_name
                     if name:
-                        self._volname = name
-                        return name
+                        # drv_name is an FSString; callers expect a str
+                        # (verify --json serializes it).
+                        self._volname = str(name)
+                        return self._volname
             except Exception:
                 pass
             # try root listing
@@ -5969,11 +5971,33 @@ def _mount_state_details(state: "MountState") -> Dict:
     return details
 
 
+def _refuse_crashed_handler(bridge, command: str, use_json: bool) -> None:
+    """Exit with status 1 when the filesystem handler has crashed.
+
+    A crashed handler answers no packet, so its disk info reads as "mount
+    state unknown", a directory as empty and every path as missing. Without
+    this check a file command reports a crash as an empty volume or a
+    missing file.
+    """
+    import json
+
+    if not _handler_has_crashed(bridge):
+        return
+    if use_json:
+        print(json.dumps(_json_error(
+            command, "HANDLER_ERROR", "Filesystem handler crashed")))
+        raise SystemExit(1)
+    raise SystemExit("Error: filesystem handler crashed")
+
+
 def _check_file_command_mount(bridge, command: str, use_json: bool) -> MountState:
     """Reject unusable volumes before resolving or creating a file."""
     import json
 
     state = bridge.is_mounted()
+    # Checked after is_mounted(): the handler can crash on the disk info
+    # packet itself.
+    _refuse_crashed_handler(bridge, command, use_json)
     if state.mounted is False:
         if use_json:
             print(json.dumps(_json_error(
@@ -6196,6 +6220,7 @@ def cmd_ls(args):
         # so without this guard the default `amifuse ls image.hdf` reports an
         # unmountable image as an empty volume and exits 0.
         state = bridge.is_mounted()
+        _refuse_crashed_handler(bridge, "ls", use_json)
         mounted, mount_reason = state.mounted, state.reason
         if mounted is False:
             if use_json:
@@ -6304,6 +6329,7 @@ def cmd_verify(args):
         # Reject a disk that the handler conclusively identified as unusable
         # before either verification path can manufacture a successful result.
         state = bridge.is_mounted()
+        _refuse_crashed_handler(bridge, "verify", use_json)
         mounted, mount_reason = state.mounted, state.reason
         if mounted is False:
             if use_json:
