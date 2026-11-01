@@ -105,15 +105,20 @@ def test_spool_beyond_memory_writes_every_byte(write_context, monkeypatch, capsy
 
 
 @pytest.mark.parametrize("use_json", [True, False], ids=["json", "text"])
+@pytest.mark.parametrize("failing", ["write", "seek"])
 def test_temporary_copy_failing_leaves_image_untouched(write_context, monkeypatch,
-                                                       capsys, use_json):
+                                                       capsys, use_json, failing):
+    # The seek back to the start flushes a spool on disk, and can fail too.
     args, bridge, created, _ = write_context
     args.json = use_json
 
     class FullSpool(tempfile.SpooledTemporaryFile):
-        def write(self, data):
-            raise OSError(errno.ENOSPC, "No space left on device")
+        pass
 
+    def full(self, *args):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    setattr(FullSpool, failing, full)
     monkeypatch.setattr(tempfile, "SpooledTemporaryFile", FullSpool)
     with pytest.raises(SystemExit) as caught:
         fs.cmd_write(args)

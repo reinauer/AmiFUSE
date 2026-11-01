@@ -6471,6 +6471,11 @@ def _spool_write_source(source, host_path: Path, host_size: int, use_json: bool)
             sys.exit(1)
         raise SystemExit(f"Error: {message[0].lower()}{message[1:]}")
 
+    def unspoolable(exc):
+        refuse("HANDLER_ERROR",
+               f"Write operation failed: cannot copy the source to a "
+               f"temporary file: {exc.strerror or exc}")
+
     spool = tempfile.SpooledTemporaryFile(max_size=_WRITE_SPOOL_MAX)
     try:
         with source:
@@ -6494,10 +6499,12 @@ def _spool_write_source(source, host_path: Path, host_size: int, use_json: bool)
                 try:
                     spool.write(data)
                 except OSError as exc:
-                    refuse("HANDLER_ERROR",
-                           f"Write operation failed: cannot copy the source to a "
-                           f"temporary file: {exc.strerror or exc}")
-        spool.seek(0)
+                    unspoolable(exc)
+        try:
+            # A spool on disk writes out what it still buffers here.
+            spool.seek(0)
+        except OSError as exc:
+            unspoolable(exc)
         return spool
     except BaseException:
         spool.close()
