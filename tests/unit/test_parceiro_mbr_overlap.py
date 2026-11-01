@@ -1,9 +1,11 @@
 """A partition of a Parceiro disk's own RDB, beside the MBR, is checked
 against the MBR entries, as one in an RDB inside a 0x76 entry is.
 
-A non-0x76 entry starting at the partition's first sector is that entry's
-Amiga view, as the FAT\\1 partition over the FAT32 entry of a real Parceiro
-card is, and may end before the partition does.
+An entry starting at the partition's first sector is that entry's Amiga
+view, as the FAT\\1 partition over the FAT32 entry of a real Parceiro card
+is, and may end before the partition does. A 0x76 entry starts with its own
+RDB, and an extended entry with the table of its own partitions, so neither
+has a view.
 """
 
 import struct
