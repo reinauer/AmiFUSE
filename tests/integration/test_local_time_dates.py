@@ -184,7 +184,7 @@ def test_existing_entry_shows_its_stored_date(volume):
 
 def test_read_only_mount_shows_stored_dates(read_only_volume, monkeypatch):
     """getattr() after readdir(), served from what readdir() read, shows the
-    date on the volume, as xdftool reads it."""
+    date on the volume, as the handler (and, on an ADF, xdftool) reads it."""
     ops, image, existing = read_only_volume
     stored = ops.bridge.stat_path(existing)["mtime"]
     if image.suffix == ".adf":

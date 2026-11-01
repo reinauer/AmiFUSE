@@ -49,7 +49,8 @@ def _pacific_offset(t):
 
 @pytest.fixture
 def california(monkeypatch):
-    """US Pacific time, which changes mid-month in March."""
+    """US Pacific time, which changes at 02:00 local time, not at midnight
+    UTC, and mid-month in March."""
     monkeypatch.setattr(amiga_time, "utc_offset", _pacific_offset)
 
 
@@ -68,9 +69,9 @@ def pacific_host(monkeypatch):
         yield
         return
     old = os.environ.get("TZ")
-    os.environ["TZ"] = PACIFIC_TZ
-    time.tzset()
     try:
+        os.environ["TZ"] = PACIFIC_TZ
+        time.tzset()
         yield
     finally:
         if old is None:
