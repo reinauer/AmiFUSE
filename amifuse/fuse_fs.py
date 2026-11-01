@@ -6240,6 +6240,7 @@ def cmd_ls(args):
             if not raw and path != "/":
                 # Path might not exist -- try stat to distinguish
                 stat = bridge.stat_path(path)
+                _refuse_crashed_handler(bridge, "ls", use_json)
                 if stat is None:
                     # On an unmountable volume no path resolves, so this
                     # branch is reachable for exactly the condition the check
@@ -6269,6 +6270,8 @@ def cmd_ls(args):
                     "protection_bits": prot_bits,
                 })
 
+        # A crash during the listing cuts it short.
+        _refuse_crashed_handler(bridge, "ls", use_json)
         if use_json:
             result = _json_result("ls",
                 target=str(args.image),
@@ -6364,6 +6367,7 @@ def cmd_verify(args):
             # Verify a specific file
             normalized = "/" + file_path.lstrip("/")
             stat = bridge.stat_path(normalized)
+            _refuse_crashed_handler(bridge, "verify", use_json)
             if stat is None:
                 # A missing file on a volume whose mount could not be
                 # confirmed is a different situation from a missing file on
@@ -6416,6 +6420,8 @@ def cmd_verify(args):
                     total_size += ent.get("size", 0)
 
             volname = bridge.volume_name()
+            # A crash during the walk cuts the counts short.
+            _refuse_crashed_handler(bridge, "verify", use_json)
             result_data = {
                 "target": str(args.image),
                 "volume": volname,
@@ -6472,6 +6478,7 @@ def cmd_hash(args):
         mount_details = _mount_state_details(state)
         normalized = "/" + file_path.lstrip("/")
         stat = bridge.stat_path(normalized)
+        _refuse_crashed_handler(bridge, "hash", use_json)
         if stat is None:
             if use_json:
                 print(json.dumps(_json_error("hash", "FILE_NOT_FOUND",
@@ -6661,6 +6668,7 @@ def cmd_read(args):
         mount_details = _mount_state_details(state)
         normalized = "/" + file_path.lstrip("/")
         stat = bridge.stat_path(normalized)
+        _refuse_crashed_handler(bridge, "read", use_json)
         if stat is None:
             if use_json:
                 print(json.dumps(_json_error("read", "FILE_NOT_FOUND",

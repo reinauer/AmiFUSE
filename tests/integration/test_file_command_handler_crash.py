@@ -72,7 +72,7 @@ def test_crash_is_an_error(crashing_volume, tmp_path, command, use_json):
     if use_json:
         error = json.loads(proc.stdout)["error"]
         assert error["code"] == "HANDLER_ERROR"
-        assert "handler crashed" in error["message"]
+        assert error["message"] == "Filesystem handler crashed"
     else:
         assert "Error: filesystem handler crashed" in proc.stderr
         assert proc.stdout == ""

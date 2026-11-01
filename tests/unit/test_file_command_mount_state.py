@@ -176,7 +176,7 @@ def test_crashed_handler_rejected_before_file_operations(command_context, capsys
         result = json.loads(captured.out)
         assert result["command"] == command
         assert result["error"]["code"] == "HANDLER_ERROR"
-        assert "handler crashed" in result["error"]["message"]
+        assert result["error"]["message"] == "Filesystem handler crashed"
     else:
         assert str(caught.value) == "Error: filesystem handler crashed"
         assert captured.out == ""
@@ -187,6 +187,48 @@ def test_crashed_handler_rejected_before_file_operations(command_context, capsys
     bridge.write_handle_reply.assert_not_called()
     bridge.flush_volume.assert_not_called()
     bridge.volume_name.assert_not_called()
+    bridge.backend.close.assert_called_once()
+    assert output.read_bytes() == b"keep existing output"
+
+
+@pytest.mark.parametrize("command,file,path,recursive,crashes", [
+    ("ls", None, "/", False, "list_dir_path"),
+    ("ls", None, "/", True, "list_dir_path"),
+    ("ls", None, "/S", False, "stat_path"),
+    ("verify", None, "/", False, "list_dir_path"),
+    ("verify", "S/file", "/", False, "stat_path"),
+    ("hash", "S/file", "/", False, "stat_path"),
+    ("read", "S/file", "/", False, "stat_path"),
+], ids=["ls", "ls-recursive", "ls-path", "verify", "verify-file", "hash", "read"])
+@pytest.mark.parametrize("use_json", [True, False])
+def test_crash_during_the_command_is_an_error(command_context, capsys, command, file, path,
+                                              recursive, crashes, use_json):
+    """A crash after the disk info is no cut-short listing or missing file."""
+    args, bridge, output = command_context
+    args.json, args.file, args.path, args.recursive = use_json, file, path, recursive
+    args.expect_size = None
+    bridge.list_dir_path.return_value = []
+
+    def crash(*a, **kwargs):
+        # The handler crashes partway through: a cut-short listing, no stat.
+        _crash(bridge)
+        if crashes == "list_dir_path":
+            return [{"name": "Startup-Sequence", "dir_type": -3, "size": 5}]
+        return None
+    getattr(bridge, crashes).side_effect = crash
+    with pytest.raises(SystemExit) as caught:
+        getattr(fs, "cmd_" + command)(args)
+    captured = capsys.readouterr()
+    if use_json:
+        assert caught.value.code == 1
+        error = json.loads(captured.out)["error"]
+        assert error["code"] == "HANDLER_ERROR"
+        assert error["message"] == "Filesystem handler crashed"
+    else:
+        assert str(caught.value) == "Error: filesystem handler crashed"
+        assert captured.out == ""
+    getattr(bridge, crashes).assert_called()
+    bridge.open_file.assert_not_called()
     bridge.backend.close.assert_called_once()
     assert output.read_bytes() == b"keep existing output"
 
