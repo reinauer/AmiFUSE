@@ -509,6 +509,46 @@ def test_a_truncate_whose_reopen_raises_leaves_its_handle_closed(bridge, monkeyp
     assert b._fh_pool == []
 
 
+def test_a_truncate_whose_write_of_no_bytes_raises_leaves_its_handle_closed(
+        bridge, monkeypatch):
+    # BFFS's truncate to 0 ends the handle and opens the file again with
+    # ACTION_FINDOUTPUT (_reopen_for_output), and the write of no bytes
+    # raises, as it does when the emulated RAM runs out. Kept, the new
+    # handle would cut the file at release after any later write.
+    b, handler = bridge
+    file_ids = iter(range(0x5550, 0x5600, 0x10))
+
+    def answer(pkt_type, args, name):
+        if pkt_type in (ACTION_FINDUPDATE, ACTION_FINDOUTPUT):
+            handler.mem.w32((args[0] << 2) + FH_ARGS, next(file_ids))
+            return -1, 0
+        return (0x400, 0) if pkt_type == ACTION_LOCATE_OBJECT else (-1, 0)
+    handler.answer = answer
+
+    ops = fs.AmigaFuseFS(b)
+    handle = ops.open("/file", os.O_RDWR)
+    entry = ops._fh_cache[handle]
+    monkeypatch.setattr(b, "truncate_handle", lambda fh, length, others=(), **_: (
+        -1, fs.ERROR_OBJECT_NOT_FOUND))
+
+    def no_memory():
+        raise VamosInternalError("[alloc: NO MEMORY for 000004 bytes]")
+    monkeypatch.setattr(b, "_alloc_empty_buf", no_memory)
+
+    with pytest.raises(VamosInternalError):
+        ops.truncate("/file", 0, handle)
+    assert entry["closed"] and entry["fh_addr"] == 0
+    assert entry["parent_lock"] == 0
+    # Both handles ended, the new one with no write.
+    ended = [args[0] for _, _, _, args, _ in handler.taken(ACTION_END)]
+    assert ended == [0x5550, 0x5560]
+    assert handler.taken(ACTION_WRITE) == []
+
+    ops.release("/file", handle)
+    assert len(handler.taken(ACTION_END)) == 2
+    assert handler.taken(ACTION_WRITE) == []
+
+
 @pytest.mark.parametrize("failing", [1, 2], ids=["new-lock", "old-lock"])
 def test_a_truncate_whose_lock_free_raises_keeps_no_pooled_handle(
         bridge, monkeypatch, failing):

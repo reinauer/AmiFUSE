@@ -3943,7 +3943,8 @@ class AmigaFuseFS(_FuseOperations):
         writes and truncates fail with EIO, and release() ends nothing. So
         is it after an open or a write that raises, as one does when the
         emulated RAM runs out, and the error goes on to the caller: the old
-        FileHandle is back in the pool, and the next open can take it.
+        FileHandle is back in the pool, and the next open can take it. A
+        write that raises ends the new handle first, unwritten.
         """
         bridge = self.bridge
         bridge.close_file(entry["fh_addr"])
@@ -3951,7 +3952,17 @@ class AmigaFuseFS(_FuseOperations):
         try:
             opened, res2 = bridge.open_file_reply(path, os.O_RDWR | os.O_TRUNC)
             if opened is not None:
-                written, res2 = bridge.write_empty_reply(opened[0])
+                try:
+                    written, res2 = bridge.write_empty_reply(opened[0])
+                except Exception:
+                    # Kept, the new handle would cut the file at release
+                    # after any later write. Ended unwritten, it cuts
+                    # nothing.
+                    (new_fh, lock), opened = opened, None
+                    bridge.close_file(new_fh)
+                    if lock:
+                        bridge.free_lock(lock)
+                    raise
                 emptied = written == 0
                 if not emptied and res2:
                     bridge.close_file(opened[0])
