@@ -9,9 +9,11 @@
   deletes; any other entry stays, so the directory is not empty (#168).
 - A deferred delete refused at release() or releasedir() keeps the
   directory hidden only while another retry is coming (#168, #197).
-- A deferred file delete refused at release() shows the file again, and
-  rmdir() defers only behind a pending file that a handle still holds
-  (#222).
+- A deferred file delete refused at release(), with no handle left to
+  send it again, shows the file again with the date utimens() held for
+  it, and a deferred rmdir() of its directory waits only on its other
+  pending children. rmdir() defers only behind a pending file that a
+  handle still holds (#222).
 
 The tests drive the real callbacks over small in-memory volumes.
 """
@@ -403,3 +405,99 @@ def test_rmdir_behind_a_pending_file_no_handle_holds_is_not_empty(make_fs):
     assert fs._pending_deletes == {"/d/x"}
     assert fs._pending_dir_deletes == {}
     assert _visible(fs, "/d")
+
+
+def test_refused_deferred_delete_waits_for_a_handle_a_failed_truncate_closed(make_fs):
+    fs, volume = make_fs(_InUseVolume, dirs={"/", "/d"}, files={"/d/x"})
+    h1 = _hold(fs, volume, "/d/x")
+    h2 = _hold(fs, volume, "/d/x")
+    volume.close_file(fs._fh_cache[h2]["fh_addr"])
+    fs._fh_cache[h2].update(fh_addr=0, closed=True)  # truncate() failed to reopen
+    h3 = _hold_alias(fs, volume, "/d/x", "/d/X")
+    assert fs.unlink("/d/x") == 0
+
+    fs.release("/d/x", h1)  # refused: the handle under /d/X keeps it in use
+    assert fs._pending_deletes == {"/d/x"}
+    assert not _visible(fs, "/d/x")
+
+    fs.release("/d/X", h3)
+    fs.release("/d/x", h2)  # sends the delete again
+
+    assert volume.deleted == ["/d/x"]
+    assert fs._pending_deletes == set()
+
+
+def test_deferred_delete_whose_directory_lookup_gets_no_reply_shows_the_file(make_fs):
+    # The delete was never sent, so nothing can still delete the file.
+    fs, volume = make_fs(_InUseVolume, dirs={"/", "/d"}, files={"/d/x"})
+    hx = _hold(fs, volume, "/d/x")
+    assert fs.unlink("/d/x") == 0
+    volume.locate_path = lambda path, **kwargs: (0, -1, [])
+
+    fs.release("/d/x", hx)
+
+    del volume.locate_path
+    assert volume.deletes == ["/d/x"]
+    assert fs._pending_deletes == set()
+    assert _visible(fs, "/d/x")
+
+
+class _CaseFoldVolume(_InUseVolume):
+    """Matches names in any letter case, as the handlers do."""
+
+    def _delete(self, path):
+        return super()._delete(path.lower())
+
+
+def test_deferred_rmdir_behind_both_spellings_runs_after_the_second_release(make_fs):
+    fs, volume = make_fs(_CaseFoldVolume, dirs={"/", "/d"}, files={"/d/x"})
+    h1 = _hold(fs, volume, "/d/x")
+    h2 = _hold_alias(fs, volume, "/d/x", "/d/X")
+    assert fs.unlink("/d/x") == 0
+    assert fs.unlink("/d/X") == 0
+    assert fs.rmdir("/d") == 0
+
+    fs.release("/d/x", h1)  # refused: the handle under /d/X keeps it in use
+    assert volume.deleted == []
+    assert not _visible(fs, "/d")  # the release of /d/X deletes the file
+
+    fs.release("/d/X", h2)
+
+    assert volume.deleted == ["/d/x", "/d"]
+    assert fs._pending_deletes == set()
+    assert fs._pending_dir_deletes == {}
+
+
+def _record_dates(fs):
+    dates = []
+    fs._set_date = lambda path, when, **kwargs: dates.append((path, when))
+    return dates
+
+
+def test_refused_deferred_delete_sets_the_date_utimens_held(make_fs):
+    fs, volume = make_fs(_InUseVolume, dirs={"/", "/d"}, files={"/d/x"})
+    dates = _record_dates(fs)
+    h1 = _hold(fs, volume, "/d/x")
+    h2 = _hold_alias(fs, volume, "/d/x", "/d/X")
+    fs._held_dates["/d/x"] = 1000.0  # utimens() while the file was open
+    assert fs.unlink("/d/x") == 0
+
+    fs.release("/d/x", h1)
+
+    assert dates == [("/d/x", 1000.0)]
+    assert fs._held_dates == {}
+
+
+@pytest.mark.parametrize("answer", [(-1, 0), (0, -1)], ids=["deleted", "no-reply"])
+def test_deferred_delete_drops_the_date_utimens_held(make_fs, answer):
+    fs, volume = make_fs(_InUseVolume, dirs={"/", "/d"}, files={"/d/x"})
+    dates = _record_dates(fs)
+    hx = _hold(fs, volume, "/d/x")
+    fs._held_dates["/d/x"] = 1000.0
+    assert fs.unlink("/d/x") == 0
+    volume.delete_object = lambda lock, name, **kwargs: answer
+
+    fs.release("/d/x", hx)
+
+    assert dates == []
+    assert fs._held_dates == {}

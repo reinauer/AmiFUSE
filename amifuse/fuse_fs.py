@@ -3969,8 +3969,6 @@ class AmigaFuseFS(_FuseOperations):
         _pending_dir_deletes) or the releasedir() of a FUSE directory handle
         open on path. Otherwise the directory shows again, and so does each
         deferred parent waiting on it, which can now never be emptied.
-        release() passes a file whose deferred delete was refused, which no
-        retry waits on either.
         """
         while True:
             if path in self._pending_dir_deletes or any(
@@ -3985,6 +3983,25 @@ class AmigaFuseFS(_FuseOperations):
                 return
             del self._pending_dir_deletes[parent]
             path = parent
+
+    def _drop_refused_delete(self, path: str):
+        """Show a file whose deferred delete the handler refused at its last
+        release(), with no handle left to send it again (#222). Caller holds
+        _fh_lock.
+
+        A deferred rmdir() of its directory now waits only on its other
+        pending children. With none left, nothing can empty the directory,
+        which shows again as _drop_failed_dir_delete shows it.
+        """
+        self._pending_deletes.discard(path)
+        parent = path.rsplit("/", 1)[0] or "/"
+        waiting = self._pending_dir_deletes.get(parent, set())
+        if path not in waiting:
+            return
+        waiting.discard(path)
+        if not waiting:
+            del self._pending_dir_deletes[parent]
+            self._drop_failed_dir_delete(parent)
 
     def mkdir(self, path, mode):
         self._check_handler_alive()
@@ -4375,9 +4392,10 @@ class AmigaFuseFS(_FuseOperations):
         with self._fh_lock:
             if path not in self._held_dates or self._has_open_file(path):
                 return
-            when = self._held_dates.pop(path)
-            if path in self._pending_deletes:  # deleted at this release
+            if path in self._pending_deletes:
+                # release() sends the delete next, then sets or drops it.
                 return
+            when = self._held_dates.pop(path)
         try:
             self._set_date(path, when)
         except FuseOSError as e:
@@ -4694,28 +4712,33 @@ class AmigaFuseFS(_FuseOperations):
                     return 0
                 self._pending_deletes.discard(resolved_path)
             delete_succeeded = False
+            dropped = False
             try:
                 dir_path, name = self._split_path(resolved_path)
-                lock_bptr, res2, locks = self.bridge.locate_path(dir_path)
+                lock_bptr, _, locks = self.bridge.locate_path(dir_path)
                 if dir_path == "/" and lock_bptr == 0:
-                    lock_bptr, res2 = self.bridge.locate(0, "")
+                    lock_bptr, _ = self.bridge.locate(0, "")
                     if lock_bptr:
                         locks.append(lock_bptr)
+                no_reply = False
                 if lock_bptr != 0:
                     res1, res2 = self.bridge.delete_object(lock_bptr, name)
                     self._log_op("release", resolved_path, f"deferred delete res1={res1} res2={res2}")
                     delete_succeeded = res1 != 0
+                    # No reply: the handler may still delete it.
+                    no_reply = not delete_succeeded and res2 == -1
                 if not delete_succeeded:
                     with self._fh_lock:
-                        if res2 == -1:
-                            # No reply: the delete may still happen.
-                            self._pending_deletes.add(resolved_path)
+                        # A handle left on the path, closed by a failed
+                        # truncate() reopen, sends the delete again.
+                        dropped = not no_reply and not any(
+                            v.get("path") == resolved_path and "fh_addr" in v
+                            for v in self._fh_cache.values()
+                        )
+                        if dropped:
+                            self._drop_refused_delete(resolved_path)
                         else:
-                            # Refused, with no handle left on the path to
-                            # send it again (#222). The file shows again,
-                            # and so does a deferred parent waiting on it,
-                            # which can now never be emptied.
-                            self._drop_failed_dir_delete(resolved_path)
+                            self._pending_deletes.add(resolved_path)
                 for l in reversed(locks):
                     self.bridge.free_lock(l)
                 if delete_succeeded:
@@ -4726,6 +4749,12 @@ class AmigaFuseFS(_FuseOperations):
                 self._log_op("release", resolved_path, f"deferred delete exception: {type(e).__name__}: {e}")
                 with self._fh_lock:
                     self._pending_deletes.add(resolved_path)
+            if dropped:
+                # The file stays, and takes the date utimens() held for it.
+                self._set_held_date(resolved_path)
+            else:
+                with self._fh_lock:
+                    self._held_dates.pop(resolved_path, None)
             # Resolve any deferred parent directory deletes only on success
             if delete_succeeded:
                 self._resolve_pending_dir_deletes(resolved_path)
