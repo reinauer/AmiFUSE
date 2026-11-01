@@ -271,6 +271,15 @@ class TestCliWithoutDriver:
         entries = json.loads(result.stdout)["entries"]
         assert [e["name"] for e in entries] == ["Multi.bin"]
 
+    @pytest.mark.parametrize("block_size", [None, "512", "1024", "2048"])
+    def test_ls_adf_ignores_block_size(self, tmp_path, no_user_driver, block_size):
+        """An ADF is read in 512-byte blocks whatever --block-size asks for."""
+        args = ["--block-size", block_size] if block_size else []
+        result = _amifuse("ls", str(_seed_adf(tmp_path, "DOS3")), "--json", *args)
+        assert result.returncode == 0, result.stdout + result.stderr
+        entries = json.loads(result.stdout)["entries"]
+        assert {e["name"] for e in entries} == {"Root.txt", "Sub"}
+
     def test_read(self, tmp_path, no_user_driver):
         out = tmp_path / "out.bin"
         result = _amifuse("read", str(_seed_adf(tmp_path, "DOS1")),

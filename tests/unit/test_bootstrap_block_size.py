@@ -9,6 +9,7 @@ from amitools.fs.blkdev.RawBlockDevice import RawBlockDevice
 from amitools.fs.rdb.RDisk import RDisk
 
 from amifuse.bootstrap import BootstrapAllocator
+from amifuse.driver_runtime import BlockDeviceBackend
 from amifuse.fuse_fs import HandlerBridge
 from amifuse.rdb_inspect import ADF_DD_SIZE, detect_adf, open_rdisk
 from tests.unit.test_mbr_rdb_block_size import _make_mbr, _make_rdb
@@ -189,3 +190,22 @@ def test_adf_keeps_512_byte_blocks(tmp_path, monkeypatch, block_size):
     seen = _bootstrap_open(monkeypatch, image, "_read_adf_env",
                            block_size=block_size, adf_info=detect_adf(image))
     assert seen == {"block_bytes": 512, "offset": 0}
+
+
+@pytest.mark.parametrize("block_size", [None, 512, 1024, 2048])
+def test_adf_backend_keeps_512_byte_blocks(tmp_path, block_size):
+    # The handler addresses an ADF in the 512-byte blocks its DosEnvec
+    # declares, so the backend opens it that way whatever size is requested.
+    image = tmp_path / "disk.adf"
+    data = b"".join(bytes([n % 251]) * 512 for n in range(ADF_DD_SIZE // 512))
+    image.write_bytes(b"DOS\0" + data[4:])
+    backend = BlockDeviceBackend(image, block_size=block_size,
+                                 adf_info=detect_adf(image))
+    backend.open()
+    try:
+        assert backend.blkdev.block_bytes == 512
+        assert backend.block_size == 512
+        assert backend.read_blocks(1) == data[512:1024]
+        assert backend.read_blocks(1759) == data[-512:]
+    finally:
+        backend.close()
