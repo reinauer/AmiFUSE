@@ -295,9 +295,10 @@ class BlockDeviceBackend:
         of a size _scan_for_rdb accepts, in 512-byte sectors 0-15, and none
         if that block lies in a 0x76 entry. The scan steps in sectors, not
         in blocks of the open device, which has the container RDB's block
-        size. Raises RDBContentError if RDSK blocks outside the 0x76
-        entries are all invalid, or the RDB found does not open on the
-        device; a failing read raises another OSError.
+        size. Raises RDBContentError if no own RDB is found but an RDSK
+        block with a bad checksum lies outside the 0x76 entries before the
+        first valid one, or the RDB found does not open on the device; a
+        failing read raises another OSError.
         """
         from amitools.fs.block.rdb.RDBlock import RDBlock
         from .rdb_inspect import (MBR_SECTOR_SIZE, MBR_TYPE_AMIGA_RDB,
@@ -314,27 +315,28 @@ class BlockDeviceBackend:
         count = min(-(-16 * MBR_SECTOR_SIZE // size), base.num_blocks)
         data = base.read_block(0, count) if count > 0 else b""
         found = None
-        invalid = []
+        bad_checksum = []
         for sector in range(min(16, len(data) // MBR_SECTOR_SIZE)):
             block = data[sector * MBR_SECTOR_SIZE:(sector + 1) * MBR_SECTOR_SIZE]
             if block[:4] != b"RDSK":
                 continue
             longs = struct.unpack(">128I", block)
-            rdb_size = longs[4]
             # amitools' checksum holds when the block's longs sum to 0.
-            if (sum(longs) & 0xFFFFFFFF == 0 and 512 <= rdb_size <= 32768
-                    and not rdb_size & (rdb_size - 1)):
+            if sum(longs) & 0xFFFFFFFF:
+                if not in_entry(sector):
+                    bad_checksum.append(sector)
+                continue
+            # A size _scan_for_rdb skips counts as no RDSK block at all.
+            rdb_size = longs[4]
+            if 512 <= rdb_size <= 32768 and not rdb_size & (rdb_size - 1):
                 found = sector
                 break
-            if not in_entry(sector):
-                invalid.append(sector)
-        if found is None:
-            if invalid:
-                raise RDBContentError(
-                    f"no RDSK block in sectors {invalid} is valid")
+        if found is None or in_entry(found):
+            # A block found in a 0x76 entry is that entry's own RDB.
+            if bad_checksum:
+                raise RDBContentError(f"an RDSK block fails its checksum "
+                                      f"in sectors {bad_checksum}")
             return []
-        if in_entry(found):
-            return []  # A 0x76 entry's own RDB: the disk has none.
         where = f"its RDSK block at sector {found}"
         if rdb_size != size:
             raise RDBContentError(
