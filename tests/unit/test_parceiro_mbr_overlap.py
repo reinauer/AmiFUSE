@@ -118,6 +118,18 @@ def test_partition_starting_at_a_0x76_entry_is_refused(tmp_path):
     assert _open(image, "DH0") == (16, 80)
 
 
+@pytest.mark.parametrize("ptype", [0x05, 0x0F, 0x85],
+                         ids=lambda t: f"0x{t:02X}")
+def test_partition_starting_at_an_extended_entry_is_refused(tmp_path, ptype):
+    # An extended entry's first sector holds the table of its own
+    # partitions, so a partition starting there is not a view of it.
+    image = _parceiro(tmp_path, [("DH0", (1, 4), DOS0), ("DH1", (5, 9), DOS0)],
+                      [(ptype, 80, 80)])
+    with pytest.raises(ValueError, match=OVERLAP):
+        _open(image, "DH1")
+    assert _open(image, "DH0") == (16, 80)
+
+
 def test_rdb_blocks_are_compared_as_512_byte_sectors(tmp_path):
     # 1024-byte blocks: DH0 on sectors 32-159 and FAT on sectors 160-319.
     parts = [("DH0", (1, 4), DOS0), ("FAT", (5, 9), FAT1)]
