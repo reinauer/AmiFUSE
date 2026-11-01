@@ -141,6 +141,10 @@ class TestMountFuseOptions:
 
         monkeypatch.setattr(fuse_fs_mod, "FUSE", fake_fuse)
 
+        # A background mount forks before the bridge is built; the tests
+        # must not fork pytest (and Windows has no fork at all).
+        monkeypatch.setattr(fuse_fs_mod, "_fork_daemon_parent", lambda: None)
+
         # Patch detect_adf and detect_iso (imported locally in mount_fuse)
         fake_rdb = MagicMock()
         fake_rdb.detect_adf.return_value = None
