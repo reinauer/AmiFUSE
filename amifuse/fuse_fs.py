@@ -7184,7 +7184,7 @@ def cmd_inspect(args):
     from .rdb_inspect import (
         open_each_rdb, detect_adf, detect_iso, list_partitions,
         amiga_rdb_partitions, build_rdisk_desc, print_inspect_report,
-        mount_names, DiskRDBError, rdb_label,
+        mount_names, DiskRDBError, rdb_label, find_partition,
     )
 
     use_json = getattr(args, "json", False)
@@ -7338,11 +7338,30 @@ def cmd_inspect(args):
     print("\nFilesystem driver per partition (without --driver):")
     # Names are unique: list_partitions renames a repeated one (DH0.1). A
     # damaged drive name has none, so the partition is labelled by its
-    # number, as get_partition_info names it.
+    # number, as get_partition_info names it, but only if --partition takes
+    # that number to it: a number selects the first RDB with a partition of
+    # that number, which on a disk with more than one RDB may be another,
+    # and a partition named as the number comes first on any disk. Otherwise
+    # the line says no value selects the partition: a spelling such as "00",
+    # which --partition may still take as the number, is not offered.
     for part in list_partitions(args.image, args.block_size).partitions:
         text = _partition_driver(args.image, args.block_size, part.name)[1]
-        label = part.name if part.name is not None else f"#{part.index}"
-        print(f"  {label}: {text}")
+        if part.name is not None:
+            print(f"  {part.name}: {text}")
+            continue
+        try:
+            ref = find_partition(args.image, args.block_size, str(part.index))
+        except OSError:
+            ref = None
+        if ref is not None and (ref.mbr_partition_index, ref.number) == (
+                part.mbr_partition_index, part.index):
+            print(f"  #{part.index}: {text}")
+            continue
+        where = ("the first RDB" if part.mbr_partition_index is None else
+                 rdb_label(amiga_rdb_partitions(args.image),
+                           part.mbr_partition_index))
+        print(f"  #{part.index} in {where}: "
+              f"damaged drive name: no --partition value selects it")
 
 
 def cmd_mount(args):

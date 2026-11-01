@@ -96,11 +96,14 @@ class PartInfo:
     never the index. ``name`` is the drive name as AmigaOS mounts it, so a
     repeated drive name reads ``DH0.1`` (:func:`mount_names`); it is None
     for a damaged drive name, which no ``--partition`` name selects.
+    ``mbr_partition_index`` tells which RDB holds the partition, as
+    :func:`open_each_rdb` yields it and :class:`PartitionRef` carries it.
     """
     index: int          # Partition.num (per-RDB positional index; collides across RDBs)
     name: Optional[str]  # unique drive name -- the --partition key for the fan-out
     dostype: int        # dos_env.dos_type
     dostype_str: str    # DosType tag string (e.g. "DOS1")
+    mbr_partition_index: Optional[int] = None  # its RDB's; None for the default open
 
 
 @dataclass
@@ -1091,6 +1094,7 @@ def list_partitions(
     # (blkdev, rdisk) and MUST close both inside the loop or N block-device
     # handles leak.
     rdb_parts = []
+    rdb_indices = []
     default_error = None
     # Each RDB that fails, named as inspect names it: its partitions are
     # missing from the list. An entry holding no RDB misses none.
@@ -1105,6 +1109,7 @@ def list_partitions(
         blkdev, rdisk, _mbr_ctx = opened
         try:
             rdb_parts.append(list(rdisk.parts))
+            rdb_indices.append(rdb_idx)
         finally:
             rdisk.close()
             blkdev.close()
@@ -1115,9 +1120,11 @@ def list_partitions(
 
     # The partitions' parsed fields outlive the closed handles (_part_info).
     all_parts: List[PartInfo] = []
-    for parts, names in zip(rdb_parts, mount_names(rdb_parts)):
+    for rdb_idx, parts, names in zip(rdb_indices, rdb_parts,
+                                     mount_names(rdb_parts)):
         for p, name in zip(parts, names):
             info = _part_info(p)
+            info.mbr_partition_index = rdb_idx
             if name is not None:
                 info.name = name
             all_parts.append(info)
