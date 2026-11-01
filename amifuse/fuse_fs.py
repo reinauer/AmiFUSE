@@ -110,7 +110,6 @@ from .driver_resolver import DriverNotFound, ResolvedDriver
 from .driver_runtime import BlockDeviceBackend, ImageInUseError
 from .vamos_runner import VamosHandlerRuntime
 from .bootstrap import BootstrapAllocator
-from .process_mgr import ProcessManager
 from .startup_runner import (
     ACTION_CREATE_DIR,
     ACTION_FINDINPUT,
@@ -121,13 +120,10 @@ from .startup_runner import (
     OFFSET_BEGINNING,
     OFFSET_CURRENT,
     OFFSET_END,
-    _get_block_state,
-    _clear_all_block_state,
-    _get_active_block_state,
     _packet_type_name,
-    _snapshot_block_state,
-    _restore_block_state,
 )
+from amitools.vamos.schedule import RunResult  # type: ignore
+from .emu_thread import EmuThread, route_methods_through_emu
 from amitools.vamos.libstructs.dos import FileInfoBlockStruct, FileHandleStruct, DosPacketStruct, InfoDataStruct  # type: ignore
 from amitools.vamos.lib.dos.DosProtection import DosProtection  # type: ignore
 from amitools.util.Win32Disk import is_windows_disk  # type: ignore
@@ -403,14 +399,15 @@ class HandlerBridge:
         self._closed = False
         # Set when a wait runs out of busy cycles; see _run_until_replies.
         self._busy_ran_out = False
-        # Set while the timer thread has left the handler running, and the
-        # busy cycles it has run it for since it last parked; see
-        # run_due_timers.
-        self._idle_unfinished = False
-        self._idle_busy_cycles = 0
+        # Called from the idle hook once the handler is found crashed.
+        self._on_crash = None
+        # The emulation runs on this thread: the machine and the scheduler
+        # are made here, and every method below runs here (emu_thread.py).
+        self._emu = EmuThread()
+        self._emu.start()
         try:
-            self._initialize(image, driver, block_size, read_only, debug,
-                             trace, partition, adf_info, iso_info)
+            self._emu.call(self._initialize, image, driver, block_size, read_only,
+                           debug, trace, partition, adf_info, iso_info)
         except BaseException:
             # A failed constructor has no caller that can close it. Preserve
             # the startup error even if tearing down partial state also fails.
@@ -532,41 +529,17 @@ class HandlerBridge:
         if debug:
             print(f"[amifuse] Segment: addr=0x{seg_addr:x} size={seg_size} end=0x{seg_addr+seg_size:x}")
         self.launcher = HandlerLauncher(self.vh, boot, seg_addr)
+        self.launcher._emu = self._emu
         self.state = self.launcher.launch_with_startup(debug=debug)
 
-        # Initialize ProcessManager early for multi-process support (e.g., SFS)
-        # This must happen before _run_until_replies since SFS creates children during startup
-        self.proc_mgr = ProcessManager(
-            vh=self.vh,
-            machine=self.vh.machine,
-            exec_impl=self.vh.slm.exec_impl,
-            parent_proc_addr=self.state.process_addr
-        )
-
-        # run startup to completion
-        # Use moderate cycle count for startup to allow child processes to run.
-        # SFS creates child processes that need to run and register ports.
-        # Smaller bursts give us more chances to interleave child execution.
-        replies = self._run_startup_until_replies(cycles=10_000, max_iters=2000)
+        # Run startup to completion. The handler, and the child processes
+        # it creates (SFS's DosList handler), run under the scheduler
+        # until all of them wait.
+        replies = self._run_startup_until_replies()
         # Check if startup succeeded - res1=0 means the handler rejected the disk
         pkt = DosPacketStruct(self.mem, self.state.stdpkt_addr)
         startup_res1 = pkt.res1.val
         startup_res2 = pkt.res2.val
-        if not replies and startup_res1 == 0 and not self.state.crashed:
-            if self._debug:
-                print("[amifuse] No startup reply yet; attempting deferred signal flush before failing")
-            if not self.state.main_loop_pc:
-                from amitools.vamos.machine.regs import REG_D0
-                cpu = self.vh.machine.cpu
-                self._capture_main_loop_from_block_state()
-                _clear_all_block_state()
-                cpu.w_reg(REG_D0, 0)
-                self._set_saved_main_reg(REG_D0, 0)
-                self._capture_main_loop_state()
-            self._flush_pending_signals()
-            replies = self._run_startup_until_replies(cycles=10_000, max_iters=2000)
-            startup_res1 = pkt.res1.val
-            startup_res2 = pkt.res2.val
         if self._debug:
             print(f"[amifuse] Startup packet result: res1={startup_res1} res2={startup_res2}")
         if startup_res1 == 0:
@@ -576,50 +549,9 @@ class HandlerBridge:
                 raise SystemExit("Filesystem handler did not reply to the startup packet")
             raise StartupDiskRejected(startup_res1, startup_res2)
         self._update_handler_port_from_startup()
-        if self._debug:
-            print(
-                f"[amifuse] Post-startup state: pc=0x{self.state.pc:x} "
-                f"sp=0x{self.state.sp:x} main_loop_pc=0x{self.state.main_loop_pc:x}"
-            )
-        # Capture main loop state from the current blocking state BEFORE
-        # clearing it. run_burst() during _run_until_replies may have
-        # already set main_loop_pc; if not, grab it from the raw
-        # blocking variables. This is critical for WaitPort-based handlers
-        # where clearing the blocking state and setting D0=0 would cause a
-        # NULL-message crash when the handler resumes from the WaitPort
-        # return address.
-        from amitools.vamos.machine.regs import REG_D0
-        cpu = self.vh.machine.cpu
-        if not self.state.main_loop_pc:
-            self._capture_main_loop_from_block_state()
-        if not self.state.main_loop_pc:
-            self.state.main_loop_pc = 0
-            self.state.main_loop_sp = 0
-            self.state.wait_mask = 0
-            self.state.block_state = None
-            _clear_all_block_state()
-            cpu.w_reg(REG_D0, 0)
-            self._set_saved_main_reg(REG_D0, 0)
-            self._capture_main_loop_state(max_iters=500, cycles=50_000)
-        if not self.state.initialized:
-            self.state.initialized = True
-        if self._debug:
-            wait_mask = getattr(self.state, "wait_mask", 0)
-            if wait_mask:
-                print(
-                    f"[amifuse] Saved main_loop_pc=0x{self.state.pc:x}, "
-                    f"main_loop_sp=0x{self.state.sp:x} wait_mask=0x{wait_mask:x}"
-                )
-            else:
-                print(
-                    f"[amifuse] Saved main_loop_pc=0x{self.state.pc:x}, "
-                    f"main_loop_sp=0x{self.state.sp:x}"
-                )
-        # Flush pending timer events so the handler can complete delayed disk
-        # validation.  PFS3 uses TR_ADDREQUEST to schedule deferred volume
-        # validation; the timer signal must fire before the volume becomes
-        # accessible.  We deliver all pending signals from the handler's
-        # wait mask so it can process any queued timer or I/O events.
+        self.state.initialized = True
+        # Run the deferred initialisation: PFS3 validates the volume on a
+        # timer request, which is due at once here, as every pending one.
         self._flush_pending_signals()
         # cache a best-effort volume name
         self._volname = None
@@ -653,6 +585,66 @@ class HandlerBridge:
         if getattr(self, "_closed", False):
             return
         self._closed = True
+        emu = getattr(self, "_emu", None)
+        try:
+            if emu is not None and emu.alive:
+                emu.set_idle(None)
+                emu.call(self._close_runtime)
+            else:
+                self._close_runtime()
+        finally:
+            if emu is not None:
+                emu.stop()
+
+    def shutdown_runtime(self):
+        """Shut the vamos runtime down, as destroy() does before the mount ends."""
+        runtime = getattr(self, "vh", None)
+        if runtime is not None:
+            runtime.shutdown()
+
+    def start_idle_timers(self, on_crash=None):
+        """Reply to due timer requests while no call is pending.
+
+        The emulation thread runs run_due_timers() whenever it has waited
+        as long as that asked for; a handler that crashes there is reported
+        to on_crash() once. Replaces the mount's timer thread.
+        """
+        self._on_crash = on_crash
+        self._emu.set_idle(self._idle_timers)
+
+    def stop_idle_timers(self):
+        self._emu.set_idle(None)
+
+    def _idle_timers(self):
+        if self.state.crashed:
+            on_crash, self._on_crash = self._on_crash, None
+            if on_crash is not None:
+                on_crash()
+            return None
+        try:
+            timeout = self.run_due_timers()
+        except Exception:
+            # As a mount goes on when a FUSE operation raises in the same
+            # bridge code: the next call runs the handler on.
+            if self._debug:
+                import traceback
+                print("[amifuse] timer: error delivering timers:", flush=True)
+                traceback.print_exc()
+            timeout = self._TIMER_RETRY
+        if self.state.crashed:
+            on_crash, self._on_crash = self._on_crash, None
+            if on_crash is not None:
+                on_crash()
+            return None
+        if timeout is not None:
+            # At least one VBLANK tick, even when a request is due again at
+            # once, so that calls waiting for the thread get their turn.
+            timer = self._timer_device()
+            if timer is not None:
+                timeout = max(timeout, timer.MIN_DELAY)
+        return timeout
+
+    def _close_runtime(self):
         runtime = getattr(self, "vh", None)
         backend = getattr(self, "backend", None)
         self.vh = None
@@ -672,11 +664,6 @@ class HandlerBridge:
         if first_error is not None:
             raise first_error
 
-    def _set_saved_main_reg(self, reg_num: int, value: int):
-        """Mirror manual register changes into the saved main handler state."""
-        if self.state.regs is not None:
-            self.state.regs[reg_num] = value
-
     def _reserved_port_addrs(self) -> set[int]:
         reserved = {self.state.port_addr, self.state.reply_port_addr}
         # The handler process's own pr_MsgPort stays its packet port after
@@ -687,10 +674,14 @@ class HandlerBridge:
             from amitools.vamos.libstructs.dos import ProcessStruct  # type: ignore
             msg_port_off = ProcessStruct.sdef.find_field_def_by_name("pr_MsgPort").offset
             reserved.add(process_addr + msg_port_off)
-        if hasattr(self, "proc_mgr"):
-            for proc in self.proc_mgr.processes.values():
-                if proc.is_child and not proc.exited and proc.port_addr:
-                    reserved.add(proc.port_addr)
+        # The ports of the child processes the handler created, which
+        # dos.library frees with them when they end.
+        dos_impl = getattr(getattr(self.vh, "slm", None), "dos_impl", None)
+        for child in list(getattr(dos_impl, "child_procs", {}).values()):
+            try:
+                reserved.add(child.proc.msg_port.addr)
+            except Exception:
+                continue
         return reserved
 
     def _drain_non_essential_ports(self, pmgr):
@@ -744,75 +735,54 @@ class HandlerBridge:
         return getattr(getattr(self, "vh", None), "timer_device", None)
 
     def _deliver_timers(self, fast_forward: bool = False) -> int:
-        """Reply to due timer requests; return the signals sent to the handler.
+        """Reply to due timer requests and end due Delay()s; return how many.
 
-        Replies signal their port's task, which sets the bits in
-        tc_SigRecvd and the fallback signals; the caller decides how the
-        parked handler wakes. With fast_forward every pending request is
-        due, so that a handler's initialisation needs no real time.
+        A reply signals its port's task, which makes that task ready: the
+        next run resumes it inside its Wait(). With fast_forward every
+        pending request is due, so that a handler's initialisation needs
+        no real time.
         """
         timer = self._timer_device()
         if timer is None:
             return 0
+
+        def count():
+            # requests replied and Delay()s ended
+            return timer.deliveries + getattr(timer, "delays_ended", 0)
+
+        before = count()
         signals = timer.deliver(fast_forward=fast_forward)
-        if signals and self._debug:
+        replied = count() - before
+        if replied and self._debug:
             print(
-                f"[amifuse] timer: replied, signals "
+                f"[amifuse] timer: replied to {replied} request(s), signals "
                 f"{ {hex(task): hex(bits) for task, bits in signals.items()} }"
                 f"{' (fast-forward)' if fast_forward else ''}"
             )
-        return signals.get(self.state.process_addr, 0)
-
-    def _deliver_timers_in_packet_wait(self):
-        """Reply to timer requests while a packet wait finds the handler parked.
-
-        Due requests are replied. A handler parked anywhere but its main
-        loop waits within the packet, possibly for its own timer, so every
-        pending request is then due, as when timer.device completed at
-        once. At its main loop the deadlines hold, as for SFS's 0.5 s
-        write-back. The main loop is its Wait() return PC on its stack
-        frame: a Wait() in a subroutine shared with deeper code returns to
-        the same PC on a deeper frame.
-        """
-        timer = self._timer_device()
-        if timer is None or timer.next_deadline() == math.inf:
-            return
-        at_main_loop = self._at_main_loop_frame()
-        signals = self._deliver_timers(fast_forward=not at_main_loop)
-        self._leave_timer_signals_to_wait_frame(signals)
-
-    def _at_main_loop_frame(self) -> bool:
-        """Whether the handler's saved PC and SP are its main loop's."""
-        state = self.state
-        return (
-            bool(state.main_loop_pc)
-            and state.pc == state.main_loop_pc
-            and state.sp == state.main_loop_sp
-        )
+        return replied
 
     # How long after its start a packet wait may still sleep until a timer
     # request falls due; see _sleep_to_timer_in_packet_wait.
     _PACKET_TIMER_WAIT = 1.0
 
+    # Emulated cycles the handler and its children run per scheduler call
+    # before the bridge looks at the reply port again.
+    _RUN_CHUNK_CYCLES = 1_000_000
+
     def _sleep_to_timer_in_packet_wait(self, wait_until: float) -> bool:
         """Sleep to the next timer deadline, for a wait about to end without a reply.
 
-        At its main loop the handler's timers keep their deadlines, so a
-        reply that waits on one, such as a delayed retry or a child's
-        timer, cannot come within the wait's bursts. If the handler is
-        parked there and a request falls due by wait_until, on the device
-        clock, the wait sleeps to its deadline and replies to the due
-        requests. Returns True once a request fell due by wait_until, so
-        the wait runs on, even if the request turned out freed and went
-        unreplied. The sleep holds the bridge lock, as the whole wait does,
-        so a wait that would have failed at once costs up to
-        _PACKET_TIMER_WAIT more, also where the due request cannot wake
-        the handler, which the bridge cannot tell: a handler in WaitPort()
-        on its DOS port is woken by its own timer only if the request
-        replies to that port.
+        Every task waits, so only time can bring the reply: the handler,
+        or a child, waits on a timer request before it replies. If a
+        request falls due by wait_until, on the device clock, the wait
+        sleeps to its deadline and replies to the due requests. Returns
+        True once a request fell due by wait_until, so the wait runs on,
+        even if the request turned out freed and went unreplied. The sleep
+        holds the bridge lock, as the whole wait does, so a wait that would
+        have failed at once costs up to _PACKET_TIMER_WAIT more.
         """
         timer = self._timer_device()
-        if timer is None or not self._at_main_loop_frame():
+        if timer is None:
             return False
         deadline = timer.next_deadline()
         if deadline > wait_until:
@@ -824,139 +794,12 @@ class HandlerBridge:
             if delay <= 0:
                 break
             time.sleep(delay)
-        self._leave_timer_signals_to_wait_frame(self._deliver_timers())
+        self._deliver_timers()
         return True
 
-    def _leave_timer_signals_to_wait_frame(self, signals: int):
-        """Keep due timer bits for a handler parked in Wait() in tc_SigRecvd only.
-
-        The resume from its saved Wait() frame in run_burst returns them
-        from tc_SigRecvd and clears them there. Left in the fallback signals
-        too, the handler's next Wait() would return them again: a spurious
-        timer wake.
-        """
-        if not signals:
-            return
-        block = _get_active_block_state(self.state.block_state)
-        if block is not None and block.get("wait_blocked_sp") is not None:
-            from amitools.vamos.lib.lexec.signalfunc import SignalFunc
-            SignalFunc._fallback_signals &= ~signals
-
-    def _run_ready_children(self, cycles_per_child: int):
-        """Run child processes once, keeping the parent's blocking state."""
-        if not hasattr(self, "proc_mgr"):
-            return
-        parent_block_state = _snapshot_block_state()
-        self.proc_mgr.run_all_ready_children(cycles_per_child=cycles_per_child)
-        if self.state.initialized:
-            _restore_block_state(parent_block_state)
-        else:
-            _clear_all_block_state()
-
-    def _parked_at_main_loop(self) -> bool:
-        """Whether the handler waits in its main-loop Wait() for signals.
-
-        Both its PC and its SP must match the main loop's, as in
-        _deliver_timers_in_packet_wait.
-        """
-        state = self.state
-        if state.crashed or not self._at_main_loop_frame():
-            return False
-        block = _get_active_block_state(state.block_state)
-        # A WaitPort() wakes only for a message, never for a signal.
-        return block is None or block.get("wait_blocked_sp") is not None
-
-    def _resume_with(
-        self, signals: int, cycles: int = 200_000, max_iters: int = 50
-    ) -> Tuple[int, bool]:
-        """Wake the handler parked at its main loop with signals, and run it.
-
-        Wait() returns the signals the handler waits for, which are cleared
-        from the fallback signals and tc_SigRecvd as Wait() would. It then
-        runs as in _run_until_parked, whose result it returns. Signals the
-        handler does not wait for stay pending.
-        """
-        from amitools.vamos.lib.lexec.signalfunc import SignalFunc
-        from amitools.vamos.libstructs.exec_ import TaskStruct
-        from amitools.vamos.machine.regs import REG_D0
-
-        state = self.state
-        block = _get_active_block_state(state.block_state)
-        wait_mask = (block or {}).get("wait_blocked_mask") or state.wait_mask
-        signals &= wait_mask
-        if not signals or not self._parked_at_main_loop():
-            # A child may have been signalled instead.
-            self._run_ready_children(cycles // 4)
-            return 0, True
-        SignalFunc._fallback_signals &= ~signals
-        sigrecvd_off = TaskStruct.sdef.find_field_def_by_name("tc_SigRecvd").offset
-        sigrecvd_addr = state.process_addr + sigrecvd_off
-        self.mem.w32(sigrecvd_addr, self.mem.r32(sigrecvd_addr) & ~signals)
-        # state.pc and state.sp already hold the parked Wait() frame.
-        self.vh.machine.cpu.w_reg(REG_D0, signals)
-        self._set_saved_main_reg(REG_D0, signals)
-        _clear_all_block_state()
-        state.block_state = None
-        if self._debug:
-            print(f"[amifuse] timer: resuming handler with D0=0x{signals:x}")
-        return self._run_until_parked(cycles, max_iters)
-
-    def _run_until_parked(
-        self, cycles: int = 200_000, max_iters: int = 50,
-        busy_limit: Optional[int] = None,
-    ) -> Tuple[int, bool]:
-        """Run the handler from where it is until it parks with nothing pending.
-
-        The parent and then any ready children run, at most max_iters
-        parks, and busy for at most busy_limit cycles, or by default under
-        the busy limits of _run_until_replies. Nothing polls the reply
-        port here: a late reply belongs to the next packet's wait. Returns
-        the busy cycles spent and whether the handler stopped, parked with
-        nothing pending, exited or crashed; if not, it is still running.
-        """
-        state = self.state
-        busy_cycles = 0
-        idle_iters = 0
-        fixed_limit = busy_limit
-        while idle_iters < max_iters:
-            busy_limit = fixed_limit or (
-                self._SHORT_BUSY_CYCLES if self._busy_ran_out
-                else self._MAX_BUSY_CYCLES
-            )
-            if busy_cycles >= busy_limit:
-                if fixed_limit is None:
-                    # As in _run_until_replies: the next wait gets the short limit.
-                    self._busy_ran_out = True
-                if self._debug:
-                    print(f"[amifuse] timer: handler still busy after "
-                          f"{busy_cycles:,} cycles, pc=0x{state.pc:x}")
-                return busy_cycles, False
-            self.launcher.run_burst(state, max_cycles=cycles, debug=self._debug)
-            rs = state.run_state
-            if state.crashed:
-                return busy_cycles, True
-            busy = not getattr(rs, "error", None) and not getattr(rs, "done", False)
-            if busy:
-                busy_cycles += cycles
-            else:
-                self._busy_ran_out = False
-            self._run_ready_children(cycles // 4)
-            if busy:
-                continue
-            if getattr(rs, "done", False):
-                return busy_cycles, True
-            # It parked. A burst that parks reports no cycles, so the parked
-            # state decides: with a wake already pending (a self-signal, a
-            # quick reply, a child's reply) run_burst left no block state,
-            # or the resume below finds the wake, and it runs again.
-            if (
-                _get_active_block_state(state.block_state) is not None
-                and not self.launcher.setup_resume_if_blocked(state, debug=self._debug)
-            ):
-                return busy_cycles, True
-            idle_iters += 1
-        # Its last park had a wake pending: it runs on.
-        return busy_cycles, False
+    def _run(self, max_cycles: Optional[int] = None) -> RunResult:
+        """Run the handler and its children; see HandlerLauncher.run."""
+        return self.launcher.run(max_cycles)
 
     # How long the mount's timer thread waits before it looks again at a
     # handler it could not wake (busy past its budget, or waiting somewhere
@@ -964,194 +807,83 @@ class HandlerBridge:
     _TIMER_RETRY = 1.0
 
     def run_due_timers(self) -> Optional[float]:
-        """Run a busy handler on, then reply to due timer requests.
+        """Run a busy handler on, then reply to due timer requests and run it.
 
         Called by the mount's timer thread between FUSE operations. A
-        handler whose packet wait ran out is still working on that packet,
-        and one the timer resume below left running, still busy or waking
-        itself, is still at work too. Each call runs it on for at most
-        _SHORT_BUSY_CYCLES busy cycles, until it parks, leaving any late
-        reply on the reply port for the next packet's wait, and asks for
-        the next call a tick later, so FUSE operations get the lock in
-        between. A handler still running after _MAX_BUSY_CYCLES cycles of
-        such slices, likely caught in a loop, is left for the next FUSE
-        operation. Due timer requests are then replied, unless the handler
-        is parked elsewhere than its main loop. A child process doing a
-        packet's work while the parent is parked is not run on: the packet
-        wait does not record that the child is still busy. Returns the
+        handler whose packet wait ran out is still working on that packet;
+        each call runs it on for at most _SHORT_BUSY_CYCLES cycles, so
+        FUSE operations get the lock in between, and asks for the next
+        call a tick later while it stays busy. Due timer requests are then
+        replied and the handler runs until it waits again; stray replies
+        it left are drained then, as after a packet wait. Returns the
         seconds until the next call is due, or None when nothing is pending.
         """
         with self._lock:
             timer = self._timer_device()
-            if timer is None or self.state.crashed:
+            if timer is None or self.state.crashed or self.state.exited:
                 return None
-            if self._busy_ran_out or self._idle_unfinished:
-                if self._idle_busy_cycles >= self._MAX_BUSY_CYCLES:
-                    # A whole busy limit, as a packet wait counts it.
+            pmgr = self.vh.slm.exec_impl.port_mgr
+            if self._busy_ran_out:
+                if self._run(self._SHORT_BUSY_CYCLES) == RunResult.BUSY:
+                    return timer.MIN_DELAY
+                # It waited or exited, so it is not caught in a loop.
+                self._busy_ran_out = False
+                self._drain_non_essential_ports(pmgr)
+            if self._deliver_timers():
+                if self._run(self._SHORT_BUSY_CYCLES) == RunResult.BUSY:
                     self._busy_ran_out = True
-                    return None if timer.next_deadline() == math.inf else self._TIMER_RETRY
-                slice_ = self._run_until_parked(busy_limit=self._SHORT_BUSY_CYCLES)
-                if not self._after_idle_run(slice_):
                     return timer.MIN_DELAY
-            self._idle_busy_cycles = 0
-            if not self._parked_at_main_loop():
-                return None if timer.next_deadline() == math.inf else self._TIMER_RETRY
-            deliveries = timer.deliveries
-            signals = self._deliver_timers()
-            if timer.deliveries != deliveries:
-                if not self._after_idle_run(self._resume_with(signals)):
-                    return timer.MIN_DELAY
+                self._drain_non_essential_ports(pmgr)
             deadline = timer.next_deadline()
             if deadline == math.inf:
                 return None
             return max(0.0, deadline - timer.clock())
 
-    def _after_idle_run(self, run: Tuple[int, bool]) -> bool:
-        """Record a timer-thread run of the handler; return whether it stopped.
+    def _run_startup_until_replies(self, max_iters: int = 200, cycles: Optional[int] = None):
+        """Run the handler until it has replied to the startup packet and waits.
 
-        A run that leaves it running marks it unfinished and costs at least
-        one slice of the idle budget, though it may have spent its parks
-        rather than cycles. Its ports are left alone then: a SendIO() reply
-        it has not taken yet is still its own (#240). Once it is parked at
-        its main loop, an IO reply still queued is stale and is drained, as
-        after a packet wait.
+        Each run goes on until every task waits, or for cycles emulated
+        cycles. A handler that waits before it has replied gets every
+        pending timer request replied, as if its time had passed: one that
+        waits on its own timer during startup gets it at once, as it
+        always did. The run ends once the reply is there and the handler
+        and its children wait, when the handler exits, or when nothing can
+        wake it any more.
         """
-        busy, stopped = run
-        self._idle_unfinished = not stopped
-        if not stopped:
-            self._idle_busy_cycles += max(busy, self._SHORT_BUSY_CYCLES)
-        elif not self.state.crashed and self._at_main_loop_frame():
-            self._drain_non_essential_ports(self.vh.slm.exec_impl.port_mgr)
-        return stopped
-
-    def _run_startup_until_replies(
-        self,
-        max_iters: int = 2000,
-        cycles: int = 10_000,
-        sleep_base: float = 0.0005,
-        sleep_max: float = 0.01,
-    ):
-        """Run startup bursts until we have the startup reply.
-
-        Some handlers reply to startup before their private mount path has
-        reached the final steady-state Wait() loop. Keep driving startup after
-        the reply arrives and hand the saved reply back to the caller once the
-        startup budget is exhausted or the handler stops making forward
-        progress.
-        """
+        if cycles is None:
+            cycles = self._RUN_CHUNK_CYCLES
         replies = []
-        sleep_time = sleep_base
-
         if self.state.crashed:
             if self._debug:
                 print("[amifuse] startup: handler crashed, returning empty")
             return []
-
         for i in range(max_iters):
-            old_pc = self.state.pc
-            self.launcher.run_burst(self.state, max_cycles=cycles, debug=self._debug)
-            rs = self.state.run_state
-            new_pc = self.state.pc
-            parent_block_state = None
-
-            if self._debug and i < 3:
-                cycles_run = getattr(rs, "cycles", 0) if rs else 0
-                print(
-                    f"[amifuse] startup iter {i}: PC 0x{old_pc:x}->0x{new_pc:x} "
-                    f"cycles={cycles_run} done={getattr(rs, 'done', False)} "
-                    f"error={getattr(rs, 'error', None)} "
-                    f"kind={getattr(rs, 'error_kind', None)} "
-                    f"detail={getattr(rs, 'error_detail', None)!r}"
-                )
-
+            result = self._run(cycles)
             if self.state.crashed:
                 if self._debug:
                     print(f"[amifuse] startup: handler crashed at iter {i}")
                 return replies
-
             polled = self.launcher.poll_replies(
-                self.state.reply_port_addr, debug=self._debug
+                self.state.reply_port_addr, debug=self._debug and i < 3
             )
             if polled:
                 replies.extend(polled)
-                # Only the startup packet is out; see _finalize_burst_blocked.
                 self.state.startup_replied = True
-                if self._debug and i > 5:
-                    print(
-                        f"[amifuse] startup: got {len(replies)} replies "
-                        f"after {i} iters; continuing"
-                    )
-
-            if hasattr(self, "proc_mgr"):
-                parent_block_state = _snapshot_block_state()
-                num_children = self.proc_mgr.run_all_ready_children(
-                    cycles_per_child=cycles // 4
-                )
-                if self.state.initialized:
-                    _restore_block_state(parent_block_state)
-                else:
-                    _clear_all_block_state()
-                if num_children > 0 and self._debug:
-                    print(f"[amifuse] startup ran {num_children} child process(es)")
-
-            parent_wait_blocked = (
-                parent_block_state is not None
-                and (
-                    parent_block_state.get("waitport_blocked_sp") is not None
-                    or parent_block_state.get("wait_blocked_sp") is not None
-                )
-            )
-            children_settled = not (
-                hasattr(self, "proc_mgr") and self.proc_mgr.has_unsettled_children()
-            )
-            parent_blocked = parent_wait_blocked or bool(getattr(rs, "error", None))
-            if replies and parent_blocked and children_settled:
-                if parent_block_state is not None:
-                    _restore_block_state(parent_block_state)
-                if self._debug:
-                    print(
-                        f"[amifuse] startup: returning after {i} iters with "
-                        f"{len(replies)} reply/replies and settled children"
-                    )
-                return replies
-
-            if getattr(rs, "error", None):
-                if not replies:
-                    # Parked before replying: a handler that waits on its own
-                    # timer during startup gets it at once, as it always did.
-                    self._deliver_timers(fast_forward=True)
-                polled = self.launcher.poll_replies(
-                    self.state.reply_port_addr, debug=self._debug
-                )
-                if polled:
-                    replies.extend(polled)
-                    self.state.startup_replied = True
-                if hasattr(self, "proc_mgr"):
-                    parent_block_state = _snapshot_block_state()
-                    self.proc_mgr.run_all_ready_children(
-                        cycles_per_child=cycles // 2
-                    )
-                    if self.state.initialized:
-                        _restore_block_state(parent_block_state)
-                    else:
-                        _clear_all_block_state()
+            if result == RunResult.BUSY:
                 continue
-
-            if getattr(rs, "done", False) and not replies:
+            if result == RunResult.DONE:
+                # The handler exited: the packet holds whatever it set.
                 break
-
-            # A burst that ends at its cycle limit, with neither done nor
-            # error set, stopped the handler in the middle of its work, so
-            # the next burst follows at once.
-            if sleep_base > 0 and getattr(rs, "done", False):
-                time.sleep(sleep_time)
-                sleep_time = min(sleep_time * 2, sleep_max)
-
+            if replies:
+                if self._debug:
+                    print(f"[amifuse] startup: {len(replies)} reply/replies after {i + 1} run(s)")
+                return replies
+            # Parked before replying: a handler that waits on its own timer
+            # during startup gets it at once. Nothing else can wake it.
+            if self._deliver_timers(fast_forward=True) == 0:
+                break
         if self._debug and not replies:
-            print(
-                f"[amifuse] startup: exhausted {max_iters} iters with no "
-                f"replies, pc=0x{self.state.pc:x}"
-            )
+            print(f"[amifuse] startup: no reply after {max_iters} run(s)")
         return replies
 
     # Emulated cycles a handler may work before the bridge gives up on a
@@ -1165,65 +897,55 @@ class HandlerBridge:
     # caught in a loop fails later than it did then.
     _SHORT_BUSY_CYCLES = 10_000_000
 
-    def _run_until_replies(self, max_iters: int = 50, cycles: int = 200_000, sleep_base: float = 0.0005, sleep_max: float = 0.01, drain_non_essential: bool = True,
+    def _run_until_replies(self, max_iters: int = 50, cycles: Optional[int] = None, sleep_base: float = 0.0005, sleep_max: float = 0.01, drain_non_essential: bool = True,
                            deadline: Optional[float] = None):
-        """Run handler bursts until at least one reply is queued.
+        """Run the handler until at least one reply is queued.
 
-        A burst that ends at its cycle limit, with neither done nor error
-        set, stopped the handler in the middle of its work. Such bursts run
-        again at once and count against a busy limit of _MAX_BUSY_CYCLES.
-        Every other burst, in which the handler waited or exited, counts
-        against max_iters. Returns [] when either limit runs out first, and
-        says so on stderr when it is _MAX_BUSY_CYCLES.
+        Each run (HandlerLauncher.run) runs the handler and its children
+        for at most cycles emulated cycles, or until every task waits. A
+        run that ends with a task still runnable counts against a busy
+        limit of _MAX_BUSY_CYCLES. Returns [] when every task waits with no
+        reply queued and no timer to wake one, or when the busy limit runs
+        out first, and says so on stderr when it is _MAX_BUSY_CYCLES.
 
         A handler whose wait ran out is still running, and the next packet
         would resume it with the full busy limit again. Until it replies to
-        any packet, waits or exits, later waits get _SHORT_BUSY_CYCLES
-        instead, and a mount's timer thread runs it on while the mount
-        idles (run_due_timers). The limit is checked before every burst,
-        so a handler that waits or exits during such a wait gets the full
-        limit for the rest of it. A reply may belong to an earlier packet, so every packet
-        wait must go through _run_until_reply, which drops such a reply.
+        any packet or waits, later waits get _SHORT_BUSY_CYCLES instead,
+        and a mount's timer thread runs it on while the mount idles
+        (run_due_timers). A reply may belong to an earlier packet, so every
+        packet wait must go through _run_until_reply, which drops such a
+        reply.
 
-        A handler waiting on timer.device parks like any other. Timer
-        requests that are due when the wait starts are replied first, so
-        their signals wake the handler with the packet's, and so are those
-        due whenever the wait finds it parked. Parked anywhere but its main
-        loop, it may wait for its own timer before it replies, so every
-        pending request is then due. Parked at its main loop, it keeps
-        real time, so a wait that would end without a reply first sleeps
-        to the next deadline, if it comes within _PACKET_TIMER_WAIT of the
-        wait's start, and runs on: a handler may reply only once its own
+        Timer requests that are due when the wait starts are replied first,
+        so their signals wake the handler with the packet's. Once every
+        task waits without a reply, the wait sleeps to the next timer
+        deadline if it comes within _PACKET_TIMER_WAIT of the wait's start,
+        replies to it and runs on: a handler may reply only once its own
         timer fires, or a child may wait on one. Between packets, a mount's
-        timer thread replies to them (run_due_timers). The limits
-        count cycles and bursts, not time: Delay() sleeps on the host and
-        spends no cycles, so the time a handler spends in it is bounded by
-        neither, as before. A deadline, on the time.monotonic() clock,
-        also ends the wait before the next burst once it has passed,
-        whatever limit the handler has then; a handler still at work then
-        gets the short limit next, as when a limit runs out, without the
-        warning.
+        timer thread replies to them (run_due_timers). The limits count
+        cycles, not time: Delay() waits as a task and spends no cycles. A
+        deadline, on the time.monotonic() clock, also ends the wait before
+        the next run once it has passed, whatever limit the handler has
+        then; a handler still at work then gets the short limit next, as
+        when a limit runs out, without the warning.
 
-        Known limits: a parent that waits while a child process does the
-        packet's work still counts against max_iters, because
-        ProcessManager.run_all_ready_children drops whether the child is
-        still busy. A packet whose wait ran out, or ended at max_iters,
-        stays queued, or held by the handler, until the handler answers it.
-        It stays in HandlerLauncher.pending until then, and neither it nor
-        the bridge's memory its arguments name is reused meanwhile; the
-        handler's own locks and file entries it names are not held back.
+        Known limit: a packet whose wait ran out, or ended at its
+        deadline, stays queued, or held by the handler, until the handler
+        answers it. It stays in HandlerLauncher.pending until then, and
+        neither it nor the bridge's memory its arguments name is reused
+        meanwhile; the handler's own locks and file entries it names are
+        not held back.
         """
-        from amitools.vamos.lib.ExecLibrary import ExecLibrary
+        if cycles is None:
+            cycles = self._RUN_CHUNK_CYCLES
         replies = []
-        sleep_time = sleep_base
-        idle_iters = 0
         busy_cycles = 0
-        # This wait runs the handler on from wherever the timer thread left it.
-        self._idle_unfinished = False
+        idle_iters = 0
         timer = self._timer_device()
         timer_wait_until = (
             -math.inf if timer is None else timer.clock() + self._PACKET_TIMER_WAIT
         )
+        busy_limit = self._MAX_BUSY_CYCLES
 
         # Check if handler has crashed - if so, don't try to run it
         if self.state.crashed:
@@ -1231,69 +953,9 @@ class HandlerBridge:
                 print("[amifuse] _run_until_replies: handler crashed, returning empty")
             return []
 
-        # Guard against re-entering at the exit trap addresses (0x400/0x402).
-        # The emulator uses low memory addresses as trap vectors; if PC lands there,
-        # it means the handler tried to exit. Reset to main loop to keep it alive.
-        if self.state.pc <= 0x1000 and getattr(self.state, "main_loop_pc", 0):
-            self.state.pc = self.state.main_loop_pc
-            self.state.sp = self.state.main_loop_sp
-
         # Reply to timer requests that fell due since the handler last ran.
-        # Their signals wake it with the DOS port's: below, or through the
-        # saved Wait() frame in run_burst.
-        timer_signals = self._deliver_timers()
-        self._leave_timer_signals_to_wait_frame(timer_signals)
-
-        # If handler is at main_loop_pc and there's a pending message, set D0 to wake it
-        # This handles the case where handler is blocked waiting but blocked state was cleared
-        if (
-            self.state.main_loop_pc
-            and self.state.pc == self.state.main_loop_pc
-            and not self.state.block_state
-        ):
-            pmgr = self.vh.slm.exec_impl.port_mgr
-            has_msg = pmgr.has_msg(self.state.port_addr)
-            if has_msg:
-                # Deliver the DOS port signal and those of due timer
-                # requests. Other signals were handled during
-                # _flush_pending_signals at init time, and stray replies
-                # from other devices are drained after every packet.
-                # Use the handler's actual Wait mask to determine which
-                # signal to deliver.  Handlers like CDFileSystem use a
-                # custom Wait loop whose mask may not include the port's
-                # mp_SigBit; signalling the port bit alone won't wake them.
-                # Fall back to bit 8 for handlers with no captured mask.
-                from amitools.vamos.libstructs.exec_ import MsgPortStruct
-                mp_sigbit_off = MsgPortStruct.sdef.find_field_def_by_name("mp_SigBit").offset
-                sigbit = self.mem.read(0, self.state.port_addr + mp_sigbit_off)
-                port_signal = 1 << sigbit if 0 <= sigbit < 32 else 0x100
-                wait_mask = getattr(self.state, 'wait_mask', 0)
-                if wait_mask and not (wait_mask & port_signal):
-                    # Port signal not in wait mask — deliver the full mask
-                    dos_signal = wait_mask
-                else:
-                    dos_signal = port_signal | (timer_signals & wait_mask)
-                # Wait() clears the timer bits it returns, from the fallback
-                # signals and tc_SigRecvd; the others stay pending.
-                from amitools.vamos.lib.lexec.signalfunc import SignalFunc
-                returned_timer = timer_signals & dos_signal
-                SignalFunc._fallback_signals &= ~returned_timer
-                self.vh.machine.cpu.w_reg(0, dos_signal)  # REG_D0
-                self._set_saved_main_reg(0, dos_signal)
-                # Also set tc_SigRecvd in case handler checks the task structure
-                from amitools.vamos.libstructs.exec_ import TaskStruct
-                sigrecvd_off = TaskStruct.sdef.find_field_def_by_name("tc_SigRecvd").offset
-                proc_addr = self.state.process_addr
-                self.mem.w32(
-                    proc_addr + sigrecvd_off,
-                    (dos_signal & ~returned_timer) | (timer_signals & ~dos_signal),
-                )
-                if self._debug:
-                    print(
-                        f"[amifuse] Resuming: port_signal=0x{port_signal:x} "
-                        f"wait_mask=0x{wait_mask:x} D0=0x{dos_signal:x} "
-                        f"tc_SigRecvd@0x{proc_addr + sigrecvd_off:x}=0x{dos_signal:x}"
-                    )
+        # Their signals wake it with the packet's.
+        self._deliver_timers()
 
         busy = timed_out = False
         for i in itertools.count():
@@ -1307,41 +969,26 @@ class HandlerBridge:
                 timed_out = True
                 break
             if idle_iters >= max_iters:
-                if not self._sleep_to_timer_in_packet_wait(timer_wait_until):
-                    break
-                # The timer's reply may bring the packet's: a full wait again.
-                idle_iters = 0
-            old_pc = self.state.pc
-            self.launcher.run_burst(self.state, max_cycles=cycles, debug=self._debug)
-            rs = self.state.run_state
-            new_pc = self.state.pc
-            # A burst that ends at its cycle limit, with neither done nor
-            # error set, stopped the handler in the middle of its work.
-            busy = not getattr(rs, "error", None) and not getattr(rs, "done", False)
-            if busy:
-                busy_cycles += cycles
-            else:
-                # It waited or exited, so it is not caught in a loop.
-                self._busy_ran_out = False
-            # A wait can take 50,000 busy bursts, so --debug reports only
-            # every 1000th of them, with the busy cycles so far, and the
-            # poll of a busy burst only then or when a reply is queued.
-            show = self._debug and (not busy or busy_cycles % (1000 * cycles) == 0)
-            if show and busy:
-                print(
-                    f"[amifuse] _run_until_replies: busy for {busy_cycles:,} "
-                    f"cycles, pc=0x{new_pc:x}"
-                )
-            # Log first few iterations to debug handler movement
-            if self._debug and i < 3:
-                cycles_run = getattr(rs, 'cycles', 0) if rs else 0
-                print(f"[amifuse] iter {i}: PC 0x{old_pc:x}->0x{new_pc:x} cycles={cycles_run} done={getattr(rs, 'done', False)} error={getattr(rs, 'error', None)}")
-            # Check if handler crashed during this burst
+                break
+            result = self._run(cycles)
             if self.state.crashed:
                 if self._debug:
                     print(f"[amifuse] _run_until_replies: handler crashed at iter {i}")
                 return []
-            # Check for replies first - if we have them, we're done
+            # A run that ends with a task still runnable stopped the handler
+            # in the middle of its work.
+            busy = result == RunResult.BUSY
+            if busy:
+                busy_cycles += cycles
+            # A wait can take thousands of busy runs, so --debug reports
+            # only every 1000th of them, with the busy cycles so far, and
+            # the poll of a busy run only then or when a reply is queued.
+            show = self._debug and (not busy or busy_cycles % (1000 * cycles) == 0)
+            if show and busy:
+                print(
+                    f"[amifuse] _run_until_replies: busy for {busy_cycles:,} "
+                    f"cycles"
+                )
             debug_poll = show or (
                 self._debug
                 and self.vh.slm.exec_impl.port_mgr.has_msg(self.state.reply_port_addr)
@@ -1357,71 +1004,21 @@ class HandlerBridge:
                         f"replies after {i} iters"
                     )
                 break
-
-            # Run any child processes that were created (e.g., SFS DosList handler)
-            # This allows children to initialize and register their ports
-            if hasattr(self, 'proc_mgr'):
-                if self._debug and i < 5:
-                    print(f"[amifuse] iter {i}: calling run_all_ready_children")
-                parent_block_state = _snapshot_block_state()
-                num_children = self.proc_mgr.run_all_ready_children(
-                    cycles_per_child=cycles // 4
-                )
-                if self.state.initialized:
-                    _restore_block_state(parent_block_state)
-                else:
-                    _clear_all_block_state()
-                if num_children > 0 and show:
-                    print(f"[amifuse] Ran {num_children} child process(es)")
-            else:
-                if self._debug and i < 5:
-                    print(f"[amifuse] iter {i}: no proc_mgr")
-
-            # Check for error FIRST - errors take precedence over blocked state
-            if getattr(rs, "error", None):
-                idle_iters += 1
-                # Error during run - might be WaitPort block or FindPort yield
-                # Check if we have replies first
-                polled = self.launcher.poll_replies(
-                    self.state.reply_port_addr, debug=self._debug
-                )
-                if polled:
-                    replies = polled
-                    break
-                # No replies - run children and continue (don't break)
-                if hasattr(self, 'proc_mgr'):
-                    parent_block_state = _snapshot_block_state()
-                    self.proc_mgr.run_all_ready_children(
-                        cycles_per_child=cycles // 2
-                    )
-                    if self.state.initialized:
-                        _restore_block_state(parent_block_state)
-                    else:
-                        _clear_all_block_state()
-                else:
-                    _clear_all_block_state()
-                # A handler that waits for its own timer before it replies
-                # gets it within this wait; the next burst resumes it.
-                self._deliver_timers_in_packet_wait()
-                continue
             if busy:
-                # Run it again at once.
                 continue
-            # If handler exited (done=True) without blocking, stop looping - it's not coming back
-            if not self.state.initialized:
-                # Handler exited during startup without entering main loop
-                # The startup packet results are in the packet struct - let caller check them
+            # It waited or exited, so it is not caught in a loop.
+            self._busy_ran_out = False
+            if result == RunResult.DONE:
                 break
             idle_iters += 1
-            # Yield with exponential backoff to avoid tight polling loops.
-            if sleep_base > 0:
-                time.sleep(sleep_time)
-                sleep_time = min(sleep_time * 2, sleep_max)
+            # Every task waits: only time can bring the reply now.
+            if self._sleep_to_timer_in_packet_wait(timer_wait_until):
+                continue
+            break
         if self._debug and not replies:
             print(
                 f"[amifuse] _run_until_replies: no replies after {idle_iters} "
-                f"idle iters and {busy_cycles:,} of {busy_limit:,} busy cycles, "
-                f"pc=0x{self.state.pc:x}"
+                f"idle iters and {busy_cycles:,} of {busy_limit:,} busy cycles"
             )
         if replies:
             # It answered a packet, so it is not caught in a loop, even if it
@@ -1442,9 +1039,6 @@ class HandlerBridge:
                     f"busy limit of {busy_limit:,} emulated cycles",
                     file=sys.stderr,
                 )
-                # It ran out with the full limit, so it was not busy before:
-                # the timer thread's budget for it starts afresh.
-                self._idle_busy_cycles = 0
             self._busy_ran_out = True
             if timer is not None:
                 # The mount's timer thread runs the handler on while idle.
@@ -1453,275 +1047,41 @@ class HandlerBridge:
         # Drain stray IO replies that accumulated during packet processing:
         # SendIO queues them at once. timer.device replies stay, since they
         # come only when due and the handler takes them.
-        # During startup (drain_non_essential=False), keep all messages
-        # so _flush_pending_signals can deliver them for deferred init.
         if drain_non_essential:
             pmgr = self.vh.slm.exec_impl.port_mgr
             self._drain_non_essential_ports(pmgr)
 
         return replies
 
-    def _capture_main_loop_from_block_state(self) -> bool:
-        """Adopt the handler's Wait/WaitPort return frame as the main loop.
-
-        When a run burst left the handler blocked, the Exec-side blocking
-        variables hold the return PC/SP of the Wait()/WaitPort() call. If
-        they look valid, save them as the main-loop restart point and
-        snapshot the block state. Returns True if a main loop was captured.
-        """
-        from amitools.vamos.lib.ExecLibrary import ExecLibrary
-
-        waitport_sp = _get_block_state(ExecLibrary, "_waitport_blocked_sp")
-        wait_sp = _get_block_state(ExecLibrary, "_wait_blocked_sp")
-        waitport_ret = _get_block_state(ExecLibrary, "_waitport_blocked_ret")
-        wait_ret = _get_block_state(ExecLibrary, "_wait_blocked_ret")
-        wait_mask = _get_block_state(ExecLibrary, "_wait_blocked_mask")
-        blocked_sp = waitport_sp if waitport_sp is not None else wait_sp
-        blocked_ret = waitport_ret if waitport_ret is not None else wait_ret
-        if blocked_sp is None:
-            return False
-        ret_addr = blocked_ret if blocked_ret is not None else self.mem.r32(blocked_sp)
-        if ret_addr < 0x800:
-            return False
-        self.state.main_loop_pc = ret_addr
-        self.state.main_loop_sp = blocked_sp + 4
-        if wait_mask:
-            self.state.wait_mask = wait_mask
-        self.state.initialized = True
-        self.state.block_state = _snapshot_block_state()
-        if self._debug:
-            mask_str = (
-                f" wait_mask=0x{self.state.wait_mask:x}"
-                if self.state.wait_mask
-                else ""
-            )
-            print(
-                f"[amifuse] Captured main_loop from blocking state: "
-                f"pc=0x{ret_addr:x}, sp=0x{blocked_sp + 4:x}{mask_str}"
-            )
-        return True
-
-    def _capture_main_loop_state(self, max_iters: int = 50, cycles: int = 10_000):
-        """Run until the handler blocks in Wait/WaitPort and capture restart PC/SP."""
-        if self.state.main_loop_pc:
-            return  # Already captured (e.g. during _run_until_replies)
-        from amitools.vamos.lib.ExecLibrary import ExecLibrary
-        for i in range(max_iters):
-            if self.state.pc < 0x800 or self.state.pc > 0xFFFFFF:
-                print(f"[_capture] ERROR: invalid state.pc=0x{self.state.pc:x} before run_burst", file=sys.stderr)
-                return
-            rs = self.launcher.run_burst(self.state, max_cycles=cycles, debug=self._debug)
-
-            # Run child processes - SFS needs DosList handler to run during init
-            if hasattr(self, 'proc_mgr'):
-                parent_block_state = _snapshot_block_state()
-                self.proc_mgr.run_all_ready_children(cycles_per_child=cycles // 2)
-                if self.state.initialized:
-                    _restore_block_state(parent_block_state)
-                else:
-                    _clear_all_block_state()
-
-            if self.state.main_loop_pc:
-                return
-            waitport_sp = _get_block_state(ExecLibrary, '_waitport_blocked_sp')
-            wait_sp = _get_block_state(ExecLibrary, '_wait_blocked_sp')
-            waitport_ret = _get_block_state(ExecLibrary, '_waitport_blocked_ret')
-            wait_ret = _get_block_state(ExecLibrary, '_wait_blocked_ret')
-            blocked_sp = waitport_sp if waitport_sp is not None else wait_sp
-            blocked_ret = waitport_ret if waitport_ret is not None else wait_ret
-            if blocked_sp is not None:
-                ret_addr = blocked_ret if blocked_ret is not None else self.mem.r32(blocked_sp)
-                if ret_addr >= 0x800:
-                    self.state.main_loop_pc = ret_addr
-                    self.state.main_loop_sp = blocked_sp + 4
-                    self.state.block_state = _snapshot_block_state()
-                    # Capture Wait mask for _flush_pending_signals
-                    wait_mask = _get_block_state(ExecLibrary, '_wait_blocked_mask')
-                    if wait_mask is not None and wait_mask != 0:
-                        self.state.wait_mask = wait_mask
-                    if self._debug:
-                        block_kind = "WaitPort" if waitport_sp is not None else "Wait"
-                        mask_str = f" wait_mask=0x{self.state.wait_mask:x}" if self.state.wait_mask else ""
-                        print(
-                            f"[amifuse] _capture_main_loop_state: {block_kind} "
-                            f"captured at iter {i}, current_pc=0x{self.state.pc:x} "
-                            f"ret=0x{ret_addr:x}, sp=0x{blocked_sp+4:x}{mask_str}"
-                        )
-                return
-            # Check if handler crashed (invalid PC)
-            if rs and hasattr(rs, 'pc') and rs.pc < 0x800:
-                print(f"[amifuse] _capture_main_loop_state: handler crashed at iter {i}, pc=0x{rs.pc:x}", file=sys.stderr)
-                return
-
     def _flush_pending_signals(self, max_rounds: int = 20):
-        """Deliver pending signals so the handler can complete deferred init.
+        """Run the handler's deferred initialisation.
 
-        PFS3 uses Signal(FindTask(NULL), ...) to schedule deferred volume
-        validation steps.  Each self-signal causes Wait() to return
-        immediately, letting the handler continue validation within one
-        burst.  When validation finishes (or the handler needs to wait for
-        real time / IO), it calls Wait() without pending self-signals and
-        blocks.
-
-        We deliver an initial timer signal (bit 19) to kick off the first
-        validation cycle.  Subsequent rounds only fire if the handler
-        blocked again with pending signals (port messages or self-signals).
-        Every round first replies to all pending timer.device requests, as
-        if their time had passed, so work a handler defers to a timer is
-        done here; a handler that re-arms its timer costs a short round.
+        PFS3 defers its volume validation to a timer request and to signals
+        it sends itself; FFS arms its tick. Each round replies to every
+        pending timer request as if its time had passed and runs the
+        handler until it waits again, until a round replied to nothing and
+        the handler still waits: what is left needs real time or a packet.
+        Stray replies are drained afterwards; timer.device replies stay for
+        the handler, since they come only when due.
         """
-        if not self.state.main_loop_pc:
+        if self.state.crashed or self.state.exited:
             return
-        from amitools.vamos.libstructs.exec_ import ExecLibraryStruct, TaskStruct, MsgPortStruct
-        from amitools.vamos.lib.ExecLibrary import ExecLibrary
-        from amitools.vamos.lib.lexec.signalfunc import SignalFunc
-        from amitools.vamos.machine.regs import REG_D0
-
-        # If we don't have a wait mask yet, run the handler once to capture it.
-        if not self.state.wait_mask:
-            _clear_all_block_state()
-            self.state.pc = self.state.main_loop_pc
-            self.state.sp = self.state.main_loop_sp
-            self.vh.machine.cpu.w_reg(REG_D0, 0)
-            self._set_saved_main_reg(REG_D0, 0)
-            self.launcher.run_burst(self.state, max_cycles=100_000)
-            wait_mask = _get_block_state(ExecLibrary, '_wait_blocked_mask')
-            if wait_mask and wait_mask != 0:
-                self.state.wait_mask = wait_mask
-            _clear_all_block_state()
-
-        wait_mask = self.state.wait_mask
-        if not wait_mask:
-            return
-
-        if self._debug:
-            print(f"[amifuse] _flush_pending_signals: wait_mask=0x{wait_mask:x}")
-
-        pmgr = self.vh.slm.exec_impl.port_mgr
-        exec_base = self.mem.r32(4)
-        this_task_off = ExecLibraryStruct.sdef.find_field_def_by_name("ThisTask").offset
-        this_task = self.mem.r32(exec_base + this_task_off)
-        sigrecvd_off = TaskStruct.sdef.find_field_def_by_name("tc_SigRecvd").offset
-        mp_sigbit_off = MsgPortStruct.sdef.find_field_def_by_name("mp_SigBit").offset
-
         for rnd in range(max_rounds):
-            # --- Gather all pending signals ---
-            # 0. Every pending timer request is due: initialisation takes
-            #    no real time. Its reply sets tc_SigRecvd and a port.
-            timer_signals = self._deliver_timers(fast_forward=True)
-
-            # 1. Self-signals set by handler via Signal(FindTask(NULL), ...)
-            self_signals = SignalFunc._fallback_signals
-
-            # 2. tc_SigRecvd from m68k memory (IO completion, etc.)
-            tc_sigrecvd = self.mem.r32(this_task + sigrecvd_off)
-
-            # 3. Signals from ports with actual messages
-            port_signals = 0
-            for port_addr, port in pmgr.ports.items():
-                has_msg = (port.queue is not None and len(port.queue) > 0)
-                if not has_msg:
-                    try:
-                        mp_msglist_off = MsgPortStruct.sdef.find_field_def_by_name("mp_MsgList").offset
-                        list_addr = port_addr + mp_msglist_off
-                        lh_head = self.mem.r32(list_addr)
-                        has_msg = (lh_head != 0 and lh_head != list_addr + 4)
-                    except Exception:
-                        pass
-                if has_msg:
-                    try:
-                        sigbit = self.mem.read(0, port_addr + mp_sigbit_off)
-                        if 0 <= sigbit < 32:
-                            port_signals |= 1 << sigbit
-                    except Exception:
-                        pass
-
-            # 4. On the first round, inject the timer/validation signal to
-            #    kick off the deferred validation cycle.
-            timer_signal = (1 << 19) if rnd == 0 else 0
-
-            # Combine and mask to what the handler is waiting for.
-            combined = (
-                self_signals | tc_sigrecvd | port_signals | timer_signal | timer_signals
-            )
-            actual_signals = combined & wait_mask
-
-            # If no signals to deliver (and past the first round), we're done.
-            if actual_signals == 0 and rnd > 0:
-                if self._debug:
-                    print(f"[amifuse] _flush round {rnd}: no pending signals, done")
-                break
-
-            # Ensure at least the timer signal on first round.
-            if actual_signals == 0:
-                actual_signals = (1 << 19) & wait_mask
-                if actual_signals == 0:
-                    actual_signals = wait_mask  # Last resort
-
-            if self._debug:
-                print(f"[amifuse] _flush round {rnd}: signals=0x{actual_signals:x} "
-                      f"(self=0x{self_signals:x} tc=0x{tc_sigrecvd:x} "
-                      f"ports=0x{port_signals:x} timer=0x{timer_signal:x} "
-                      f"timer.device=0x{timer_signals:x})")
-
-            # Clear delivered signals from _fallback_signals and tc_SigRecvd,
-            # mimicking how Wait() atomically clears returned signals.
-            SignalFunc._fallback_signals &= ~actual_signals
-            self.mem.w32(this_task + sigrecvd_off, tc_sigrecvd & ~actual_signals)
-
-            # Set up Wait() return: D0 = returned signals
-            self.state.pc = self.state.main_loop_pc
-            self.state.sp = self.state.main_loop_sp
-            self.vh.machine.cpu.w_reg(REG_D0, actual_signals)
-            self._set_saved_main_reg(REG_D0, actual_signals)
-            _clear_all_block_state()
-
-            old_pc = self.state.pc
-            self.launcher.run_burst(self.state, max_cycles=2_000_000)
-            rs = self.state.run_state
-            if self._debug:
-                cycles_run = getattr(rs, 'cycles', 0) if rs else 0
-                print(f"[amifuse] _flush round {rnd}: PC 0x{old_pc:x}->0x{self.state.pc:x} "
-                      f"cycles={cycles_run} error={getattr(rs, 'error', None)} crashed={self.state.crashed}")
-
+            replied = self._deliver_timers(fast_forward=True)
+            result = self._run(self._RUN_CHUNK_CYCLES)
             # Drain any spurious replies (timer completion etc.)
             self.launcher.poll_replies(self.state.reply_port_addr)
-            _clear_all_block_state()
-            if self.state.crashed:
+            if self._debug:
+                print(
+                    f"[amifuse] _flush round {rnd}: timer replies={replied} "
+                    f"result={result.name} crashed={self.state.crashed}"
+                )
+            if self.state.crashed or result == RunResult.DONE:
                 break
-
-            # If the handler made no progress (0 cycles), it blocked
-            # immediately and these signals aren't useful.  Stop flushing.
-            cycles_ran = getattr(rs, 'cycles', 0) if rs else 0
-            if cycles_ran == 0 and rnd > 0:
-                if self._debug:
-                    print(f"[amifuse] _flush round {rnd}: no progress, stopping")
+            if result == RunResult.IDLE and not replied:
                 break
-
-            # Capture updated wait_mask if handler changed it
-            new_mask = _get_block_state(ExecLibrary, '_wait_blocked_mask')
-            if new_mask and new_mask != 0:
-                wait_mask = new_mask
-                self.state.wait_mask = new_mask
-
         # Drain stray replies from non-essential ports (disk change etc.).
-        # timer.device replies stay for the handler: they come only when due.
-        self._drain_non_essential_ports(pmgr)
-
-        # Clean up fallback signals to avoid stale signals during normal
-        # DOS packet processing.
-        SignalFunc._fallback_signals = 0
-
-        # After the flush rounds, the handler is blocked in Wait() and
-        # run_burst has set state.pc to the Wait() return address (= the
-        # main loop entry).  Update main_loop_pc/sp to match so subsequent
-        # _run_until_replies calls work correctly.
-        if self.state.pc >= 0x800:
-            self.state.main_loop_pc = self.state.pc
-            self.state.main_loop_sp = self.state.sp
-
-        # Ensure clean blocking state for normal operation.
-        _clear_all_block_state()
+        self._drain_non_essential_ports(self.vh.slm.exec_impl.port_mgr)
 
     def _update_handler_port_from_startup(self):
         pkt = DosPacketStruct(self.mem, self.state.stdpkt_addr)
@@ -1844,9 +1204,9 @@ class HandlerBridge:
         handler that parks during a wait has the full busy limit for the
         rest of it. Late replies are given back as in
         _run_until_reply. The other ports are drained only after a wait
-        that leaves the handler parked at its main loop, as the idle
-        runner does (_after_idle_run): in the middle of its work, a
-        SendIO() reply it has not taken yet is still its own (#240).
+        that leaves the handler waiting, as the idle timers do
+        (run_due_timers): in the middle of its work, a SendIO() reply it
+        has not taken yet is still its own (#240).
         Returns the names of the packets still out.
         """
         with self._lock:
@@ -1858,7 +1218,7 @@ class HandlerBridge:
                 replies = self._run_until_replies(
                     deadline=deadline, drain_non_essential=False)
                 self._log_replies("pending", replies)
-                if not self.state.crashed and self._at_main_loop_frame():
+                if not self.state.crashed and not self._busy_ran_out:
                     self._drain_non_essential_ports(self.vh.slm.exec_impl.port_mgr)
                 for _, reply_pkt, res1, _ in replies:
                     self._give_back_late_reply(sent.get(reply_pkt), res1)
@@ -3215,6 +2575,15 @@ class HandlerBridge:
                     print("[amifuse] Volume flush may have failed", flush=True)
 
 
+# Every bridge method may run or wake a task, so all of them run on the
+# bridge's emulation thread (emu_thread.py). close() ends that thread, and
+# the idle-timer switches only post to it.
+route_methods_through_emu(
+    HandlerBridge,
+    exclude={"close", "start_idle_timers", "stop_idle_timers", "_timer_device"},
+)
+
+
 class AmigaFuseFS(_FuseOperations):
     # Mounted through WinFsp, which goes on passing a handle's callbacks the
     # name the file was opened under after rename() moved it (_handle_path),
@@ -3252,8 +2621,7 @@ class AmigaFuseFS(_FuseOperations):
         bridge: HandlerBridge,
         debug: bool = False,
         icons: bool = False,
-        mountpoint: Optional[Path] = None,
-    ):
+        mountpoint: Optional[Path] = None, ready_fd=None):
         self.bridge = bridge
         self._debug = debug
         self._mountpoint = mountpoint
@@ -3302,10 +2670,12 @@ class AmigaFuseFS(_FuseOperations):
         self._held_dates: Dict[str, float] = {}
         self._last_op_time = time.time()
         self._op_count = 0
-        # Replies to timer.device requests while the mount is idle; see
-        # _run_timer_thread.
-        self._timer_thread: Optional[threading.Thread] = None
-        self._timer_stop = False
+        # Whether the bridge replies to timer.device requests while the
+        # mount is idle; see _start_timer_thread.
+        self._timers_started = False
+        # Daemon mode: the pipe to tell the parent the mount is up; see
+        # _fork_daemon_parent.
+        self._ready_fd = ready_fd
         # Icon support - use platform-specific handler
         self._icons_enabled = icons
         self._icon_parser = None
@@ -5240,92 +4610,67 @@ class AmigaFuseFS(_FuseOperations):
         """Called when filesystem is mounted. Notify shell on Windows."""
         if self._unmount_control is not None:
             self._unmount_control.start()
-        # init runs in the mount process, after libfuse has daemonised.
         self._start_timer_thread()
+        self._report_ready()
         if sys.platform.startswith("win") and self._mountpoint:
             from .platform import notify_shell_drive_change
             notify_shell_drive_change(str(self._mountpoint), added=True)
 
-    # The longest the timer thread sleeps at once. A request armed with an
-    # earlier deadline wakes it anyway.
-    _TIMER_MAX_SLEEP = 3600.0
+    def _report_ready(self):
+        """Tell the daemon-mode parent the mount is up, and let the terminal go.
+
+        As libfuse's daemonize did after its fork: stdin, stdout and stderr
+        go to /dev/null, and the working directory to /, so the mount holds
+        neither the terminal nor a directory.
+        """
+        fd = self._ready_fd
+        if fd is None:
+            return
+        self._ready_fd = None
+        try:
+            os.write(fd, b"ready\n")
+        except OSError:
+            pass
+        finally:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+            null = os.open(os.devnull, os.O_RDWR)
+            for std in (0, 1, 2):
+                os.dup2(null, std)
+            if null > 2:
+                os.close(null)
+            os.chdir("/")
+        except OSError:
+            pass
 
     def _start_timer_thread(self):
-        timer = getattr(getattr(self.bridge, "vh", None), "timer_device", None)
-        if timer is None or self._timer_thread is not None:
-            return
-        self._timer_stop = False
-        self._timer_thread = threading.Thread(
-            target=self._run_timer_thread, args=(timer,),
-            name="amifuse-timer", daemon=True,
-        )
-        self._timer_thread.start()
-
-    def _run_timer_thread(self, timer):
-        """Reply to timer.device requests when due, between FUSE operations.
+        """Have the bridge reply to timer.device requests between FUSE operations.
 
         Without it an idle handler never sees time pass, so work it defers
         to a timer, such as a write-back, would wait for the next operation.
-        It sleeps until the earliest deadline, or until a request arms an
-        earlier one, and costs nothing while no request is pending. It also
-        runs on a handler whose packet wait ran out, in slices a tick
-        apart, until it parks (run_due_timers); a wait that runs out sets
-        the event, so that it starts at once.
+        The bridge's emulation thread does it while no operation is in
+        progress (HandlerBridge.start_idle_timers); a handler that crashes
+        there shuts the mount down, as a FUSE operation does when it finds
+        the handler crashed.
         """
         bridge = self.bridge
-        while True:
-            with bridge._lock:
-                if self._timer_stop:
-                    return
-                timeout = None
-                try:
-                    if not _handler_has_crashed(bridge):
-                        timeout = bridge.run_due_timers()
-                except Exception:
-                    # It goes on, as a mount does when a FUSE operation
-                    # raises in the same bridge code: fusepy answers that
-                    # with an error, and the next operation runs the handler
-                    # from where the burst left it. A handler that crashed
-                    # stops the thread below.
-                    if self._debug:
-                        import traceback
-                        print("[amifuse] timer: error delivering timers:", flush=True)
-                        traceback.print_exc()
-                    timeout = HandlerBridge._TIMER_RETRY
-                if _handler_has_crashed(bridge):
-                    # Shut the mount down, as a FUSE operation does when it
-                    # finds the handler crashed.
-                    self._schedule_crash_shutdown()
-                    return
-                # Cleared after run_due_timers, which reads the deadline
-                # last under the lock, so a request the handler armed while
-                # it ran is in the timeout. One armed after this point sets
-                # the event again.
-                timer.event.clear()
-                # The clear may have erased the wake of a stop that came
-                # while run_due_timers ran.
-                if self._timer_stop:
-                    return
-            if timeout is not None:
-                # At least one VBLANK tick, even when a request is due again
-                # at once, so that FUSE operations waiting for the lock get
-                # it: a resume that outlasts the handler's re-arm delay would
-                # otherwise retake it at once, again and again. Event.wait
-                # raises OverflowError above threading.TIMEOUT_MAX.
-                timeout = min(max(timeout, timer.MIN_DELAY), self._TIMER_MAX_SLEEP)
-            timer.event.wait(timeout)
+        if self._timers_started or getattr(bridge, "_emu", None) is None:
+            return
+        if getattr(getattr(bridge, "vh", None), "timer_device", None) is None:
+            return
+        self._timers_started = True
+        bridge.start_idle_timers(on_crash=self._schedule_crash_shutdown)
 
     def _stop_timer_thread(self):
-        thread = getattr(self, "_timer_thread", None)
-        if thread is None:
+        if not self._timers_started:
             return
-        self._timer_thread = None
-        self._timer_stop = True
-        timer = getattr(getattr(self.bridge, "vh", None), "timer_device", None)
-        if timer is not None:
-            timer.event.set()
-        # Not under the bridge lock: the thread needs it to see the stop.
-        thread.join()
+        self._timers_started = False
+        self.bridge.stop_idle_timers()
 
     def destroy(self, path):
         """Called when filesystem is unmounted. Flush and release all resources."""
@@ -5370,7 +4715,7 @@ class AmigaFuseFS(_FuseOperations):
             success = False
             print(f"[amifuse] WARNING: flush failed: {e}", flush=True)
         try:
-            shutdown = getattr(getattr(self.bridge, "vh", None), "shutdown", None)
+            shutdown = getattr(self.bridge, "shutdown_runtime", None)
             if shutdown is not None:
                 shutdown()
         except Exception as e:
@@ -5658,6 +5003,47 @@ def _close_bridge(bridge):
         print(f"[amifuse] could not close the bridge: {exc}", file=sys.stderr)
 
 
+def _fork_daemon_parent() -> int:
+    """Fork for daemon mode; the parent exits once the child is mounted or gone.
+
+    libfuse daemonizes after the mount is set up, with a fork. The bridge
+    cannot be forked: its emulation runs on a thread of its own (see
+    emu_thread.py), and a fork keeps only the forking thread. So the mount
+    forks here, before the bridge is built, and the child builds it, mounts
+    in the foreground and reports over a pipe. Returns, in the child, the
+    fd to write "ready" to once mounted; the child keeps the terminal until
+    then, so its errors reach the user. The parent reads the pipe: on
+    "ready" it exits 0, and once the child ends first, with the child's
+    exit status.
+    """
+    read_fd, write_fd = os.pipe()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    pid = os.fork()
+    if pid == 0:
+        os.close(read_fd)
+        try:
+            os.setsid()
+        except OSError:
+            pass
+        return write_fd
+    os.close(write_fd)
+    data = b""
+    try:
+        while b"\n" not in data:
+            chunk = os.read(read_fd, 4096)
+            if not chunk:
+                break
+            data += chunk
+    finally:
+        os.close(read_fd)
+    if data.startswith(b"ready"):
+        os._exit(0)
+    _, status = os.waitpid(pid, 0)
+    code = os.waitstatus_to_exitcode(status)
+    os._exit(code if code >= 0 else 1)
+
+
 def mount_fuse(
     image: Path,
     driver: Optional[Path],
@@ -5789,6 +5175,13 @@ def mount_fuse(
         if icons:
             print("[amifuse] icon mode enabled; Amiga icons will appear as macOS custom icons")
 
+        # Daemon mode forks here, before the handler starts; see
+        # _fork_daemon_parent. The child mounts in the foreground.
+        ready_fd = None
+        if not foreground and hasattr(os, "fork") and not sys.platform.startswith("win"):
+            ready_fd = _fork_daemon_parent()
+            foreground = True
+
         try:
             bridge = HandlerBridge(
                 image,
@@ -5868,7 +5261,8 @@ def mount_fuse(
         control = None
         operations = None
         try:
-            operations = AmigaFuseFS(bridge, debug=debug, icons=icons, mountpoint=mountpoint)
+            operations = AmigaFuseFS(bridge, debug=debug, icons=icons, mountpoint=mountpoint,
+                                     ready_fd=ready_fd)
             if sys.platform.startswith("win"):
                 from .windows_unmount import UnmountControl
                 control = UnmountControl()

@@ -147,8 +147,10 @@ def test_inspect_reports_the_loop(tmp_path, capsys):
 
 
 def test_parceiro_lseg_block_is_accepted(tmp_path):
-    """A Parceiro checksum without a loop still gives the driver, with
-    the first LSEG block's data cut to its size field."""
+    """A Parceiro checksum without a loop gives the driver, with the first
+    LSEG block's data cut to its size field. amitools checksums an RDB
+    block over its SummedLongs now, as the Parceiro firmware does, so the
+    block is as valid as any and nothing is said about it."""
     image = _rdb(tmp_path)
     _, clean, _, _ = _open(image)
     data = bytes(clean[0].get_data())
@@ -157,8 +159,5 @@ def test_parceiro_lseg_block_is_accepted(tmp_path):
     assert parts == ["DH0"]
     assert [entry.fshd.dos_type for entry in fs] == [DOS3]
     assert bytes(fs[0].get_data()) == data[:(64 - 5) * 4] + data[123 * 4:]
-    assert warnings == [
-        "Filesystem #0 (DOS3/0x444f5303): Parceiro checksum in 1 LSEG "
-        "block(s) (accepted)",
-    ]
+    assert warnings == []
     assert damaged == []

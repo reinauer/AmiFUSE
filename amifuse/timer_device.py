@@ -10,6 +10,11 @@ bridge calls deliver() between emulator bursts, and delivery replies the
 request the way SendIO's quick path does. Absolute units and the clock
 arithmetic are amitools' behaviour.
 
+It also holds the deadlines of dos.library's Delay(): AmiFuseDosLibrary
+has the task wait on SIGF_SINGLE, as AmigaOS does, and deliver() signals
+it once the delay has passed, so the other tasks run meanwhile. A host
+sleep in the library call, as vamos does it, would hold up every task.
+
 It also corrects the system time. amitools counts it from the Unix epoch
 in UTC, while AmigaOS counts from 1978-01-01 in local time, so a handler
 stamping files with GetSysTime dated them eight years ahead. It tells the
@@ -73,6 +78,8 @@ _RELATIVE_UNITS = (UNIT_MICROHZ, UNIT_VBLANK, UNIT_ECLOCK)
 
 IOF_QUICK = 1
 IOERR_ABORTED = -2
+# exec's signal for a task's own synchronous waits, which Delay() uses
+SIGF_SINGLE = 1 << 4
 
 _IO_MSG_OFF = IORequestStruct.sdef.find_field_def_by_name("io_Message").offset
 _LN_SUCC = _IO_MSG_OFF + NodeStruct.sdef.find_field_def_by_name("ln_Succ").offset
@@ -113,6 +120,10 @@ class AmiFuseTimerDevice(TimerDevice):
         self.clock = clock
         # io address -> (deadline, io_Device when armed)
         self._pending: Dict[int, Tuple[float, int]] = {}
+        # task address -> deadline of its Delay()
+        self._delays: Dict[int, float] = {}
+        # Delays that ended, for tests and --debug.
+        self.delays_ended = 0
         # io_Unit address -> (unit, its Unit), from OpenDevice until CloseDevice
         self._units: Dict[int, Tuple[int, object]] = {}
         self._bases = set()
@@ -249,28 +260,49 @@ class AmiFuseTimerDevice(TimerDevice):
 
     # ---- bridge interface ----
 
+    def add_delay(self, task: int, deadline: float):
+        """Note a Delay() of the task at task until deadline on the device clock.
+
+        deliver() signals the task with SIGF_SINGLE once it has passed. A
+        task delays once at a time: a new delay replaces its earlier one.
+        """
+        earliest = self.next_deadline()
+        self._delays[task] = deadline
+        if deadline < earliest:
+            self.event.set()
+
     def next_deadline(self) -> float:
         """The earliest deadline on the device clock, or inf if none."""
-        if not self._pending:
-            return math.inf
-        return min(deadline for deadline, _ in self._pending.values())
+        deadlines = [deadline for deadline, _ in self._pending.values()]
+        deadlines.extend(self._delays.values())
+        return min(deadlines) if deadlines else math.inf
 
     def deliver(self, fast_forward: bool = False) -> Dict[int, int]:
         """Reply to every request whose deadline has passed.
 
-        With fast_forward, every pending request is due. Returns the signal
-        bits sent, per task address.
+        With fast_forward, every pending request is due, and so is every
+        Delay(). Returns the signal bits sent, per task address.
         """
-        if not self._pending:
-            return {}
-        mem = self._exec.mem
+        signals: Dict[int, int] = {}
         now = self.clock()
+        for task, deadline in list(self._delays.items()):
+            if fast_forward or deadline <= now:
+                del self._delays[task]
+                self.delays_ended += 1
+                try:
+                    self._exec.signal_func.signal(task, SIGF_SINGLE)
+                except Exception as exc:
+                    log_timer.warning("deliver: Delay() of task 0x%06x not ended: %s", task, exc)
+                    continue
+                signals[task] = signals.get(task, 0) | SIGF_SINGLE
+        if not self._pending:
+            return signals
+        mem = self._exec.mem
         due = [
             (deadline, io, device)
             for io, (deadline, device) in self._pending.items()
             if fast_forward or deadline <= now
         ]
-        signals: Dict[int, int] = {}
         for _, io, device in sorted(due):
             del self._pending[io]
             # Each request on its own, so that one the handler broke cannot

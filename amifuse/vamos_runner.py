@@ -14,26 +14,13 @@ from types import SimpleNamespace
 from typing import Optional
 
 from amitools.vamos.cfg import VamosMainParser
-from amitools.vamos.error import UnsupportedFeatureError
 from amitools.vamos.log import log_machine, log_setup
 from amitools.vamos.machine import Machine, MemoryMap, Runtime
 from amitools.vamos.trace import TraceManager
 
 
-@dataclass
-class SimpleRunState:
-    """Simple run state for tracking machine execution results."""
-    pc: int
-    sp: int
-    done: bool = False
-    error: bool = False
-    cycles: int = 0
-    error_kind: Optional[str] = None
-    error_detail: Optional[str] = None
-
-
 from amitools.vamos.path import VamosPathManager
-from amitools.vamos.schedule import Scheduler
+from amitools.vamos.schedule import Scheduler, SchedulerConfig
 from amitools.vamos.libmgr import SetupLibManager
 from amitools.vamos.disk import DiskSession
 
@@ -56,19 +43,11 @@ def _ensure_vamos_logging(levels):
     _LOG_SETUP_DONE = True
 
 
-def _reset_runtime_state():
-    """Clear cross-runtime global state left behind by prior handlers."""
-    from amitools.vamos.lib.DosLibrary import DosLibrary
-    from amitools.vamos.lib.lexec.signalfunc import SignalFunc
-    from amifuse.startup_runner import _clear_all_block_state
-
-    _clear_all_block_state()
-    DosLibrary._child_processes.clear()
-    SignalFunc._fallback_signals = 0
-    SignalFunc._fallback_sig_alloc = 0x0000FFFF
-
-
 class VamosHandlerRuntime:
+    # Emulated cycles a task runs before the scheduler looks for another
+    # ready task.
+    SLICE_CYCLES = 50_000
+
     def __init__(self):
         self.machine = None
         self.mem_map = None
@@ -89,7 +68,6 @@ class VamosHandlerRuntime:
         self.timer_device = None
 
     def setup(self, cpu: Optional[str] = None):
-        _reset_runtime_state()
         self.disk_session = DiskSession(
             acknowledge_read_only_writes=True,
             acknowledge_unsupported_commands=True,
@@ -152,8 +130,12 @@ class VamosHandlerRuntime:
         if not self.path_mgr.setup():
             raise RuntimeError("Failed to setup path manager")
 
-        # scheduler
-        self.scheduler = Scheduler(self.machine)
+        # The scheduler runs the handler and the processes it creates.
+        # A slice is how long a task runs before the scheduler may switch
+        # to another ready one; the bridge's cycle budgets are its multiples.
+        self.scheduler = Scheduler(
+            self.machine, SchedulerConfig(slice_cycles=self.SLICE_CYCLES)
+        )
 
         # Create a runtime for m68k code execution
         self.runtime = Runtime(self.machine, self.machine.scratch_end)
@@ -178,96 +160,35 @@ class VamosHandlerRuntime:
         # Before exec.library and dos.library open: a stub binds the methods
         # then. The clock reads tell local time (clock_libraries).
         self.slm.lib_mgr.add_impl_cls("exec.library", AmiFuseExecLibrary)
-        self.slm.lib_mgr.add_impl_cls("dos.library", AmiFuseDosLibrary)
+
+        # One timer device for the runtime, so that pending requests survive
+        # the device being expunged and opened again, and the bridge can
+        # reach it. dos.library's Delay() waits on it too. Made when first
+        # needed: it takes exec.library, which opens before dos.library.
+        def make_dos_library():
+            dos_lib = AmiFuseDosLibrary()
+            dos_lib.delay_timer = self._get_timer_device()
+            return dos_lib
+
+        self.slm.lib_mgr.add_impl_cls("dos.library", make_dos_library)
         self.slm.lib_mgr.add_impl_cls("intuition.library", AmiFuseIntuitionLibrary)
         self.slm.open_base_libs()
         # Register the shared vamos disk device. The backend is supplied by
         # HandlerBridge after it has applied AmiFUSE's image detection.
         self.disk_session.install_devices(self.slm)
         from amifuse.null_device import NullDevice  # lazy import to avoid cycles
-        from amifuse.timer_device import AmiFuseTimerDevice
         self.slm.lib_mgr.add_impl_cls("keyboard.device", NullDevice)
-        # One device for the runtime, so that pending requests survive the
-        # device being expunged and opened again, and the bridge can reach it.
-        timer_device = AmiFuseTimerDevice(self.slm.exec_impl)
-        self.timer_device = timer_device
-        self.slm.lib_mgr.add_impl_cls("timer.device", lambda: timer_device)
+        self.slm.lib_mgr.add_impl_cls("timer.device", self._get_timer_device)
         self.slm.lib_mgr.add_impl_cls("console.device", NullDevice)
 
-        # Add run() method to machine for backwards compatibility
-        self._add_machine_run_method()
 
-    def _add_machine_run_method(self):
-        """Add a run() method to machine that provides the expected interface."""
-        machine = self.machine
+    def _get_timer_device(self):
+        """The runtime's AmiFuseTimerDevice, made on first use."""
+        if self.timer_device is None:
+            from amifuse.timer_device import AmiFuseTimerDevice
 
-        def machine_run(pc, sp=None, set_regs=None, max_cycles=1000,
-                        cycles_per_run=None, name=None):
-            """Run m68k code and return a SimpleRunState.
-
-            If sp is provided and differs from current SP, prepare() is called
-            which pushes an exit trap. If sp matches current SP, we resume
-            without modifying the stack (for resuming from blocked state).
-            """
-            from amitools.vamos.machine.regs import REG_A7
-
-            cpu = machine.cpu
-            mem = machine.get_mem()
-
-            # Set up registers
-            if set_regs:
-                for reg, val in set_regs.items():
-                    cpu.w_reg(reg, val)
-
-            current_sp = cpu.r_reg(REG_A7)
-
-            # Check if we should use prepare() or just set PC directly
-            if sp is None:
-                sp = current_sp
-
-            # Only call prepare() for initial runs (when SP changes significantly)
-            # For resumption from blocked state, just set PC and SP directly
-            needs_prepare = abs(sp - current_sp) > 16  # Heuristic: significant SP change
-
-            if needs_prepare:
-                machine.prepare(pc, sp)
-            else:
-                # Resume without pushing exit trap - just set PC and SP
-                cpu.w_pc(pc)
-                cpu.w_sp(sp)
-
-            total_cycles = 0
-            done = False
-            error = False
-            error_kind = None
-            error_detail = None
-
-            try:
-                er = machine.execute(max_cycles)
-                total_cycles = er.cycles if hasattr(er, 'cycles') else max_cycles
-                done = machine.was_exit(er)
-            except UnsupportedFeatureError:
-                # WaitPort/WaitPkt blocked - this is expected behavior
-                error = True
-                error_kind = "UnsupportedFeatureError"
-                error_detail = None
-            except Exception as exc:
-                # Unexpected error during execution
-                error = True
-                error_kind = type(exc).__name__
-                error_detail = str(exc)
-
-            return SimpleRunState(
-                pc=cpu.r_pc(),
-                sp=cpu.r_sp(),
-                done=done,
-                error=error,
-                cycles=total_cycles,
-                error_kind=error_kind,
-                error_detail=error_detail,
-            )
-
-        machine.run = machine_run
+            self.timer_device = AmiFuseTimerDevice(self.slm.exec_impl)
+        return self.timer_device
 
     def set_scsi_backend(self, backend, debug=False):
         self.scsi_backend = backend
@@ -322,10 +243,6 @@ class VamosHandlerRuntime:
 
     def shutdown(self):
         first_error = None
-        try:
-            _reset_runtime_state()
-        except BaseException as exc:
-            first_error = exc
         # Handlers may leave internal library/device state in a partially
         # torn-down state by the time AmiFuse unmounts. Calling
         # close_base_libs() here can end up touching stale Library structs
@@ -354,10 +271,5 @@ class VamosHandlerRuntime:
         )
         self.scsi_backend = None
         self.timer_device = None
-        try:
-            _reset_runtime_state()
-        except BaseException as exc:
-            if first_error is None:
-                first_error = exc
         if first_error is not None:
             raise first_error

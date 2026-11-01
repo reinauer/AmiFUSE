@@ -17,118 +17,10 @@ class TestProcessStackBase:
     def test_pr_stackbase_is_stack_upper(self):
         """Verify pr_StackBase is set to the stack upper bound (top of stack)."""
         from amifuse.startup_runner import HandlerLauncher
+
         source = inspect.getsource(HandlerLauncher._create_process)
         assert "proc.stack_base.bptr = stack.get_upper() >> 2" in source
         assert "proc.stack_base.bptr = stack.get_lower() >> 2" not in source
-
-
-def test_build_resume_frame_wait_uses_all_pending_signals():
-    from amifuse.startup_runner import _build_resume_frame
-
-    cleared = []
-
-    block_state = {
-        "waitport_blocked_sp": None,
-        "waitport_blocked_port": None,
-        "waitport_blocked_ret": None,
-        "wait_blocked_mask": 0x12,
-        "wait_blocked_sp": 0x2000,
-        "wait_blocked_ret": 0x3456,
-        "waitpkt_blocked": False,
-    }
-
-    class FakeMem:
-        def r32(self, _addr):
-            raise AssertionError("explicit wait_blocked_ret should be used")
-
-    class FakePortMgr:
-        def has_msg(self, _addr):
-            return False
-
-        def get_msg(self, _addr):
-            raise AssertionError("Wait() resume must not dequeue a message")
-
-    def fake_pending(mask):
-        if mask == 0x12:
-            return 0x10
-        if mask == 0xFFFFFFFF:
-            return 0x34
-        raise AssertionError(f"unexpected mask {mask:#x}")
-
-    resume = _build_resume_frame(
-        block_state,
-        default_port_addr=0x9999,
-        mem=FakeMem(),
-        port_mgr=FakePortMgr(),
-        compute_pending_signals=fake_pending,
-        clear_signals_from_task=cleared.append,
-    )
-
-    assert resume == {"pc": 0x3456, "sp": 0x2004, "d0": 0x34}
-    assert cleared == [0x34]
-
-
-def test_build_resume_frame_waitport_dequeues_message():
-    from amifuse.startup_runner import _build_resume_frame
-
-    block_state = {
-        "waitport_blocked_sp": 0x1800,
-        "waitport_blocked_port": 0x2222,
-        "waitport_blocked_ret": 0x4567,
-        "wait_blocked_mask": None,
-        "wait_blocked_sp": None,
-        "wait_blocked_ret": None,
-        "waitpkt_blocked": False,
-    }
-
-    class FakeMem:
-        def __init__(self):
-            self.values = {
-                0xABC0 + 0: 0x3000,
-                0xABC0 + 4: 0x4000,
-            }
-            self.writes = []
-
-        def r32(self, addr):
-            return self.values[addr]
-
-        def w32(self, addr, value):
-            self.writes.append((addr, value))
-
-    class FakePortMgr:
-        def __init__(self):
-            self.got = []
-
-        def has_msg(self, addr):
-            return addr == 0x2222
-
-        def get_msg(self, addr):
-            self.got.append(addr)
-            return 0xABC0
-
-    mem = FakeMem()
-    pmgr = FakePortMgr()
-    resume = _build_resume_frame(
-        block_state,
-        default_port_addr=0x9999,
-        mem=mem,
-        port_mgr=pmgr,
-        compute_pending_signals=lambda _mask: 0,
-        clear_signals_from_task=lambda _signals: None,
-    )
-
-    assert resume == {"pc": 0x4567, "sp": 0x1804, "d0": 0xABC0}
-    assert pmgr.got == [0x2222]
-    assert mem.writes == [(0x4000, 0x3000), (0x3000 + 4, 0x4000)]
-
-
-def test_run_burst_reseeds_execbase_when_restarting_at_main_loop_with_null_a6():
-    from amifuse.startup_runner import HandlerLauncher
-
-    source = inspect.getsource(HandlerLauncher.run_burst)
-
-    assert "state.pc == state.main_loop_pc" in source
-    assert "state.regs[REG_A6] == 0" in source
 
 
 class TestStdpktRingBuffer:
@@ -138,8 +30,10 @@ class TestStdpktRingBuffer:
         from amifuse.startup_runner import HandlerLauncher
 
         launcher = HandlerLauncher.__new__(HandlerLauncher)
+        launcher._emu = None
         launcher.alloc = MagicMock()
         launcher.mem = MagicMock()
+        launcher.port_mgr = MagicMock()
         launcher._stdpkt_ring = []
         launcher._stdpkt_sizes = []
         launcher._stdpkt_ring_size = 8
@@ -160,9 +54,9 @@ class TestStdpktRingBuffer:
         launcher._dp_type_offset = 8
         launcher._dp_arg1_offset = 12
         launcher._debug = False
-        launcher.exec_impl = MagicMock()
-        # Stub out _link_msg_to_port — we're only testing allocation behavior
+        # Stub out the port list and the signal: only allocation is tested
         launcher._link_msg_to_port = lambda *args, **kwargs: None
+        launcher._signal_port = lambda *args, **kwargs: None
         return launcher
 
     def test_stdpkt_first_alloc(self):
@@ -175,6 +69,7 @@ class TestStdpktRingBuffer:
         launcher.alloc.alloc_memory.assert_called_once()
         launcher.alloc.free_memory.assert_not_called()
         assert launcher._stdpkt_ring[0] is new_mem
+        launcher.port_mgr.put_msg.assert_called_once_with(0x1000, 0x5000)
 
     def test_stdpkt_reuses_existing_slot(self):
         launcher = self._make_launcher()
@@ -216,19 +111,30 @@ class TestStdpktRingBuffer:
         launcher.alloc.free_memory.assert_not_called()
 
 
-class TestFinalizeBurstBlocked:
-    """Verify _finalize_burst_blocked helper exists and is used."""
+class TestSignalTask:
+    """A packet's signal reaches the task's scheduler task, or its tc_SigRecvd."""
 
-    def test_method_exists(self):
-        """HandlerLauncher has _finalize_burst_blocked method."""
+    def _make_launcher(self, found):
         from amifuse.startup_runner import HandlerLauncher
-        assert hasattr(HandlerLauncher, '_finalize_burst_blocked')
 
-    def test_run_burst_uses_helper(self):
-        """run_burst delegates blocked-state handling to _finalize_burst_blocked."""
-        import inspect
-        from amifuse.startup_runner import HandlerLauncher
-        source = inspect.getsource(HandlerLauncher.run_burst)
-        assert "_finalize_burst_blocked" in source
-        # Should appear at least twice (error branch + done branch)
-        assert source.count("_finalize_burst_blocked") >= 2
+        launcher = HandlerLauncher.__new__(HandlerLauncher)
+        launcher._emu = None
+        launcher.mem = MagicMock()
+        launcher.mem.r32.return_value = 0x0
+        launcher.scheduler = SimpleNamespace(find_task_pred_func=lambda pred: found)
+        return launcher
+
+    def test_scheduler_task_gets_the_signal(self):
+        task = MagicMock()
+        launcher = self._make_launcher(task)
+        assert launcher.signal_task(0x3000, 0x100)
+        task.set_signal.assert_called_once_with(0x100, 0x100)
+        launcher.mem.w32.assert_not_called()
+
+    def test_task_the_scheduler_does_not_know_gets_tc_sigrecvd(self):
+        from amifuse.startup_runner import _TC_SIGRECVD
+
+        launcher = self._make_launcher(None)
+        launcher.mem.r32.return_value = 0x20
+        assert not launcher.signal_task(0x3000, 0x100)
+        launcher.mem.w32.assert_called_once_with(0x3000 + _TC_SIGRECVD, 0x120)

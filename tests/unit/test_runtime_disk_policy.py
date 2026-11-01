@@ -20,8 +20,6 @@ def disk(monkeypatch):
     for name in ("Machine", "MemoryMap", "TraceManager", "VamosPathManager",
                  "Scheduler", "Runtime", "SetupLibManager"):
         monkeypatch.setattr(vamos_runner, name, MagicMock())
-    monkeypatch.setattr(vamos_runner.VamosHandlerRuntime,
-                        "_add_machine_run_method", lambda self: None)
     runtime = vamos_runner.VamosHandlerRuntime()
     backend = MagicMock()
     backend.block_size = 512

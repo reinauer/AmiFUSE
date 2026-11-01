@@ -1,8 +1,8 @@
 """An RDB filesystem or LSEG link to a block past the end of the device.
 
 amitools raises the same IOError for such a block as for a failing read, so
-the strict open raises, and the lenient parse that follows must stop at the
-link without reading it: the partitions open and the entries before it stay.
+the lenient parse must stop at the link without reading it: the partitions
+open and the entries before it stay.
 Each image has one DOS3 partition and the bundled FastFileSystem in its RDB,
 with the first filesystem header at block 2 and its first LSEG at block 3.
 """
@@ -140,7 +140,7 @@ def test_inspect_reports_the_link(tmp_path, capsys):
 
 def test_failing_read_still_raises(tmp_path):
     """A read error is not taken for a link past the end: the lenient parse
-    reads the block again, and its error propagates as a read error."""
+    reads the block, and its error propagates as a read error."""
     image = _rdb(tmp_path)
     raw = RawBlockDevice(str(image), read_only=True)
     raw.open()
@@ -161,6 +161,6 @@ def test_failing_read_still_raises(tmp_path):
             _parse_rdb(raw, rdb_block)
         assert not isinstance(caught.value, RDBContentError)
         assert str(caught.value) == "device read failed"
-        assert failed == [FSHD, FSHD]  # The strict open, then the lenient one.
+        assert failed == [FSHD]  # The lenient parse alone reads it.
     finally:
         raw.close()

@@ -55,7 +55,8 @@ def test_unmount_waits_for_destroy_and_reports_failures(monkeypatch, failure):
 
     bridge = SimpleNamespace(
         _write_enabled=True, state=SimpleNamespace(crashed=failure == "crashed"),
-        wait_for_pending=lambda: [], flush_volume=step("flush"), vh=SimpleNamespace(shutdown=step("shutdown")),
+        wait_for_pending=lambda: [], flush_volume=step("flush"),
+        shutdown_runtime=step("shutdown"), vh=SimpleNamespace(),
         backend=SimpleNamespace(sync=step("sync"), close=step("close")),
     )
     fs = AmigaFuseFS(bridge)
