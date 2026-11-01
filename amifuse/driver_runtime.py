@@ -233,10 +233,13 @@ class BlockDeviceBackend:
     def _open_image(self):
         from .rdb_inspect import open_rdisk
 
-        # For ADF images, skip RDB/MBR parsing and use synthetic geometry
+        # For ADF images, skip RDB/MBR parsing and use synthetic geometry.
+        # A floppy always has 512-byte blocks, the size the handler's
+        # DosEnvec declares, so a requested block size does not apply.
         if self.adf_info is not None:
             self.blkdev = RawBlockDevice(
-                str(self.image), read_only=self.read_only, block_bytes=self.block_size
+                str(self.image), read_only=self.read_only,
+                block_bytes=self.adf_info.block_size
             )
             self.blkdev.open()
             self.rdb = None
