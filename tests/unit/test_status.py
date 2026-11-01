@@ -55,6 +55,25 @@ class TestParseMountTokens:
         assert image == "/images/test.hdf"
         assert mp == "/Users/me/mnt"
 
+    @pytest.mark.parametrize("cmdline, expected", [
+        # cmd.exe passes the quotes on as typed; the Windows tokenizer splits
+        # the value at the space, so no mountpoint beats half of one.
+        ('amifuse mount C:\\img.hdf --mountpoint="C:\\a b" --write', None),
+        ('amifuse mount --mountpoint="C:\\a  b" C:\\img.hdf', None),
+        # list2cmdline quotes the whole token, which stays one token.
+        ('amifuse mount C:\\img.hdf "--mountpoint=C:\\a b"', "C:\\a b"),
+        ('amifuse mount C:\\img.hdf --mountpoint="C:\\ab"', "C:\\ab"),
+        ('amifuse mount C:\\img.hdf --mountpoint "C:\\a b"', "C:\\a b"),
+    ])
+    def test_windows_quoted_mountpoint(self, cmdline, expected):
+        """Windows discovery tokenizes with shlex.split(posix=False)."""
+        import shlex
+        from amifuse.platform import _parse_mount_tokens
+
+        image, mp = _parse_mount_tokens(shlex.split(cmdline, posix=False))
+        assert image == "C:\\img.hdf"
+        assert mp == expected
+
     def test_no_mount_subcommand(self):
         from amifuse.platform import _parse_mount_tokens
 

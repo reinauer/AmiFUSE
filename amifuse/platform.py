@@ -606,11 +606,23 @@ def _parse_mount_tokens(tokens):
         tok = tokens[i]
         # argparse also takes "--mountpoint=PATH" and any unambiguous
         # prefix ("--mount PATH"); no other mount option starts with "--m".
-        option, eq, value = tok.partition("=")
+        # A Windows command line may quote the whole token
+        # ("--mountpoint=C:\a b"), which the Windows tokenizer keeps as one.
+        option, eq, value = _strip_matched_quotes(tok).partition("=")
         if len(option) >= 3 and "--mountpoint".startswith(option):
             if eq:
-                mountpoint = value
                 i += 1
+                if value.startswith('"') and (len(value) < 2
+                                              or not value.endswith('"')):
+                    # cmd.exe passes --mountpoint="C:\a b" on as typed, and
+                    # the Windows tokenizer splits it at each run of spaces,
+                    # so the path can't be rebuilt exactly. Skip its pieces
+                    # and report no mountpoint rather than part of one.
+                    while i < len(tokens) and not tokens[i].endswith('"'):
+                        i += 1
+                    i += 1
+                else:
+                    mountpoint = value
                 continue
             if i + 1 < len(tokens):
                 mountpoint = tokens[i + 1]
