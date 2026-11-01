@@ -595,10 +595,12 @@ def _mount_option(name):
 
     argparse takes an option's full name or any unambiguous prefix of it, so
     anything else that starts with "-" can't be an option of a running
-    mount: it is a piece of a value `ps` split at its spaces.
+    mount: it is a piece of a value `ps` split at its spaces. So is -h or
+    --help: argparse prints the help and exits.
     """
-    options = _MOUNT_VALUE_OPTIONS + _MOUNT_SWITCHES
-    if name in options or name in ("-h", "--"):
+    options = tuple(option for option in _MOUNT_VALUE_OPTIONS + _MOUNT_SWITCHES
+                    if option != "--help")
+    if name in options or name == "--":
         return name
     if len(name) < 3 or not name.startswith("--"):
         return None
@@ -641,7 +643,10 @@ def _parse_mount_tokens(tokens):
         name, eq, value = _strip_matched_quotes(tok).partition("=")
         option = _mount_option(name)
         if option is not None:
-            in_run = False
+            # An option ends the run of positionals after the mountpoint.
+            # "--" takes no value, so a "--" piece (`/Volumes/Games -- WHD`)
+            # mustn't end it.
+            in_run = in_run and option == "--"
             i += 1
             if eq and value.count('"') % 2:
                 # cmd.exe passes --mountpoint="C:\a b" on as typed, and the

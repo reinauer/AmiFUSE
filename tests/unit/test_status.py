@@ -98,6 +98,11 @@ class TestParseMountTokens:
         ("amifuse mount img.hdf --mountpoint=/Volumes/Games - WHD", None),
         ("amifuse mount img.hdf --mountpoint /Volumes/Games -WHD --write", None),
         ("amifuse mount --mount=/Volumes/A -B img.hdf", None),
+        ("amifuse mount img.hdf --mountpoint=/Volumes/Games -- WHD", None),
+        ("amifuse mount img.hdf --mountpoint /Volumes/Games -h WHD", None),
+        ("amifuse mount img.hdf --mountpoint /Volumes/Games --help", None),
+        # A real "--" before the image.
+        ("amifuse mount --mountpoint /V/W -- img.hdf", "/V/W"),
         # Abbreviated and "=" value options take their value with them.
         ("amifuse mount --vol Work --part DH1 --mountpoint /V/W img.hdf", "/V/W"),
         ("amifuse mount --volname=Work --mountpoint /V/W img.hdf", "/V/W"),
@@ -117,10 +122,15 @@ class TestParseMountTokens:
 
         with pytest.raises(SystemExit):
             fuse_fs.main(["mount", "--help"])
-        options = set(re.findall(r"(?<![\w-])--[a-z][a-z-]*",
-                                 capsys.readouterr().out))
+        out = capsys.readouterr().out
+        options = set(re.findall(r"(?<![\w-])--[a-z][a-z-]*", out))
         assert options == set(plat._MOUNT_VALUE_OPTIONS
                               + plat._MOUNT_SWITCHES)
+        # The usage line shows each option that takes a value with its
+        # metavar: "[--driver DRIVER]".
+        usage = " ".join(out.split("\n\n")[0].split())
+        assert set(re.findall(r"\[(--[a-z-]+) [A-Z_]+\]", usage)) == set(
+            plat._MOUNT_VALUE_OPTIONS)
 
     def test_no_mount_subcommand(self):
         from amifuse.platform import _parse_mount_tokens
