@@ -163,6 +163,7 @@ def _fs(volume, free_blocks=4096):
     bridge.mem.w_block.side_effect = volume.w_block
     bridge.mem.r_block.side_effect = volume.r_block
     bridge._alloc_read_buf = MagicMock(return_value=SimpleNamespace(addr=0x2000))
+    bridge._alloc_empty_buf = MagicMock(return_value=SimpleNamespace(addr=0x2000))
     bridge._run_until_replies = MagicMock(side_effect=lambda: volume.reply)
     bridge.get_disk_info = MagicMock(return_value={
         "num_blocks": 8192, "num_blocks_used": 8192 - free_blocks,
