@@ -768,3 +768,66 @@ def test_unmount_flush_after_the_deadline_gets_the_short_limit(
     # 15 s of waiting for the grow, then 10 bursts for the flush.
     assert now[0] - 1000.0 == 25.0
     assert "Unmount completed with errors." in capsys.readouterr().out
+
+
+def _io_reply_port(b, handler):
+    """A port of the handler's own for IO replies, and a message for it."""
+    io_port, io_msg = (b.vh.alloc.alloc_memory(64, label=label).addr
+                       for label in ("io_port", "io_msg"))
+    handler.ports.ports[io_port] = []
+    return io_port, io_msg
+
+
+def test_unmount_wait_leaves_a_handler_at_work_its_io_reply(
+        bridge, short_limits, monkeypatch):
+    # #240: at work on a packet, the handler sends an IO request whose
+    # reply comes at once, and takes it with GetMsg() only after the wait
+    # that queued it has ended at the short limit, 10 bursts.
+    b, handler = bridge
+    fh = _open(b, handler, "/grow", 0x5550)
+    handler.delay = lambda pkt_type, name: NEVER if pkt_type == ACTION_SET_FILE_SIZE else 0
+    assert b.set_handle_size(fh, 0x7FFFFFFF) == -1
+    io_port, io_msg = _io_reply_port(b, handler)
+    ports = handler.ports
+    now = [1000.0]
+    monkeypatch.setattr(fs.time, "monotonic", lambda: now[0])
+    bursts, got = [0], []
+
+    def run_burst(state, max_cycles=200000, debug=False):
+        now[0] += 1.0
+        bursts[0] += 1
+        if bursts[0] == 1:
+            ports.put_msg(io_port, io_msg)  # SendIO()
+        elif bursts[0] == 12 and ports.has_msg(io_port):
+            got.append(ports.get_msg(io_port))  # GetMsg(), then the answer
+            handler.answer_now(ACTION_SET_FILE_SIZE)
+        handler.run_burst(state, max_cycles, debug)
+        if not got:
+            state.run_state = BUSY
+        return state.run_state
+    b.launcher.run_burst = run_burst
+
+    assert b.wait_for_pending(timeout=15.0) == []
+    assert got == [io_msg]
+
+
+def test_unmount_wait_drains_io_replies_once_the_handler_is_at_its_main_loop(
+        bridge, short_limits):
+    b, handler = bridge
+    fh = _open(b, handler, "/grow", 0x5550)
+    handler.delay = lambda pkt_type, name: NEVER if pkt_type == ACTION_SET_FILE_SIZE else 0
+    assert b.set_handle_size(fh, 0x7FFFFFFF) == -1
+    io_port, io_msg = _io_reply_port(b, handler)
+    b.state.main_loop_pc, b.state.main_loop_sp, b.state.sp = 0x5000, 0x8000, 0x8000
+
+    def run_burst(state, max_cycles=200000, debug=False):
+        # A reply it will not take, then the answer and back to its main loop.
+        handler.ports.put_msg(io_port, io_msg)
+        handler.answer_now(ACTION_SET_FILE_SIZE)
+        handler.run_burst(state, max_cycles, debug)
+        state.pc = state.main_loop_pc
+        return state.run_state
+    b.launcher.run_burst = run_burst
+
+    assert b.wait_for_pending() == []
+    assert not handler.ports.has_msg(io_port)
