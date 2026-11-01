@@ -362,3 +362,65 @@ def test_delete_file_at_the_old_name_while_the_renamed_file_is_open(winfsp_renam
 
     assert _read(ops, "/b-new.txt") == DOOMED
     assert ops._pending_deletes == set()
+
+
+def test_delete_file_at_the_old_name_from_a_handle_a_failed_truncate_closed(winfsp_rename):
+    """A handle a failed truncate() reopen left closed is still one on the old
+    name: its delete-on-close deletes that file, not the renamed one."""
+    ops = winfsp_rename
+    fh = _create_renamed(ops, "/b-old.txt", "/b-new.txt")
+    _write(ops, "/b-old.txt", KEEP)
+    dh = ops.open("/b-old.txt", os.O_RDWR)
+    entry = ops._fh_cache[dh]
+    ops.bridge.close_file(entry["fh_addr"])
+    if entry.get("parent_lock"):
+        ops.bridge.free_lock(entry["parent_lock"])
+    entry.update(fh_addr=0, parent_lock=0, closed=True)  # as _reopen_for_output
+
+    assert ops.unlink("/b-old.txt") == 0
+    assert ops.release("/b-old.txt", dh) == 0
+    assert "b-old.txt" not in _on_disk(ops)
+    assert ops.release("/b-old.txt", fh) == 0
+
+    assert _read(ops, "/b-new.txt") == DOOMED
+    assert ops._pending_deletes == set()
+
+
+def test_delete_on_close_after_another_file_was_renamed_onto_the_old_name(winfsp_rename):
+    """A save that renames the old version away through its handle, renames
+    the new version onto its name, then deletes the old version on close
+    keeps the new version. WinFsp names the new version's handle by the name
+    it was opened under, so it can't be the one deleting."""
+    ops = winfsp_rename
+    _write(ops, "/doc.txt", DOOMED)
+    old = ops.open("/doc.txt", os.O_RDWR)
+    new = ops.create("/new.txt", 0o644)
+    assert ops.write("/new.txt", KEEP, 0, new) == len(KEEP)
+    assert ops.rename("/doc.txt", "/doc.bak") == 0
+    assert ops.rename("/new.txt", "/doc.txt") == 0
+
+    assert ops.unlink("/doc.txt") == 0
+    assert ops.release("/doc.txt", old) == 0
+    assert ops.release("/new.txt", new) == 0
+
+    assert "doc.bak" not in _on_disk(ops)
+    assert _read(ops, "/doc.txt") == KEEP
+    assert ops._pending_deletes == set()
+
+
+def test_delete_on_close_while_a_directory_renamed_from_the_name_is_open(winfsp_rename):
+    """Only a file handle deletes a file: a directory handle renamed from the
+    same name leaves the renamed file the one to delete."""
+    ops = winfsp_rename
+    ops.mkdir("/p", 0o755)
+    dh = ops.opendir("/p")
+    assert ops.rename("/p", "/q") == 0
+    fh = _create_renamed(ops, "/p", "/r")
+
+    assert ops.unlink("/p") == 0
+    assert ops.release("/p", fh) == 0
+    assert ops.releasedir("/p", dh) == 0
+
+    assert "r" not in _on_disk(ops)
+    assert "q" in _on_disk(ops)
+    assert ops._pending_deletes == set()

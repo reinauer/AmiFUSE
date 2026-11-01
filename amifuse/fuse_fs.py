@@ -4273,14 +4273,20 @@ class AmigaFuseFS(_FuseOperations):
         if not self.bridge._write_enabled:
             raise FuseOSError(errno.EROFS)
         if self._winfsp:
-            # WinFsp passes the name a handle was opened under, also for
-            # the delete-on-close of a file renamed through that handle, so
-            # the file renamed from path is the one to delete. A name two
-            # objects could answer (None) is deleted as given, as before: a
-            # DeleteFile() holds its own handle on it (#290).
+            # WinFsp passes the name the deleting file handle was opened
+            # under, also after a rename through that handle (#290), so the
+            # file handles opened under path tell which file to delete. A
+            # handle a failed truncate() reopen left closed counts, as in
+            # release(). Files opened under path that are now at two paths,
+            # as when a DeleteFile() of a new file there comes while a file
+            # renamed from there is open, leave path as given, as before.
             with self._fh_lock:
-                target = self._renamed_open_file(path)
-            if target is not None and target != path:
+                targets = {
+                    v.get("path") for v in self._fh_cache.values()
+                    if "fh_addr" in v and v.get("opened_as", v.get("path")) == path
+                }
+            if len(targets) == 1 and path not in targets:
+                target = targets.pop()
                 self._log_op("unlink", path, f"renamed open file: {target}")
                 path = target
         dir_path, name = self._split_path(path)
