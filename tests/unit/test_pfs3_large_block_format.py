@@ -1,8 +1,9 @@
-"""format refuses a PFS partition with blocks over 1024 bytes for pfs3aio < 20.
+"""format refuses pfs3aio before 20.0 on blocks over 1024 bytes.
 
 pfs3aio 19.2 fixes its reserved blocks at 1024 bytes, so with 2048- or
-4096-byte partition blocks it divides by zero in ACTION_FORMAT; 20.0 formats
-them. format refuses before the handler starts, by the driver's $VER.
+4096-byte partition blocks it divides by zero in ACTION_FORMAT, whatever the
+partition's DOS type; 20.0 formats them. format refuses before the handler
+starts, by the driver's $VER.
 """
 
 from pathlib import Path
@@ -17,8 +18,12 @@ from tests.unit.test_partition_name_before_number import _make_rdb_parts
 PFS3 = 0x50465303
 PDS3 = 0x50445303
 DOS3 = 0x444F5303
+MUPF = 0x6D755046
+AFS1 = 0x41465301
 VER_19 = b"$VER: Professional-File-System-III 19.2 PFS3AIO-VERSION (2.10.2018) written by Michiel"
 VER_20 = b"$VER: Professional-File-System-III 20.0 PFS3AIO-VERSION (31.10.2026) written by Michiel"
+VER_FFS = b"$VER: fs 47.4 (16.6.2020)"
+VER_SFS = b"$VER: SmartFilesystem 1.293 (12.4.2020)"
 
 
 class BridgeStarted(OSError):
@@ -51,9 +56,11 @@ def _format(monkeypatch, tmp_path, driver, dostype, block_size):
 
 
 @pytest.mark.parametrize("block_size", [2048, 4096])
-@pytest.mark.parametrize("dostype", [PFS3, PDS3], ids=["PFS3", "PDS3"])
+@pytest.mark.parametrize("dostype", [PFS3, PDS3, MUPF, AFS1, DOS3],
+                         ids=["PFS3", "PDS3", "muPF", "AFS1", "DOS3"])
 def test_pfs3aio_19_is_refused_above_1024(monkeypatch, tmp_path, dostype,
                                           block_size):
+    """19.2 formats whatever the partition's DOS type, so each is refused."""
     message, started = _format(monkeypatch, tmp_path,
                                _driver(tmp_path, VER_19), dostype, block_size)
     assert not started
@@ -63,9 +70,15 @@ def test_pfs3aio_19_is_refused_above_1024(monkeypatch, tmp_path, dostype,
         "or 1024-byte blocks, or pfs3aio 20.0 or later.")
 
 
-def test_a_driver_without_version_is_refused(monkeypatch, tmp_path):
-    message, started = _format(monkeypatch, tmp_path, _driver(tmp_path, b""),
-                               PFS3, 2048)
+@pytest.mark.parametrize("ver,dostype", [
+    (b"", PFS3),
+    (b"", MUPF),
+    (b"$VER: Professional-File-System-III beta (1.1.2020)", DOS3),
+], ids=["no-VER-PFS3", "no-VER-muPF", "PFS-no-number-DOS3"])
+def test_a_driver_without_version_is_refused(monkeypatch, tmp_path, ver,
+                                             dostype):
+    message, started = _format(monkeypatch, tmp_path, _driver(tmp_path, ver),
+                               dostype, 2048)
     assert not started
     assert "the driver's version could not be determined" in message
     assert "pfs3aio 20.0 or later" in message
@@ -74,10 +87,14 @@ def test_a_driver_without_version_is_refused(monkeypatch, tmp_path):
 @pytest.mark.parametrize("ver,dostype,block_size", [
     (VER_20, PFS3, 2048),
     (VER_20, PFS3, 4096),
+    (VER_20, DOS3, 2048),
     (VER_19, PFS3, 1024),
     (VER_19, PFS3, 512),
-    (VER_19, DOS3, 2048),
-], ids=["20.0-2048", "20.0-4096", "19.2-1024", "19.2-512", "DOS3-2048"])
+    (VER_FFS, DOS3, 4096),
+    (VER_SFS, PFS3, 2048),
+    (b"", DOS3, 2048),
+], ids=["20.0-2048", "20.0-4096", "20.0-DOS3", "19.2-1024", "19.2-512",
+        "FFS-4096", "SFS-on-PFS3", "no-VER-DOS3"])
 def test_format_goes_on(monkeypatch, tmp_path, ver, dostype, block_size):
     message, started = _format(monkeypatch, tmp_path, _driver(tmp_path, ver),
                                dostype, block_size)

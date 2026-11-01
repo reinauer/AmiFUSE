@@ -5371,20 +5371,26 @@ def _ver_number(ver: Optional[str]) -> Optional[Tuple[int, str]]:
 
 def _pfs3_format_refusal(dostype: int, block_bytes: Optional[int], driver: Path,
                          partition: str) -> Optional[str]:
-    """Return why format refuses a PFS partition with large blocks, or None.
+    """Return why format refuses pfs3aio on a partition with large blocks, or None.
 
-    pfs3aio before 20.0 fixes its reserved blocks at 1024 bytes, so with
-    2048- or 4096-byte partition blocks it counts 0 sectors per reserved
-    block and divides by zero formatting the partition. A driver whose
-    version cannot be read is refused too: it may be one of those.
+    pfs3aio before 20.0 cannot format blocks over 1024 bytes: 19.2 fixes
+    its reserved blocks at 1024 bytes, counts 0 sectors per reserved block
+    and divides by zero, whatever the partition's DOS type. pfs3aio names
+    itself in its $VER. A driver without $VER is refused on a PFS
+    partition, since it may be one of those.
     Raises OSError when the driver cannot be read.
     """
-    # "PFS\x" and "PDS\x"; pfs3aio registers \1 and \3 of each.
-    if dostype & 0xFFFFFF00 not in (0x50465300, 0x50445300):
-        return None
     if block_bytes is None or block_bytes <= 1024:
         return None
-    number = _ver_number(driver_resolver.find_version(Path(driver).read_bytes()))
+    ver = driver_resolver.find_version(Path(driver).read_bytes())
+    if ver is None:
+        # "PFS\x", "PDS\x", "muPF", "muAF" and "AFS\1".
+        if (dostype & 0xFFFFFF00 not in (0x50465300, 0x50445300)
+                and dostype not in (0x6D755046, 0x6D754146, 0x41465301)):
+            return None
+    elif "Professional-File-System" not in ver:
+        return None
+    number = _ver_number(ver)
     if number is not None and number[0] >= 20:
         return None
     if number is None:

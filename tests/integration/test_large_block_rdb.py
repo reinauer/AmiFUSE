@@ -68,16 +68,22 @@ def test_format_write_list_and_read(fixture_root, tmp_path, name, dos_type,
     assert output.read_bytes() == data
 
 
-@pytest.mark.parametrize("block_bytes", [2048, 4096])
-def test_pfs3aio_19_refuses_large_blocks(fixture_root, tmp_path, block_bytes):
-    """pfs3aio 19.2 divides by zero formatting these; format refuses first."""
+@pytest.mark.parametrize("block_bytes,dos_type", [
+    (2048, 0x50465303),
+    (4096, 0x50465303),
+    (2048, 0x444F5303),
+], ids=["pfs3-2048", "pfs3-4096", "dos3-2048"])
+def test_pfs3aio_19_refuses_large_blocks(fixture_root, tmp_path, block_bytes,
+                                         dos_type):
+    """pfs3aio 19.2 divides by zero formatting these, whatever the DOS type;
+    format refuses first."""
     driver = fixture_root / "drivers" / "pfs3aio"
     if not driver.exists():
         pytest.skip("Missing handler pfs3aio")
     if b"Professional-File-System-III 19.2 " not in driver.read_bytes():
         pytest.skip("The pfs3aio fixture is not 19.2")
     image = tmp_path / "rdb.hdf"
-    make_rdb(image, block_bytes, 0x50465303)
+    make_rdb(image, block_bytes, dos_type)
     before = image.read_bytes()
 
     result = subprocess.run(
