@@ -148,7 +148,7 @@ def bridge():
     alloc = MemoryAlloc(mem, addr=0x1000)
     ports = Ports()
     vh = SimpleNamespace(
-        alloc=alloc, scheduler=None, timer_device=None,
+        alloc=alloc, scheduler=None, timer_device=None, shutdown=lambda: None,
         slm=SimpleNamespace(exec_impl=SimpleNamespace(port_mgr=ports)))
     launcher = HandlerLauncher(vh, {}, 0)
     state = SimpleNamespace(
