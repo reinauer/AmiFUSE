@@ -181,8 +181,8 @@ def should_auto_create_mountpoint(mountpoint: Path) -> bool:
         import posixpath
 
         # macFUSE creates mount points directly in /Volumes automatically.
-        # Compare the normalized parent, so /Volumes/a/b and /Volumes/../x
-        # are created and checked here instead.
+        # Compare the normalized parent, so a path such as /Volumes/a/b or
+        # /Volumes/../x is created here when missing.
         path = posixpath.normpath(str(mountpoint))
         return posixpath.dirname(path) == "/Volumes"
     if sys.platform.startswith("win"):
