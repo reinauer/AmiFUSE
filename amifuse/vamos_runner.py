@@ -6,6 +6,7 @@ the handler into memory so we can later jump into it.
 """
 
 import logging
+import os
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -280,9 +281,27 @@ class VamosHandlerRuntime:
     def load_handler(self, handler_path: Path) -> int:
         if not self.slm:
             raise RuntimeError("setup() not called")
-        seg_baddr = self.slm.seg_loader.load_sys_seglist(str(handler_path))
+        # A bad handler file is a user error: raise OSError or ValueError,
+        # which mount and format report in one line. The loader returns 0
+        # both for a missing file and for one in no format it knows.
+        if not os.path.isfile(handler_path):
+            raise FileNotFoundError(
+                f"Failed to load handler {handler_path}: no such file")
+        try:
+            seg_baddr = self.slm.seg_loader.load_sys_seglist(str(handler_path))
+        except Exception as exc:
+            # The file is the loader's only input. Its parsers fail on a
+            # damaged file with assorted errors (HunkParseError, IndexError,
+            # struct.error, ...); --debug still shows the original.
+            raise ValueError(
+                f"Failed to load handler {handler_path}: damaged Amiga "
+                f"executable ({type(exc).__name__}: {exc})"
+            ) from exc
         if seg_baddr == 0:
-            raise RuntimeError(f"Failed to load handler {handler_path}")
+            raise ValueError(
+                f"Failed to load handler {handler_path}: not an Amiga "
+                f"executable (HUNK or ELF)"
+            )
         self.seglist_baddr = seg_baddr
         return seg_baddr
 
