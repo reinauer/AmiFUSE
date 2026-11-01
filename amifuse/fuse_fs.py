@@ -5178,7 +5178,7 @@ def mount_fuse(
         # Daemon mode forks here, before the handler starts; see
         # _fork_daemon_parent. The child mounts in the foreground.
         ready_fd = None
-        if not foreground and hasattr(os, "fork") and not sys.platform.startswith("win"):
+        if not foreground and not sys.platform.startswith("win"):
             ready_fd = _fork_daemon_parent()
             foreground = True
 
