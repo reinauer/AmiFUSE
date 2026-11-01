@@ -642,11 +642,20 @@ def _parse_mount_tokens(tokens):
         # ("--mountpoint=C:\a b"), which the Windows tokenizer keeps as one.
         name, eq, value = _strip_matched_quotes(tok).partition("=")
         option = _mount_option(name)
+        if option is not None and eq and option not in _MOUNT_VALUE_OPTIONS:
+            option = None  # argparse refuses "--write=1" and "--=x"
         if option is not None:
-            # An option ends the run of positionals after the mountpoint.
-            # "--" takes no value, so a "--" piece (`/Volumes/Games -- WHD`)
-            # mustn't end it.
-            in_run = in_run and option == "--"
+            # Only a value option ends the run of pieces after the
+            # mountpoint. A switch or "--" there may be a piece of a split
+            # path (`/Volumes/Games --write WHD`), and a "--" in the run
+            # counts as one. What `ps` can't settle: a mountpoint like
+            # "/Volumes/Games --write" looks exactly like a real --write.
+            # Only the exact argv (/proc/<pid>/cmdline, sysctl
+            # KERN_PROCARGS2) would; a wrong reading matters only when
+            # another program's FUSE-T mount sits at the shortened path.
+            in_run = in_run and option not in _MOUNT_VALUE_OPTIONS
+            if option == "--" and mountpoint is not None:
+                run += in_run
             i += 1
             if eq and value.count('"') % 2:
                 # cmd.exe passes --mountpoint="C:\a b" on as typed, and the
