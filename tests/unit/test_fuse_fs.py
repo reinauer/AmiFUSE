@@ -6772,6 +6772,10 @@ class TestCmdWrite:
         import amifuse.fuse_fs as fuse_fs_mod
 
         mock_bridge = _make_mock_bridge()
+        # The destination name is new
+        mock_bridge.locate_path.return_value = (
+            0, fuse_fs_mod.ERROR_OBJECT_NOT_FOUND, [])
+        mock_bridge.delete_object.return_value = (-1, 0)
         monkeypatch.setattr(
             fuse_fs_mod, "_create_bridge_from_args",
             lambda args, cmd, read_only=True: (mock_bridge, None),
@@ -6869,6 +6873,8 @@ class TestCmdWrite:
         captured = {}
         mock_bridge = _make_mock_bridge()
         mock_bridge.open_file.return_value = (0x1000, 0x2000)
+        mock_bridge.locate_path.return_value = (
+            0, fuse_fs_mod.ERROR_OBJECT_NOT_FOUND, [])  # a new name
         mock_bridge.write_handle_reply.return_value = (5, 0)
         mock_bridge.close_file.return_value = None
         mock_bridge.flush_volume.return_value = None
@@ -7108,6 +7114,8 @@ class TestCmdWrite:
 
         mock_bridge = _make_mock_bridge()
         mock_bridge.open_file.return_value = (0x1000, 0x2000)
+        mock_bridge.locate_path.return_value = (
+            0, fuse_fs_mod.ERROR_OBJECT_NOT_FOUND, [])  # a new name
         mock_bridge.write_handle_reply.return_value = (5, 0)
         mock_bridge.close_file.return_value = None
         mock_bridge.flush_volume.return_value = None
@@ -7198,6 +7206,8 @@ class TestCmdWrite:
         written_data = bytearray()
         mock_bridge = _make_mock_bridge()
         mock_bridge.open_file.return_value = (0x1000, 0x2000)
+        mock_bridge.locate_path.return_value = (
+            0, fuse_fs_mod.ERROR_OBJECT_NOT_FOUND, [])  # a new name
         mock_bridge.close_file.return_value = None
         mock_bridge.flush_volume.return_value = None
         mock_bridge.seek_handle.return_value = None

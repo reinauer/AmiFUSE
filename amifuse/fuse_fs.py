@@ -6447,6 +6447,63 @@ def _open_write_source(host_path: Path, use_json: bool):
         raise
 
 
+# `amifuse write` keeps a copy of its source up to this size in memory; a
+# larger source is copied to a temporary file on the host's disk.
+_WRITE_SPOOL_MAX = 16 * 1024 * 1024
+
+
+def _spool_write_source(source, host_path: Path, host_size: int, use_json: bool):
+    """Copy the whole source of `amifuse write` before the image is touched.
+
+    Opening the destination empties an existing file. A source that fails
+    part way through, one another program has locked from some offset say,
+    would then leave the destination holding part of the new contents.
+
+    Closes source, and returns the copy positioned at its start, or exits
+    with an error.
+    """
+    import json
+    import tempfile
+
+    def refuse(code, message, details=None):
+        if use_json:
+            print(json.dumps(_json_error("write", code, message, details)))
+            sys.exit(1)
+        raise SystemExit(f"Error: {message[0].lower()}{message[1:]}")
+
+    spool = tempfile.SpooledTemporaryFile(max_size=_WRITE_SPOOL_MAX)
+    try:
+        with source:
+            size = 0
+            while True:
+                try:
+                    data = source.read(IO_CHUNK)
+                except OSError as exc:
+                    refuse("INVALID_ARGUMENT",
+                           f"Cannot read source file: {host_path}: {exc.strerror or exc}")
+                if not data:
+                    break
+                size += len(data)
+                if size > _MAX_FILE_SIZE:
+                    # The source holds more than its fstat() size: it grew
+                    # while it was read
+                    refuse("FILE_TOO_LARGE",
+                           f"Source holds more than {_MAX_FILE_SIZE} bytes, the "
+                           f"largest AmigaDOS file: {host_path}",
+                           {"size": host_size, "max_size": _MAX_FILE_SIZE})
+                try:
+                    spool.write(data)
+                except OSError as exc:
+                    refuse("HANDLER_ERROR",
+                           f"Write operation failed: cannot copy the source to a "
+                           f"temporary file: {exc.strerror or exc}")
+        spool.seek(0)
+        return spool
+    except BaseException:
+        spool.close()
+        raise
+
+
 # How `amifuse write` names the AmigaDOS error code of a failed write: the
 # codes _WRITE_ERRNOS maps for the FUSE layer.
 _WRITE_ERROR_REASONS = {
@@ -6507,6 +6564,10 @@ def cmd_write(args):
                 f"Error: source file is larger than {_MAX_FILE_SIZE} bytes, the "
                 f"largest AmigaDOS file: {host_path} ({host_size} bytes)")
 
+        # From here on, source is a copy of the whole source file, so a read
+        # error fails the command before the image is touched.
+        source = _spool_write_source(source, host_path, host_size, use_json)
+
         # Safety warning (stderr so it doesn't interfere with JSON output)
         print(f"WARNING: This will modify the disk image: {args.image}", file=sys.stderr)
         print(f"  Source: {host_path} ({host_size:,} bytes)", file=sys.stderr)
@@ -6520,6 +6581,9 @@ def cmd_write(args):
     flushed = False  # Guard flag to avoid double flush
     write_started = False
     mount_details = None
+    # Added to a failure report while an existing destination, emptied when
+    # it was opened, holds only part of the new contents.
+    partial = ""
     try:
         state = _check_file_command_mount(bridge, "write", use_json)
         mount_details = _mount_state_details(state)
@@ -6530,6 +6594,15 @@ def cmd_write(args):
         _ensure_parent_dirs(bridge, normalized, use_json=use_json, debug=debug,
                             error_details=mount_details)
 
+        # A write that fails removes a file it created. An existing file
+        # cannot get its old contents back, and is kept. A lookup that gets
+        # no clear answer counts as neither.
+        lock, res2, locks = bridge.locate_path(normalized)
+        for l in reversed(locks):
+            bridge.free_lock(l)
+        existed = lock != 0
+        new_name = lock == 0 and res2 in _NOT_FOUND_ERRORS
+
         # Open for write (create/truncate)
         fh_result = bridge.open_file(normalized, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
         if fh_result is None:
@@ -6539,10 +6612,14 @@ def cmd_write(args):
                 sys.exit(1)
             raise SystemExit(f"Error: failed to open file for writing: {amiga_path}")
 
-        # Note: _dir_lock from open_file() is never freed. This is a
+        # Note: dir_lock from open_file() is never freed. This is a
         # pre-existing pattern also present in cmd_hash().
         # Not a blocker -- the lock is released when the bridge is destroyed.
-        fh_addr, _dir_lock = fh_result
+        fh_addr, dir_lock = fh_result
+        if existed:
+            partial = (f"; the existing {amiga_path} is left partial, and its "
+                       f"old contents are gone")
+        completed = False
         try:
             # Handler crash safety: If the handler crashes during the
             # write loop, the error paths handle it gracefully:
@@ -6556,22 +6633,6 @@ def cmd_write(args):
                     data = f.read(chunk_size)
                     if not data:
                         break
-                    if bytes_written + len(data) > _MAX_FILE_SIZE:
-                        # The source holds more than its fstat() size: it grew
-                        # while it was read
-                        if use_json:
-                            print(json.dumps(_json_error("write", "FILE_TOO_LARGE",
-                                f"Source holds more than {_MAX_FILE_SIZE} bytes, "
-                                f"the largest AmigaDOS file; the destination "
-                                f"keeps the first {bytes_written} bytes",
-                                {**mount_details, "size": host_size,
-                                 "bytes_written": bytes_written,
-                                 "max_size": _MAX_FILE_SIZE})))
-                            sys.exit(1)
-                        raise SystemExit(
-                            f"Error: source holds more than {_MAX_FILE_SIZE} "
-                            f"bytes, the largest AmigaDOS file; the destination "
-                            f"keeps the first {bytes_written} bytes")
                     n, res2 = bridge.write_handle_reply(fh_addr, data)
                     # Distinguish write failure modes:
                     # n < 0, res2 != 0: the handler failed the write with
@@ -6593,11 +6654,13 @@ def cmd_write(args):
                             reason = "no reply from handler"
                         if use_json:
                             print(json.dumps(_json_error("write", "WRITE_ERROR",
-                                f"Write failed at offset {bytes_written}: {reason}",
+                                f"Write failed at offset {bytes_written}: "
+                                f"{reason}{partial}",
                                 details)))
                             sys.exit(1)
                         raise SystemExit(
-                            f"Error: write failed at offset {bytes_written}: {reason}")
+                            f"Error: write failed at offset {bytes_written}: "
+                            f"{reason}{partial}")
                     if n < len(data):
                         # Partial write -- handler couldn't write all data
                         # (likely disk full). Record what was written then error.
@@ -6612,15 +6675,27 @@ def cmd_write(args):
                         if use_json:
                             print(json.dumps(_json_error("write", "WRITE_ERROR",
                                 f"Partial write: wrote {bytes_written} of "
-                                f"{host_size} bytes ({reason})",
+                                f"{host_size} bytes ({reason}){partial}",
                                 details)))
                             sys.exit(1)
                         raise SystemExit(
                             f"Error: partial write ({bytes_written}/{host_size} "
-                            f"bytes, {reason})")
+                            f"bytes, {reason}){partial}")
                     bytes_written += n
+            completed = True
+            partial = ""
         finally:
             bridge.close_file(fh_addr)
+            if new_name and not completed:
+                # The name was not there before: leave nothing under it.
+                name = [p for p in normalized.split("/") if p][-1]
+                try:
+                    removed = bridge.delete_object(dir_lock, name)[0] != 0
+                except Exception:
+                    removed = False
+                if not removed:
+                    print(f"Warning: cannot remove the partial file {amiga_path}",
+                          file=sys.stderr)
 
         # Flush is CRITICAL after writes -- without this, writes cached in
         # handler memory never reach the image file.
@@ -6647,9 +6722,9 @@ def cmd_write(args):
     except Exception as e:
         if use_json:
             print(json.dumps(_json_error("write", "HANDLER_ERROR",
-                f"Write operation failed: {e}", details=mount_details)))
+                f"Write operation failed: {e}{partial}", details=mount_details)))
             sys.exit(1)
-        raise SystemExit(f"Error during write: {e}")
+        raise SystemExit(f"Error during write: {e}{partial}")
     finally:
         # On error paths, we still want to flush what was written to
         # avoid losing partially-written data. But if flush_volume() already

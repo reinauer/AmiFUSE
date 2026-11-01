@@ -28,6 +28,8 @@ def write_context(monkeypatch, tmp_path):
                            input=str(source), json=True, debug=False)
     bridge = Mock()
     bridge.is_mounted.return_value = fs.MountState(True, None, None)
+    bridge.locate_path.return_value = (0, fs.ERROR_OBJECT_NOT_FOUND, [])  # a new name
+    bridge.delete_object.return_value = (-1, 0)
     bridge.open_file.return_value = (0x1000, 0x2000)
     bridge.write_handle_reply.side_effect = lambda fh, data: (len(data), 0)
     created = []
@@ -113,7 +115,8 @@ def test_source_growing_to_limit_still_written(write_context, monkeypatch,
 @pytest.mark.parametrize("use_json", [True, False])
 def test_source_growing_past_limit_stops(write_context, monkeypatch, capsys,
                                          use_json):
-    """A source that grows while it is read, or a stream, stops below the limit."""
+    """A source that grows past the limit while it is read, or a stream, is
+    refused before the image is touched."""
     args, bridge, created, source, report_size = write_context
     args.json = use_json
     source.write_bytes(b"x" * 20)
@@ -122,16 +125,14 @@ def test_source_growing_past_limit_stops(write_context, monkeypatch, capsys,
     monkeypatch.setattr(fs, "IO_CHUNK", 8)
     with pytest.raises(SystemExit) as caught:
         fs.cmd_write(args)
+    message = f"Source holds more than 12 bytes, the largest AmigaDOS file: {source}"
     if use_json:
         assert caught.value.code == 1
         error = json.loads(capsys.readouterr().out)["error"]
         assert error["code"] == "FILE_TOO_LARGE"
-        assert error["details"]["bytes_written"] == 8
-        assert error["details"]["size"] == 4
-        assert "keeps the first 8 bytes" in error["message"]
+        assert error["message"] == message
+        assert error["details"] == {"size": 4, "max_size": 12}
     else:
-        assert "holds more than 12 bytes" in str(caught.value)
-        assert "keeps the first 8 bytes" in str(caught.value)
-    assert [c.args[1] for c in bridge.write_handle_reply.call_args_list] == [b"x" * 8]
-    bridge.close_file.assert_called_once_with(0x1000)
-    bridge.flush_volume.assert_called()
+        assert str(caught.value) == f"Error: s{message[1:]}"
+    assert created == []
+    bridge.write_handle_reply.assert_not_called()

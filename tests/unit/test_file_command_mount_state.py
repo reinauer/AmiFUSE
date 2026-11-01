@@ -18,6 +18,9 @@ def command_context(monkeypatch, tmp_path):
                            json=True, input=str(source), out=str(output))
     bridge = Mock()
     bridge.is_mounted.return_value = fs.MountState(True, None, None)
+    # write's destination name is new
+    bridge.locate_path.return_value = (0, fs.ERROR_OBJECT_NOT_FOUND, [])
+    bridge.delete_object.return_value = (-1, 0)
     monkeypatch.setattr(fs, "_create_bridge_from_args", lambda *a, **kw: (bridge, None))
     return args, bridge, output
 
