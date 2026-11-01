@@ -4667,7 +4667,7 @@ class AmigaFuseFS(_FuseOperations):
         bridge.start_idle_timers(on_crash=self._schedule_crash_shutdown)
 
     def _stop_timer_thread(self):
-        if not self._timers_started:
+        if not getattr(self, "_timers_started", False):
             return
         self._timers_started = False
         self.bridge.stop_idle_timers()
