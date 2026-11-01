@@ -1916,8 +1916,11 @@ class HandlerBridge:
         A read or write buffer (data) past _RETIRED_MAX stays where it is,
         out of use, and the request fails with EIO instead, so that a
         handler which leaves read after read unanswered cannot run the
-        emulated RAM out. Reads and writes work again once late replies
-        free enough of it. A small buffer is always retired.
+        emulated RAM out. Before it fails, it takes the replies already
+        queued, without running the handler: the timer thread runs the
+        handler on while the mount idles, but takes no replies. So reads
+        and writes work again as soon as replies that free enough of it
+        have come. A small buffer is always retired.
         """
         if mem_obj is None or not self._is_held(mem_obj.addr, held):
             return False
@@ -1925,9 +1928,27 @@ class HandlerBridge:
             self._retired = [*self._retired, mem_obj]
             return True
         if sum(m.size for m in self._retired_data) + mem_obj.size > self._RETIRED_MAX:
-            raise FuseOSError(errno.EIO)
+            self._take_late_replies()
+            held = self._held_args()
+            self._free_retired(held)
+            if not self._is_held(mem_obj.addr, held):
+                return False
+            if sum(m.size for m in self._retired_data) + mem_obj.size > self._RETIRED_MAX:
+                raise FuseOSError(errno.EIO)
         self._retired_data = [*self._retired_data, mem_obj]
         return True
+
+    def _take_late_replies(self) -> None:
+        """Take the replies queued for packets whose waits ran out.
+
+        No wait is in progress, so every reply queued is a late one. Each
+        is given back as in _run_until_reply, without running the handler.
+        """
+        sent = dict(self._pending_packets())
+        replies = self.launcher.poll_replies(self.state.reply_port_addr)
+        self._log_replies("late", replies)
+        for _, reply_pkt, res1, _ in replies:
+            self._give_back_late_reply(sent.get(reply_pkt), res1)
 
     def _alloc_fib(self):
         held = self._held_args()
