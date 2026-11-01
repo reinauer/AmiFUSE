@@ -12,8 +12,8 @@ env:
   # takes a branch or tag, not a SHA, so those steps fetch this commit into
   # an empty repository and move it into place only once it is checked out.
   # To move the pin, put the full 40-character SHA of a commit on
-  # reinauer/AmiFUSE-testing's main here in a PR. A failed fetch leaves no
-  # fixtures and the fixture tests skip, so check that the PR's run used them.
+  # reinauer/AmiFUSE-testing's main here in a PR. A SHA that can't be fetched
+  # fails the clone step, and with it every job that uses the fixtures.
   AMIFUSE_TESTING_SHA: d313203ac20124b004911aeb66f75f15a2eefcb9
 
 jobs:
@@ -140,7 +140,6 @@ jobs:
           git -C ../AmiFUSE-testing.tmp fetch --depth 1 origin ${{ env.AMIFUSE_TESTING_SHA }}
           git -C ../AmiFUSE-testing.tmp checkout --quiet FETCH_HEAD
           mv ../AmiFUSE-testing.tmp ../AmiFUSE-testing
-        continue-on-error: true
 
       - name: Install machine68k-amifuse (Windows)
         # Upstream machine68k lacks Windows fixes (cnvogelg/machine68k#8,
@@ -197,7 +196,6 @@ jobs:
           git -C ../AmiFUSE-testing.tmp fetch --depth 1 origin ${{ env.AMIFUSE_TESTING_SHA }}
           git -C ../AmiFUSE-testing.tmp checkout --quiet FETCH_HEAD
           mv ../AmiFUSE-testing.tmp ../AmiFUSE-testing
-        continue-on-error: true
 
       - name: Install machine68k-amifuse (Windows)
         # Upstream machine68k lacks Windows fixes (cnvogelg/machine68k#8,
@@ -272,7 +270,6 @@ jobs:
           git -C ../AmiFUSE-testing.tmp fetch --depth 1 origin ${{ env.AMIFUSE_TESTING_SHA }}
           git -C ../AmiFUSE-testing.tmp checkout --quiet FETCH_HEAD
           mv ../AmiFUSE-testing.tmp ../AmiFUSE-testing
-        continue-on-error: true
 
       - name: Install machine68k-amifuse (Windows)
         if: runner.os == 'Windows'
