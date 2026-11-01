@@ -195,6 +195,10 @@ def test_unlinked_file_held_by_its_writer(ops, opener):
     finally:
         ops.release("/u.bin", fh)
 
+    # A delete release() could not carry out would stay pending, and
+    # hidden from getattr() and readdir() as well: ask the handler.
+    assert ops._pending_deletes == set()
+    assert not ops.bridge.stat_path("/u.bin")
     with pytest.raises(FuseOSError) as exc_info:
         ops.getattr("/u.bin")
     assert exc_info.value.args[0] == errno.ENOENT
