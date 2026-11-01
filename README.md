@@ -513,3 +513,11 @@ Or use the installer's uninstall mode:
   `amifuse unmount <mountpoint>`
 - macOS Finder/Spotlight indexing is automatically disabled to improve performance
 - First directory traversal may be slow as the handler processes each path; subsequent accesses are cached
+- Above 16 MiB, `amifuse write` first copies its source to a temporary file,
+  so a large write needs free space for the whole source in the temporary
+  directory (`TMPDIR`, else `TEMP` or `TMP`; Windows normally sets `TEMP`) as
+  well as room in the image. If it runs short, the write stops with "cannot
+  copy the source to a temporary file" (`HANDLER_ERROR` with `--json`) before
+  the image is touched. A temporary directory on tmpfs, as `/tmp` often is,
+  also holds the copy in RAM. Setting `TMPDIR` to an existing directory on a
+  larger disk gets around both.
