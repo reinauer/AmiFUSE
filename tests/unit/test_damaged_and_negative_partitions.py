@@ -18,6 +18,7 @@ from amifuse.fuse_fs import _partition_driver, get_partition_info, main
 from amifuse.launcher import _enumerate_mount_units
 from amifuse.rdb_inspect import (PartInfo, PartitionList, find_partition,
                                  list_partitions)
+from tests.unit.test_mbr_rdb_block_size import _make_mbr
 from tests.unit.test_partition_name_before_number import (_damage_first_name,
                                                           _make_rdb_parts)
 
@@ -116,6 +117,82 @@ def test_inspect_labels_the_damaged_partition_by_number(
         "  #0: damaged drive name: no --partition name selects it")
     assert lines[1].startswith("  DH1: ")
     assert len(lines) == 2
+
+
+def _two_rdbs_damaged_in_the_second(tmp_path):
+    """Two 0x76 entries: DH0 in the first RDB, and in the second a partition
+    0 whose drive name reads as None (#298)."""
+    first = _make_rdb_parts(tmp_path, 512, [("DH0", DOS3)])
+    second = _damage_first_name(
+        tmp_path, _make_rdb_parts(tmp_path, 512, [("DH1", DOS7)]))
+    return _make_mbr(tmp_path, [(64, first), (448, second)])
+
+
+def _driver_lines(capsys, image):
+    main(["inspect", str(image)])
+    out = capsys.readouterr().out
+    return out.split("Filesystem driver per partition (without --driver):\n",
+                     1)[1].splitlines()
+
+
+def test_list_partitions_gives_each_partition_its_rdb(tmp_path):
+    image = _two_rdbs_damaged_in_the_second(tmp_path)
+    assert [(p.mbr_partition_index, p.index, p.name)
+            for p in list_partitions(image).partitions] == [
+        (0, 0, "DH0"), (1, 0, None)]
+    plain = _damaged(tmp_path, [("DH0", DOS3), ("DH1", DOS7)])
+    assert [p.mbr_partition_index
+            for p in list_partitions(plain).partitions] == [None, None]
+
+
+def test_inspect_labels_a_damaged_partition_in_a_later_rdb_by_its_rdb(
+        tmp_path, capsys, user_driver_dir):
+    image = _two_rdbs_damaged_in_the_second(tmp_path)
+    # --partition 0 selects DH0, in the first RDB.
+    assert find_partition(image, None, "0").mbr_partition_index == 0
+    lines = _driver_lines(capsys, image)
+    assert lines[0].startswith("  DH0: ")
+    assert lines[1] == ("  #0 in MBR partition [1]: "
+                        "damaged drive name: no --partition value selects it")
+    assert len(lines) == 2
+
+
+def test_inspect_keeps_the_number_when_it_selects_a_later_rdbs_partition(
+        tmp_path, capsys, user_driver_dir):
+    # The first entry holds no RDB, so --partition 0 selects partition 0 of
+    # the second entry's RDB: the damaged one.
+    damaged = _damage_first_name(
+        tmp_path, _make_rdb_parts(tmp_path, 512, [("DH1", DOS7)]))
+    image = _make_mbr(tmp_path, [(64, bytes(len(damaged))), (448, damaged)])
+    assert [(p.mbr_partition_index, p.index, p.name)
+            for p in list_partitions(image).partitions] == [(1, 0, None)]
+    lines = _driver_lines(capsys, image)
+    assert lines == ["  #0: damaged drive name: no --partition name selects it"]
+
+
+def test_inspect_labels_a_damaged_partition_whose_number_is_a_name(
+        tmp_path, capsys, user_driver_dir):
+    # --partition 0 selects the partition named "0": names come first.
+    image = _damaged(tmp_path, [("DH0", DOS3), ("0", DOS7)])
+    lines = _driver_lines(capsys, image)
+    assert lines[0] == ("  #0 in the first RDB: "
+                        "damaged drive name: no --partition value selects it")
+    assert lines[1].startswith("  0: ")
+    assert len(lines) == 2
+
+
+def test_inspect_labels_a_damaged_partition_when_the_lookup_fails(
+        tmp_path, capsys, monkeypatch, user_driver_dir):
+    image = _damaged(tmp_path, [("DH0", DOS3), ("DH1", DOS7)])
+
+    def failing_lookup(*args, **kwargs):
+        raise OSError("read error")
+
+    monkeypatch.setattr(rdb_inspect, "find_partition", failing_lookup)
+    lines = _driver_lines(capsys, image)
+    assert lines[0] == ("  #0 in the first RDB: "
+                        "damaged drive name: no --partition value selects it")
+    assert lines[1].startswith("  DH1: ")
 
 
 @pytest.mark.parametrize("selector", ["-1", "-2", "-3"])
