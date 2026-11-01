@@ -66,3 +66,29 @@ def test_format_write_list_and_read(fixture_root, tmp_path, name, dos_type,
     run_cli("read", image, "--driver", driver, "--file", "probe",
             "--out", output)
     assert output.read_bytes() == data
+
+
+@pytest.mark.parametrize("block_bytes", [2048, 4096])
+def test_pfs3aio_19_refuses_large_blocks(fixture_root, tmp_path, block_bytes):
+    """pfs3aio 19.2 divides by zero formatting these; format refuses first."""
+    driver = fixture_root / "drivers" / "pfs3aio"
+    if not driver.exists():
+        pytest.skip("Missing handler pfs3aio")
+    if b"Professional-File-System-III 19.2 " not in driver.read_bytes():
+        pytest.skip("The pfs3aio fixture is not 19.2")
+    image = tmp_path / "rdb.hdf"
+    make_rdb(image, block_bytes, 0x50465303)
+    before = image.read_bytes()
+
+    result = subprocess.run(
+        [sys.executable, "-m", "amifuse", "format", str(image), "DH0", "Large",
+         "--driver", str(driver)],
+        capture_output=True, text=True, timeout=30)
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert (f"Error: partition 'DH0' has {block_bytes}-byte blocks, which "
+            "pfs3aio before 20.0 cannot format, and the driver is version "
+            "19.2. Use 512- or 1024-byte blocks, or pfs3aio 20.0 or later."
+            ) in result.stderr
+    assert "crashed" not in result.stdout + result.stderr
+    assert image.read_bytes() == before

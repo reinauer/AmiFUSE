@@ -81,7 +81,8 @@ def test_name_in_later_rdb_wins_over_number_in_earlier(tmp_path):
     assert find_partition_mbr_index(image, None, "1") == 1
     # mount --partition 1 opens the partition named 1, not DH1.
     assert get_partition_info(image, None, "1") == {"name": "1",
-                                                    "dostype": DOS3}
+                                                    "dostype": DOS3,
+                                                    "block_size": 512}
 
 
 def test_name_in_the_rdb_beside_the_mbr_is_found_first(tmp_path):
@@ -178,7 +179,8 @@ def test_number_in_later_rdb_when_earlier_lacks_it(tmp_path):
                    first=[("DH0", DOS3)])
     assert find_partition_mbr_index(image, None, "1") == 1
     assert get_partition_info(image, None, "1") == {"name": "DH3",
-                                                    "dostype": DOS7}
+                                                    "dostype": DOS7,
+                                                    "block_size": 512}
 
 
 @pytest.mark.parametrize("selector,index", [("1", 0), ("DH9", None)])

@@ -4907,11 +4907,12 @@ class AmigaFuseFS(_FuseOperations):
 
 
 def get_partition_info(image: Path, block_size: Optional[int], partition: Optional[str]) -> dict:
-    """Get partition name and dostype from RDB.
+    """Get partition name, dostype and block size in bytes from RDB.
 
     The name is the one the partition mounts as: a repeated drive name reads
     DH0.1 (rdb_inspect.find_partition). A damaged drive name, which amitools
-    reads as None, is named by the partition's number: #0.
+    reads as None, is named by the partition's number: #0. The block size
+    is the partition's own (de_SizeBlock), which the handler uses.
     """
     from .rdb_inspect import open_rdisk, find_partition
     ref = find_partition(image, block_size, partition) if partition else None
@@ -4923,7 +4924,7 @@ def get_partition_info(image: Path, block_size: Optional[int], partition: Option
         else:
             part = rdisk.get_partition(ref.number) if ref else None
         if part is None:
-            return {"name": "AmigaFS", "dostype": None}
+            return {"name": "AmigaFS", "dostype": None, "block_size": None}
         drive_name = part.get_drive_name()
         if ref and ref.name:
             name = ref.name
@@ -4934,6 +4935,7 @@ def get_partition_info(image: Path, block_size: Optional[int], partition: Option
         return {
             "name": name,
             "dostype": part.part_blk.dos_env.dos_type,
+            "block_size": part.part_blk.dos_env.block_size * 4,
         }
     finally:
         rdisk.close()
@@ -5354,6 +5356,48 @@ def mount_fuse(
                       file=sys.stderr)
 
 
+def _ver_number(ver: Optional[str]) -> Optional[Tuple[int, str]]:
+    """Return the major version and the version in a $VER text.
+
+    E.g. (19, "19.2") for "name 19.2 (date)": the first word that is two
+    numbers joined by a dot. None if there is no such word.
+    """
+    for token in (ver or "").split():
+        major, dot, minor = token.partition(".")
+        if dot and major.isdigit() and minor.isdigit():
+            return int(major), token
+    return None
+
+
+def _pfs3_format_refusal(dostype: int, block_bytes: Optional[int], driver: Path,
+                         partition: str) -> Optional[str]:
+    """Return why format refuses a PFS partition with large blocks, or None.
+
+    pfs3aio before 20.0 fixes its reserved blocks at 1024 bytes, so with
+    2048- or 4096-byte partition blocks it counts 0 sectors per reserved
+    block and divides by zero formatting the partition. A driver whose
+    version cannot be read is refused too: it may be one of those.
+    Raises OSError when the driver cannot be read.
+    """
+    # "PFS\x" and "PDS\x"; pfs3aio registers \1 and \3 of each.
+    if dostype & 0xFFFFFF00 not in (0x50465300, 0x50445300):
+        return None
+    if block_bytes is None or block_bytes <= 1024:
+        return None
+    number = _ver_number(driver_resolver.find_version(Path(driver).read_bytes()))
+    if number is not None and number[0] >= 20:
+        return None
+    if number is None:
+        found = "the driver's version could not be determined"
+    else:
+        found = f"the driver is version {number[1]}"
+    return (
+        f"Error: partition '{partition}' has {block_bytes}-byte blocks, which "
+        f"pfs3aio before 20.0 cannot format, and {found}. Use 512- or "
+        "1024-byte blocks, or pfs3aio 20.0 or later."
+    )
+
+
 def format_volume(
     image: Path,
     driver: Optional[Path],
@@ -5405,6 +5449,17 @@ def format_volume(
         print(f"Filesystem driver: {driver_desc}")
         print(f"Volume name: {volname}")
         print(f"DOS type: {dt_str} (0x{dostype:08x})")
+
+        # Refuse before the handler starts, so the image is not touched.
+        try:
+            refusal = _pfs3_format_refusal(
+                dostype, part_info.get("block_size"), driver, partition)
+        except OSError as exc:
+            if debug:
+                raise
+            raise SystemExit(f"Error: {exc}") from exc
+        if refusal is not None:
+            raise SystemExit(refusal)
 
         try:
             bridge = HandlerBridge(
