@@ -286,3 +286,14 @@ def test_write_opens_a_selector_beside_a_disk_rdb_that_opens(tmp_path):
         assert backend.partition_number == 0
     finally:
         backend.close()
+
+
+def test_launcher_leaves_out_an_entry_holding_no_rdb(tmp_path):
+    from tests.unit.test_mbr_rdb_block_size import _make_mbr
+
+    # An Emu68 disk, without its own RDB: PI0's entry and an empty one.
+    image = _make_mbr(tmp_path, [(200, _make_rdb(tmp_path, 512, "PI0")),
+                                 (400, bytes(160 * 512))])
+    listed = list_partitions(image)
+    assert [p.name for p in listed.partitions] == ["PI0"]
+    assert listed.fallback_reason is None
