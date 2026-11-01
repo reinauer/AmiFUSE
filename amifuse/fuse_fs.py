@@ -1789,6 +1789,9 @@ class HandlerBridge:
                 break
         for packet, res1 in dropped:
             self._give_back_late_reply(packet, res1)
+        if dropped:
+            # The memory those packets held back is no packet's now.
+            self._free_retired(self._held_args())
         return answer
 
     def _give_back_late_reply(self, packet, res1: int) -> None:
@@ -1836,6 +1839,8 @@ class HandlerBridge:
                 self._log_replies("pending", replies)
                 for _, reply_pkt, res1, _ in replies:
                     self._give_back_late_reply(sent.get(reply_pkt), res1)
+                if replies:
+                    self._free_retired(self._held_args())
                 if not replies and not self._busy_ran_out:
                     break  # parked, or exited: nothing more comes
             return [_packet_type_name(pkt_type)
@@ -1844,6 +1849,9 @@ class HandlerBridge:
     # Bridge memory taken out of use while a packet still out points to it:
     # the FIB, read buffers and BSTRs; see _free_retired.
     _retired = ()
+    # The most of it at once: 16 full read buffers, an eighth of the 8 MiB
+    # the handler and the bridge share (VamosHandlerRuntime's ram_size).
+    _RETIRED_MAX = 16 * IO_CHUNK
 
     def _pending_packets(self) -> Dict[int, Tuple[int, Tuple[int, ...]]]:
         """The launcher's packets with no reply yet, packet -> (type, args)."""
@@ -1878,9 +1886,17 @@ class HandlerBridge:
         self._retired = keep
 
     def _retire_if_held(self, mem_obj, held: Set[int]) -> bool:
-        """Retire mem_obj if a packet still out points to it; say whether."""
+        """Retire mem_obj if a packet still out points to it; say whether.
+
+        Past _RETIRED_MAX it stays where it is, out of use, and the request
+        fails with EIO instead, so that a handler which leaves packet after
+        packet unanswered cannot run the emulated RAM out. Requests work
+        again once late replies free enough of it.
+        """
         if mem_obj is None or not self._is_held(mem_obj.addr, held):
             return False
+        if sum(m.size for m in self._retired) + mem_obj.size > self._RETIRED_MAX:
+            raise FuseOSError(errno.EIO)
         self._retired = [*self._retired, mem_obj]
         return True
 
@@ -2503,7 +2519,10 @@ class HandlerBridge:
             parts = []
             while size > 0:
                 n = min(size, IO_CHUNK)
-                buf_mem = self._alloc_read_buf(n)
+                try:
+                    buf_mem = self._alloc_read_buf(n)
+                except FuseOSError:
+                    return None  # past _RETIRED_MAX; nothing was sent
                 pkt_addr, _ = self.launcher.send_read_handle(
                     self.state, fh_addr, buf_mem.addr, n)
                 reply = self._run_until_reply(pkt_addr, "read")
@@ -2615,7 +2634,10 @@ class HandlerBridge:
             done, res2 = 0, 0
             while done < len(data):
                 chunk = data[done:done + IO_CHUNK]
-                buf_mem = self._alloc_read_buf(len(chunk))
+                try:
+                    buf_mem = self._alloc_read_buf(len(chunk))
+                except FuseOSError:
+                    return -1, 0  # past _RETIRED_MAX; nothing was sent
                 self.mem.w_block(buf_mem.addr, chunk)
                 pkt_addr, _ = self.launcher.send_write_handle(
                     self.state, fh_addr, buf_mem.addr, len(chunk))
@@ -2965,7 +2987,10 @@ class HandlerBridge:
         """
         with self._lock:
             self._unwritten_outputs.discard(fh_addr)
-            buf_mem = self._alloc_read_buf(1)
+            try:
+                buf_mem = self._alloc_read_buf(1)
+            except FuseOSError:
+                return -1, 0  # past _RETIRED_MAX; nothing was sent
             pkt_addr, _ = self.launcher.send_write_handle(
                 self.state, fh_addr, buf_mem.addr, 0)
             reply = self._run_until_reply(pkt_addr, "write")

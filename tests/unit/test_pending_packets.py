@@ -11,6 +11,7 @@ A scripted handler on the real HandlerLauncher, in MockMemory, takes each
 packet the bridge queues and answers it at once, later, or never.
 """
 
+import errno
 import math
 import os
 import threading
@@ -256,6 +257,58 @@ def test_a_write_still_out_keeps_its_data_buffer(bridge):
     assert read_args[1] != write_args[1]
     # The handler can still copy out what the write asked for.
     assert bytes(b.mem.r_block(write_args[1], 100)) == b"A" * 100
+
+
+def test_a_late_reply_frees_the_buffer_it_held(bridge):
+    b, handler = bridge
+    fh = _open(b, handler, "/file", 0x5550)
+    handler.delay = lambda pkt_type, name: NEVER if pkt_type == ACTION_WRITE else 0
+    handler.answer = lambda pkt_type, args, name: (
+        (args[2], 0) if pkt_type == ACTION_READ else (0x400, 0))
+
+    assert b._write_packets(fh, b"A" * 100) == (-1, 0)
+    assert b.read_handle(fh, 10) is not None  # the write's buffer is set aside
+    (_, _, _, write_args, _), = handler.taken(ACTION_WRITE)
+    assert write_args[1] in b.vh.alloc.mem_objs
+
+    handler.answer_now(ACTION_WRITE)
+    # The late reply comes in this wait, and nothing is allocated after it.
+    assert b.locate(0, "next") == (0x400, 0)
+
+    assert write_args[1] not in b.vh.alloc.mem_objs
+    assert b._retired == []
+
+
+def test_io_fails_once_too_much_memory_is_held(bridge, monkeypatch):
+    b, handler = bridge
+    monkeypatch.setattr(fs.HandlerBridge, "_RETIRED_MAX", 3 * 1000)
+    fh = _open(b, handler, "/file", 0x5550)
+    handler.delay = lambda pkt_type, name: NEVER if pkt_type == ACTION_READ else 0
+    handler.answer = lambda pkt_type, args, name: (
+        (args[2], 0) if pkt_type == ACTION_READ else (0x400, 0))
+
+    # Each read the handler leaves unanswered sets the last one's buffer
+    # aside: three of them fit.
+    for _ in range(4):
+        assert b.read_handle(fh, 1000) is None
+    assert len(handler.taken(ACTION_READ)) == 4
+    assert sum(m.size for m in b._retired) == 3 * 1000
+
+    # The fourth buffer would pass the cap: the I/O fails, and sends nothing.
+    assert b.read_handle(fh, 1000) is None
+    assert b._write_packets(fh, b"A" * 1000) == (-1, 0)
+    assert len(handler.taken(ACTION_READ)) == 4
+    assert not handler.taken(ACTION_WRITE)
+    with pytest.raises(OSError) as exc:
+        b._alloc_read_buf(1000)
+    assert exc.value.errno == errno.EIO
+
+    # Once the handler answers them, I/O works again.
+    handler.answer_now(ACTION_READ)
+    assert b.locate(0, "next") == (0x400, 0)
+    assert b._retired == []
+    handler.delay = lambda pkt_type, name: 0
+    assert b.read_handle(fh, 1000) == bytes(1000)
 
 
 def test_an_open_still_out_keeps_its_file_handle(bridge):
