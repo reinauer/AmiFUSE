@@ -885,10 +885,11 @@ class TestEnumerateMountUnits:
         """
         from types import SimpleNamespace
 
-        def _plist(names, fallback_reason=None):
+        def _plist(names, fallback_reason=None, default_open_fails=False):
             return SimpleNamespace(
                 partitions=[SimpleNamespace(name=n) for n in names],
                 fallback_reason=fallback_reason,
+                default_open_fails=default_open_fails,
             )
 
         def _set(adf=None, iso=None, parts=None):
@@ -958,19 +959,19 @@ class TestEnumerateMountUnits:
         assert [u.name for u in units] == ["WB_1.3", "WB_2.x", "Work"]
         assert fallback is None
 
-    def test_lone_partition_beside_a_failed_rdb_keeps_its_name(self, rdb):
-        """A lone partition with fallback_reason set, an RDB on the disk that
-        fails to open, is mounted by name, as a mount without --partition can
-        stop on that RDB or reach another one; the reason propagates."""
+    def test_duplicate_name_fallback_returns_reason_and_single_unit(self, rdb):
+        """A fallback (partitions == [first], fallback_reason set), if
+        list_partitions gives one, collapses to one no---partition unit and
+        propagates the reason."""
         helper = rdb(adf=None, iso=None)
-        reason = "RDB beside the MBR: Failed to parse RDB"
+        reason = "multiple RDBs with colliding partition names ('DH0'); mounted first only"
         rdb(adf=None, iso=None,
             parts=helper.plist(["WB_1.3"], fallback_reason=reason))
 
         from amifuse.launcher import _enumerate_mount_units
-        units, fallback = _enumerate_mount_units("failing.hdf")
+        units, fallback = _enumerate_mount_units("colliding.hdf")
 
-        assert [u.name for u in units] == ["WB_1.3"]
+        assert len(units) == 1 and units[0].name is None
         assert fallback == reason
 
     def test_enumeration_error_falls_back_to_single_unit(self, rdb):
