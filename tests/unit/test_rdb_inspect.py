@@ -336,6 +336,7 @@ class _MockBlockDevice:
 
     def __init__(self, block_bytes=512):
         self.block_bytes = block_bytes
+        self.num_blocks = 1 << 20
         self._blocks = {}
         self._read_log = []
         self._write_log = []
