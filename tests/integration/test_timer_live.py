@@ -130,7 +130,8 @@ def test_idle_mount_delivers_timers(fixture_root, tmp_path, timer_probe,
     fs = AmigaFuseFS(bridge)
     fs.init("/")
     try:
-        assert fs._timer_thread.is_alive()
+        # the bridge's emulation thread replies to the timers while idle
+        assert fs._timers_started and fs.bridge._emu.alive
         _write(bridge, "/timer_live.bin", DATA)
         delivered = timer.deliveries
         written = _image_bytes(bridge, image)

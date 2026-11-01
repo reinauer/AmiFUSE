@@ -278,10 +278,12 @@ def test_unexpected_error_closes_device(tmp_path, devices, monkeypatch,
         _make_rdb(tmp_path, 512)
         image = tmp_path / "rdb-DH0.hdf"
 
-    def fail(self):
+    def fail(rdisk):
         raise RuntimeError("injected")
 
-    monkeypatch.setattr(rdb_inspect.RDisk, "open", fail)
+    # the parse that reads the RDB's lists (RDisk.open() is not used: its
+    # LSEG walk has no bound)
+    monkeypatch.setattr(rdb_inspect, "_lenient_rdisk_open", fail)
     with pytest.raises(RuntimeError, match="injected"):
         open_rdisk(image)
     assert devices == {"open": 1, "close": 1}

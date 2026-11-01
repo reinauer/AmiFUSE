@@ -53,7 +53,7 @@ def _parceiro(tmp_path, entries=(None, None)):
 def _disk_rdb(tmp_path, entries, rdb_block):
     """_parceiro's disk with its own RDB at rdb_block. At block 0, the RDSK
     block keeps the MBR's table and signature in bytes 0x1BE-0x1FF, and its
-    checksum is redone over the whole block, as amitools reads it."""
+    checksum is redone over its rdb_SummedLongs longs, as amitools reads it."""
     rdb_image = tmp_path / "rdb.hdf"
     raw = RawBlockDevice(str(rdb_image), read_only=False, block_bytes=512)
     with ExitStack() as cleanup:
@@ -75,7 +75,9 @@ def _disk_rdb(tmp_path, entries, rdb_block):
     data[rdb_block * 512:rdb_block * 512 + len(rdsk)] = rdsk
     if rdb_block == 0:
         struct.pack_into(">I", data, 8, 0)  # rdb_ChkSum
-        total = sum(struct.unpack_from(">128I", data, 0)) & 0xFFFFFFFF
+        # over rdb_SummedLongs longs, as amitools checks an RDB block
+        summed = struct.unpack_from(">I", data, 4)[0]
+        total = sum(struct.unpack_from(f">{summed}I", data, 0)) & 0xFFFFFFFF
         struct.pack_into(">I", data, 8, -total & 0xFFFFFFFF)
     data[3 * 512:4 * 512] = _with_next(rdb[512:1024], 4)
     data[4 * 512:5 * 512] = rdb[1024:1536]

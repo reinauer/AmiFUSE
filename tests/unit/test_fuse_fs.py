@@ -382,8 +382,13 @@ class TestMountFuseOptions:
         assert "noapplexattr" not in kwargs
 
     def test_mount_defaults_to_daemon_on_linux(self, monkeypatch, mock_mount_fuse_deps):
-        """Linux mounts default to background mode."""
+        """Linux mounts default to background mode: a fork before the
+        handler starts, then a foreground mount in the child."""
         monkeypatch.setattr("sys.platform", "linux")
+        import amifuse.fuse_fs as fuse_fs_mod
+        forks = []
+        monkeypatch.setattr(fuse_fs_mod, "_fork_daemon_parent",
+                            lambda: forks.append(1) or 99)
         from amifuse.fuse_fs import mount_fuse
 
         mount_fuse(
@@ -395,11 +400,16 @@ class TestMountFuseOptions:
 
         kwargs = mock_mount_fuse_deps["fuse_kwargs"]
         assert kwargs is not None, "FUSE was not called"
-        assert kwargs["foreground"] is False
+        assert forks == [1]
+        assert kwargs["foreground"] is True
 
     def test_mount_defaults_to_daemon_on_darwin(self, monkeypatch, mock_mount_fuse_deps):
-        """macOS mounts default to background mode."""
+        """macOS mounts default to background mode, forking before the handler."""
         monkeypatch.setattr("sys.platform", "darwin")
+        import amifuse.fuse_fs as fuse_fs_mod
+        forks = []
+        monkeypatch.setattr(fuse_fs_mod, "_fork_daemon_parent",
+                            lambda: forks.append(1) or 99)
         from amifuse.fuse_fs import mount_fuse
 
         mount_fuse(
@@ -411,7 +421,8 @@ class TestMountFuseOptions:
 
         kwargs = mock_mount_fuse_deps["fuse_kwargs"]
         assert kwargs is not None, "FUSE was not called"
-        assert kwargs["foreground"] is False
+        assert forks == [1]
+        assert kwargs["foreground"] is True
 
     @pytest.mark.parametrize("mountpoint, shown", [
         (None, "/mnt/test"),
@@ -1564,7 +1575,7 @@ class TestDestroyCleanup:
     def test_destroy_shuts_down_runtime(self, fs_with_mock_bridge):
         fs, bridge = fs_with_mock_bridge
         fs.destroy("/")
-        bridge.vh.shutdown.assert_called_once()
+        bridge.shutdown_runtime.assert_called_once()
 
     def test_destroy_flushes_when_write_enabled(self, fs_with_mock_bridge):
         fs, bridge = fs_with_mock_bridge
@@ -1583,12 +1594,12 @@ class TestDestroyCleanup:
         bridge._write_enabled = True
         bridge.flush_volume.side_effect = RuntimeError("flush failed")
         fs.destroy("/")
-        bridge.vh.shutdown.assert_called_once()
+        bridge.shutdown_runtime.assert_called_once()
         bridge.backend.close.assert_called_once()
 
     def test_destroy_continues_after_shutdown_failure(self, fs_with_mock_bridge):
         fs, bridge = fs_with_mock_bridge
-        bridge.vh.shutdown.side_effect = RuntimeError("shutdown failed")
+        bridge.shutdown_runtime.side_effect = RuntimeError("shutdown failed")
         fs.destroy("/")
         bridge.backend.close.assert_called_once()
 
@@ -7488,19 +7499,10 @@ class TestHandlerBridgePortDrain:
 
         bridge = HandlerBridge.__new__(HandlerBridge)
         bridge.state = type("State", (), {"port_addr": 0x10, "reply_port_addr": 0x20})()
-        bridge.proc_mgr = type(
-            "ProcMgr",
-            (),
-            {
-                "processes": {
-                    1: type(
-                        "Proc",
-                        (),
-                        {"is_child": True, "exited": False, "port_addr": 0x30},
-                    )()
-                }
-            },
-        )()
+        # a child process the handler made, which dos.library tracks
+        child = SimpleNamespace(proc=SimpleNamespace(msg_port=SimpleNamespace(addr=0x30)))
+        bridge.vh = SimpleNamespace(slm=SimpleNamespace(dos_impl=SimpleNamespace(
+            child_procs={0x1234: child})))
         pmgr = FakePortMgr()
 
         bridge._drain_non_essential_ports(pmgr)

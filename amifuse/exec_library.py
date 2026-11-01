@@ -20,15 +20,42 @@ What it relies on in amitools:
   returns None for an address that is no library.
 - DoIO queues no reply itself; WaitIO takes a reply off a port the port
   manager knows, from its queue and, by ln_Succ and ln_Pred, its list.
-- Wait and WaitPort record a parked task on ExecLibrary by name, where the
-  bridge reads it, so the subclass holds none of that state.
+- WaitPort on an empty port the port manager knows raises
+  UnsupportedFeatureError instead of waiting; on a port it does not know
+  it waits for the port's signal. AmiFuseExecLibrary waits on both.
+- The stub binds a call's arguments and its result by the method's
+  annotations, so WaitPort keeps amitools' (msg_port: MsgPort) -> Message.
+- signal_func.wait() suspends the current task until one of the signals
+  is set, and takes the signals it returns.
 """
 
 from amitools.vamos.lib.ExecLibrary import ExecLibrary  # type: ignore
+from amitools.vamos.libstructs.exec_ import MsgPortFlags  # type: ignore
+from amitools.vamos.libtypes import Message, MsgPort  # type: ignore
 
 
 class AmiFuseExecLibrary(ExecLibrary):
-    """ExecLibrary whose DoIO and WaitIO have a device complete a held request."""
+    """ExecLibrary whose DoIO and WaitIO have a device complete a held request,
+    and whose WaitPort waits on a port the port manager knows."""
+
+    def WaitPort(self, ctx, msg_port: MsgPort) -> Message:
+        """Wait for a message on the port, then return the first one.
+
+        A packet to the handler goes to a port the port manager knows, and
+        amitools' WaitPort fails on such a port when it is empty. Wait for
+        the port's signal instead, as Exec does, until a message is there;
+        then amitools' WaitPort returns it without taking it off the port.
+        """
+        port_mgr = self.port_mgr
+        addr = msg_port.addr
+        if port_mgr.has_port(addr):
+            while not port_mgr.has_msg(addr):
+                sig_bit = msg_port.sig_bit.val
+                if msg_port.flags.val != MsgPortFlags.PA_SIGNAL or not 0 <= sig_bit < 32:
+                    # nothing would ever wake us: let amitools report it
+                    break
+                self.signal_func.wait(1 << sig_bit)
+        return super().WaitPort(ctx, msg_port)
 
     def DoIO(self, ctx, io_request):
         result = super().DoIO(ctx, io_request)

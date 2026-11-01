@@ -10,6 +10,7 @@ it: in the port manager's queue and in the port's m68k message list.
 import threading
 import time
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -351,43 +352,6 @@ class TestTimerDevice:
             clear_signals_from_task=lambda signals: None,
             leave_queued=timer.device.delays)
 
-    def test_child_parked_in_waitport_wakes_on_delivery(self, timer):
-        """A process parked in WaitPort() on the timer port resumes with the reply.
-
-        As Exec's WaitPort() does, the resume leaves the reply queued, so
-        the GetMsg() that follows, as in while (!GetMsg(p)) WaitPort(p),
-        takes it.
-        """
-        timer.send(micro=100_000)
-        assert self._waitport_frame(timer) is None
-        timer.clock.now = 100.1
-        timer.device.deliver()
-        assert self._waitport_frame(timer) == {"pc": 0x5000, "sp": 0x4004, "d0": IO}
-        assert timer.exec.port_mgr.ports[PORT].queue == [IO]
-        assert _m68k_list(timer.mem) == [IO]
-
-    @pytest.mark.parametrize("case", ["waitpkt", "quick reply"])
-    def test_resume_still_takes_other_messages_off_the_port(self, timer, case):
-        """WaitPkt() and messages timer.device did not delay are taken off, as before."""
-        if case == "waitpkt":
-            timer.send(micro=100_000)
-            timer.clock.now = 100.1
-            timer.device.deliver()
-        else:
-            timer.send(cmd=TR_GETSYSTIME)  # replied at once by SendIO
-        assert timer.exec.port_mgr.ports[PORT].queue == [IO]
-        frame = self._waitport_frame(timer, waitpkt=case == "waitpkt")
-        assert frame["pc"] == 0x5000
-        assert timer.exec.port_mgr.ports[PORT].queue == []
-        assert _m68k_list(timer.mem) == []
-
-    # Each place that resumes a WaitPort() passes timer.device's delays, so
-    # a delayed reply stays queued for the GetMsg() that follows.
-
-    _DOS_PORT = 0x2800     # the handler's own pr_MsgPort
-    _DOS_MSG = 0x2900
-
-    @pytest.fixture
     def parked(self, timer, monkeypatch):
         """No live Exec/DOS block state; the resumes below clear it."""
         from amitools.vamos.lib.DosLibrary import DosLibrary
@@ -433,64 +397,6 @@ class TestTimerDevice:
         assert (pc, d0) == (0x5000, IO)
         assert timer.exec.port_mgr.ports[PORT].queue == [IO]
         assert _m68k_list(timer.mem) == [IO]
-
-    def test_setup_resume_leaves_a_delayed_reply_queued(self, timer, parked):
-        """setup_resume_if_blocked, for a reply that came after the burst."""
-        launcher = self._launcher(timer)
-        state = self._state(parked)
-        self._deliver(timer)
-        assert launcher.setup_resume_if_blocked(state)
-        self._assert_reply_left_queued(timer, state.pc, state.regs[0])
-
-    def test_burst_that_parks_leaves_a_delayed_reply_queued(self, timer, parked):
-        """_finalize_burst_blocked, for a reply already there when the burst parks."""
-        launcher = self._launcher(timer)
-        state = self._state(parked)
-        self._deliver(timer)
-        launcher._finalize_burst_blocked(
-            state, state.block_state, 0x4000, 0x5000, None, 0x4000, 0x10000)
-        self._assert_reply_left_queued(timer, state.pc, state.regs[0])
-
-    def test_child_resume_leaves_a_delayed_reply_queued(self, timer, parked):
-        """ProcessManager._resume_child_if_ready, for a child parked on its timer port."""
-        from amifuse.process_mgr import ProcessManager, ProcessState
-
-        pm = ProcessManager.__new__(ProcessManager)
-        pm.mem = timer.mem
-        pm.exec_impl = timer.exec
-        pm.vh = SimpleNamespace(timer_device=timer.device)
-        child = ProcessState(proc_addr=TASK, entry_pc=0x7000, sp=0x7800,
-                             port_addr=PORT, blocked=True, block_state=dict(parked))
-        self._deliver(timer)
-        assert pm._resume_child_if_ready(child)
-        self._assert_reply_left_queued(timer, child.entry_pc, child.regs[0])
-
-    @pytest.mark.parametrize("on", ["dos port", "timer port"])
-    def test_burst_parked_in_waitport_wakes_on_the_port_it_waits_on(
-            self, timer, parked, on):
-        """A WaitPort() park wakes for its own port, not for the DOS port.
-
-        A handler in WaitPort(timer_port) with a packet on its DOS port
-        stays parked: resumed, it would get D0 = 0, which no WaitPort()
-        returns. A reply on the timer port wakes it with an empty DOS port.
-        """
-        launcher = self._launcher(timer)
-        state = self._state(parked, port_addr=self._DOS_PORT)
-        timer.exec.port_mgr.register_port(self._DOS_PORT)
-        if on == "dos port":
-            timer.send(micro=100_000)  # pending: the timer port is empty
-            timer.exec.port_mgr.put_msg(self._DOS_PORT, self._DOS_MSG)
-        else:
-            self._deliver(timer)
-        launcher._finalize_burst_blocked(
-            state, state.block_state, 0x4000, 0x5000, None, 0x4000, 0x10000)
-        if on == "dos port":
-            # Still parked: the block state stays and D0 is not set.
-            assert state.block_state == parked
-            assert launcher.vh.machine.cpu.regs == {}
-            assert timer.exec.port_mgr.ports[self._DOS_PORT].queue == [self._DOS_MSG]
-        else:
-            self._assert_reply_left_queued(timer, state.pc, state.regs[0])
 
     def test_bad_reply_port_is_replied_as_sendio_does(self, timer):
         """A reply port outside memory gets no link and no signal, and raises nothing.
@@ -567,42 +473,6 @@ class TestTimerDevice:
         timer.mem.w16(IO + 28, TR_ADDREQUEST)
         assert not timer.device.delays(IO)
 
-    def test_waitport_on_a_pending_request_parks(self, timer, monkeypatch):
-        """WaitPort on the reply port of a pending request parks, then gets the reply.
-
-        amitools' WaitPort parks only on a port the port manager knows and
-        spins on any other empty one, so arming registers the port.
-        """
-        from amitools.vamos.error import UnsupportedFeatureError
-        from amitools.vamos.lib.ExecLibrary import ExecLibrary
-        from amitools.vamos.lib.lexec.msgfunc import MessageFunc
-
-        for name in ("sp", "port", "ret"):
-            monkeypatch.setattr(ExecLibrary, f"_waitport_blocked_{name}", None)
-
-        class Spin:
-            def wait(self, mask):
-                raise AssertionError("WaitPort spins on an unregistered port")
-
-        sp = 0x4000
-        timer.mem.w32(sp, 0x5000)
-        ctx = SimpleNamespace(mem=timer.mem, cpu=SimpleNamespace(r_reg=lambda reg: sp))
-        msg_func = MessageFunc(ctx, None, Spin(), None, timer.exec.port_mgr)
-        port = SimpleNamespace(addr=PORT)
-        timer.send(micro=100_000)
-        with pytest.raises(UnsupportedFeatureError):
-            msg_func.wait_port(port)
-        assert ExecLibrary._waitport_blocked_port == PORT
-        timer.clock.now = 100.1
-        timer.device.deliver()
-        assert msg_func.wait_port(port).addr == IO
-
-
-# ---------------------------------------------------------------------------
-# B. The bridge -- drain, packet resume, and the mount's timer thread
-# ---------------------------------------------------------------------------
-
-
 class _Timer:
     """The bridge's view of AmiFuseTimerDevice."""
 
@@ -637,478 +507,129 @@ class _Timer:
         return time.monotonic()
 
 
-class TestBridgeDelivery:
-    """Where HandlerBridge replies to due timer requests."""
+class TestIdleTimers:
+    """AmigaFuseFS has the bridge reply to timers while idle, from init() to destroy().
 
-    def _bridge(self, timer, **state):
-        from amifuse import fuse_fs as fs
-        from amitools.vamos.lib.lexec.PortManager import PortManager
+    The bridge's emulation thread runs run_due_timers() whenever it has
+    waited as long as that asked for (HandlerBridge.start_idle_timers); the
+    mount only switches it on and off, and is told of a crash found there.
+    """
 
-        bridge = fs.HandlerBridge.__new__(fs.HandlerBridge)
-        bridge._debug = False
-        bridge._busy_ran_out = False
-        bridge._idle_unfinished = False
-        bridge._idle_busy_cycles = 0
-        bridge._lock = threading.RLock()
-        bridge.state = SimpleNamespace(
-            crashed=False, process_addr=TASK, port_addr=0x6000,
-            reply_port_addr=0x6100, pc=0x4000, main_loop_pc=0x4000,
-            main_loop_sp=0x7000, sp=0x7000, block_state=None,
-            wait_mask=0x101, regs=[0] * 16, initialized=True)
-        for key, val in state.items():
-            setattr(bridge.state, key, val)
-        bridge.mem = FakeMem()
-        bridge.vh = SimpleNamespace(
-            timer_device=timer, machine=SimpleNamespace(cpu=SimpleNamespace(
-                regs={}, w_reg=lambda reg, val: bridge.vh.machine.cpu.regs.__setitem__(reg, val))),
-            slm=SimpleNamespace(exec_impl=SimpleNamespace(port_mgr=PortManager(None))))
-        return bridge
-
-    def test_drain_keeps_timer_replies(self):
-        """Stray device replies are dropped; a delivered timer reply stays."""
-        timer = _Timer(owned={IO})
-        bridge = self._bridge(timer)
-        pmgr = bridge.vh.slm.exec_impl.port_mgr
-        pmgr.register_port(PORT)
-        pmgr.put_msg(PORT, 0x1800)  # a stray reply from another device
-        pmgr.put_msg(PORT, IO)
-        pmgr.put_msg(bridge.state.port_addr, 0x1900)  # a DOS packet: reserved
-        bridge._drain_non_essential_ports(pmgr)
-        assert pmgr.ports[PORT].queue == [IO]
-        assert pmgr.ports[bridge.state.port_addr].queue == [0x1900]
-
-    def test_drain_drops_timer_replies_that_came_at_once(self, timer):
-        """A timer request that completed at once is drained; a delayed one stays."""
-        bridge = self._bridge(timer.device)
-        bridge.vh.slm.exec_impl.port_mgr = pmgr = timer.exec.port_mgr
-        timer.send(IO2, micro=100_000)
-        timer.clock.now = 100.1
-        timer.device.deliver()
-        timer.send(IO, cmd=TR_GETSYSTIME)
-        assert pmgr.ports[PORT].queue == [IO2, IO]
-        bridge._drain_non_essential_ports(pmgr)
-        assert pmgr.ports[PORT].queue == [IO2]
-
-    def test_deliver_timers_returns_the_handlers_signals(self):
-        """Only the bits for the handler's own task wake it; children's wait."""
-        timer = _Timer(signals={TASK: 0x1, 0x9000: 0x10})
-        assert self._bridge(timer)._deliver_timers() == 0x1
-        assert timer.delivered == [False]
-
-    def test_packet_resume_adds_due_timer_bits(self, monkeypatch):
-        """The resume for a packet returns the DOS bit and the timer's bit."""
-        from amifuse import fuse_fs as fs
-        from amitools.vamos.lib.lexec.signalfunc import SignalFunc
-
-        timer = _Timer(signals={TASK: 0x1})
-        bridge = self._bridge(timer)
-        pmgr = bridge.vh.slm.exec_impl.port_mgr
-        pmgr.register_port(bridge.state.port_addr)
-        pmgr.put_msg(bridge.state.port_addr, 0x1900)
-        bridge.mem.w8(bridge.state.port_addr + 15, 8)  # mp_SigBit of the DOS port
-        monkeypatch.setattr(SignalFunc, "_fallback_signals", 0x1)
-        seen = {}
-
-        class Launcher:
-            last_pkt_type = None
-
-            def run_burst(self, state, max_cycles=0, debug=False):
-                seen["d0"] = state.regs[0]
-                state.run_state = SimpleNamespace(done=False, error=True, cycles=0)
-
-            def poll_replies(self, port_addr, debug=False):
-                return [(0x1900, 0x1a00, 1, 0)]
-
-        bridge.launcher = Launcher()
-        monkeypatch.setattr(fs, "_clear_all_block_state", lambda: None)
-        assert bridge._run_until_replies() == [(0x1900, 0x1a00, 1, 0)]
-        assert seen["d0"] == 0x101
-        assert bridge.vh.machine.cpu.regs[0] == 0x101
-        # Wait() clears what it returns, so the next Wait() gets no timer bit.
-        assert SignalFunc._fallback_signals == 0
-        assert bridge.mem.r32(TASK + _TC_SIGRECVD) & 0x1 == 0
-
-    def test_timer_bit_for_a_wait_frame_is_returned_once(self, monkeypatch):
-        """A due timer bit for a handler parked in Wait() leaves the fallback signals.
-
-        The resume from the saved Wait() frame returns it from tc_SigRecvd
-        and clears it there; the next Wait() must not return it again.
-        """
-        from amifuse import fuse_fs as fs
-        from amitools.vamos.lib.lexec.signalfunc import SignalFunc
-
-        timer = _Timer(signals={TASK: 0x1})
-        bridge = self._bridge(timer, pc=0x4100, block_state={
-            "wait_blocked_sp": 0x6ff0, "wait_blocked_mask": 0x1,
-            "wait_blocked_ret": 0x4100})
-        monkeypatch.setattr(SignalFunc, "_fallback_signals", 0x1 | 0x20)
-        bridge.mem.w32(TASK + _TC_SIGRECVD, 0x1)  # as Signal() sets it
-
-        class Launcher:
-            last_pkt_type = None
-
-            def run_burst(self, state, max_cycles=0, debug=False):
-                state.run_state = SimpleNamespace(done=False, error=True, cycles=0)
-
-            def poll_replies(self, port_addr, debug=False):
-                return [(0x1900, 0x1a00, 1, 0)]
-
-        bridge.launcher = Launcher()
-        monkeypatch.setattr(fs, "_clear_all_block_state", lambda: None)
-        bridge._run_until_replies()
-        assert SignalFunc._fallback_signals == 0x20
-        assert bridge.mem.r32(TASK + _TC_SIGRECVD) == 0x1
-
-    def _packet_wait(self, monkeypatch, bridge, timer, reply_after_delivery):
-        """Run a packet wait whose handler replies once a timer was delivered."""
-        from amifuse import fuse_fs as fs
-
-        bursts = []
-
-        class Launcher:
-            last_pkt_type = None
-
-            def run_burst(self, state, max_cycles=0, debug=False):
-                bursts.append(timer.deliveries)
-                state.run_state = SimpleNamespace(done=False, error=True, cycles=0)
-
-            def poll_replies(self, port_addr, debug=False):
-                if reply_after_delivery and timer.deliveries:
-                    return [(0x1900, 0x1a00, 1, 0)]
-                return []
-
-        bridge.launcher = Launcher()
-        monkeypatch.setattr(fs, "_clear_all_block_state", lambda: None)
-        return bridge._run_until_replies(max_iters=5), bursts
-
-    def test_timer_a_handler_waits_for_mid_packet_is_replied_in_the_wait(self, monkeypatch):
-        """Parked away from its main loop, the handler gets every pending timer at once.
-
-        It waits in Wait() for its own timer before replying to the packet,
-        so the timer fast-forwards, as when timer.device completed at once,
-        and the same wait gets the reply.
-        """
-        timer = _Timer(signals={TASK: 0x1}, deadline=time.monotonic() + 60, held=True)
-        bridge = self._bridge(timer, pc=0x4100, block_state={
-            "wait_blocked_sp": 0x6ff0, "wait_blocked_mask": 0x1,
-            "wait_blocked_ret": 0x4100})
-        replies, bursts = self._packet_wait(monkeypatch, bridge, timer, True)
-        assert replies == [(0x1900, 0x1a00, 1, 0)]
-        assert timer.delivered == [False, True]
-        assert bursts == [0, 1]
-
-    def test_no_fast_forward_at_the_main_loop(self, monkeypatch):
-        """Parked at its main loop, the handler's timers keep their deadlines."""
-        timer = _Timer(signals={TASK: 0x1}, deadline=time.monotonic() + 60, held=True)
-        bridge = self._bridge(timer, block_state={
-            "wait_blocked_sp": 0x6ff0, "wait_blocked_mask": 0x101,
-            "wait_blocked_ret": 0x4000})
-        replies, _ = self._packet_wait(monkeypatch, bridge, timer, False)
-        assert replies == []
-        assert True not in timer.delivered
-        assert len(timer.delivered) == 6  # at the start, then once per idle burst
-
-    def test_run_due_timers_skips_a_handler_not_at_its_main_loop(self):
-        timer = _Timer(signals={TASK: 0x1}, deadline=0.0)
-        bridge = self._bridge(timer, pc=0x4100)
-        assert bridge.run_due_timers() == bridge._TIMER_RETRY
-        assert timer.delivered == []
-
-    # A Wait() in a subroutine called from the main loop and from deeper
-    # code returns to the main loop's PC on a deeper stack frame.
-    _DEEPER_FRAME = {"sp": 0x6f00, "block_state": {
-        "wait_blocked_sp": 0x6efc, "wait_blocked_mask": 0x1,
-        "wait_blocked_ret": 0x4000}}
-
-    def test_run_due_timers_skips_the_main_loop_pc_on_a_deeper_frame(self):
-        timer = _Timer(signals={TASK: 0x1}, deadline=0.0)
-        bridge = self._bridge(timer, **self._DEEPER_FRAME)
-        assert bridge.run_due_timers() == bridge._TIMER_RETRY
-        assert timer.delivered == []
-        assert bridge.state.sp == 0x6f00
-
-    def test_main_loop_pc_on_a_deeper_frame_gets_its_timer_in_the_wait(self, monkeypatch):
-        """Parked at the main loop's PC on a deeper frame, it waits within the packet."""
-        timer = _Timer(signals={TASK: 0x1}, deadline=time.monotonic() + 60, held=True)
-        bridge = self._bridge(timer, **self._DEEPER_FRAME)
-        replies, bursts = self._packet_wait(monkeypatch, bridge, timer, True)
-        assert replies == [(0x1900, 0x1a00, 1, 0)]
-        assert timer.delivered == [False, True]
-        assert bursts == [0, 1]
-
-    # The handler parked again in its main-loop Wait().
-    _PARKED = {"wait_blocked_sp": 0x6ffc, "wait_blocked_mask": 0x101,
-               "wait_blocked_ret": 0x4000}
-
-    def _parking_launcher(self, bursts, resumes, wakes=None):
-        """A launcher whose bursts all park, reporting 0 cycles as machine_run does.
-
-        wakes maps a burst number to where its wake comes from: "burst",
-        already pending when it parks, so run_burst leaves no block state;
-        or "child", a child's reply after it, which setup_resume_if_blocked
-        finds. resumes records what each setup_resume_if_blocked call found.
-        """
-        parked = self._PARKED
-        wakes = wakes or {}
-
-        class Launcher:
-            def run_burst(self, state, max_cycles=0, debug=False):
-                bursts.append((state.pc, state.regs[0]))
-                state.run_state = SimpleNamespace(done=False, error=True, cycles=0)
-                pending = wakes.get(len(bursts)) == "burst"
-                state.block_state = None if pending else dict(parked)
-
-            def setup_resume_if_blocked(self, state, debug=False):
-                found = wakes.get(len(bursts)) == "child"
-                resumes.append(found)
-                if found:
-                    state.block_state = None
-                return found
-
-        return Launcher()
-
-    def test_run_due_timers_wakes_the_parked_handler(self, monkeypatch):
-        """Due bits are returned by its main-loop Wait(), and it runs until it parks."""
-        from amifuse import fuse_fs as fs
-
-        timer = _Timer(signals={TASK: 0x1})
-        bridge = self._bridge(timer)
-        bursts, resumes = [], []
-        bridge.launcher = self._parking_launcher(bursts, resumes)
-        monkeypatch.setattr(fs, "_clear_all_block_state", lambda: None)
-        assert bridge.run_due_timers() is None
-        # It parks with nothing pending: one burst.
-        assert bursts == [(0x4000, 0x1)]
-        assert resumes == [False]
-        assert bridge._busy_ran_out is False
-
-    @pytest.mark.parametrize("wake", ["burst", "child"])
-    def test_resume_runs_a_handler_that_parks_with_a_wake_pending(self, monkeypatch, wake):
-        """A park with a wake pending runs again in the same resume.
-
-        Every burst that parks reports 0 cycles. Parked with a self-signal
-        or a quick reply already pending (burst), or with a child's reply
-        that came after it (child), the handler must not wait for the next
-        timer or FUSE operation.
-        """
-        from amifuse import fuse_fs as fs
-
-        timer = _Timer(signals={TASK: 0x1})
-        bridge = self._bridge(timer)
-        bursts, resumes = [], []
-        bridge.launcher = self._parking_launcher(bursts, resumes, wakes={1: wake})
-        monkeypatch.setattr(fs, "_clear_all_block_state", lambda: None)
-        assert bridge.run_due_timers() is None
-        assert len(bursts) == 2
-        assert resumes == ([False] if wake == "burst" else [True, False])
-
-    def test_timer_resume_that_runs_out_sets_busy_ran_out(self, monkeypatch):
-        """A resume that never parks again stops at the busy limit, as a packet does."""
-        from amifuse import fuse_fs as fs
-
-        timer = _Timer(signals={TASK: 0x1})
-        bridge = self._bridge(timer)
-        monkeypatch.setattr(fs.HandlerBridge, "_MAX_BUSY_CYCLES", 1_000_000)
-
-        class Launcher:
-            bursts = 0
-
-            def run_burst(self, state, max_cycles=0, debug=False):
-                Launcher.bursts += 1
-                state.run_state = SimpleNamespace(done=False, error=False, cycles=max_cycles)
-
-        bridge.launcher = Launcher()
-        monkeypatch.setattr(fs, "_clear_all_block_state", lambda: None)
-        bridge.run_due_timers()
-        assert Launcher.bursts == 5
-        assert bridge._busy_ran_out is True
-
-
-class TestTimerThread:
-    """AmigaFuseFS runs one amifuse-timer thread from init() to destroy()."""
-
-    def _fs(self, timer, crashed=False, results=()):
-        """An AmigaFuseFS whose run_due_timers returns results, then None.
-
-        A result that is an exception is raised instead.
-        """
+    def _fs(self, timer, emu=True):
         from amifuse.fuse_fs import AmigaFuseFS
-
-        calls = []
-        results = list(results)
-
-        def run_due_timers():
-            calls.append(time.monotonic())
-            result = results.pop(0) if results else None
-            if isinstance(result, Exception):
-                raise result
-            return result  # None: nothing pending, wait for the event
 
         bridge = SimpleNamespace(
             _write_enabled=False, _lock=threading.RLock(),
-            state=SimpleNamespace(crashed=crashed), run_due_timers=run_due_timers,
-            vh=SimpleNamespace(timer_device=timer, shutdown=lambda: None),
-            backend=SimpleNamespace(sync=lambda: None, close=lambda: None))
-        return AmigaFuseFS(bridge), calls
+            state=SimpleNamespace(crashed=False),
+            vh=SimpleNamespace(timer_device=timer), shutdown_runtime=lambda: None,
+            backend=SimpleNamespace(sync=lambda: None, close=lambda: None),
+            start_idle_timers=Mock(), stop_idle_timers=Mock())
+        if emu:
+            bridge._emu = SimpleNamespace(alive=True)
+        return AmigaFuseFS(bridge)
 
-    def test_thread_starts_with_init_and_stops_with_destroy(self):
-        timer = _Timer()
-        fs, calls = self._fs(timer)
+    def test_init_starts_the_timers_and_destroy_stops_them(self):
+        fs = self._fs(_Timer())
         fs.init("/")
-        thread = fs._timer_thread
-        assert thread.name == "amifuse-timer" and thread.daemon
-        time.sleep(0.2)
-        # Nothing pending: one look, then it waits on the event.
-        assert len(calls) == 1
-        timer.event.set()
-        time.sleep(0.2)
-        assert len(calls) == 2
+        fs.bridge.start_idle_timers.assert_called_once_with(
+            on_crash=fs._schedule_crash_shutdown)
+        assert fs._timers_started
         fs.destroy("/")
-        assert not thread.is_alive()
-        assert fs._timer_thread is None
+        fs.bridge.stop_idle_timers.assert_called_once_with()
+        assert not fs._timers_started
 
-    @pytest.fixture
-    def shutdowns(self, monkeypatch):
-        """Set by a crash shutdown, which would otherwise send SIGTERM to pytest."""
-        from amifuse.fuse_fs import AmigaFuseFS
-
-        done = threading.Event()
-        monkeypatch.setattr(
-            AmigaFuseFS, "_terminate_mount_after_crash", lambda self: done.set())
-        return done
-
-    def test_thread_stops_when_the_handler_crashed(self, shutdowns):
-        fs, calls = self._fs(_Timer(), crashed=True)
+    def test_no_timers_without_a_timer_device(self):
+        fs = self._fs(None)
         fs.init("/")
-        fs._timer_thread.join(2)
-        assert not fs._timer_thread.is_alive()
-        assert calls == []
-        assert shutdowns.wait(2)
+        fs.bridge.start_idle_timers.assert_not_called()
+        fs.destroy("/")
+        fs.bridge.stop_idle_timers.assert_not_called()
+
+    def test_no_timers_without_an_emulation_thread(self):
+        fs = self._fs(_Timer(), emu=False)
+        fs.init("/")
+        fs.bridge.start_idle_timers.assert_not_called()
         fs.destroy("/")
 
-    def test_crash_in_a_timer_burst_shuts_the_mount_down(self, shutdowns):
-        """A handler that crashes while idle shuts the mount down, as a FUSE operation does."""
-        timer = _Timer()
-        fs, calls = self._fs(timer)
 
-        def run_due_timers():
-            calls.append(time.monotonic())
-            fs.bridge.state.crashed = True
-            return None  # nothing pending: unchecked, the thread would wait forever
+class TestBridgeIdleTimers:
+    """What the bridge does when its emulation thread is idle."""
 
-        fs.bridge.run_due_timers = run_due_timers
-        fs.init("/")
-        fs._timer_thread.join(2)
-        assert not fs._timer_thread.is_alive()
-        assert len(calls) == 1
-        assert shutdowns.wait(2)
-        fs.destroy("/")
+    def _bridge(self, timer, results):
+        """A bridge whose run_due_timers returns results, then None.
 
-    def test_thread_yields_the_lock_when_a_request_is_due_again_at_once(self):
-        """After each look it waits a tick, so FUSE operations get the lock.
-
-        Each call stands for a resume that outlasts the handler's re-arm
-        delay: it holds the lock, re-arms (which sets the event) and leaves
-        the request due again at once. It counts a fixed number of looks,
-        not a time window, so a slow runner only makes it take longer.
+        A result that is an exception is raised instead.
         """
-        timer = _Timer()
-        fs, _ = self._fs(timer)
-        looks = 6
-        spans = []
-        done = threading.Event()
-
-        def run_due_timers():
-            start = time.monotonic()
-            while time.monotonic() - start < 0.05:  # emulation holds the GIL
-                pass
-            spans.append((start, time.monotonic()))
-            if len(spans) == looks:
-                done.set()
-                return None  # nothing pending: it waits on the event
-            timer.event.set()
-            return 0.0
-
-        fs.bridge.run_due_timers = run_due_timers
-        fs.init("/")
-        waits = []
-        deadline = time.monotonic() + 30
-        while not done.is_set() and time.monotonic() < deadline:
-            start = time.monotonic()
-            if fs.bridge._lock.acquire(timeout=5.0):
-                fs.bridge._lock.release()
-            waits.append(time.monotonic() - start)
-            time.sleep(0.005)
-        fs.destroy("/")
-        assert len(spans) == looks
-        gaps = [nxt[0] - prev[1] for prev, nxt in zip(spans, spans[1:])]
-        assert min(gaps) >= timer.MIN_DELAY / 2
-        assert max(waits) < 2.0
-
-    def test_destroy_during_a_timer_burst_does_not_hang(self):
-        """A stop that comes while run_due_timers runs ends the thread.
-
-        The thread clears the event after run_due_timers, which would erase
-        the stop's wake; with nothing pending it would then wait for good,
-        and destroy() with it, before the final flush.
-        """
-        timer = _Timer()
-        fs, calls = self._fs(timer)
-        inside, release = threading.Event(), threading.Event()
-
-        def run_due_timers():
-            calls.append(time.monotonic())
-            inside.set()
-            release.wait(5)  # a resume in progress, holding the bridge lock
-            return None  # nothing pending afterwards
-
-        fs.bridge.run_due_timers = run_due_timers
-        fs.init("/")
-        thread = fs._timer_thread
-        assert inside.wait(5)
-        destroy = threading.Thread(target=fs.destroy, args=("/",), daemon=True)
-        destroy.start()
-        time.sleep(0.2)  # destroy has set the stop and the event, and joins
-        release.set()
-        destroy.join(3)
-        hung = destroy.is_alive()
-        timer.event.set()  # frees a hung thread, so it does not outlive the test
-        destroy.join(3)
-        assert not hung
-        assert not thread.is_alive()
-        assert len(calls) == 1
-
-    def test_a_long_timeout_does_not_end_the_thread(self):
-        """A deadline beyond threading.TIMEOUT_MAX is slept in bounded steps."""
-        timer = _Timer()
-        fs, calls = self._fs(timer, results=[threading.TIMEOUT_MAX * 10])
-        fs.init("/")
-        time.sleep(0.2)
-        assert fs._timer_thread.is_alive()
-        assert len(calls) == 1
-        thread = fs._timer_thread
-        fs.destroy("/")
-        assert not thread.is_alive()
-
-    def test_an_error_does_not_end_the_thread(self, monkeypatch, capsys):
-        """An exception from run_due_timers is reported under --debug, then retried."""
         from amifuse.fuse_fs import HandlerBridge
 
-        monkeypatch.setattr(HandlerBridge, "_TIMER_RETRY", 0.05)
-        timer = _Timer()
-        fs, calls = self._fs(timer, results=[RuntimeError("boom")])
-        fs._debug = True
-        fs.init("/")
-        time.sleep(0.3)
-        assert fs._timer_thread.is_alive()
-        assert len(calls) == 2
-        fs.destroy("/")
-        err = capsys.readouterr()
-        assert "error delivering timers" in err.out
-        assert "RuntimeError: boom" in err.err
+        results = list(results)
+        calls = []
 
-    def test_no_thread_without_a_timer_device(self):
-        fs, _ = self._fs(None)
-        fs.init("/")
-        assert fs._timer_thread is None
-        fs.destroy("/")
+        def run_due_timers():
+            calls.append(1)
+            result = results.pop(0) if results else None
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+        bridge = HandlerBridge.__new__(HandlerBridge)
+        bridge._debug = False
+        bridge._on_crash = None
+        bridge.state = SimpleNamespace(crashed=False)
+        bridge.vh = SimpleNamespace(timer_device=timer)
+        bridge.run_due_timers = run_due_timers
+        bridge.calls = calls
+        return bridge
+
+    def test_start_sets_the_hook_and_stop_takes_it_away(self):
+        bridge = self._bridge(_Timer(), [])
+        bridge._emu = Mock()
+        on_crash = Mock()
+        bridge.start_idle_timers(on_crash=on_crash)
+        bridge._emu.set_idle.assert_called_once_with(bridge._idle_timers)
+        assert bridge._on_crash is on_crash
+        bridge.stop_idle_timers()
+        bridge._emu.set_idle.assert_called_with(None)
+
+    def test_hook_returns_the_next_deadline_at_least_a_tick_away(self):
+        bridge = self._bridge(_Timer(), [0.0, 5.0])
+        # a request due again at once still yields a tick to the callers
+        assert bridge._idle_timers() == _Timer.MIN_DELAY
+        assert bridge._idle_timers() == 5.0
+        # nothing pending: wait for a call
+        assert bridge._idle_timers() is None
+        assert len(bridge.calls) == 3
+
+    def test_an_error_is_retried_and_shown_under_debug(self, capsys):
+        from amifuse.fuse_fs import HandlerBridge
+
+        bridge = self._bridge(_Timer(), [RuntimeError("boom")])
+        bridge._debug = True
+        assert bridge._idle_timers() == HandlerBridge._TIMER_RETRY
+        out = capsys.readouterr()
+        assert "error delivering timers" in out.out
+        assert "RuntimeError: boom" in out.err
+
+    def test_a_crashed_handler_is_reported_once(self):
+        bridge = self._bridge(_Timer(), [])
+        on_crash = Mock()
+        bridge._on_crash = on_crash
+        bridge.state.crashed = True
+        assert bridge._idle_timers() is None
+        assert bridge._idle_timers() is None
+        on_crash.assert_called_once_with()
+        assert bridge.calls == []
+
+    def test_a_crash_while_delivering_is_reported(self):
+        bridge = self._bridge(_Timer(), [])
+        on_crash = Mock()
+        bridge._on_crash = on_crash
+
+        def crash():
+            bridge.calls.append(1)
+            bridge.state.crashed = True
+            return None
+
+        bridge.run_due_timers = crash
+        assert bridge._idle_timers() is None
+        on_crash.assert_called_once_with()

@@ -596,11 +596,10 @@ def _lenient_rdisk_open(rdisk) -> List[str]:
 def _parse_rdb(dev, rdb_block) -> RDisk:
     """Parse the RDB that _scan_for_rdb found on dev.
 
-    Tries the strict RDisk.open() first, then the lenient parse that
-    tolerates corrupt filesystem blocks, when the strict open fails or
-    raises OSError. Raises RDBContentError, saying why, if neither works
-    or the RDB uses another block size than dev. Other OSErrors, such as
-    a failing read, propagate.
+    Uses the lenient parse, which reads the partitions as strictly as
+    RDisk.open() and tolerates corrupt filesystem blocks. Raises
+    RDBContentError, saying why, if it fails or the RDB uses another block
+    size than dev. Other OSErrors, such as a failing read, propagate.
     """
     if rdb_block.block_size != dev.block_bytes:
         # Only a forced block size gets here: otherwise _scan_for_rdb has
@@ -610,22 +609,12 @@ def _parse_rdb(dev, rdb_block) -> RDisk:
             f"RDB uses {rdb_block.block_size}-byte blocks, "
             f"but the device was opened with {dev.block_bytes}-byte blocks"
         )
+    # Not RDisk.open(): its walk of an LSEG chain has no bound, so a chain
+    # that links back on itself never ends. The lenient parse reads the
+    # partitions as strictly, and stops at such a loop with a warning.
     rdisk = RDisk(dev)
     rdisk.rdb = rdb_block
-    rdisk.rdb_warnings = []
-    try:
-        opened = rdisk.open()
-    except OSError:
-        # amitools raises the same IOError for a link past the device's end
-        # as for a failing read (OffsetBlockDevice an RDBContentError). The
-        # lenient parse never reads such a filesystem link, and a failing
-        # read fails there again.
-        opened = False
-    if not opened:
-        # Strict open failed - try lenient parse (tolerates corrupt FS blocks)
-        rdisk = RDisk(dev)
-        rdisk.rdb = rdb_block
-        rdisk.rdb_warnings = _lenient_rdisk_open(rdisk)
+    rdisk.rdb_warnings = _lenient_rdisk_open(rdisk)
     return rdisk
 
 

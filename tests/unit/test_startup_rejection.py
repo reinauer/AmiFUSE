@@ -26,7 +26,6 @@ def test_startup_refusal_requires_a_reply(tmp_path, monkeypatch, res2, replied,
     monkeypatch.setattr(fs, "VamosHandlerRuntime", lambda: runtime)
     monkeypatch.setattr(fs, "BootstrapAllocator", Mock(return_value=bootstrap))
     monkeypatch.setattr(fs, "HandlerLauncher", Mock(return_value=launcher))
-    monkeypatch.setattr(fs, "ProcessManager", Mock())
     monkeypatch.setattr(fs, "DosPacketStruct", Mock(return_value=packet))
     monkeypatch.setattr(fs.HandlerBridge, "_run_startup_until_replies",
                         Mock(return_value=[(1, 2, 0, res2)] if replied else []))
