@@ -14,12 +14,12 @@ from pathlib import Path
 
 import pytest
 from amitools.fs.blkdev.RawBlockDevice import RawBlockDevice
+from amitools.fs.block.rdb.RDBlock import RDBlock
 
 from amifuse import driver_resolver
 from amifuse.rdb_inspect import (
     RDBContentError,
     _parse_rdb,
-    _scan_for_rdb,
     open_rdisk,
     print_inspect_report,
 )
@@ -145,7 +145,8 @@ def test_failing_read_still_raises(tmp_path):
     raw = RawBlockDevice(str(image), read_only=True)
     raw.open()
     try:
-        rdb_block, _ = _scan_for_rdb(raw, None)
+        rdb_block = RDBlock(raw, 0)  # rdbtool puts the RDB at block 0.
+        assert rdb_block.read()
         real_read = raw.read_block
         failed = []
 
