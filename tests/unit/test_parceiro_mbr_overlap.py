@@ -15,6 +15,8 @@ import pytest
 from amitools.fs.FSString import FSString
 from amitools.fs.blkdev.DiskGeometry import DiskGeometry
 from amitools.fs.blkdev.RawBlockDevice import RawBlockDevice
+from amitools.fs.block.Block import Block
+from amitools.fs.block.rdb.RDBlock import RDBlock
 from amitools.fs.rdb.RDisk import RDisk
 
 from amifuse.driver_runtime import BlockDeviceBackend
@@ -187,12 +189,18 @@ def _no_second_open(monkeypatch):
 
 def _rdb0_mbr(tmp_path, partitions, entries):
     """An RDB with its RDSK block at block 0, whose sector also holds an MBR
-    listing (type, start, sectors) entries. The RDSK checksum covers the
-    whole block, MBR table included, as amitools checks it."""
+    listing (type, start, sectors) entries. The RDSK checksum holds over
+    the whole block, MBR table included, and over its first SummedLongs
+    (64) longs, whichever amitools checks: long 100, in the MBR boot code
+    area, balances the upper half."""
     data = bytearray(_rdb(tmp_path, partitions))
     for index, entry in enumerate(entries):
         _entry(data, index, *entry)
     data[510:512] = b"\x55\xaa"
+    assert struct.unpack_from(">I", data, 4)[0] == 64
+    struct.pack_into(">I", data, 400, 0)
+    struct.pack_into(">I", data, 400,
+                     -sum(struct.unpack(">64I", data[256:512])) & 0xFFFFFFFF)
     struct.pack_into(">I", data, 8, 0)
     struct.pack_into(">I", data, 8,
                      -sum(struct.unpack(">128I", data[:512])) & 0xFFFFFFFF)
@@ -379,6 +387,26 @@ def test_0x76_entry_beside_an_invalid_own_rdsk_block(tmp_path, monkeypatch):
     with pytest.raises(ValueError, match="own RDB can't be checked.*sectors \\[2\\]"):
         _open_as(image, partition="DH1")
     assert _open_as(image, read_only=True, partition="DH1") == (272, 416)
+
+
+def test_own_rdsk_block_is_valid_as_amitools_checks_it(tmp_path, monkeypatch):
+    # The own RDSK block holds data past its first SummedLongs longs, and
+    # amitools sets its checksum, over the whole block or over those longs
+    # only: the block is as valid to the own-RDB check as to amitools.
+    image = _parceiro_76(tmp_path, (1, 39))
+    raw = RawBlockDevice(str(image), read_only=False)
+    raw.open()
+    try:
+        rdsk = RDBlock(raw, 2)
+        assert rdsk.read()
+        rdsk._put_long(100, 0x12345678)
+        Block.write(rdsk)
+    finally:
+        raw.close()
+    _select_entry_dh1(monkeypatch)
+    _no_second_open(monkeypatch)
+    with pytest.raises(ValueError, match=OVERLAP):
+        _open_as(image, partition="DH1")
 
 
 def test_invalid_own_rdsk_block_before_a_0x76_entry_rdsk_block(tmp_path, monkeypatch):

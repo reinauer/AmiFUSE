@@ -8,7 +8,6 @@ import errno
 import os
 import sys
 import stat
-import struct
 from pathlib import Path
 from typing import Optional
 
@@ -314,20 +313,31 @@ class BlockDeviceBackend:
 
         count = min(-(-16 * MBR_SECTOR_SIZE // size), base.num_blocks)
         data = base.read_block(0, count) if count > 0 else b""
+
+        class Sectors:
+            """The sectors read, as a 512-byte device: _scan_for_rdb's
+            first scan reads RDSK blocks through one."""
+            block_bytes = MBR_SECTOR_SIZE
+            block_longs = MBR_SECTOR_SIZE // 4
+
+            def read_block(self, blk_num, num_blks=1):
+                return data[blk_num * MBR_SECTOR_SIZE:
+                            (blk_num + num_blks) * MBR_SECTOR_SIZE]
+
+        sectors = Sectors()
         found = None
         bad_checksum = []
         for sector in range(min(16, len(data) // MBR_SECTOR_SIZE)):
-            block = data[sector * MBR_SECTOR_SIZE:(sector + 1) * MBR_SECTOR_SIZE]
-            if block[:4] != b"RDSK":
+            if sectors.read_block(sector)[:4] != b"RDSK":
                 continue
-            longs = struct.unpack(">128I", block)
-            # amitools' checksum holds when the block's longs sum to 0.
-            if sum(longs) & 0xFFFFFFFF:
+            # amitools judges the checksum, as it does for _scan_for_rdb.
+            rdsk = RDBlock(sectors, sector)
+            if not rdsk.read():
                 if not in_entry(sector):
                     bad_checksum.append(sector)
                 continue
             # A size _scan_for_rdb skips counts as no RDSK block at all.
-            rdb_size = longs[4]
+            rdb_size = rdsk.block_size
             if 512 <= rdb_size <= 32768 and not rdb_size & (rdb_size - 1):
                 found = sector
                 break
