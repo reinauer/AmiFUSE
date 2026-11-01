@@ -1856,9 +1856,11 @@ class HandlerBridge:
     # 8 MiB the handler and the bridge share (VamosHandlerRuntime's
     # ram_size). The small ones have no cap: each packet still out holds
     # at most two, so tens of thousands of packets would have to go
-    # unanswered, each after a full wait, before they took that much. And a
-    # cap on them would fail a lookup halfway through a path, or the undo
-    # of a rename, with the locks it took still held.
+    # unanswered before they took that much. That is no long wait: a
+    # handler hung in Wait() leaves a packet unanswered after 50 bursts,
+    # under a millisecond, so a busy indexer could get there in minutes.
+    # But a cap on them would fail a lookup halfway through a path, or the
+    # undo of a rename, with the locks it took still held.
     _RETIRED_MAX = 16 * IO_CHUNK
     # write_empty_reply's buffer; see _alloc_empty_buf.
     _empty_buf_mem = None
@@ -3953,18 +3955,23 @@ class AmigaFuseFS(_FuseOperations):
                 emptied = written == 0
                 if not emptied and res2:
                     bridge.close_file(opened[0])
-                    if opened[1]:
-                        bridge.free_lock(opened[1])
-                    opened = None
+                    # The FileHandle is back in the pool, whatever the
+                    # free_lock below does.
+                    lock, opened = opened[1], None
+                    if lock:
+                        bridge.free_lock(lock)
             if opened is None and res2:
                 opened = bridge.open_file(path, os.O_RDWR)
         finally:
-            if entry.get("parent_lock"):
-                bridge.free_lock(entry["parent_lock"])
+            # The entry is set first: the old FileHandle is already back
+            # in the pool, even when the free_lock below raises.
+            old_lock = entry.get("parent_lock")
             if opened is None:
                 entry.update(fh_addr=0, parent_lock=0, closed=True)
             else:
                 entry["fh_addr"], entry["parent_lock"] = opened
+            if old_lock:
+                bridge.free_lock(old_lock)
         if not emptied:
             return -1, res2
         self._pin_stat(path, 0)
