@@ -394,30 +394,38 @@ def _is_parceiro_checksum(block) -> bool:
 
 
 def _read_fs_parceiro(blkdev, fs_blk_num, fs_num):
-    """Try reading a FileSystem accepting Parceiro-style LSEG checksums.
+    """Read a FileSystem as FileSystem.read() does, also accepting
+    Parceiro-style LSEG checksums and stopping at an LSEG chain that loops.
 
     The Parceiro firmware checksums only the first ``size`` longs of each
     LSEG block instead of the full block.  This function accepts such
     blocks as valid, producing usable filesystem driver data.
 
-    Returns (FileSystem, parceiro_count) where parceiro_count is the number
-    of LSEG blocks with Parceiro checksums, or (None, 0) on failure.
+    Returns (FileSystem, parceiro_count, problem). fs.fshd is the header
+    block, valid or not. problem is None when the whole entry reads, and
+    parceiro_count is then the number of LSEG blocks with Parceiro
+    checksums; otherwise problem says what is wrong and fs.valid is False.
     """
     from amitools.fs.block.rdb.FSHeaderBlock import FSHeaderBlock
     from amitools.fs.block.rdb.LoadSegBlock import LoadSegBlock
     from amitools.fs.block.Block import Block
     from amitools.fs.rdb.FileSystem import FileSystem
 
-    fshd = FSHeaderBlock(blkdev, fs_blk_num)
-    if not fshd.read():
-        return None, 0
+    fs = FileSystem(blkdev, fs_blk_num, fs_num)
+    fs.fshd = FSHeaderBlock(blkdev, fs_blk_num)
+    if not fs.fshd.read():
+        return fs, 0, "corrupt filesystem header"
 
-    lseg_blk = fshd.dev_node.seg_list_blk
+    lseg_blk = fs.fshd.dev_node.seg_list_blk
     lsegs = []
     data = b""
     parceiro_count = 0
+    seen = set()
 
     while lseg_blk != 0xFFFFFFFF:
+        if lseg_blk in seen:
+            return fs, 0, f"LSEG chain loops back to block {lseg_blk}"
+        seen.add(lseg_blk)
         ls = LoadSegBlock(blkdev, lseg_blk)
         Block.read(ls)  # Load data, validate type and checksum
 
@@ -427,7 +435,7 @@ def _read_fs_parceiro(blkdev, fs_blk_num, fs_num):
             ls.valid = True
             parceiro_count += 1
         else:
-            return None, 0  # Genuinely corrupt
+            return fs, 0, "corrupt data block in LSEG chain"
 
         # Parse LSEG fields (data already loaded by Block.read)
         ls.size = ls._get_long(1)
@@ -438,13 +446,11 @@ def _read_fs_parceiro(blkdev, fs_blk_num, fs_num):
         data += ls.get_data()
         lsegs.append(ls)
 
-    fs = FileSystem(blkdev, fs_blk_num, fs_num)
-    fs.fshd = fshd
     fs.lsegs = lsegs
     fs.data = data
     fs.valid = True
 
-    return fs, parceiro_count
+    return fs, parceiro_count, None
 
 
 def _lenient_rdisk_open(rdisk) -> List[str]:
@@ -457,6 +463,9 @@ def _lenient_rdisk_open(rdisk) -> List[str]:
     LSEG blocks with Parceiro-style checksums (off by exactly one) are
     accepted and the filesystem driver data is made available.
 
+    A filesystem list or LSEG chain that links back to a block it has
+    already read ends there, with a warning.
+
     Returns a list of warning strings (empty if everything parsed cleanly).
     Each filesystem entry it drops is also recorded in rdisk.damaged_fs as
     (DOS type, warning); the DOS type is None when the header is unreadable.
@@ -464,7 +473,6 @@ def _lenient_rdisk_open(rdisk) -> List[str]:
     from amitools.fs.block.Block import Block
     from amitools.fs.block.rdb.PartitionBlock import PartitionBlock
     from amitools.fs.rdb.Partition import Partition
-    from amitools.fs.rdb.FileSystem import FileSystem
 
     rdb = rdisk.rdb
     if rdb.block_size != rdisk.rawblk.block_bytes:
@@ -494,42 +502,41 @@ def _lenient_rdisk_open(rdisk) -> List[str]:
     fs_blk = rdb.fs_list
     rdisk.fs = []
     num = 0
+    seen = set()
     while fs_blk != PartitionBlock.no_blk:
-        fs = FileSystem(rdisk.rawblk, fs_blk, num)
+        if fs_blk in seen:
+            # Every entry of the loop has been read: nothing is skipped.
+            warnings.append(
+                f"Filesystem list loops back to block {fs_blk} "
+                f"(list ends there)"
+            )
+            break
+        seen.add(fs_blk)
+        # Not FileSystem.read(): its LSEG walk has no bound.
+        fs, parceiro_count, problem = _read_fs_parceiro(rdisk.rawblk, fs_blk, num)
         num += 1
-        if not fs.read():
-            if fs.fshd is not None and fs.fshd.valid:
-                # FSHD OK but LSEG chain failed — try Parceiro tolerance
-                parceiro_fs, parceiro_count = _read_fs_parceiro(
-                    rdisk.rawblk, fs_blk, fs.num
-                )
-                if parceiro_fs is not None and parceiro_count > 0:
-                    dt = parceiro_fs.fshd.dos_type
-                    dt_str = DosType.num_to_tag_str(dt)
-                    warnings.append(
-                        f"Filesystem #{parceiro_fs.num} ({dt_str}/0x{dt:08x}): "
-                        f"Parceiro checksum in {parceiro_count} LSEG block(s) (accepted)"
-                    )
-                    rdisk.fs.append(parceiro_fs)
-                    rdisk.used_blks += parceiro_fs.get_blk_nums()
-                    fs_blk = parceiro_fs.get_next_fs_blk()
-                else:
-                    dt = fs.fshd.dos_type
-                    dt_str = DosType.num_to_tag_str(dt)
-                    warnings.append(
-                        f"Filesystem #{fs.num} ({dt_str}/0x{dt:08x}): "
-                        f"corrupt data block in LSEG chain (driver data unavailable)"
-                    )
-                    rdisk.damaged_fs.append((dt, warnings[-1]))
-                    fs_blk = fs.fshd.next
-            else:
-                warnings.append(
-                    f"Corrupt filesystem header at block {fs_blk} "
-                    f"(remaining filesystem entries skipped)"
-                )
-                rdisk.damaged_fs.append((None, warnings[-1]))
-                break
+        if not fs.fshd.valid:
+            warnings.append(
+                f"Corrupt filesystem header at block {fs_blk} "
+                f"(remaining filesystem entries skipped)"
+            )
+            rdisk.damaged_fs.append((None, warnings[-1]))
+            break
+        dt = fs.fshd.dos_type
+        dt_str = DosType.num_to_tag_str(dt)
+        if problem is not None:
+            warnings.append(
+                f"Filesystem #{fs.num} ({dt_str}/0x{dt:08x}): "
+                f"{problem} (driver data unavailable)"
+            )
+            rdisk.damaged_fs.append((dt, warnings[-1]))
+            fs_blk = fs.fshd.next
             continue
+        if parceiro_count > 0:
+            warnings.append(
+                f"Filesystem #{fs.num} ({dt_str}/0x{dt:08x}): "
+                f"Parceiro checksum in {parceiro_count} LSEG block(s) (accepted)"
+            )
         rdisk.fs.append(fs)
         rdisk.used_blks += fs.get_blk_nums()
         fs_blk = fs.get_next_fs_blk()
