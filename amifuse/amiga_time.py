@@ -13,14 +13,14 @@ Each conversion takes the UTC offset in force at the instant converted,
 so a summer date and a winter date each get their own.
 
 A DateStamp has no time zone. In the hour the clocks go back, a local
-time happens twice, and it reads back as only one of the two, so a date
-stored at the other reads back off by the size of the change, an hour in
-most places. In Los Angeles, 2026-11-01 09:30 UTC is stored as 01:30 and
-reads back as 08:30 UTC, an hour early, so `rsync -t` copies such a file
-again on every run. West of Greenwich the first occurrence wins, as
-there; east of it, the second. A stored time in the hour the clocks skip
-when they go forward, such as one an Amiga wrote, reads back off by the
-same amount: in Los Angeles, 02:30 on 2026-03-08 reads back as 01:30.
+time happens twice, and it reads back as only one of the two (which one
+depends on the zone), so a date stored at the other reads back off by
+the size of the change, an hour in most places. In Los Angeles,
+2026-11-01 09:30 UTC is stored as 01:30 and reads back as 08:30 UTC, an
+hour early, so `rsync -t` copies such a file again on every run. A
+stored time in the hour the clocks skip when they go forward, such as
+one an Amiga wrote, reads back off by the same amount: in Los Angeles,
+02:30 on 2026-03-08 reads back as 01:30.
 """
 
 import calendar
