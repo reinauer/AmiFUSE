@@ -1827,7 +1827,11 @@ class HandlerBridge:
         seconds have passed. Each wait also ends at that deadline: a
         handler that parks during a wait has the full busy limit for the
         rest of it. Late replies are given back as in
-        _run_until_reply. Returns the names of the packets still out.
+        _run_until_reply. The other ports are drained only after a wait
+        that leaves the handler parked at its main loop, as the idle
+        runner does (_after_idle_run): in the middle of its work, a
+        SendIO() reply it has not taken yet is still its own (#240).
+        Returns the names of the packets still out.
         """
         with self._lock:
             deadline = time.monotonic() + timeout
@@ -1835,8 +1839,11 @@ class HandlerBridge:
                    and time.monotonic() < deadline):
                 sent = dict(self._pending_packets())
                 self._busy_ran_out = True
-                replies = self._run_until_replies(deadline=deadline)
+                replies = self._run_until_replies(
+                    deadline=deadline, drain_non_essential=False)
                 self._log_replies("pending", replies)
+                if not self.state.crashed and self._at_main_loop_frame():
+                    self._drain_non_essential_ports(self.vh.slm.exec_impl.port_mgr)
                 for _, reply_pkt, res1, _ in replies:
                     self._give_back_late_reply(sent.get(reply_pkt), res1)
                 if replies:
