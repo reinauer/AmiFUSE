@@ -2950,7 +2950,8 @@ class AmigaFuseFS(_FuseOperations):
         # entry reply; if that probe hit PFS3 it would get ERROR_OBJECT_IN_USE
         # while the new file's handle is still open, and the kernel would
         # return ENOENT to userspace. Populated by create() and an O_TRUNC
-        # open(), cleared by release()/unlink().
+        # open(), cleared by release() and by an unlink() that deletes at
+        # once; a deferred delete keeps it until release().
         self._pinned_stats: Set[str] = set()
         if self.bridge._write_enabled:
             self._cache_ttl = 0.0
