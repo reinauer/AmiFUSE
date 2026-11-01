@@ -39,6 +39,7 @@ from amifuse.startup_runner import (
     ACTION_LOCATE_OBJECT,
     ACTION_READ,
     ACTION_RENAME_OBJECT,
+    ACTION_SET_DATE,
     ACTION_SET_FILE_SIZE,
     ACTION_WRITE,
     HandlerLauncher,
@@ -177,6 +178,7 @@ def bridge():
                                 close=lambda: None)
     b._volname = None
     b._fib_mem = None
+    b._datestamp_mem = None
     b._read_buf_mem = None
     b._read_buf_size = 0
     b._bstr_ring = []
@@ -282,6 +284,30 @@ def test_a_late_reply_frees_the_buffer_it_held(bridge):
 
     assert write_args[1] not in b.vh.alloc.mem_objs
     assert b._retired_data == []
+
+
+def test_a_set_date_still_out_keeps_its_date_stamp(bridge):
+    b, handler = bridge
+    handler.delay = lambda pkt_type, name: NEVER if pkt_type == ACTION_SET_DATE else 0
+    handler.answer = lambda pkt_type, args, name: (-1, 0)
+    first, second = 1_000_000_000.0, 1_700_000_000.0
+
+    assert b.set_date(0x100, "first", first) == (0, -1)
+    handler.delay = lambda pkt_type, name: 0
+    assert b.set_date(0x100, "second", second) == (-1, 0)
+
+    (_, _, _, first_args, _), (_, _, _, second_args, _) = handler.taken(ACTION_SET_DATE)
+    assert second_args[3] != first_args[3]
+    # The handler still finds the first file's date where it left it.
+    stamp = tuple(b.mem.r32(first_args[3] + offset) for offset in (0, 4, 8))
+    assert stamp == fs.to_datestamp(first)
+    assert first_args[3] in b.vh.alloc.mem_objs
+
+    handler.answer_now(ACTION_SET_DATE)
+    # The late reply comes in this wait, and frees the first DateStamp.
+    assert b.locate(0, "next") == (-1, 0)
+    assert first_args[3] not in b.vh.alloc.mem_objs
+    assert b._retired == []
 
 
 def test_io_fails_once_too_much_memory_is_held(bridge, monkeypatch):
