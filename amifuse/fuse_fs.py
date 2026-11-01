@@ -6965,6 +6965,15 @@ def cmd_mount(args):
 def cmd_format(args):
     """Handle the 'format' subcommand."""
     _validate_driver_path(args.driver)
+    # The handler gets the name as a BSTR, whose length is a single byte, so
+    # a longer name cannot be sent: refuse it before the image is opened.
+    # The length is counted as the BSTR encodes it, one byte per character.
+    # Shorter names are the handler's to judge: FastFileSystem takes at most
+    # 30 characters, PFS3 and SmartFilesystem take 255.
+    length = len(args.volname.encode("latin-1", errors="replace"))
+    if length > 255:
+        raise SystemExit(
+            f"Error: volume name is {length} characters long; at most 255 are allowed.")
 
     format_volume(
         args.image, args.driver, args.block_size,
