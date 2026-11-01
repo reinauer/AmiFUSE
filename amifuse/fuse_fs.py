@@ -1858,7 +1858,9 @@ class HandlerBridge:
     # at most two, so tens of thousands of packets would have to go
     # unanswered before they took that much. That is no long wait: a
     # handler hung in Wait() leaves a packet unanswered after 50 bursts,
-    # under a millisecond, so a busy indexer could get there in minutes.
+    # about half a millisecond to two milliseconds, or up to a second more
+    # when one of its timer requests falls due, so a busy indexer could get
+    # there in minutes.
     # But a cap on them would fail a lookup halfway through a path, or the
     # undo of a rename, with the locks it took still held.
     _RETIRED_MAX = 16 * IO_CHUNK
