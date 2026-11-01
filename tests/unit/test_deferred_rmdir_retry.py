@@ -9,6 +9,9 @@
   deletes; any other entry stays, so the directory is not empty (#168).
 - A deferred delete refused at release() or releasedir() keeps the
   directory hidden only while another retry is coming (#168, #197).
+- A deferred file delete refused at release() shows the file again, and
+  rmdir() defers only behind a pending file that a handle still holds
+  (#222).
 
 The tests drive the real callbacks over small in-memory volumes.
 """
@@ -320,3 +323,83 @@ def test_releasedir_refusal_waits_for_the_release_of_a_pending_child(make_fs):
     assert volume.deleted == ["/d/x", "/d"]
     assert fs._pending_deletes == set()
     assert fs._pending_dir_deletes == {}
+
+
+# A refused deferred file delete shows the file again; rmdir() defers only
+# behind a pending file that a handle still holds (#222)
+
+
+def _hold_alias(fs, volume, path, alias):
+    """A second handle on path's file, opened under another letter case."""
+    handle = _hold(fs, volume, path)
+    fs._fh_cache[handle]["path"] = alias
+    return handle
+
+
+def test_deferred_delete_refused_at_release_shows_the_file(make_fs):
+    fs, volume = make_fs(_InUseVolume, dirs={"/", "/d"}, files={"/d/x"})
+    h1 = _hold(fs, volume, "/d/x")
+    h2 = _hold_alias(fs, volume, "/d/x", "/d/X")
+    assert fs.unlink("/d/x") == 0
+
+    fs.release("/d/x", h1)  # the handle under /d/X keeps it in use
+
+    assert volume.deletes == ["/d/x", "/d/x"]
+    assert volume.deleted == []
+    assert fs._pending_deletes == set()
+    assert _visible(fs, "/d/x")
+
+    fs.release("/d/X", h2)
+    assert _errno_of(fs.rmdir, "/d") == errno.ENOTEMPTY
+    assert fs._pending_deletes == set()
+    assert fs._pending_dir_deletes == {}
+    assert _visible(fs, "/d")
+    assert "/d/x" in volume.files
+
+
+def test_deferred_delete_refused_at_release_shows_the_parents_waiting_on_it(make_fs):
+    fs, volume = make_fs(_InUseVolume, dirs={"/", "/g", "/g/d"}, files={"/g/d/x"})
+    h1 = _hold(fs, volume, "/g/d/x")
+    h2 = _hold_alias(fs, volume, "/g/d/x", "/g/d/X")
+    assert fs.unlink("/g/d/x") == 0
+    assert fs.rmdir("/g/d") == 0
+    assert fs.rmdir("/g") == 0
+
+    fs.release("/g/d/x", h1)
+    fs.release("/g/d/X", h2)
+
+    assert volume.deleted == []
+    assert fs._pending_deletes == set()
+    assert fs._pending_dir_deletes == {}
+    assert _visible(fs, "/g/d/x")
+    assert _visible(fs, "/g/d")
+    assert _visible(fs, "/g")
+
+
+def test_deferred_delete_with_no_reply_at_release_stays_hidden(make_fs):
+    # The handler may still hold the packet, and the delete still happen.
+    fs, volume = make_fs(_InUseVolume, dirs={"/", "/d"}, files={"/d/x"})
+    hx = _hold(fs, volume, "/d/x")
+    assert fs.unlink("/d/x") == 0
+    volume.delete_object = lambda lock, name, **kwargs: (0, -1)
+
+    fs.release("/d/x", hx)
+
+    assert fs._pending_deletes == {"/d/x"}
+    assert not _visible(fs, "/d/x")
+
+
+def test_rmdir_behind_a_pending_file_no_handle_holds_is_not_empty(make_fs):
+    fs, volume = make_fs(_InUseVolume, dirs={"/", "/d"}, files={"/d/x"})
+    hx = _hold(fs, volume, "/d/x")
+    assert fs.unlink("/d/x") == 0
+    no_reply = lambda lock, name, **kwargs: (0, -1)
+    volume.delete_object = no_reply
+    fs.release("/d/x", hx)  # no reply: /d/x stays pending, with no handle
+    assert fs._pending_deletes == {"/d/x"}
+
+    assert _errno_of(fs.rmdir, "/d") == errno.ENOTEMPTY
+
+    assert fs._pending_deletes == {"/d/x"}
+    assert fs._pending_dir_deletes == {}
+    assert _visible(fs, "/d")
