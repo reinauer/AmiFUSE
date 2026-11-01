@@ -413,6 +413,31 @@ class TestMountFuseOptions:
         assert kwargs is not None, "FUSE was not called"
         assert kwargs["foreground"] is False
 
+    @pytest.mark.parametrize("mountpoint, hint", [
+        # On FUSE-T, `amifuse unmount` can't identify a mount started
+        # without --mountpoint, so the banner doesn't offer it there.
+        (None, f"unmount with: umount {Path('/mnt/test')}"),
+        (Path("/Users/me/mnt"), "unmount with: amifuse unmount "),
+    ])
+    def test_darwin_daemon_banner_offers_an_unmount_that_works(
+            self, monkeypatch, mock_mount_fuse_deps, capsys, mountpoint, hint):
+        monkeypatch.setattr("sys.platform", "darwin")
+        import amifuse.platform as plat_mod
+        monkeypatch.setattr(plat_mod, "validate_mountpoint", lambda mp: None)
+        from amifuse.fuse_fs import mount_fuse
+
+        mount_fuse(
+            image=Path("/tmp/test.hdf"),
+            driver=None,
+            mountpoint=mountpoint,
+            block_size=None,
+        )
+
+        out = capsys.readouterr().out
+        assert hint in out
+        if mountpoint is None:
+            assert "amifuse unmount" not in out
+
     def test_mount_defaults_to_daemon_on_windows(self, monkeypatch, mock_mount_fuse_deps):
         """Windows defaults to daemon mode now that unmount is available."""
         monkeypatch.setattr("sys.platform", "win32")
