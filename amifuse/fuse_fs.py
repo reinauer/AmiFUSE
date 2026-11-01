@@ -34,21 +34,36 @@ class FuseOSError(OSError):
         super().__init__(error, os.strerror(error))
 
 
-# In AmigaDOS a colon ends a device or volume name, so the handler would read
-# a host name holding one as another path (#242). Creating such a name gets
-# EINVAL and looking one up gets ENOENT, before any packet. mknod, symlink and
-# link refuse every call already.
+# Host names the handler can't take as typed would name another file. In
+# AmigaDOS a colon ends a device or volume name, so the handler would read a
+# name holding one as another path (#242). The handler takes names in
+# Latin-1, so a character outside it would reach the handler as "?" (#258).
+# Creating such a name gets EINVAL and looking one up gets ENOENT, before any
+# packet. mknod, symlink and link refuse every call already.
 _COLON_CREATE_OPS = frozenset(("create", "mkdir"))
 _COLON_UNCHECKED_OPS = frozenset(("mknod", "symlink", "link"))
 
 
+def _unsendable_path_reason(path):
+    """Why the handler can't take volume path `path` as typed, or None."""
+    if ":" in path:
+        return "a colon ends an AmigaDOS device or volume name"
+    try:
+        path.encode("latin-1")
+    except UnicodeEncodeError as exc:
+        return (f"character U+{ord(path[exc.start]):04X} is outside Latin-1, "
+                "the character set of AmigaDOS names")
+    return None
+
+
 def _colon_path_errno(op, args):
-    """The errno refusing a volume path with a colon in `op`'s args, or None."""
+    """The errno refusing a volume path in `op`'s args that the handler
+    can't take as typed (a colon or a character outside Latin-1), or None."""
     if op in _COLON_UNCHECKED_OPS:
         return None
     paths = args[:2] if op == "rename" else args[:1]
     for index, path in enumerate(paths):
-        if isinstance(path, str) and ":" in path:
+        if isinstance(path, str) and _unsendable_path_reason(path):
             if op in _COLON_CREATE_OPS or (op == "rename" and index == 1):
                 return errno.EINVAL
             return errno.ENOENT
@@ -57,7 +72,7 @@ def _colon_path_errno(op, args):
 
 class _FuseOperations:
     """The fusepy Operations defaults used by AmigaFuseFS, plus the refusal
-    of host names with a colon at dispatch."""
+    at dispatch of host names the handler can't take as typed."""
 
     bmap = None
     lock = None
@@ -6205,10 +6220,34 @@ def _cleanup_bridge(bridge, temp_driver=None):
             pass
 
 
+def _refuse_unsendable_path_args(args, command: str):
+    """Exit with INVALID_ARGUMENT when the volume path a file command takes
+    (`--file`, or `ls`'s `--path`) is one the handler can't take as typed.
+
+    Sent as typed, a colon or a character outside Latin-1 names another file
+    (#257, #258): `write --file T/draft:notes.txt` would empty T/notes.txt.
+    """
+    import json as _json
+
+    for name in ("file", "path"):
+        path = getattr(args, name, None)
+        if not isinstance(path, str):
+            continue
+        reason = _unsendable_path_reason(path)
+        if reason is None:
+            continue
+        message = f"Invalid Amiga path: {path}: {reason}"
+        if getattr(args, "json", False):
+            print(_json.dumps(_json_error(command, "INVALID_ARGUMENT", message)))
+            sys.exit(1)
+        raise SystemExit(f"Error: {message[0].lower()}{message[1:]}")
+
+
 def _create_bridge_from_args(args, command: str, read_only: bool = True):
     """Create a HandlerBridge from CLI arguments.
 
-    Handles driver resolution (RDB extraction or explicit --driver),
+    Refuses a volume path the handler can't take as typed first, then
+    handles driver resolution (RDB extraction or explicit --driver),
     ADF/ISO detection, and JSON error reporting.
 
     Args:
@@ -6227,6 +6266,8 @@ def _create_bridge_from_args(args, command: str, read_only: bool = True):
     """
     import json as _json
     from .rdb_inspect import detect_adf, detect_iso
+
+    _refuse_unsendable_path_args(args, command)
 
     use_json = getattr(args, "json", False)
     image = args.image
@@ -7104,6 +7145,9 @@ def cmd_write(args):
     debug = getattr(args, "debug", False)
     amiga_path = args.file
     host_path = Path(args.input)  # --in maps to args.input (dest="input")
+
+    # Before the source is read and the warning printed; the bridge checks again.
+    _refuse_unsendable_path_args(args, "write")
 
     # Validate host source file. Both checks open the path to stat it, and
     # can fail: a Windows named pipe with no free instance fails is_dir().
