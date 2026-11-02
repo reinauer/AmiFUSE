@@ -452,6 +452,8 @@ def test_sweep_keeps_the_file_of_a_running_process(temp_dir):
     finally:
         proc.communicate(b"\n")
 
+    # On Windows a PID exists for as long as a handle to its process is open.
+    del proc
     fuse_fs._remove_stale_drivers()
     assert not path.exists()
 
