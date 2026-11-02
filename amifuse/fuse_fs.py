@@ -1858,7 +1858,7 @@ class HandlerBridge:
             None, info, "handler reported no disk type or volume node")
 
     def volume_name(self) -> str:
-        """Best-effort name: RDB drive name, else first dir entry, else fallback."""
+        """Best-effort name: the root's, else the opened partition's, else fallback."""
         with self._lock:
             if self._volname:
                 return self._volname
@@ -1880,23 +1880,23 @@ class HandlerBridge:
                     self.free_lock(root_lock)
             except Exception:
                 pass
-            # try RDB partition name
+            # try the name of the partition the backend opened
             try:
-                if self.backend.rdb and self.backend.rdb.parts:
-                    name = self.backend.rdb.parts[0].part_blk.drv_name
-                    if name:
-                        # drv_name is an FSString; callers expect a str
-                        # (verify --json serializes it).
-                        self._volname = str(name)
-                        return self._volname
+                part = None
+                if self.backend.rdb:
+                    # No number: the backend opened the first partition.
+                    part = self.backend.rdb.get_partition(
+                        self.backend.partition_number or 0)
+                if part is not None:
+                    # An FSString is true even when empty, and None for a
+                    # damaged name; callers expect a str (verify --json
+                    # serializes it).
+                    name = part.get_drive_name()
+                    self._volname = (str(name) if name is not None else ""
+                                     ) or f"#{part.num}"
+                    return self._volname
             except Exception:
                 pass
-            # try root listing
-            entries = self.list_dir(0)
-            for ent in entries:
-                if ent.get("name"):
-                    self._volname = ent["name"]
-                    return ent["name"]
             self._volname = "AmigaFS"
             return self._volname
 
