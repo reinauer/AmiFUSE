@@ -1720,11 +1720,14 @@ def main(argv=None):
 
     if args.json:
         # JSON mode: collect all RDBs into a single JSON structure,
-        # skipping RDBs that fail to open.
+        # skipping RDBs that fail to open, unless none opens.
         all_rdbs = []
-        count = len(amiga_rdb_partitions(args.image))
-        for _rdb_idx, opened in open_each_rdb(args.image, args.block_size, count):
+        failures = []
+        amiga_parts = amiga_rdb_partitions(args.image)
+        for rdb_idx, opened in open_each_rdb(args.image, args.block_size,
+                                             len(amiga_parts)):
             if isinstance(opened, IOError):
+                failures.append((rdb_idx, opened))
                 continue
             blkdev, rdisk, mbr_ctx = opened
             try:
@@ -1732,6 +1735,13 @@ def main(argv=None):
             finally:
                 rdisk.close()
                 blkdev.close()
+        if not all_rdbs:
+            if len(failures) == 1:
+                raise SystemExit(f"Error: {failures[0][1]}")
+            raise SystemExit("\n".join(
+                [f"Error: {_no_rdb_opens_message(args.image)}"]
+                + [f"{rdb_label(amiga_parts, rdb_idx)}: {error}"
+                   for rdb_idx, error in failures]))
         if len(all_rdbs) == 1:
             print(json.dumps(all_rdbs[0], indent=2))
         else:
