@@ -1,6 +1,6 @@
 """timer.device under real handlers: replies at the deadline, while idle.
 
-Each fixture handler writes a file through the bridge while the mount's
+Each handler writes a file through the bridge while the mount's
 timer thread runs, as it does in a mount, and must read it back from the
 image afterwards. The handlers arm timers after a write (PFS3 and SFS to
 write back, FFS too), so each must see deliveries, and the image must
@@ -22,13 +22,19 @@ from collections import Counter
 
 import pytest
 
+from amitools.fs import DosType
+
+from tests.fixtures.images import make_adf
+from tests.fixtures.paths import BUNDLED_FFS
+
 pytestmark = pytest.mark.integration
 
-# (handler, image): every fixture handler with a writable fixture image.
+# (handler, image): every fixture handler with a writable fixture image, and
+# the bundled FastFileSystem on an OFS floppy built here.
 CASES = [
     ("pfs3aio", "pfs.hdf"),
     ("SmartFilesystem", "sfs.hdf"),
-    ("FastFileSystem", "ofs.adf"),
+    pytest.param(None, None, id="bundled-FastFileSystem", marks=pytest.mark.no_fixtures),
 ]
 DATA = bytes(range(256)) * 300  # 76,800 bytes: several blocks, two packets
 
@@ -70,9 +76,13 @@ def timer_probe(monkeypatch):
     return counts, devices
 
 
-def _setup(fixture_root, tmp_path, driver_name, image_name):
+def _setup(request, tmp_path, driver_name, image_name):
     from amifuse.rdb_inspect import detect_adf
 
+    if driver_name is None:
+        image = make_adf(tmp_path / "ofs.adf", DosType.DOS0)
+        return image, BUNDLED_FFS, detect_adf(image)
+    fixture_root = request.getfixturevalue("fixture_root")
     driver = fixture_root / "drivers" / driver_name
     source = fixture_root / "fixtures" / "readonly" / image_name
     if not driver.exists() or not source.exists():
@@ -114,13 +124,13 @@ def _read_back(image, driver, adf_info, path):
 
 
 @pytest.mark.parametrize("driver_name, image_name", CASES)
-def test_idle_mount_delivers_timers(fixture_root, tmp_path, timer_probe,
+def test_idle_mount_delivers_timers(request, tmp_path, timer_probe,
                                     driver_name, image_name):
     """While the mount idles after a write, the handler's timers fire."""
     from amifuse.exec_library import AmiFuseExecLibrary
     from amifuse.fuse_fs import AmigaFuseFS, HandlerBridge
 
-    image, driver, adf_info = _setup(fixture_root, tmp_path, driver_name, image_name)
+    image, driver, adf_info = _setup(request, tmp_path, driver_name, image_name)
     counts, devices = timer_probe
     bridge = HandlerBridge(image, driver, read_only=False, adf_info=adf_info)
     # The device counts DoIO and WaitIO only under AmiFUSE's Exec.
@@ -149,7 +159,7 @@ def test_idle_mount_delivers_timers(fixture_root, tmp_path, timer_probe,
 
 
 @pytest.mark.parametrize("driver_name, image_name", CASES)
-def test_flush_with_a_timer_pending(fixture_root, tmp_path, driver_name, image_name):
+def test_flush_with_a_timer_pending(request, tmp_path, driver_name, image_name):
     """An unmount right after a write flushes while a timer is pending.
 
     SFS then aborts its write-back timer with AbortIO and WaitIO before
@@ -157,7 +167,7 @@ def test_flush_with_a_timer_pending(fixture_root, tmp_path, driver_name, image_n
     """
     from amifuse.fuse_fs import AmigaFuseFS, HandlerBridge
 
-    image, driver, adf_info = _setup(fixture_root, tmp_path, driver_name, image_name)
+    image, driver, adf_info = _setup(request, tmp_path, driver_name, image_name)
     bridge = HandlerBridge(image, driver, read_only=False, adf_info=adf_info)
     fs = AmigaFuseFS(bridge)
     fs.init("/")

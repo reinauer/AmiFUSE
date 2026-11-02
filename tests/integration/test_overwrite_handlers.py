@@ -21,12 +21,12 @@ import pytest
 
 from amifuse.fuse_fs import AmigaFuseFS, FuseOSError, HandlerBridge
 from amifuse.rdb_inspect import detect_adf
+from tests.fixtures.paths import BUNDLED_FFS
 
 pytestmark = pytest.mark.integration
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 AMITOOLS_ROOT = REPO_ROOT / "amitools"
-BUNDLED_FFS = REPO_ROOT / "amifuse" / "drivers" / "FastFileSystem.OS3"
 
 OLD = bytes((i * 7) % 251 for i in range(3000))
 NEW = b"new data\n" * 11
@@ -35,7 +35,8 @@ HANDLERS = [
     ("pfs.hdf", "pfs3aio"),
     ("sfs.hdf", "SmartFilesystem"),
     ("ofs.adf", "FastFileSystem"),
-    ("bundled", "FastFileSystem.OS3"),
+    pytest.param(("bundled", "FastFileSystem.OS3"), marks=pytest.mark.no_fixtures,
+                 id="bundled-FastFileSystem.OS3"),
 ]
 
 
@@ -49,12 +50,13 @@ def _bundled_image(tmp_path):
     return image, BUNDLED_FFS
 
 
-@pytest.fixture(params=HANDLERS, ids=[f"{i}-{d}" for i, d in HANDLERS])
-def ops(request, fixture_root, tmp_path):
+@pytest.fixture(params=HANDLERS, ids=lambda handler: f"{handler[0]}-{handler[1]}")
+def ops(request, tmp_path):
     image_name, driver_name = request.param
     if image_name == "bundled":
         image, driver = _bundled_image(tmp_path)
     else:
+        fixture_root = request.getfixturevalue("fixture_root")
         source = fixture_root / "fixtures" / "readonly" / image_name
         driver = fixture_root / "drivers" / driver_name
         if not source.exists() or not driver.exists():

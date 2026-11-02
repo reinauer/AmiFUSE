@@ -1,4 +1,8 @@
-"""A real handler startup refusal must preserve the disk diagnosis."""
+"""A real handler startup refusal must preserve the disk diagnosis.
+
+FastFileSystem 47.4 refuses this disk at startup. The bundled handler starts
+and reports a disk that isn't DOS, so it can't stand in for 47.4 here.
+"""
 
 import json
 import shutil

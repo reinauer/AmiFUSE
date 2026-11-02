@@ -5,15 +5,20 @@ as a packet whose wait ran out, so that its reply comes during the next
 call's wait, which drops it. The handler takes the lock and refuses the
 delete in the same burst with ERROR_OBJECT_IN_USE. Once the bridge frees
 the dropped lock, the next delete of the file succeeds. Runs on a copy of
-each fixture image; no host FUSE driver is needed.
+a fixture image and on a floppy built here for the bundled FastFileSystem;
+no host FUSE driver is needed.
 """
 
 import shutil
 
 import pytest
 
+from amitools.fs import DosType
+
 from amifuse.fuse_fs import HandlerBridge
 from amifuse.rdb_inspect import detect_adf
+from tests.fixtures.images import make_adf
+from tests.fixtures.paths import BUNDLED_FFS
 
 pytestmark = pytest.mark.integration
 
@@ -22,16 +27,22 @@ ERROR_OBJECT_IN_USE = 202
 
 @pytest.mark.parametrize("image_name, driver_name, name", [
     ("pfs.hdf", "pfs3aio", "foo.md"),
-    ("ofs.adf", "FastFileSystem", "OFS_README.txt"),
+    pytest.param(None, None, "probe.txt", id="bundled-FastFileSystem",
+                 marks=pytest.mark.no_fixtures),
 ])
-def test_a_dropped_late_lock_is_freed(fixture_root, tmp_path, image_name,
+def test_a_dropped_late_lock_is_freed(request, tmp_path, image_name,
                                       driver_name, name):
-    source = fixture_root / "fixtures" / "readonly" / image_name
-    driver = fixture_root / "drivers" / driver_name
-    if not source.exists() or not driver.exists():
-        pytest.skip(f"Missing {image_name} or {driver_name}")
-    image = tmp_path / image_name
-    shutil.copy2(source, image)
+    if image_name is None:
+        image = make_adf(tmp_path / "ofs.adf", DosType.DOS0, {name: b"probe"})
+        driver = BUNDLED_FFS
+    else:
+        fixture_root = request.getfixturevalue("fixture_root")
+        source = fixture_root / "fixtures" / "readonly" / image_name
+        driver = fixture_root / "drivers" / driver_name
+        if not source.exists() or not driver.exists():
+            pytest.skip(f"Missing {image_name} or {driver_name}")
+        image = tmp_path / image_name
+        shutil.copy2(source, image)
     bridge = HandlerBridge(image, driver, read_only=False, adf_info=detect_adf(image))
     try:
         root, _ = bridge.locate(0, "")

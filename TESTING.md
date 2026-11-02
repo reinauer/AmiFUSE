@@ -478,6 +478,7 @@ pytest tests/integration/ -v
 | `slow` | Slow tests (deselect with `-m "not slow"`) |
 | `fuse` | Requires FUSE/WinFSP kernel driver |
 | `integration` | Requires external fixtures and machine68k |
+| `no_fixtures` | An `integration` test on the bundled FastFileSystem and an image from `tests/fixtures/images.py`: needs machine68k but no external fixtures |
 | `windows` / `macos` / `linux` | Platform-specific tests |
 
 ### CI (GitHub Actions)

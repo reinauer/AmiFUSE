@@ -36,15 +36,17 @@ def _make_ffs_adf(path):
     blkdev.close()
 
 
-@pytest.mark.parametrize("handler", ["FastFileSystem", "bundled"])
-def test_failed_write_on_full_volume_is_undone(fixture_root, tmp_path, handler):
+@pytest.mark.parametrize("handler", [
+    "FastFileSystem", pytest.param("bundled", marks=pytest.mark.no_fixtures),
+])
+def test_failed_write_on_full_volume_is_undone(request, tmp_path, handler):
     """With about 31 KiB left, a write of IO_CHUNK bytes at the end of a
     1000-byte file fails with ENOSPC and frees what it took, getattr()
     reports 1000 bytes, and an append there lands at the end of file."""
     if handler == "bundled":
         driver = BUNDLED_DRIVER
     else:
-        driver = fixture_root / "drivers" / handler
+        driver = request.getfixturevalue("fixture_root") / "drivers" / handler
         if not driver.exists():
             pytest.skip(f"{handler} handler not found")
     image = tmp_path / "full.adf"

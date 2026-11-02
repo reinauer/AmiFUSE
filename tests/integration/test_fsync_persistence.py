@@ -9,9 +9,12 @@ import shutil
 
 import pytest
 
+from amitools.fs import DosType
+
 from amifuse.fuse_fs import AmigaFuseFS, HandlerBridge
 from amifuse.rdb_inspect import detect_adf
-from tests.fixtures.paths import FFS_DRIVER
+from tests.fixtures.images import make_adf
+from tests.fixtures.paths import BUNDLED_FFS
 
 pytestmark = pytest.mark.integration
 
@@ -48,16 +51,14 @@ def _read_back(image, driver):
         bridge.close()
 
 
-@pytest.fixture(params=["pfs3", "ofs"])
+@pytest.fixture(params=["pfs3", pytest.param("ofs", marks=pytest.mark.no_fixtures)])
 def writable_image(request, tmp_path):
     if request.param == "pfs3":
         image = request.getfixturevalue("pfs3_image")
         driver = request.getfixturevalue("pfs3_driver")
     else:
-        image = request.getfixturevalue("ofs_adf_image")
-        if FFS_DRIVER is None or not FFS_DRIVER.exists():
-            pytest.skip("FastFileSystem handler not found")
-        driver = FFS_DRIVER
+        image = make_adf(tmp_path / "ofs.adf", DosType.DOS0)
+        driver = BUNDLED_FFS
     work = tmp_path / ("work" + image.suffix)
     shutil.copy2(image, work)
     return work, driver

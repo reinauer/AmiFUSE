@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+BUNDLED_FFS = REPO_ROOT / "amifuse" / "drivers" / "FastFileSystem.OS3"
 
 
 def _resolve_fixture_root() -> Path | None:
@@ -48,5 +49,3 @@ READONLY_DIR = FIXTURE_ROOT / "fixtures" / "readonly" if FIXTURE_ROOT else None
 # Specific fixture files used by integration tests
 PFS3AIO = DRIVERS_DIR / "pfs3aio" if DRIVERS_DIR else None
 PFS3_HDF = READONLY_DIR / "pfs.hdf" if READONLY_DIR else None
-OFS_ADF = READONLY_DIR / "ofs.adf" if READONLY_DIR else None
-FFS_DRIVER = DRIVERS_DIR / "FastFileSystem" if DRIVERS_DIR else None

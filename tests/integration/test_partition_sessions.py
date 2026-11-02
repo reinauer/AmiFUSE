@@ -15,6 +15,8 @@ from amitools.fs.blkdev.DiskGeometry import DiskGeometry
 from amitools.fs.blkdev.RawBlockDevice import RawBlockDevice
 from amitools.fs.rdb.RDisk import RDisk
 
+from tests.fixtures.paths import BUNDLED_FFS
+
 pytestmark = pytest.mark.integration
 
 WORKER = """
@@ -63,13 +65,17 @@ def wait_unmounted(proc):
 
 
 @pytest.fixture(params=[("pfs3aio", 0x50465303),
-                       ("FastFileSystem", 0x444f5301),
+                       pytest.param((None, 0x444f5301), id="bundled-FastFileSystem",
+                                    marks=pytest.mark.no_fixtures),
                        ("SmartFilesystem", 0x53465300)])
-def partition_image(request, fixture_root, tmp_path):
+def partition_image(request, tmp_path):
     name, dos_type = request.param
-    driver = fixture_root / "drivers" / name
-    if not driver.exists():
-        pytest.skip(f"Missing handler {name}")
+    if name is None:
+        driver = BUNDLED_FFS
+    else:
+        driver = request.getfixturevalue("fixture_root") / "drivers" / name
+        if not driver.exists():
+            pytest.skip(f"Missing handler {name}")
     image = tmp_path / "two.hdf"
     raw = RawBlockDevice(str(image), read_only=False)
     with ExitStack() as cleanup:
@@ -140,6 +146,8 @@ def test_concurrent_handler_writes_persist(partition_image, tmp_path):
             proc.communicate(timeout=5)
 
 
+# FastFileSystem 47.4: its create fails on the rejected read. The bundled
+# handler's goes on and returns a handle, so nothing here would recover.
 @pytest.mark.parametrize("partition_image", [("FastFileSystem", 0x444f5301)],
                          indirect=True)
 def test_handler_recovers_after_range_error(partition_image):
