@@ -333,6 +333,23 @@ def test_format_rdb_partition_without_driver(tmp_path, no_user_driver):
     assert "Fresh" in listing and "DOS3" in listing
 
 
+def test_unformatted_partition_keeps_its_own_name(tmp_path, no_user_driver):
+    """An unformatted DH1 has no volume name, and isn't given DH0's."""
+    image = tmp_path / "disk.hdf"
+    _amitool(
+        "amitools.tools.rdbtool", str(image),
+        "create", "size=16Mi", "+", "init", "rdb_cyls=2",
+        "+", "add", "size=6MiB", "name=DH0", "fs=DOS3",
+        "+", "add", "size=6MiB", "name=DH1", "fs=DOS3",
+    )
+    resolved = resolve_driver(image, None, None, "DH1")
+    bridge = HandlerBridge(image, resolved.path, partition="DH1")
+    try:
+        assert bridge.volume_name() == "DH1"
+    finally:
+        bridge.close()
+
+
 def test_partition_beyond_4gib(tmp_path, no_user_driver, capsys):
     """A DOS3 partition that ends past 4 GiB formats, writes and reads back.
 

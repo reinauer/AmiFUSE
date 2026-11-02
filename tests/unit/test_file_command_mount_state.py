@@ -233,6 +233,53 @@ def test_crash_during_the_command_is_an_error(command_context, capsys, command, 
     assert output.read_bytes() == b"keep existing output"
 
 
+def _backend(drive_names, partition_number=None):
+    parts = [SimpleNamespace(num=num, get_drive_name=lambda name=name: name)
+             for num, name in enumerate(drive_names)]
+    return SimpleNamespace(
+        partition_number=partition_number,
+        rdb=SimpleNamespace(
+            get_partition=lambda n: parts[n] if n < len(parts) else None))
+
+
+def _bridge_without_a_root_name(backend):
+    """A bridge whose examine of the root fails, on ``backend``."""
+    bridge = object.__new__(fs.HandlerBridge)
+    bridge._lock = threading.RLock()
+    bridge._volname = None
+    bridge._alloc_fib = Mock(side_effect=RuntimeError("no reply"))
+    # The root's entries are not volume names.
+    bridge.list_dir = Mock(return_value=[{"name": "Devs"}])
+    bridge.backend = backend
+    return bridge
+
+
+def test_volume_name_falls_back_to_the_opened_partition():
+    from amitools.fs.FSString import FSString
+
+    backend = _backend([FSString("DH0"), FSString("DH1")], partition_number=1)
+    assert _bridge_without_a_root_name(backend).volume_name() == "DH1"
+
+
+@pytest.mark.parametrize("empty", ["fsstring", None])
+def test_volume_name_of_a_partition_without_a_drive_name(empty):
+    """An empty or damaged name gets the label inspect gives that partition."""
+    from amitools.fs.FSString import FSString
+
+    name = FSString("") if empty else None
+    backend = _backend([FSString("DH0"), name], partition_number=1)
+    assert _bridge_without_a_root_name(backend).volume_name() == "#1"
+
+
+@pytest.mark.parametrize("backend", [
+    SimpleNamespace(partition_number=None, rdb=None),
+    SimpleNamespace(partition_number=None,
+                    rdb=SimpleNamespace(get_partition=lambda n: None)),
+], ids=["no-rdb", "no-partition"])
+def test_volume_name_never_comes_from_the_root_listing(backend):
+    assert _bridge_without_a_root_name(backend).volume_name() == "AmigaFS"
+
+
 def test_volume_name_from_the_rdb_is_a_str():
     """verify --json serializes the name; an FSString fails json.dumps."""
     from amitools.fs.FSString import FSString
@@ -241,8 +288,7 @@ def test_volume_name_from_the_rdb_is_a_str():
     bridge._lock = threading.RLock()
     bridge._volname = None
     bridge._alloc_fib = Mock(side_effect=RuntimeError("no reply"))
-    part = SimpleNamespace(part_blk=SimpleNamespace(drv_name=FSString("DH0")))
-    bridge.backend = SimpleNamespace(rdb=SimpleNamespace(parts=[part]))
+    bridge.backend = _backend([FSString("DH0")])
     name = bridge.volume_name()
     assert type(name) is str
     assert json.dumps(name) == '"DH0"'
