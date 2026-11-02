@@ -64,9 +64,9 @@ def test_a_name_outside_latin1_leaves_the_question_mark_file(tmp_path):
                            read_only=False, adf_info=detect_adf(image))
     ops = AmigaFuseFS(bridge)
     try:
-        # The decomposed accent ("e" and U+0301, as macOS can pass "café")
-        # would reach the handler as "cafe?.txt".
-        for name in ("/a€.txt", "/a™.txt", "/café.txt"):
+        # "q" and U+0301 has no composed form, and would reach the handler
+        # as "q?.txt".
+        for name in ("/a€.txt", "/a™.txt", "/q́.txt"):
             assert _errno_of(ops, "getattr", name, None) == errno.ENOENT
             assert _errno_of(ops, "open", name, os.O_RDONLY) == errno.ENOENT
             assert _errno_of(ops, "create", name, 0o644) == errno.EINVAL
@@ -88,6 +88,59 @@ def test_a_name_outside_latin1_leaves_the_question_mark_file(tmp_path):
     for name in ("a?.txt", "cafe?.txt"):
         _xdftool(image, "read", name, str(tmp_path / "back.bin"))
         assert (tmp_path / "back.bin").read_bytes() == OLD
+
+
+def _names(ops):
+    return sorted(n for n in ops("readdir", "/", None) if n not in (".", ".."))
+
+
+def test_a_decomposed_name_is_one_composed_name_on_the_volume(tmp_path):
+    """Both spellings reach one object, and only the composed one is listed."""
+    from tests.integration.conftest import _machine68k_works
+
+    if not _machine68k_works():
+        pytest.skip("machine68k CPU not functional")
+    nfd, nfc = "/cafe\u0301.txt", "/caf\xe9.txt"
+    image = tmp_path / "disk.adf"
+    old = tmp_path / "old.txt"
+    old.write_bytes(OLD)
+    _xdftool(image, "create", "+", "format", "Seed", "DOS3",
+             "+", "write", str(old), "cafe?.txt")
+
+    bridge = HandlerBridge(image, driver_resolver.BUNDLED_DRIVER,
+                           read_only=False, adf_info=detect_adf(image))
+    ops = AmigaFuseFS(bridge)
+    try:
+        fh = ops("create", nfd, 0o644)
+        ops("write", nfd, NOTES, 0, fh)
+        ops("release", nfd, fh)
+        assert _names(ops) == ["cafe?.txt", nfc[1:]]
+        assert ops("getattr", nfd, None)["st_size"] == len(NOTES)
+        assert ops("getattr", nfc, None)["st_size"] == len(NOTES)
+
+        ops("rename", nfc, nfd)
+        assert _names(ops) == ["cafe?.txt", nfc[1:]]
+
+        ops("rename", nfd, "/nai\u0308ve.txt")
+        assert _names(ops) == ["cafe?.txt", "na\xefve.txt"]
+        assert _errno_of(ops, "getattr", nfd, None) == errno.ENOENT
+        ops("rename", "/na\xefve.txt", nfd)
+
+        # A delete through one spelling leaves no cached entry for the other.
+        ops("unlink", nfc)
+        assert _errno_of(ops, "getattr", nfd, None) == errno.ENOENT
+        assert _names(ops) == ["cafe?.txt"]
+
+        fh = ops("create", nfd, 0o644)
+        ops("write", nfd, NOTES, 0, fh)
+        ops("release", nfd, fh)
+    finally:
+        ops("destroy", "/")
+
+    _xdftool(image, "read", "caf\xe9.txt", str(tmp_path / "back.bin"))
+    assert (tmp_path / "back.bin").read_bytes() == NOTES
+    _xdftool(image, "read", "cafe?.txt", str(tmp_path / "back.bin"))
+    assert (tmp_path / "back.bin").read_bytes() == OLD
 
 
 @pytest.fixture
@@ -113,6 +166,19 @@ def _refused(func, args, path):
         func(args)
     message = str(exc_info.value.code)
     assert message.startswith("Error: ") and path in message
+
+
+@pytest.mark.integration
+def test_file_commands_take_a_decomposed_name(pfs_args, tmp_path):
+    source = tmp_path / "source.txt"
+    source.write_bytes(NOTES)
+
+    fuse_fs.cmd_write(pfs_args(file="T/cafe\u0301.txt", input=str(source)))
+
+    for spelling in ("T/cafe\u0301.txt", "T/caf\xe9.txt"):
+        back = tmp_path / "back.bin"
+        fuse_fs.cmd_read(pfs_args(file=spelling, out=str(back)))
+        assert back.read_bytes() == NOTES
 
 
 @pytest.mark.integration

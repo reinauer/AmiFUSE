@@ -177,6 +177,16 @@ def test_file_replaces_a_file(make_fs):
     assert volume.objects == {"/": DIR, "/b": b"new"}
 
 
+def test_two_spellings_of_one_name_leave_it_as_it_is(make_fs):
+    """Through dispatch they arrive equal. A handler may call the name taken."""
+    fs, volume = make_fs({"/caf\xe9": b"data"})
+
+    assert fs("rename", "/caf\xe9", "/cafe\u0301") == 0
+
+    assert volume.objects == {"/": DIR, "/caf\xe9": b"data"}
+    assert volume.renames == []
+
+
 def test_refused_rename_puts_the_target_back(make_fs):
     fs, volume = make_fs({"/a": b"new", "/b": b"old"})
     volume.refuse[("a", "b")] = [None, ERROR_DISK_FULL]

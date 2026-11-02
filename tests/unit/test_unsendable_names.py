@@ -6,16 +6,20 @@ colon would end the name early, so either names another file. fusepy's
 dispatch refuses such a path (a lookup gets ENOENT, a new name EINVAL), and
 the file commands (ls, verify, hash, read, write) refuse it with
 INVALID_ARGUMENT before the handler starts.
+
+A name counts in NFC (#321): "e" and U+0301, as macOS can pass "café", is
+Latin-1 once composed.
 """
 
 import errno
 import json
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
 from amifuse import fuse_fs
-from amifuse.fuse_fs import FuseOSError, _FuseOperations
+from amifuse.fuse_fs import FuseOSError, HandlerBridge, _FuseOperations
 
 
 class _Recorder(_FuseOperations):
@@ -67,10 +71,10 @@ def _errno_of(ops, op, *args):
 
 # Each would reach the handler with "?" in place of a character: the euro
 # sign, a curly quote, an en dash, a CJK character, a lone surrogate (an
-# undecodable byte in a POSIX file name), and a decomposed accent ("e" and
-# U+0301, as macOS can pass "café"), which is refused, not normalized.
+# undecodable byte in a POSIX file name), and an accent with no composed form
+# ("q" and U+0301).
 NON_LATIN1 = ["/a€.txt", "/a’.txt", "/a–.txt", "/a中.txt",
-              "/a\udce9.txt", "/café.txt"]
+              "/a\udce9.txt", "/q́.txt"]
 
 
 @pytest.mark.parametrize("path", NON_LATIN1)
@@ -98,6 +102,41 @@ def test_dispatch_still_passes_latin1_names():
     assert ops("create", "/café.txt", 0o644) == 0
     assert ops("rename", "/café.txt", "/naïve.txt") == 0
     assert [call[0] for call in ops.calls] == ["getattr", "create", "rename"]
+
+
+def test_dispatch_composes_a_decomposed_name():
+    ops = _Recorder()
+
+    assert ops("getattr", "/cafe\u0301.txt", None) == 0
+    assert ops("create", "/cafe\u0301.txt", 0o644) == 0
+    assert ops("mkdir", "/A\u030a/b", 0o755) == 0
+    assert ops("rename", "/cafe\u0301.txt", "/nai\u0308ve.txt") == 0
+
+    assert ops.calls == [
+        ("getattr", ("/caf\xe9.txt", None)),
+        ("create", ("/caf\xe9.txt", 0o644)),
+        ("mkdir", ("/\xc5/b", 0o755)),
+        ("rename", ("/caf\xe9.txt", "/na\xefve.txt")),
+    ]
+
+
+def test_alloc_bstr_composes_a_name_and_refuses_the_rest():
+    bridge = HandlerBridge.__new__(HandlerBridge)
+    bridge.vh = SimpleNamespace(alloc=MagicMock())
+    bridge.vh.alloc.alloc_memory.return_value = SimpleNamespace(addr=0x3000, size=16)
+    bridge.mem = MagicMock()
+    bridge._bstr_ring = [None] * 8
+    bridge._bstr_sizes = [0] * 8
+    bridge._bstr_ring_size = 8
+    bridge._bstr_index = 0
+    bridge._held_args = lambda: set()
+
+    bridge._alloc_bstr("cafe\u0301")
+
+    bridge.mem.w_block.assert_called_once_with(0x3000, b"\x04caf\xe9\x00")
+    with pytest.raises(UnicodeEncodeError):
+        bridge._alloc_bstr("a\u20ac")
+    assert bridge.mem.w_block.call_count == 1
 
 
 # --- The file commands -------------------------------------------------------
@@ -173,6 +212,15 @@ def test_file_command_refuses_the_path_as_text(no_handler, tmp_path, command,
     assert message.startswith("Error: ")
     assert path in message
     assert reason in message
+
+
+@pytest.mark.parametrize("command", COMMANDS)
+def test_file_command_takes_a_decomposed_path(no_handler, tmp_path, command):
+    """It passes the check, and goes on to start the handler."""
+    func, extra = _commands(tmp_path, "T/cafe\u0301.txt")[command]
+
+    with pytest.raises(AssertionError, match="the handler was started"):
+        func(_args(tmp_path, False, **extra))
 
 
 def test_write_refuses_the_path_before_reading_the_source(no_handler, tmp_path,

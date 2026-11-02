@@ -18,6 +18,7 @@ import subprocess
 import sys
 import threading
 import time
+import unicodedata
 
 from enum import Enum
 from pathlib import Path
@@ -41,12 +42,18 @@ class FuseOSError(OSError):
 # Latin-1, so a character outside it would reach the handler as "?" (#258).
 # Creating such a name gets EINVAL and looking one up gets ENOENT, before any
 # packet. mknod, symlink and link refuse every call already.
+#
+# A name counts in NFC. macOS can pass "cafe" and U+0301, and only the composed
+# form fits Latin-1. Names the handler lists are NFC, as Latin-1 text always
+# is, so both spellings of a host name are one object on the volume, and
+# readdir shows the composed one.
 _COLON_CREATE_OPS = frozenset(("create", "mkdir"))
 _COLON_UNCHECKED_OPS = frozenset(("mknod", "symlink", "link"))
 
 
 def _unsendable_path_reason(path):
     """Why the handler can't take volume path `path` as typed, or None."""
+    path = unicodedata.normalize("NFC", path)
     if ":" in path:
         return "a colon ends an AmigaDOS device or volume name"
     try:
@@ -55,6 +62,20 @@ def _unsendable_path_reason(path):
         return (f"character U+{ord(path[exc.start]):04X} is outside Latin-1, "
                 "the character set of AmigaDOS names")
     return None
+
+
+def _nfc_path_args(op, args):
+    """`args` with the volume paths of `op` in NFC.
+
+    At dispatch, so that the path caches and the handle table, which are
+    keyed on the path, see one spelling of a name.
+    """
+    if op in _COLON_UNCHECKED_OPS:
+        return args
+    count = 2 if op == "rename" else 1
+    return tuple(unicodedata.normalize("NFC", arg)
+                 if index < count and isinstance(arg, str) else arg
+                 for index, arg in enumerate(args))
 
 
 def _colon_path_errno(op, args):
@@ -81,6 +102,7 @@ class _FuseOperations:
     def __call__(self, op, *args):
         if not hasattr(self, op):
             raise FuseOSError(errno.EFAULT)
+        args = _nfc_path_args(op, args)
         error = _colon_path_errno(op, args)
         if error is not None:
             raise FuseOSError(error)
@@ -1484,7 +1506,8 @@ class HandlerBridge:
         return self._datestamp_mem
 
     def _alloc_bstr(self, text: str):
-        encoded = text.encode("latin-1", errors="replace")
+        # Strict: a name past the checks fails here, not as another file.
+        encoded = unicodedata.normalize("NFC", text).encode("latin-1")
         if len(encoded) > 255:
             encoded = encoded[:255]
         # Keep one trailing NUL byte so handlers can temporarily treat the
@@ -4028,6 +4051,11 @@ class AmigaFuseFS(_FuseOperations):
         _, dst_name = self._split_path(new)
         if not src_name or not dst_name:
             raise FuseOSError(errno.EINVAL)
+        # Two spellings of one name reach here equal: to rename(2) that is
+        # one file, which stays as it is, and a handler may call it taken.
+        if old == new:
+            self.getattr(old)
+            return 0
         res1, res2 = self._rename_object(old, new)
         # AmigaDOS renames onto no existing name, while rename(2) replaces
         # one, and editors save by renaming a new file over the old one.
