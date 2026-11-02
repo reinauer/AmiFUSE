@@ -190,7 +190,8 @@ class BlockDeviceBackend:
         start = env.low_cyl * cyl_blocks
         end = (env.high_cyl + 1) * cyl_blocks
         reserved_end = self.rdb.rdb.log_drv.rdb_blk_hi + 1
-        name = part.get_drive_name()
+        from .rdb_inspect import partition_label
+        name = partition_label(part)
         if env.surfaces <= 0 or env.blk_per_trk <= 0 or end <= start:
             raise ValueError(f"Partition {name} has invalid geometry")
         if (start < reserved_end

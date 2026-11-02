@@ -4867,7 +4867,7 @@ def get_partition_info(image: Path, block_size: Optional[int], partition: Option
     reads as None, is named by the partition's number: #0. The block size
     is the partition's own (de_SizeBlock), which the handler uses.
     """
-    from .rdb_inspect import open_rdisk, find_partition
+    from .rdb_inspect import open_rdisk, find_partition, partition_label
     ref = find_partition(image, block_size, partition) if partition else None
     mbr_idx = ref.mbr_partition_index if ref else None
     blkdev, rdisk, _mbr_ctx = open_rdisk(image, block_size=block_size, mbr_partition_index=mbr_idx)
@@ -4878,15 +4878,8 @@ def get_partition_info(image: Path, block_size: Optional[int], partition: Option
             part = rdisk.get_partition(ref.number) if ref else None
         if part is None:
             return {"name": "AmigaFS", "dostype": None, "block_size": None}
-        drive_name = part.get_drive_name()
-        if ref and ref.name:
-            name = ref.name
-        elif drive_name is not None:
-            name = str(drive_name)
-        else:
-            name = f"#{part.num}"
         return {
-            "name": name,
+            "name": ref.name if ref and ref.name else partition_label(part),
             "dostype": part.part_blk.dos_env.dos_type,
             "block_size": part.part_blk.dos_env.block_size * 4,
         }
@@ -4931,7 +4924,7 @@ def extract_embedded_driver(
     picked in its place.
     """
     import tempfile
-    from .rdb_inspect import open_rdisk, find_partition
+    from .rdb_inspect import open_rdisk, find_partition, partition_label
 
     ref = find_partition(image, block_size, partition) if partition else None
     mbr_idx = ref.mbr_partition_index if ref else None
@@ -4983,7 +4976,7 @@ def extract_embedded_driver(
         if damaged:
             known = any(dos_type == target_dostype for dos_type, _ in damaged)
             raise DriverNotFound(
-                f"Partition {part.get_drive_name()} ({dt_str}) "
+                f"Partition {partition_label(part)} ({dt_str}) "
                 f"{'has' if known else 'may have'} a damaged filesystem driver "
                 f"in its RDB: {'; '.join(warning for _, warning in damaged)}.\n"
                 "AmiFUSE does not use another driver in its place; "
