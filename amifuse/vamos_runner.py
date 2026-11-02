@@ -43,6 +43,21 @@ def _ensure_vamos_logging(levels):
     _LOG_SETUP_DONE = True
 
 
+def end_task(scheduler, task):
+    """End a task that the scheduler still has.
+
+    rem_task() throws TaskStop into the task's greenlet, which unwinds its
+    wait and the library call it waits in, and the task takes itself out of
+    the scheduler. Only a greenlet that has started and not ended can take
+    that: for any other, greenlet raises TaskStop straight back here, so the
+    task just leaves the scheduler's lists.
+    """
+    if task.glet:
+        scheduler.rem_task(task)
+    else:
+        scheduler.terminate_task(task)
+
+
 class VamosHandlerRuntime:
     # Emulated cycles a task runs before the scheduler looks for another
     # ready task.
@@ -286,12 +301,7 @@ class VamosHandlerRuntime:
 
     @staticmethod
     def _stop_tasks(scheduler):
-        """End every task the scheduler still has, the current one included.
-
-        rem_task() throws TaskStop into the task's greenlet, which unwinds
-        its wait and the library call it waits in, and the task takes
-        itself out of the scheduler.
-        """
+        """End every task the scheduler still has, the current one included."""
         from amitools.vamos.schedule import TaskState  # type: ignore
 
         tasks = list(scheduler.ready_tasks) + list(scheduler.waiting_tasks)
@@ -300,4 +310,4 @@ class VamosHandlerRuntime:
             tasks.append(current)
         for task in tasks:
             if task.get_state() != TaskState.TS_REMOVED:
-                scheduler.rem_task(task)
+                end_task(scheduler, task)

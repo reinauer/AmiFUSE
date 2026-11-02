@@ -53,6 +53,7 @@ from .amiga_structs import DeviceNodeStruct  # type: ignore
 from .emu_thread import route_methods_through_emu
 from .handler_process import HandlerProcess
 from .handler_stub import build_entry_stub  # type: ignore
+from .vamos_runner import end_task
 
 
 # Dos packet opcodes we care about
@@ -516,8 +517,10 @@ class HandlerLauncher:
             import traceback
             state.last_traceback = traceback.format_exc()
             self._note_crash(exc)
+            # The exception may be a child's: the handler is then still
+            # suspended in its wait.
             if task.get_state() != SchedTaskState.TS_REMOVED:
-                self.scheduler.terminate_task(task)
+                end_task(self.scheduler, task)
             return RunResult.DONE
         if task.get_state() == SchedTaskState.TS_REMOVED:
             state.exited = True
