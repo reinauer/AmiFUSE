@@ -1381,12 +1381,16 @@ class HandlerBridge:
             self._retired = [*self._retired, mem_obj]
             return True
         if sum(m.size for m in self._retired_data) + mem_obj.size > self._RETIRED_MAX:
+            ran_out = self._busy_ran_out
             self._take_late_replies()
             held = self._held_args()
             self._free_retired(held)
             if not self._is_held(mem_obj.addr, held):
                 return False
             if sum(m.size for m in self._retired_data) + mem_obj.size > self._RETIRED_MAX:
+                # No packet goes out, so no wait runs the handler on: only
+                # the timer thread can bring the replies that free the rest.
+                self._busy_ran_out = ran_out
                 raise FuseOSError(errno.EIO)
         self._retired_data = [*self._retired_data, mem_obj]
         return True
@@ -1396,12 +1400,18 @@ class HandlerBridge:
 
         No wait is in progress, so every reply queued is a late one. Each
         is given back as in _run_until_reply, without running the handler.
+        A reply ends the short limit, as in _run_until_replies.
         """
         sent = dict(self._pending_packets())
         replies = self.launcher.poll_replies(self.state.reply_port_addr)
         self._log_replies("late", replies)
         for _, reply_pkt, res1, _ in replies:
             self._give_back_late_reply(sent.get(reply_pkt), res1)
+        if replies:
+            # It answered a packet, so it is not caught in a loop, even if it
+            # went on to the next packet without waiting.
+            self._busy_ran_out = False
+            self._idle_busy_cycles = 0
 
     def _alloc_fib(self):
         held = self._held_args()

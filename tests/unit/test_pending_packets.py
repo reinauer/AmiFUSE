@@ -360,6 +360,56 @@ def test_io_at_the_cap_takes_the_replies_already_queued(bridge, monkeypatch):
     assert b._retired_data == []
 
 
+def _reads_run_out_at_the_cap(b, handler, monkeypatch):
+    """Fill the cap with reads whose waits run out on a handler still at work."""
+    monkeypatch.setattr(fs.HandlerBridge, "_RETIRED_MAX", 3 * 1000)
+    fh = _open(b, handler, "/file", 0x5550)
+    handler.delay = lambda pkt_type, name: 10_000
+    handler.answer = lambda pkt_type, args, name: (
+        (args[2], 0) if pkt_type == ACTION_READ else (0x400, 0))
+    for _ in range(4):
+        assert b.read_handle(fh, 1000) is None
+    assert b._busy_ran_out
+    return fh
+
+
+def test_a_late_reply_taken_at_the_cap_restores_the_full_limit(
+        bridge, short_limits, monkeypatch):
+    # #330: the handler answers the reads while the mount idles and goes
+    # straight on. The next read takes it 31 runs, past the short limit.
+    b, handler = bridge
+    fh = _reads_run_out_at_the_cap(b, handler, monkeypatch)
+    handler.answer_now(ACTION_READ)
+    handler.run()
+
+    handler.delay = lambda pkt_type, name: 30
+    assert b.read_handle(fh, 1000) == bytes(1000)
+    assert not b._busy_ran_out
+
+
+def test_a_read_that_fails_at_the_cap_leaves_the_handler_to_the_idle_timers(
+        bridge, short_limits, monkeypatch):
+    # The idle timers had given the handler up as caught in a loop, but it
+    # answers a lookup. The reply frees no read buffer, so the read fails
+    # and sends nothing: with no packet to wait for, the idle timers must
+    # run the handler on again, or the buffers never come free.
+    b, handler = bridge
+    fh = _reads_run_out_at_the_cap(b, handler, monkeypatch)
+    assert b.locate(0, "late") == (0, -1)
+    handler.answer_now(ACTION_LOCATE_OBJECT)
+    handler.run()
+    b._idle_busy_cycles = fs.HandlerBridge._MAX_BUSY_CYCLES
+
+    assert b.read_handle(fh, 1000) is None
+    assert handler.taken(ACTION_FREE_LOCK) == []  # sent, and nothing ran since
+
+    b.vh.timer_device = SimpleNamespace(
+        MIN_DELAY=0.02, deliveries=0, deliver=lambda fast_forward=False: {},
+        next_deadline=lambda: math.inf)
+    assert b.run_due_timers() == 0.02
+    assert handler.taken(ACTION_FREE_LOCK)  # the handler ran on
+
+
 def _at_the_cap(b, handler, monkeypatch):
     """Fill the cap with reads never answered, and hold every small buffer.
 
