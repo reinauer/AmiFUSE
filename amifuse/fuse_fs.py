@@ -7071,13 +7071,9 @@ def cmd_inspect(args):
         # Resolved with the image closed: a Windows disk admits one reader.
         for desc, names in zip(all_rdbs, mount_names(rdb_parts)):
             for part, name in zip(desc["partitions"], names):
-                if name is None:
-                    # A damaged drive name, which amitools' desc gives as
-                    # "None": no --partition name selects the partition.
-                    part["name"] = None
-                elif name != part["name"]:
+                if name not in (None, part["name"]):
                     # A repeated drive name, which mount --partition takes
-                    # as AmigaOS names it.
+                    # as AmigaOS names it. A damaged one has no such name.
                     part["mount_name"] = name
                 part["driver"], text = _partition_driver(
                     args.image, args.block_size, name)

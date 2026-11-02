@@ -1474,8 +1474,13 @@ def build_rdisk_desc(rdisk: RDisk, mbr_ctx: Optional[MBRContext]) -> dict:
 
     Folds the MBR context and lenient-parse warnings into the amitools
     desc dict. Shared by `rdb-inspect --json` and `amifuse inspect --json`.
+    A damaged drive name, which amitools reads as None and its desc gives as
+    "None", is given as None, to tell it from a partition named None.
     """
     desc = rdisk.get_desc()
+    for part_desc, part in zip(desc["partitions"], rdisk.parts):
+        if part.get_drive_name() is None:
+            part_desc["name"] = None
     if mbr_ctx is not None:
         mbr_desc = {
             "scheme": mbr_ctx.scheme,
