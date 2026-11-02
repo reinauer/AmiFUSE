@@ -5115,7 +5115,7 @@ def extract_embedded_driver(
         # The lenient RDB parser drops damaged entries; None is a corrupt
         # header, whose DOS type is unknown.
         damaged = [(dos_type, warning)
-                   for dos_type, warning in getattr(rdisk, "damaged_fs", ())
+                   for dos_type, warning, _num in getattr(rdisk, "damaged_fs", ())
                    if dos_type in (target_dostype, None)]
         if damaged:
             known = any(dos_type == target_dostype for dos_type, _ in damaged)

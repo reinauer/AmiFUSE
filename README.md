@@ -392,7 +392,7 @@ rdb-inspect --extract-fs 0 --out pfs3.bin /path/to/disk.hdf
 | `--block-size` | Block size in bytes (default: auto-detect or 512) |
 | `--full` | Show full partition details |
 | `--json` | Output parsed RDB as JSON |
-| `--extract-fs N` | Extract filesystem entry N (0-based) to a file |
+| `--extract-fs N` | Extract filesystem entry N (0-based), the report's `FS #N`, to a file |
 | `--out` | Output path for extracted filesystem (default: auto-derived) |
 
 ### driver-info
