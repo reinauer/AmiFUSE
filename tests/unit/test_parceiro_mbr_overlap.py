@@ -333,12 +333,12 @@ def _rdb_image(path, blocks, name, cyls, block_bytes=512):
 
 
 def _parceiro_76(tmp_path, own_cyls, own_sector=2, own_bytes=512,
-                 inner_bytes=512):
+                 inner_bytes=512, own_name="DH0"):
     """A 640-sector Parceiro disk: its own RDB, with its RDSK block moved to
     own_sector and DH0 on own_cyls, beside a 0x76 entry on sectors 256-415
     holding an RDB with DH1 on its cylinders 1-4 (1024-byte blocks) or 1-9."""
     own_blocks = 640 * 512 // own_bytes
-    data = _rdb_image(tmp_path / "own.hdf", own_blocks, "DH0", own_cyls,
+    data = _rdb_image(tmp_path / "own.hdf", own_blocks, own_name, own_cyls,
                       own_bytes)
     rdsk = bytes(data[:own_bytes])
     data[:own_bytes] = bytes(own_bytes)

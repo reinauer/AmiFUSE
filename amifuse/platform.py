@@ -110,8 +110,10 @@ def get_default_mountpoint(volname: str) -> Optional[Path]:
     """
     if sys.platform.startswith("darwin"):
         # The name comes from the image: keep it a single path component so
-        # the mountpoint is always a direct child of /Volumes.
-        name = volname.replace("/", "_").replace("\0", "_")
+        # the mountpoint is always a direct child of /Volumes, and printable
+        # so that no message naming the mountpoint carries a control character.
+        name = "".join(
+            "_" if ch == "/" or not ch.isprintable() else ch for ch in volname)
         if name in ("", ".", ".."):
             name = "_" + name
         return Path(f"/Volumes/{name}")

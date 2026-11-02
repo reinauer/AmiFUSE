@@ -108,6 +108,7 @@ from . import driver_resolver
 from .amiga_time import host_time, to_datestamp
 from .driver_resolver import DriverNotFound, ResolvedDriver
 from .driver_runtime import BlockDeviceBackend, ImageInUseError
+from .rdb_inspect import dos_type_tag, escape_text
 from .vamos_runner import VamosHandlerRuntime
 from .bootstrap import BootstrapAllocator
 from .startup_runner import (
@@ -5033,23 +5034,10 @@ def _entry_partitions_hint(names: List[str]) -> str:
     """Return the line that follows an open error, from _entry_partitions."""
     if not names:
         return ""
+    # The image chooses the names; error.details.partitions keeps them raw.
+    shown = [escape_text(name) for name in names]
     return (f"\nThe partitions in the MBR's 0x76 entries still open, read-only: "
-            f"{', '.join(names)}. Open one with --partition {names[0]}.")
-
-
-def _dos_type_tag(dos_type: int) -> str:
-    """Return a DOS type's tag, e.g. "PFS3", for printing.
-
-    An image chooses the bytes, so a character outside 0x20-0x7E is shown
-    escaped, e.g. "\\x1b", and never reaches the terminal. A backslash is
-    escaped too, as "\\x5c", so that an escape cannot be faked.
-    """
-    import amitools.fs.DosType as DosType
-
-    return "".join(
-        ch if " " <= ch <= "~" and ch != "\\" else f"\\x{ord(ch):02x}"
-        for ch in DosType.num_to_tag_str(dos_type)
-    )
+            f"{', '.join(shown)}. Open one with --partition {shown[0]}.")
 
 
 def extract_embedded_driver(
@@ -5083,7 +5071,7 @@ def extract_embedded_driver(
             return None
 
         target_dostype = part.part_blk.dos_env.dos_type
-        dt_str = _dos_type_tag(target_dostype)
+        dt_str = dos_type_tag(target_dostype)
 
         # Search filesystem blocks for matching dostype
         for fs in rdisk.fs:
@@ -5120,7 +5108,7 @@ def extract_embedded_driver(
         if damaged:
             known = any(dos_type == target_dostype for dos_type, _ in damaged)
             raise DriverNotFound(
-                f"Partition {partition_label(part)} ({dt_str}) "
+                f"Partition {escape_text(partition_label(part))} ({dt_str}) "
                 f"{'has' if known else 'may have'} a damaged filesystem driver "
                 f"in its RDB: {'; '.join(warning for _, warning in damaged)}.\n"
                 "AmiFUSE does not use another driver in its place; "
@@ -5184,7 +5172,7 @@ def resolve_driver(
     name = part_info.get("name") or partition
     return driver_resolver.find_folder_driver(
         dostype,
-        f"Partition {name} has no filesystem driver for "
+        f"Partition {escape_text(name)} has no filesystem driver for "
         f"{driver_resolver.dos_tag(dostype)} in its RDB.",
     )
 
@@ -5353,7 +5341,7 @@ def mount_fuse(
         elif iso_info is not None:
             print(f"Mounting ISO 9660 image ({iso_info.volume_id}) from {image}")
         else:
-            print(f"Mounting partition '{part_name}' from {image}")
+            print(f"Mounting partition '{escape_text(part_name)}' from {image}")
         print(f"Filesystem driver: {driver_desc}")
         print(f"Mount point: {mountpoint}")
         if sys.platform.startswith("win") and fuse_mountpoint.startswith("\\\\.\\"):
@@ -5657,7 +5645,7 @@ def format_volume(
     dostype = part_info["dostype"]
     if dostype is None:
         raise SystemExit(f"Could not determine dostype for partition '{partition}'.")
-    dt_str = _dos_type_tag(dostype)
+    dt_str = dos_type_tag(dostype)
 
     # Resolve driver
     try:
@@ -6253,10 +6241,11 @@ def cmd_ls(args):
             print(json.dumps(result, indent=2))
         else:
             for ent in entries:
+                name = escape_text(ent["name"])
                 if ent["type"] == "dir":
-                    print(f"  {ent['name']:30s}  <dir>     {ent['protection']}")
+                    print(f"  {name:30s}  <dir>     {ent['protection']}")
                 else:
-                    print(f"  {ent['name']:30s}  {ent['size']:>10d}  {ent['protection']}")
+                    print(f"  {name:30s}  {ent['size']:>10d}  {ent['protection']}")
             # An empty listing that we could not confirm is a real listing
             # looks identical to an empty volume. Say so, on stderr, so the
             # listing itself stays clean for anything parsing stdout.
@@ -6405,7 +6394,7 @@ def cmd_verify(args):
             if use_json:
                 print(json.dumps(_json_result("verify", **result_data), indent=2))
             else:
-                print(f"Volume: {volname}")
+                print(f"Volume: {escape_text(volname)}")
                 print(f"  Directories: {total_dirs}")
                 print(f"  Files: {total_files}")
                 print(f"  Total size: {total_size:,} bytes")
@@ -7359,7 +7348,7 @@ def cmd_inspect(args):
     for part in list_partitions(args.image, args.block_size).partitions:
         text = _partition_driver(args.image, args.block_size, part.name)[1]
         if part.name is not None:
-            print(f"  {part.name}: {text}")
+            print(f"  {escape_text(part.name)}: {text}")
             continue
         selector = f"--partition {part.index}"
         try:
@@ -7375,7 +7364,7 @@ def cmd_inspect(args):
             if ref is None:
                 note = f"{selector} selects no partition"
             elif ref.name is not None:
-                note = f"{selector} selects '{ref.name}' instead"
+                note = f"{selector} selects '{escape_text(ref.name)}' instead"
             else:
                 note = (f"{selector} selects #{ref.number} in "
                         f"{rdb_name(ref.mbr_partition_index)} instead")

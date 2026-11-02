@@ -252,7 +252,7 @@ def test_extracted_handler_is_named_by_number(temp_dir, extracted, dos_type, sho
     *HOSTILE.values(),
 ], ids=["PFS3", "DOS1", "SFS0", *HOSTILE])
 def test_dos_type_tag_escapes_non_printing_characters(dos_type, shown):
-    assert fuse_fs._dos_type_tag(dos_type) == shown
+    assert rdb_inspect.dos_type_tag(dos_type) == shown
 
 
 def test_mount_prints_dos_type_escaped(
@@ -268,6 +268,24 @@ def test_mount_prints_dos_type_escaped(
 
     out = capsys.readouterr().out
     assert "Filesystem driver: \\x1b[2J/0x1b5b324a (from RDB)" in out
+    assert "\x1b" not in out
+
+
+def test_mount_prints_drive_name_escaped(
+        monkeypatch, capsys, tmp_path, extracted, bridge):
+    """The mount banner shows the drive name escaped."""
+    monkeypatch.setattr(
+        fuse_fs, "get_partition_info",
+        lambda *a, **kw: {"name": "D\x1b[2J", "dostype": PFS3})
+    _bridge_refused(monkeypatch, bridge)
+
+    with pytest.raises(SystemExit):
+        fuse_fs.mount_fuse(
+            Path("work.hdf"), None, tmp_path / "mnt", None,
+            partition="DH0", foreground=True)
+
+    out = capsys.readouterr().out
+    assert "Mounting partition 'D\\x1b[2J' from work.hdf" in out
     assert "\x1b" not in out
 
 
