@@ -644,8 +644,8 @@ def _parse_rdb(dev, rdb_block) -> RDisk:
     """
     if rdb_block.block_size != dev.block_bytes:
         # Only a forced block size gets here: otherwise _scan_for_rdb has
-        # the device reopened at the RDB's size. Both parses below would
-        # raise ValueError.
+        # the device reopened at the RDB's size. The parse below would raise
+        # ValueError.
         raise RDBContentError(
             f"RDB uses {rdb_block.block_size}-byte blocks, "
             f"but the device was opened with {dev.block_bytes}-byte blocks"
