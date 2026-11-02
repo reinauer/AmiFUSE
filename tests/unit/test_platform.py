@@ -698,7 +698,9 @@ class TestValidateMountpoint:
         monkeypatch.setattr("amifuse.platform.os.path.ismount", lambda path: False)
         from amifuse.platform import get_default_mountpoint, validate_mountpoint
 
-        result = validate_mountpoint(get_default_mountpoint("Macintosh HD"))
+        assert get_default_mountpoint("Macintosh HD") == Path("/Volumes/Macintosh HD")
+        # PurePosixPath: on a Windows host, Path would turn the slashes round.
+        result = validate_mountpoint(PurePosixPath("/Volumes/Macintosh HD"))
         assert result is not None
         assert "/Volumes/Macintosh HD is a symbolic link" in result
         assert "--mountpoint" in result
