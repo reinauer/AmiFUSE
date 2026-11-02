@@ -4312,7 +4312,14 @@ class AmigaFuseFS(_FuseOperations):
             raise FuseOSError(_SET_DATE_ERRNOS.get(res2, errno.EIO))
 
     def _set_held_date(self, path: str):
-        """Set the date utimens() held for path, once no handle is open on it."""
+        """Set the date utimens() held for path, once no handle is open on it.
+
+        A refusal has nowhere to go but stderr: utimens() returned 0 long
+        ago, the date can only be set after the handle ends, since a handler
+        stamps a file it closes, and close() does not wait for release().
+        The program that asked never hears of it. A daemon mount's stderr is
+        /dev/null (_report_ready), so the line takes --interactive to see.
+        """
         with self._fh_lock:
             if path not in self._held_dates or self._has_open_file(path):
                 return
@@ -4323,6 +4330,8 @@ class AmigaFuseFS(_FuseOperations):
         try:
             self._set_date(path, when)
         except FuseOSError as e:
+            print(f"[amifuse] could not set the date of {path} (errno {e.args[0]})",
+                  file=sys.stderr, flush=True)
             self._log_op("release", path, f"held date not set: errno {e.args[0]}")
 
     def access(self, path, mode):

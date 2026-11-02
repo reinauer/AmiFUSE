@@ -9,6 +9,7 @@ UTC offset is patched to seven hours west, so the tests do not depend on
 the machine's time zone.
 """
 
+import errno
 import os
 import shutil
 import time
@@ -245,6 +246,22 @@ def test_date_set_on_open_written_file_survives_close(volume, flags):
     assert ops.utimens(path, (DATE, DATE)) == 0
     ops.release(path, fh)
     assert _mtime(ops, path) == pytest.approx(DATE, abs=0.01)
+
+
+def test_date_refused_at_release_is_reported(volume, capfd):
+    """cp -p sets the date on the open file, so a refusal comes at its release (#301)."""
+    ops, _, _, _ = volume
+    ops.bridge.set_date = lambda lock, name, when: (0, 214)  # ERROR_DISK_WRITE_PROTECTED
+    fh = ops.create("/dated.txt", 0o644)
+    ops.write("/dated.txt", b"data\n", 0, fh)
+    assert ops.utimens("/dated.txt", (DATE, DATE)) == 0
+    capfd.readouterr()
+
+    assert ops.release("/dated.txt", fh) == 0
+
+    message = f"[amifuse] could not set the date of /dated.txt (errno {errno.EROFS})\n"
+    assert message in capfd.readouterr().err
+    assert _mtime(ops, "/dated.txt") != pytest.approx(DATE, abs=0.01)
 
 
 @pytest.fixture
