@@ -3,8 +3,9 @@
 The names and numbers of the RDBs after it shift, so a writable open by
 name, by number or without --partition is refused (#304), a disk RDSK
 block failing its checksum counts as such an RDB (#305), and a device or
-media error in an entry's RDB ends the lookup (#267). Read-only opens of
-the RDBs that open are unchanged.
+media error in an entry's RDB ends the lookup (#267), read-only only if
+the selector is not a name before that entry. Read-only opens of the RDBs
+that open are unchanged.
 """
 
 import errno
@@ -15,9 +16,12 @@ from amitools.fs.blkdev.RawBlockDevice import RawBlockDevice
 from amifuse.driver_runtime import BlockDeviceBackend
 from amifuse import rdb_inspect
 from amifuse.rdb_inspect import (DiskRDBError, NoEntryRDBError,
-                                 find_partition, list_partitions, open_rdisk)
+                                 PartitionRef, find_partition,
+                                 list_partitions, open_rdisk)
 from tests.unit.test_mbr_rdb_block_size import _make_mbr, _make_rdb
 from tests.unit.test_parceiro_partitions import _disk_rdb
+from tests.unit.test_repeated_partition_names import (DOS3, NO_AUTOMOUNT,
+                                                      _image)
 
 
 def _flip(image, block, byte=40):
@@ -136,6 +140,77 @@ def test_read_error_in_an_entry_rdb_ends_the_lookup(tmp_path, monkeypatch):
             backend.open()
         assert caught.value.errno == errno.EIO
         assert backend.blkdev is None
+
+
+def _later_entry_fails(tmp_path, monkeypatch, first):
+    """Entries at LBA 64 and 256: entry 0's RDB holds a partition per
+    (name, DOS type[, flags]) in first, entry 1's WORK, and reading entry
+    1's blocks 0-15 fails."""
+    a = _image(tmp_path, first, name="a.hdf")
+    b = _image(tmp_path, [("WORK", DOS3)], name="b.hdf")
+    image = _make_mbr(tmp_path, [(64, a.read_bytes()), (256, b.read_bytes())])
+    read_block = RawBlockDevice.read_block
+
+    def failing(self, blk_num, num_blks=1, **kwargs):
+        start = blk_num * self.block_bytes
+        end = start + num_blks * self.block_bytes
+        if start < 272 * 512 and 256 * 512 < end:  # entry 1's blocks 0-15
+            raise OSError(errno.EIO, "Input/output error")
+        return read_block(self, blk_num, num_blks, **kwargs)
+
+    monkeypatch.setattr(RawBlockDevice, "read_block", failing)
+    return image
+
+
+def _eio(image, partition, block_size=None, write=False):
+    with pytest.raises(OSError) as caught:
+        find_partition(image, block_size, partition, write=write)
+    assert caught.value.errno == errno.EIO
+
+
+@pytest.mark.parametrize("selector,number,name", [("DH0", 0, "DH0"),
+                                                  ("dh1", 1, "DH1")])
+def test_read_error_in_a_later_entry_leaves_earlier_names(
+        tmp_path, monkeypatch, selector, number, name):
+    # A read error in entry 1 cannot change what a name in entry 0 resolves
+    # to, so read-only opens it; writes are still refused.
+    image = _later_entry_fails(tmp_path, monkeypatch,
+                               [("DH0", DOS3), ("DH1", DOS3)])
+    assert find_partition(image, None, selector) == PartitionRef(0, number,
+                                                                 name)
+    assert find_partition(image, 512, selector) == PartitionRef(0, number,
+                                                                name)
+    assert _open(image, selector) == (0, name)
+    _eio(image, selector, write=True)
+    backend = BlockDeviceBackend(image, partition_scope=True,
+                                 partition=selector, read_only=False)
+    with pytest.raises(OSError) as caught:
+        backend.open()
+    assert caught.value.errno == errno.EIO
+    assert backend.blkdev is None
+
+
+@pytest.mark.parametrize("selector", ["WORK", "DH0.1", "0", "1", "2"])
+def test_read_error_ends_a_lookup_not_named_before_it(tmp_path, monkeypatch,
+                                                      selector):
+    # WORK is in entry 1 and DH0.1 is no name in entry 0, so each ends with
+    # the read error rather than "not found". A number does too, even one
+    # entry 0 has: entry 1 may hold a partition named as the number, which
+    # names outrank.
+    image = _later_entry_fails(tmp_path, monkeypatch,
+                               [("DH0", DOS3), ("DH1", DOS3)])
+    _eio(image, selector)
+    _eio(image, selector, 512)
+
+
+def test_read_error_ends_a_lookup_of_a_name_a_later_rdb_can_take(
+        tmp_path, monkeypatch):
+    # Entry 0's DH0 is not mounted by AmigaOS, so a mounted DH0 in entry 1
+    # takes the name (mount_names) and the read error ends the lookup.
+    image = _later_entry_fails(tmp_path, monkeypatch,
+                               [("DH0", DOS3, NO_AUTOMOUNT)])
+    _eio(image, "DH0")
+    _eio(image, "DH0", 512)
 
 
 def _bad_disk_rdsk(tmp_path, entries=("DH0", "PI1")):
