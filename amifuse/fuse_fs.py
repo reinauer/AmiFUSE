@@ -1273,8 +1273,9 @@ class HandlerBridge:
             # Arg1 is the FileHandle's BPTR; the handler filled in its fh_Args.
             self.launcher.send_end_handle(self.state, args[0] << 2)
 
-    # How long unmount runs the handler for packets still out: well within
-    # the 30 s that the unmount requesters wait for the mount to end.
+    # How long unmount, or a flush, runs the handler for packets still out:
+    # well within the 30 s that the unmount requesters wait for the mount
+    # to end. Every other call queues behind a wait this long.
     _PENDING_WAIT = 15.0
 
     def wait_for_pending(self, timeout: float = _PENDING_WAIT) -> List[str]:
@@ -1282,7 +1283,7 @@ class HandlerBridge:
 
         A packet whose wait ran out may still be at work in the handler,
         which can answer later packets, ACTION_FLUSH included, before it.
-        Stopping it then leaves the volume half changed, so unmount waits
+        Stopping it then leaves the volume half changed, so flushes wait
         here first. The handler runs in waits of the short busy limit
         until no packet is out, it parks without replying, or timeout
         seconds have passed. Each wait also ends at that deadline: a
@@ -2628,29 +2629,72 @@ class HandlerBridge:
             # We call flush_volume() on unmount instead of after every file close.
             self._free_fh(fh_addr)
 
-    def flush_volume(self):
-        """Flush the handler's buffers to disk. Call on unmount."""
+    def flush_volume(self, wait_pending: bool = True):
+        """Flush the handler's buffers to disk.
+
+        ACTION_FLUSH proves nothing while an earlier packet is unanswered:
+        a handler may answer it at once, in the middle of that packet's
+        work (#118). So the packets still out get wait_for_pending's bound
+        first, and OSError names those that stay out: the volume may be
+        half changed, and the caller must not report it as written. A
+        handler at work at the bound gets no flush; one that waits does,
+        since it may answer only once a packet wakes it, and the work that
+        ends then gets a flush of its own.
+
+        With wait_pending False the flush goes out at once: unmount waits
+        by itself, and flushes what it can even with packets left out.
+        """
         with self._lock:
             if self.state.crashed:
                 raise OSError("handler crashed before volume flush")
-            if self._debug:
-                print("[amifuse] Flushing volume buffers to disk...", flush=True)
-            pkt_addr, _ = self.launcher.send_flush(self.state)
-            # Only the flush's own reply says that the buffers are written.
-            reply = self._run_until_reply(pkt_addr, "flush_volume")
-            # Sync the underlying file to disk
-            self.backend.sync()
-            if self.state.crashed or reply is None or reply[0] == 0:
-                raise OSError("filesystem handler did not acknowledge ACTION_FLUSH")
-            # fsync() and a clean unmount promise data on stable storage.
-            self.backend.fsync()
-            if self._debug:
-                print("[amifuse] Volume flush complete", flush=True)
+            if wait_pending:
+                unanswered = self.wait_for_pending()
+                if unanswered and not self._busy_ran_out:
+                    try:
+                        self._flush_now()
+                    except OSError:
+                        pass  # the packets still out decide
+                    unanswered = self.wait_for_pending(timeout=1.0)
+                if unanswered and not self.state.crashed:
+                    raise OSError(
+                        f"the handler has not answered {', '.join(unanswered)}; "
+                        f"the volume may be left half changed")
+            self._flush_now()
+
+    def _flush_now(self):
+        """Send ACTION_FLUSH and bring what it wrote to stable storage."""
+        if self.state.crashed:
+            raise OSError("handler crashed before volume flush")
+        if self._debug:
+            print("[amifuse] Flushing volume buffers to disk...", flush=True)
+        pkt_addr, _ = self.launcher.send_flush(self.state)
+        # Only the flush's own reply says that the buffers are written.
+        reply = self._run_until_reply(pkt_addr, "flush_volume")
+        # Sync the underlying file to disk
+        self.backend.sync()
+        if self.state.crashed or reply is None or reply[0] == 0:
+            raise OSError("filesystem handler did not acknowledge ACTION_FLUSH")
+        # fsync() and a clean unmount promise data on stable storage.
+        self.backend.fsync()
+        if self._debug:
+            print("[amifuse] Volume flush complete", flush=True)
 
     def inhibit_cycle(self):
-        """Inhibit then uninhibit the handler to clear all internal state."""
+        """Inhibit then uninhibit the handler to clear all internal state.
+
+        Skipped if a packet is still out after a second, as the callers
+        skip it while a file is open: an inhibit that reaches a handler in
+        the middle of a packet's work is the same risk (#129, #265). The
+        wait also takes replies that are only not polled yet.
+        """
         with self._lock:
             if self.state.crashed:
+                return
+            unanswered = self.wait_for_pending(timeout=1.0)
+            if unanswered:
+                if self._debug:
+                    print(f"[amifuse] inhibit cycle skipped: "
+                          f"{', '.join(unanswered)} still out", flush=True)
                 return
             # Each wait takes its own packet's reply: a late reply to another
             # packet would end the inhibit's wait before the handler inhibits.
@@ -4801,7 +4845,7 @@ class AmigaFuseFS(_FuseOperations):
                 unanswered = self.bridge.wait_for_pending()
                 flush_error = None
                 try:
-                    self.bridge.flush_volume()
+                    self.bridge.flush_volume(wait_pending=False)
                 except Exception as e:
                     # A handler that takes packets in order, still at work
                     # on one, does not answer the flush: the packets still
@@ -4815,7 +4859,7 @@ class AmigaFuseFS(_FuseOperations):
                     # end then needs a flush of its own.
                     unanswered = self.bridge.wait_for_pending(timeout=1.0)
                     if not unanswered:
-                        self.bridge.flush_volume()
+                        self.bridge.flush_volume(wait_pending=False)
                         flush_error = None
                 if unanswered:
                     success = False
@@ -7057,9 +7101,10 @@ def cmd_write(args):
                           file=sys.stderr)
 
         # Flush is CRITICAL after writes -- without this, writes cached in
-        # handler memory never reach the image file.
-        bridge.flush_volume()
+        # handler memory never reach the image file. One that fails gets no
+        # second try below: it would wait for the same packets again.
         flushed = True  # Mark as flushed to avoid double flush
+        bridge.flush_volume()
 
         if use_json:
             result = _json_result("write",

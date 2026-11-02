@@ -38,9 +38,11 @@ from amifuse.startup_runner import (
     ACTION_FINDUPDATE,
     ACTION_FLUSH,
     ACTION_FREE_LOCK,
+    ACTION_INHIBIT,
     ACTION_LOCATE_OBJECT,
     ACTION_READ,
     ACTION_RENAME_OBJECT,
+    ACTION_SEEK,
     ACTION_SET_DATE,
     ACTION_SET_FILE_SIZE,
     ACTION_WRITE,
@@ -1042,3 +1044,168 @@ def test_a_wait_past_its_deadline_leaves_a_handler_still_at_work_its_io_reply(
 
     assert handler.ports.has_msg(io_port)
     assert runs == []
+
+
+def _flushes_of(b, name):
+    """The FUSE operation name on a mount of b."""
+    return getattr(fs.AmigaFuseFS(b), name)
+
+
+@pytest.mark.parametrize("flush", ["fsync", "fsyncdir"])
+def test_fsync_waits_for_a_packet_still_out_before_the_flush(bridge, short_limits, flush):
+    # #265: FastFileSystem answers ACTION_FLUSH at once while it is still
+    # growing a file, so a flush sent now would say nothing about the grow.
+    b, handler = bridge
+    fh = _open(b, handler, "/grow", 0x5550)
+    handler.delay = lambda pkt_type, name: 100 if pkt_type == ACTION_SET_FILE_SIZE else 0
+    assert b.set_handle_size(fh, 0x7FFFFFFF) == -1
+
+    assert _flushes_of(b, flush)("/grow", 0, 0) == 0
+
+    kinds = [(kind, pkt_type) for kind, pkt_type, *_ in handler.events]
+    before_flush = kinds[:kinds.index(("take", ACTION_FLUSH))]
+    assert ("answer", ACTION_SET_FILE_SIZE) in before_flush
+
+
+@pytest.mark.parametrize("flush", ["fsync", "fsyncdir"])
+def test_fsync_fails_at_the_bound_with_the_handler_still_at_work(
+        bridge, short_limits, monkeypatch, flush):
+    b, handler = bridge
+    now = _busy_for_good(b, handler, monkeypatch)
+
+    with pytest.raises(fs.FuseOSError) as caught:
+        _flushes_of(b, flush)("/grow", 0, 0)
+
+    assert caught.value.errno == errno.EIO
+    assert now[0] - 1000.0 == fs.HandlerBridge._PENDING_WAIT
+    assert not handler.taken(ACTION_FLUSH)
+
+
+def test_flush_names_the_packet_still_out(bridge, short_limits, monkeypatch):
+    b, handler = bridge
+    _busy_for_good(b, handler, monkeypatch)
+
+    with pytest.raises(OSError, match="ACTION_SET_FILE_SIZE"):
+        b.flush_volume()
+
+
+def test_flush_fails_with_a_parked_handler_that_never_answers(bridge, short_limits):
+    b, handler = bridge
+    fh = _open(b, handler, "/grow", 0x5550)
+    handler.delay = lambda pkt_type, name: NEVER if pkt_type == ACTION_SET_FILE_SIZE else 0
+    assert b.set_handle_size(fh, 0x7FFFFFFF) == -1
+
+    with pytest.raises(OSError, match="ACTION_SET_FILE_SIZE"):
+        b.flush_volume()
+
+
+def test_flush_wakes_a_handler_that_answers_only_on_a_packet(bridge, short_limits):
+    # It waits with the packet unanswered, so the wait ends at once, and
+    # the flush brings the answer. The work that ends needs a flush of
+    # its own, as at unmount.
+    b, handler = bridge
+    fh = _open(b, handler, "/grow", 0x5550)
+    handler.delay = lambda pkt_type, name: NEVER if pkt_type == ACTION_SET_FILE_SIZE else 0
+    assert b.set_handle_size(fh, 0x7FFFFFFF) == -1
+    handler.answer_now(ACTION_SET_FILE_SIZE)
+    runs = handler.run
+
+    def run(max_cycles=None):
+        if not handler.ports.has_msg(b.state.port_addr):
+            return PARKED  # asleep until a packet comes
+        return runs(max_cycles)
+    b.launcher.run = run
+
+    b.flush_volume()
+
+    kinds = [(kind, pkt_type) for kind, pkt_type, *_ in handler.events]
+    first = kinds.index(("answer", ACTION_SET_FILE_SIZE))
+    assert ("take", ACTION_FLUSH) in kinds[first:]
+    assert not b._pending_packets()
+
+
+def test_inhibit_cycle_waits_for_a_packet_still_out(bridge, short_limits):
+    b, handler = bridge
+    fh = _open(b, handler, "/grow", 0x5550)
+    handler.delay = lambda pkt_type, name: 100 if pkt_type == ACTION_SET_FILE_SIZE else 0
+    assert b.set_handle_size(fh, 0x7FFFFFFF) == -1
+
+    b.inhibit_cycle()
+
+    kinds = [(kind, pkt_type) for kind, pkt_type, *_ in handler.events]
+    before_inhibit = kinds[:kinds.index(("take", ACTION_INHIBIT))]
+    assert ("answer", ACTION_SET_FILE_SIZE) in before_inhibit
+
+
+def test_inhibit_cycle_is_skipped_while_a_packet_stays_out(bridge, short_limits, monkeypatch):
+    b, handler = bridge
+    now = _busy_for_good(b, handler, monkeypatch)
+
+    b.inhibit_cycle()
+
+    assert not handler.taken(ACTION_INHIBIT)
+    assert now[0] - 1000.0 == 1.0
+
+
+def _write_command(b, handler, monkeypatch, tmp_path, end_delay):
+    """amifuse write on the scripted handler; returns the command's args."""
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"hello")
+
+    def answer(pkt_type, args, name):
+        if pkt_type == ACTION_FINDOUTPUT:
+            handler.mem.w32((args[0] << 2) + FH_ARGS, 0x5550)
+        if pkt_type == ACTION_LOCATE_OBJECT:
+            return 0x400, 0
+        if pkt_type == ACTION_WRITE:
+            return args[2], 0
+        return (0, 0) if pkt_type == ACTION_SEEK else (-1, 0)
+    handler.answer = answer
+    handler.delay = lambda pkt_type, name: end_delay if pkt_type == ACTION_END else 0
+    monkeypatch.setattr(fs, "_create_bridge_from_args", lambda *a, **kw: (b, None))
+    monkeypatch.setattr(fs, "_check_file_command_mount",
+                        lambda *a, **kw: fs.MountState(True, None, None))
+    monkeypatch.setattr(fs, "_cleanup_bridge", lambda *a, **kw: None)
+    return SimpleNamespace(image=tmp_path / "image.hdf", file="file",
+                           input=str(source), json=False, debug=False)
+
+
+def test_write_waits_for_an_end_still_out_before_the_flush(
+        bridge, short_limits, monkeypatch, tmp_path, capsys):
+    # #265: ACTION_END outlasts its wait, and the handler answers it later.
+    b, handler = bridge
+    args = _write_command(b, handler, monkeypatch, tmp_path, end_delay=100)
+
+    fs.cmd_write(args)
+
+    kinds = [(kind, pkt_type) for kind, pkt_type, *_ in handler.events]
+    before_flush = kinds[:kinds.index(("take", ACTION_FLUSH))]
+    assert ("answer", ACTION_END) in before_flush
+    assert "Written: file" in capsys.readouterr().out
+
+
+def test_write_fails_naming_an_end_never_answered(
+        bridge, short_limits, monkeypatch, tmp_path, capsys):
+    b, handler = bridge
+    args = _write_command(b, handler, monkeypatch, tmp_path, end_delay=NEVER)
+    now = [1000.0]
+    monkeypatch.setattr(fs.time, "monotonic", lambda: now[0])
+    ended_at = []
+
+    def run(max_cycles=None):
+        result = handler.run(max_cycles)
+        now[0] += 1.0
+        if not handler.taken(ACTION_END):
+            return result
+        ended_at.append(now[0])
+        return BUSY
+    b.launcher.run = run
+
+    with pytest.raises(SystemExit) as caught:
+        fs.cmd_write(args)
+
+    assert "has not answered ACTION_END" in str(caught.value)
+    assert "Written:" not in capsys.readouterr().out
+    assert not handler.taken(ACTION_FLUSH)
+    # The 60 busy runs of END's own wait, and one bound for the flush.
+    assert now[0] - ended_at[0] == 59 + fs.HandlerBridge._PENDING_WAIT

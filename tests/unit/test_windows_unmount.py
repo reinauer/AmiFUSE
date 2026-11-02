@@ -46,7 +46,7 @@ def test_unmount_waits_for_destroy_and_reports_failures(monkeypatch, failure):
     order = []
 
     def step(name):
-        def run():
+        def run(**_):
             assert not events.events["done"].is_set()
             order.append(name)
             if name == failure:
