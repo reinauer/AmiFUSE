@@ -4342,6 +4342,7 @@ class TestCreateBridgeFromArgs:
         fake_rdb = MagicMock()
         fake_rdb.detect_adf.return_value = None
         fake_rdb.detect_iso.return_value = None
+        fake_rdb.DiskRDBError = type("DiskRDBError", (OSError,), {})
         monkeypatch.setitem(sys.modules, "amifuse.rdb_inspect", fake_rdb)
 
         # Create a real temp file
@@ -4383,6 +4384,7 @@ class TestCreateBridgeFromArgs:
         fake_rdb = MagicMock()
         fake_rdb.detect_adf.return_value = None
         fake_rdb.detect_iso.return_value = None
+        fake_rdb.DiskRDBError = type("DiskRDBError", (OSError,), {})
         monkeypatch.setitem(sys.modules, "amifuse.rdb_inspect", fake_rdb)
         message = "test.hdf is in use by another AmiFUSE or vamos session"
         monkeypatch.setattr(fuse_fs_mod, "HandlerBridge",

@@ -4900,6 +4900,47 @@ def get_partition_name(image: Path, block_size: Optional[int], partition: Option
     return get_partition_info(image, block_size, partition)["name"]
 
 
+def _entry_partitions(error: Exception, image: Path,
+                      block_size: Optional[int]) -> List[str]:
+    """Name the partitions that still open after an open fails with error.
+
+    Where the disk's own RDB fails (DiskRDBError), the partitions in its
+    0x76 entries still open by name. Returns those names, as list_partitions
+    gives them, and [] after any other error. A partition with a damaged
+    drive name has none to give, and a name that --partition does not take
+    to its partition, as after a device or media error in an entry, is left
+    out.
+    """
+    from .rdb_inspect import DiskRDBError, find_partition, list_partitions
+
+    if not isinstance(error, DiskRDBError):
+        return []
+    try:
+        parts = list_partitions(image, block_size).partitions
+    except OSError:
+        return []
+    names = []
+    for part in parts:
+        if part.name is None:
+            continue
+        try:
+            ref = find_partition(image, block_size, part.name)
+        except OSError:
+            continue
+        if ref is not None and (ref.mbr_partition_index, ref.number) == (
+                part.mbr_partition_index, part.index):
+            names.append(part.name)
+    return names
+
+
+def _entry_partitions_hint(names: List[str]) -> str:
+    """Return the line that follows an open error, from _entry_partitions."""
+    if not names:
+        return ""
+    return (f"\nThe partitions in the MBR's 0x76 entries still open, read-only: "
+            f"{', '.join(names)}. Open one with --partition {names[0]}.")
+
+
 def _dos_type_tag(dos_type: int) -> str:
     """Return a DOS type's tag, e.g. "PFS3", for printing.
 
@@ -5146,7 +5187,8 @@ def mount_fuse(
             try:
                 part_info = get_partition_info(image, block_size, partition)
             except IOError as e:
-                raise SystemExit(f"Error: {e}")
+                names = _entry_partitions(e, image, block_size)
+                raise SystemExit(f"Error: {e}{_entry_partitions_hint(names)}")
             part_name = part_info["name"]
 
     try:
@@ -5833,10 +5875,13 @@ def _create_bridge_from_args(args, command: str, read_only: bool = True):
         resolved = resolve_driver(
             image, driver, block_size, partition, adf_info=adf_info, iso_info=iso_info)
     except IOError as e:
+        names = _entry_partitions(e, image, block_size)
         if use_json:
-            print(_json.dumps(_json_error(command, "IMAGE_INVALID", str(e))))
+            print(_json.dumps(_json_error(
+                command, "IMAGE_INVALID", str(e),
+                details={"partitions": names} if names else None)))
             sys.exit(1)
-        raise SystemExit(f"Error: {e}")
+        raise SystemExit(f"Error: {e}{_entry_partitions_hint(names)}")
     except DriverNotFound as e:
         msg = " ".join(str(e).splitlines())
         if use_json:
@@ -5883,17 +5928,21 @@ def _create_bridge_from_args(args, command: str, read_only: bool = True):
                 pass
         # A busy image is not a handler fault; the handler never started.
         in_use = isinstance(e, ImageInUseError)
+        # With --driver, the bridge is the first to open the image.
+        names = _entry_partitions(e, image, block_size)
         if use_json:
             if in_use:
                 error = _json_error(command, "IMAGE_IN_USE", str(e))
             else:
                 error = _json_error(command, "HANDLER_ERROR",
-                    f"Failed to initialize filesystem handler: {e}")
+                    f"Failed to initialize filesystem handler: {e}",
+                    details={"partitions": names} if names else None)
             print(_json.dumps(error))
             sys.exit(1)
         if in_use:
             raise SystemExit(f"Error: {e}")
-        raise SystemExit(f"Error initializing handler: {e}")
+        raise SystemExit(
+            f"Error initializing handler: {e}{_entry_partitions_hint(names)}")
 
     return bridge, temp_driver
 
