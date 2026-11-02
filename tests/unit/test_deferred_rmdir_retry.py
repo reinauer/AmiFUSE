@@ -24,6 +24,7 @@ import pytest
 
 from tests.unit.test_rmdir_object_in_use import (
     ERROR_DIRECTORY_NOT_EMPTY,
+    ERROR_OBJECT_IN_USE,
     _errno_of,
     _hold,
     _InUseVolume,
@@ -598,3 +599,111 @@ def test_each_lock_is_freed_when_one_free_raises(make_fs):
     assert fs.release("/d/x", hx) == 0
 
     assert freed.locks == [0x201, 0x200]
+
+
+# An exception in the deletes of unlink() and of a deferred rmdir() (#363).
+
+
+def _delete_raises(lock, name):
+    raise OSError("delete_object failed")
+
+
+@pytest.mark.parametrize("raising", [0, 1], ids=["delete", "delete+free"])
+def test_unlink_with_delete_object_raising_frees_every_lock(make_fs, raising):
+    fs, volume = make_fs(_InUseVolume, dirs={"/", "/d"}, files={"/d/x"})
+    volume.locate_path = lambda path: (0x201, None, [0x200, 0x201])
+    volume.delete_object = _delete_raises
+    freed = _Freed(volume, raising=raising)
+
+    with pytest.raises(OSError, match="delete_object failed"):
+        fs.unlink("/d/x")
+
+    assert freed.locks == [0x201, 0x200]
+
+
+def _unlink_with(volume, answer):
+    volume.locate_path = lambda path: (0x201, None, [0x200, 0x201])
+    volume.delete_object = lambda lock, name: answer
+
+
+def test_unlink_deleted_frees_each_lock_when_one_free_raises(make_fs):
+    fs, volume = make_fs(_InUseVolume, dirs={"/", "/d"}, files={"/d/x"})
+    _unlink_with(volume, (-1, 0))
+    freed = _Freed(volume, raising=1)
+
+    assert fs.unlink("/d/x") == 0
+
+    assert freed.locks == [0x201, 0x200]
+
+
+def test_unlink_refused_frees_each_lock_when_one_free_raises(make_fs):
+    fs, volume = make_fs(_InUseVolume, dirs={"/", "/d"}, files={"/d/x"})
+    _unlink_with(volume, (0, 218))
+    freed = _Freed(volume, raising=1)
+
+    assert _errno_of(fs.unlink, "/d/x") == errno.EIO
+
+    assert freed.locks == [0x201, 0x200]
+
+
+def test_unlink_deferred_by_an_open_handle_frees_its_locks(make_fs):
+    fs, volume = make_fs(_InUseVolume, dirs={"/", "/d"}, files={"/d/x"})
+    _hold(fs, volume, "/d/x")
+    _unlink_with(volume, (0, ERROR_OBJECT_IN_USE))
+    freed = _Freed(volume)
+
+    assert fs.unlink("/d/x") == 0
+
+    assert freed.locks == [0x201, 0x200]
+    assert "/d/x" in fs._pending_deletes
+
+
+def _deferred_rmdir(make_fs):
+    """/d is a deferred rmdir() behind /d/x; release() of /d/x is next."""
+    fs, volume = make_fs(_FfsVolume, dirs={"/", "/d"}, files={"/d/x"})
+    hx = _hold(fs, volume, "/d/x")
+    assert fs.unlink("/d/x") == 0
+    assert fs.rmdir("/d") == 0
+    assert "/d" in fs._pending_dir_deletes
+    return fs, volume, hx
+
+
+def _answer_rmdir(volume, answer):
+    """Let the delete of /d/x through, with two locks for the one of /d."""
+    delete, locate = volume.delete_object, volume.locate_path
+
+    def locate_two(path):
+        if path == "/" and "/d/x" not in volume.files:
+            return 0x201, None, [0x200, 0x201]
+        return locate(path)
+
+    volume.locate_path = locate_two
+    volume.delete_object = (
+        lambda lock, name: answer(lock, name) if name == "d"
+        else delete(lock, name))
+
+
+@pytest.mark.parametrize("answer", [
+    _delete_raises,
+    lambda lock, name: (-1, 0),
+    lambda lock, name: (0, ERROR_DIRECTORY_NOT_EMPTY),
+], ids=["raises", "deleted", "refused"])
+def test_deferred_rmdir_frees_each_lock_when_one_free_raises(make_fs, answer):
+    fs, volume, hx = _deferred_rmdir(make_fs)
+    _answer_rmdir(volume, answer)
+    freed = _Freed(volume, raising=1)
+
+    assert fs.release("/d/x", hx) == 0
+
+    assert freed.locks[-2:] == [0x201, 0x200]
+    assert "/d" not in fs._pending_dir_deletes
+
+
+def test_deferred_rmdir_deleted_stays_settled_when_a_free_raises(make_fs):
+    fs, volume, hx = _deferred_rmdir(make_fs)
+    _answer_rmdir(volume, lambda lock, name: (-1, 0))
+    _Freed(volume, raising=1)
+
+    assert fs.release("/d/x", hx) == 0
+
+    assert "/d" not in fs._pending_deletes
