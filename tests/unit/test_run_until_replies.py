@@ -441,6 +441,69 @@ def test_a_deadline_cuts_the_sleep_to_a_delay_short(sleeps, monkeypatch):
     assert not bridge._busy_ran_out
 
 
+def _fake_clocks(sleeps, timer, monkeypatch):
+    """Move the monotonic clock and the timer's together, with each pause."""
+    sleeps.timers.append(timer)
+    now = [100.0]
+    monkeypatch.setattr(fs.time, "monotonic", lambda: now[0])
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        now[0] += seconds
+        timer.now += seconds
+
+    monkeypatch.setattr(fs.time, "sleep", sleep)
+
+
+class DelayingForEver(ScriptedLauncher):
+    """A handler that never replies, beside a task that always delays again."""
+
+    def __init__(self, timer):
+        super().__init__(repeat(IDLE))
+        self.timer = timer
+
+    def run(self, max_cycles=None):
+        result = super().run(max_cycles)
+        self.timer.delay = self.timer.now + 1.0
+        return result
+
+
+def test_a_wait_gives_up_on_delays_that_never_end(sleeps, monkeypatch):
+    # Nothing else ends this wait, and it holds the emulation thread: every
+    # other FUSE call and the unmount's close() queue behind it.
+    limit = fs.HandlerBridge._DELAY_WAIT
+    timer = FakeTimer()
+    _fake_clocks(sleeps, timer, monkeypatch)
+    launcher = DelayingForEver(timer)
+    bridge = _bridge(launcher, timer)
+    assert bridge._run_until_replies() == []
+    assert sum(sleeps) == pytest.approx(limit)
+    assert launcher.runs == limit + 1
+    # the handler waits, so it is not taken for busy
+    assert not bridge._busy_ran_out
+
+
+def test_the_delay_limit_cuts_a_long_delay_short(sleeps, monkeypatch):
+    limit = fs.HandlerBridge._DELAY_WAIT
+    timer = FakeTimer(delay=100.0 + limit + 5)
+    _fake_clocks(sleeps, timer, monkeypatch)
+    launcher = ScriptedLauncher(repeat(IDLE))
+    assert _bridge(launcher, timer)._run_until_replies() == []
+    assert launcher.runs == 2
+    assert sleeps == [pytest.approx(limit)]
+    assert timer.delays_ended == 0
+
+
+def test_a_wait_with_a_later_deadline_keeps_it_past_the_delay_limit(sleeps, monkeypatch):
+    # The caller's deadline decides, not the limit for a wait without one.
+    wait = fs.HandlerBridge._DELAY_WAIT * 2
+    timer = FakeTimer()
+    _fake_clocks(sleeps, timer, monkeypatch)
+    launcher = DelayingForEver(timer)
+    assert _bridge(launcher, timer)._run_until_replies(deadline=100.0 + wait) == []
+    assert sum(sleeps) == pytest.approx(wait)
+
+
 # ---------------------------------------------------------------------------
 # The idle hook runs a handler whose wait ran out (run_due_timers)
 # ---------------------------------------------------------------------------
