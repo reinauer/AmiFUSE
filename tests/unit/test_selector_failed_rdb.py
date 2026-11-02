@@ -4,8 +4,9 @@ The names and numbers of the RDBs after it shift, so a writable open by
 name, by number or without --partition is refused (#304), a disk RDSK
 block failing its checksum counts as such an RDB (#305), and a device or
 media error in an entry's RDB ends the lookup (#267), read-only only if
-the selector is not a name before that entry. Read-only opens of the RDBs
-that open are unchanged.
+the selector is not a name before that entry; so does one in the default
+open of a disk with a single entry (#329). Read-only opens of the RDBs that
+open are unchanged.
 """
 
 import errno
@@ -140,6 +141,43 @@ def test_read_error_in_an_entry_rdb_ends_the_lookup(tmp_path, monkeypatch):
             backend.open()
         assert caught.value.errno == errno.EIO
         assert backend.blkdev is None
+
+
+def _only_entry_fails(tmp_path, monkeypatch):
+    """A disk whose only 0x76 entry, at LBA 200, fails to read its blocks
+    0-15, with no RDB of the disk's own."""
+    image = _make_mbr(tmp_path, [(200, _make_rdb(tmp_path, 512, "DH0"))])
+    read_block = RawBlockDevice.read_block
+
+    def failing(self, blk_num, num_blks=1, **kwargs):
+        start = blk_num * self.block_bytes
+        end = start + num_blks * self.block_bytes
+        if start < 216 * 512 and 200 * 512 < end:
+            raise OSError(errno.EIO, "Input/output error")
+        return read_block(self, blk_num, num_blks, **kwargs)
+
+    monkeypatch.setattr(RawBlockDevice, "read_block", failing)
+    return image
+
+
+@pytest.mark.parametrize("selector", ["DH0", "0", "NOSUCH"])
+@pytest.mark.parametrize("block_size", [None, 512], ids=["auto", "forced"])
+@pytest.mark.parametrize("write", [False, True], ids=["read", "write"])
+def test_read_error_in_the_only_entry_ends_the_lookup(
+        tmp_path, monkeypatch, selector, block_size, write):
+    # The default open stands for the entry, so its read error is not a
+    # partition not found, as it is not on a disk with two entries.
+    image = _only_entry_fails(tmp_path, monkeypatch)
+    _eio(image, selector, block_size, write)
+
+
+def test_read_error_in_the_only_entry_ends_a_default_write_check(
+        tmp_path, monkeypatch):
+    # _default_rdb reads the disk as find_partition does.
+    image = _only_entry_fails(tmp_path, monkeypatch)
+    with pytest.raises(OSError) as caught:
+        rdb_inspect.check_default_write(image)
+    assert caught.value.errno == errno.EIO
 
 
 def _later_entry_fails(tmp_path, monkeypatch, first):
