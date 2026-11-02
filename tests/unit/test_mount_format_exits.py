@@ -148,7 +148,8 @@ def mount(monkeypatch, tmp_path):
     monkeypatch.setattr(fuse_fs, "get_partition_info",
                         lambda *a, **kw: {"name": "DH0", "dostype": DOS3})
     monkeypatch.setattr(fuse_fs, "resolve_driver", lambda *a, **kw: SimpleNamespace(
-        path=handler, description="DOS3/0x444f5303 (from RDB)", temporary=True))
+        path=handler, description="DOS3/0x444f5303 (from RDB)", temporary=True,
+        display_name="the DOS3 (0x444f5303) driver stored in the RDB"))
     monkeypatch.setattr(fuse_fs, "HandlerBridge", MagicMock(side_effect=load_handler))
     monkeypatch.setattr(windows_unmount, "UnmountControl", MagicMock())
     monkeypatch.setattr(fuse_fs, "AmigaFuseFS", MagicMock())

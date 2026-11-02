@@ -52,6 +52,8 @@ class ResolvedDriver:
     "dev_fallback". description follows "Filesystem driver:" in banners.
     version is the driver's $VER text; tag is the bundled release tag.
     Only a temporary driver (an RDB extraction) is the caller's to delete.
+    display_name names a driver in an error where path does not: that of an
+    RDB extraction is a temporary file, deleted before the error is shown.
     """
 
     path: Path
@@ -61,6 +63,7 @@ class ResolvedDriver:
     version: Optional[str] = None
     sha256: Optional[str] = None
     tag: Optional[str] = None
+    display_name: Optional[str] = None
 
     def to_json(self) -> dict:
         """The driver object reported by inspect --json."""
