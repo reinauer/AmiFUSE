@@ -1236,6 +1236,16 @@ def find_partition_mbr_index(
     return None if found is None else found.mbr_partition_index
 
 
+def partition_label(part) -> str:
+    """How a message names an amitools ``Partition`` it has opened.
+
+    The drive name; a damaged one, which amitools reads as None, by the
+    partition's number: #0.
+    """
+    drive_name = part.get_drive_name()
+    return f"#{part.num}" if drive_name is None else str(drive_name)
+
+
 def _part_info(p) -> PartInfo:
     """Build a :class:`PartInfo` from an amitools ``Partition``.
 
@@ -1487,6 +1497,15 @@ def build_rdisk_desc(rdisk: RDisk, mbr_ctx: Optional[MBRContext]) -> dict:
 def format_rdisk_report(rdisk: RDisk, full: bool = False) -> List[str]:
     """Format RDB info, filesystem drivers, and warnings as printable lines."""
     lines = list(rdisk.get_info(full=full))
+    for part in rdisk.parts:
+        if part.get_drive_name() is None:
+            # amitools' line reads as if the partition were named None.
+            prefix = f"Partition: #{part.num} 'None'"
+            lines = [
+                f"Partition: #{part.num} (damaged drive name)"
+                + line[len(prefix):] if line.startswith(prefix) else line
+                for line in lines
+            ]
     fs_lines = format_fs_summary(rdisk)
     if fs_lines:
         lines.append("")
