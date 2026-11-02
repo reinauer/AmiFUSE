@@ -33,10 +33,27 @@ from amitools.vamos.lib.ExecLibrary import ExecLibrary  # type: ignore
 from amitools.vamos.libstructs.exec_ import MsgPortFlags  # type: ignore
 from amitools.vamos.libtypes import Message, MsgPort  # type: ignore
 
+from .rdb_inspect import escape_text
+
 
 class AmiFuseExecLibrary(ExecLibrary):
     """ExecLibrary whose DoIO and WaitIO have a device complete a held request,
-    and whose WaitPort waits on a port the port manager knows."""
+    whose WaitPort waits on a port the port manager knows, and whose console
+    shows a handler's text escaped."""
+
+    def _raw_console_write(self, value):
+        """Send one byte of a handler's debug text to stderr.
+
+        Handlers print names from the image here: ODFileSystem logs the
+        volume and system IDs of an ISO. So a byte goes through escape_text,
+        as such a name would, but for the line ends and tabs of the text.
+        """
+        if value in (9, 10, 13):
+            super()._raw_console_write(value)
+            return
+        if value:
+            for ch in escape_text(chr(value)):
+                super()._raw_console_write(ord(ch))
 
     def WaitPort(self, ctx, msg_port: MsgPort) -> Message:
         """Wait for a message on the port, then return the first one.

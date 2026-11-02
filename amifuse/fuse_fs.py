@@ -478,7 +478,7 @@ class HandlerBridge:
                 print(f"[amifuse]   Total blocks: {adf_info.total_blocks}")
             elif iso_info:
                 print(f"[amifuse] ISO 9660 geometry:")
-                print(f"[amifuse]   Volume: {iso_info.volume_id}")
+                print(f"[amifuse]   Volume: {escape_text(iso_info.volume_id)}")
                 print(f"[amifuse]   Block size: {iso_info.block_size}")
                 print(f"[amifuse]   Total blocks: {iso_info.total_blocks}")
             else:
@@ -5148,7 +5148,7 @@ def resolve_driver(
             adf_info.dos_type, f"ADF floppy image detected ({floppy_type}, {dt_str}).")
     if iso_info is not None:
         raise DriverNotFound(
-            f"ISO 9660 image detected (volume: {iso_info.volume_id}).\n"
+            f"ISO 9660 image detected (volume: {escape_text(iso_info.volume_id)}).\n"
             "ISO images don't contain embedded filesystem drivers.\n"
             "You need to specify a filesystem handler with --driver.\n"
             "For ISO 9660, use CDFileSystem from an AmigaOS installation."
@@ -5339,7 +5339,7 @@ def mount_fuse(
             floppy_type = "HD" if adf_info.is_hd else "DD"
             print(f"Mounting ADF floppy ({floppy_type}) from {image}")
         elif iso_info is not None:
-            print(f"Mounting ISO 9660 image ({iso_info.volume_id}) from {image}")
+            print(f"Mounting ISO 9660 image ({escape_text(iso_info.volume_id)}) from {image}")
         else:
             print(f"Mounting partition '{escape_text(part_name)}' from {image}")
         print(f"Filesystem driver: {driver_desc}")
@@ -7258,7 +7258,7 @@ def cmd_inspect(args):
             print(_json.dumps(envelope, indent=2))
             return
         print(f"ISO 9660 Image: {args.image}")
-        print(f"  Volume ID: {iso_info.volume_id}")
+        print(f"  Volume ID: {escape_text(iso_info.volume_id)}")
         print(f"  Block size: {iso_info.block_size} bytes")
         print(f"  Total blocks: {iso_info.total_blocks}")
         return

@@ -569,8 +569,9 @@ class BlockDeviceBackend:
                 f"secs={self.secs} block={self.block_size}"
             )
         if self.iso_info is not None:
+            from .rdb_inspect import escape_text
             return (
-                f"{self.image} ISO 9660 ({self.iso_info.volume_id}) "
+                f"{self.image} ISO 9660 ({escape_text(self.iso_info.volume_id)}) "
                 f"blocks={self.total_blocks} block={self.block_size}"
             )
         assert self.rdb is not None
