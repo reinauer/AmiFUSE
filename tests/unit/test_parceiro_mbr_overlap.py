@@ -1,11 +1,14 @@
 """A partition of a Parceiro disk's own RDB, beside the MBR, is checked
 against the MBR entries, as one in an RDB inside a 0x76 entry is.
 
-An entry starting at the partition's first sector is that entry's Amiga
-view, as the FAT\\1 partition over the FAT32 entry of a real Parceiro card
-is, and may end before the partition does. A 0x76 entry starts with its own
-RDB, and an extended entry with the table of its own partitions, so neither
-has a view.
+An entry starting at the first sector of a FAT partition is that entry's
+Amiga view, as the FAT\\1 partition over the FAT32 entry of a real Parceiro
+card is, and may end before the partition does; a partition of another type
+is no view of it. A 0x76 entry starts with its own RDB, and an extended
+entry with the table of its own partitions, so neither has a view. A 0x76
+entry is also checked against the partitions and the blocks of the disk's
+own RDB. Each refusal names what the partition or entry overlaps, and holds
+for a read-only open too.
 """
 
 import struct
@@ -20,10 +23,15 @@ from amitools.fs.block.rdb.RDBlock import RDBlock
 from amitools.fs.rdb.RDisk import RDisk
 
 from amifuse.driver_runtime import BlockDeviceBackend
+from tests.unit.test_rdb_chain_loops import _edit
 
 DOS0 = 0x444F5300
+DOS3 = 0x444F5303
+PFS3 = 0x50465303
+SFS0 = 0x53465300
 FAT1 = 0x46415401  # FAT\1
 OVERLAP = "Overlapping MBR containers cannot be shared"
+NO_BLK = 0xFFFFFFFF
 
 
 def _rdb(tmp_path, partitions, block_bytes=512):
@@ -221,6 +229,68 @@ def test_rdb_at_block_0_partition_over_an_mbr_entry_is_refused(tmp_path, monkeyp
     assert image.read_bytes() == before
 
 
+FAT32_AT_16 = "MBR partition [0] (type 0x0C, start sector 16)"
+
+
+@pytest.mark.parametrize("read_only", [False, True], ids=["write", "read"])
+@pytest.mark.parametrize("dos_type", [DOS0, DOS3, 0x444F5307, PFS3, SFS0,
+                                      0x46415403],
+                         ids=["DOS0", "DOS3", "DOS7", "PFS3", "SFS0", "FAT3"])
+def test_partition_starting_on_a_fat32_entry_is_no_view_of_it(
+        tmp_path, dos_type, read_only):
+    # DH0 on blocks 16-159, a FAT32 entry on sectors 16-79 at its start: a
+    # write through DH0 overwrites the FAT32 filesystem.
+    image = _parceiro(tmp_path, [("DH0", (1, 9), dos_type)], [(0x0C, 16, 64)])
+    with pytest.raises(ValueError) as caught:
+        _open_as(image, read_only=read_only, partition="DH0")
+    assert str(caught.value) == (
+        f"{OVERLAP}: partition DH0 overlaps {FAT32_AT_16}")
+
+
+@pytest.mark.parametrize("fat_type", [0x46415400, FAT1, 0x46415402],
+                         ids=["FAT0", "FAT1", "FAT2"])
+def test_only_a_fat_partition_is_a_view_of_a_fat32_entry(tmp_path, fat_type):
+    image = _parceiro(tmp_path, [("DH0", (1, 4), DOS3), ("FAT", (5, 9), fat_type)],
+                      [(0x0C, 16, 64), (0x0C, 80, 64)])
+    assert _open(image, "FAT") == (80, 160)
+    with pytest.raises(ValueError, match=OVERLAP):
+        _open(image, "DH0")
+
+
+def test_rdb_at_block_0_partition_starting_on_a_fat32_entry_is_refused(
+        tmp_path, monkeypatch):
+    image = _rdb0_mbr(tmp_path, [("DH0", (1, 9), DOS0)], [(0x0C, 16, 64)])
+    _no_second_open(monkeypatch)
+    with pytest.raises(ValueError) as caught:
+        _open_as(image, partition="DH0")
+    assert str(caught.value) == (
+        f"{OVERLAP}: partition DH0 overlaps {FAT32_AT_16}")
+
+
+def test_refusal_names_the_entry_a_partition_reaches_into(tmp_path):
+    image = _parceiro(tmp_path, [("DH0", (1, 9), DOS0)],
+                      [(0x83, 2, 4), (0x0C, 64, 64)])
+    with pytest.raises(ValueError) as caught:
+        _open(image, "DH0")
+    assert str(caught.value) == (
+        f"{OVERLAP}: partition DH0 overlaps "
+        f"MBR partition [1] (type 0x0C, start sector 64)")
+
+
+def test_refusal_names_the_entry_a_container_overlaps(tmp_path):
+    data = bytearray(256 * 512) + bytearray(_rdb(tmp_path, [("DH0", (1, 9), DOS0)]))
+    _entry(data, 2, 0x76, 256, 160)
+    _entry(data, 3, 0x0C, 320, 64)
+    data[510:512] = b"\x55\xaa"
+    image = tmp_path / "emu68.hdf"
+    image.write_bytes(bytes(data))
+    with pytest.raises(ValueError) as caught:
+        _open(image, "DH0")
+    assert str(caught.value) == (
+        f"{OVERLAP}: MBR partition [2] (type 0x76, start sector 256) overlaps "
+        f"MBR partition [3] (type 0x0C, start sector 320)")
+
+
 def test_rdb_at_block_0_with_an_unreadable_sector_0(tmp_path, monkeypatch):
     # A writable open does not go on without the MBR check; a read-only
     # open does.
@@ -294,6 +364,96 @@ def test_0x76_entry_inside_an_own_rdb_partition_is_refused(tmp_path, monkeypatch
     with pytest.raises(ValueError, match=OVERLAP):
         _open_as(image, partition="DH0")
     assert image.read_bytes() == before
+
+
+ENTRY_AT_256 = "MBR partition [0] (type 0x76, start sector 256)"
+
+
+def test_refusal_names_the_own_rdb_partition(tmp_path):
+    image = _parceiro_76(tmp_path, (1, 39))
+    with pytest.raises(ValueError) as caught:
+        _open_as(image, partition="DH1")
+    assert str(caught.value) == (
+        f"{OVERLAP}: {ENTRY_AT_256} overlaps partition DH0 of the disk's own RDB")
+
+
+# Hand-edited links of the own RDB of _parceiro_76, whose RDSK block is at
+# sector 2 and PART block at sector 1, to block 300, inside the 0x76 entry.
+
+def _own_fshd(image, block, seg_list=NO_BLK):
+    _edit(image, block, {0: int.from_bytes(b"FSHD", "big"), 1: 64, 3: 7,
+                         4: NO_BLK, 18: seg_list}, summed=64)
+    _edit(image, 2, {8: block}, summed=64)  # rdb_FileSysHeaderList
+
+
+def _part_in_entry(image):
+    data = bytearray(image.read_bytes())
+    data[300 * 512:301 * 512] = data[512:1024]
+    image.write_bytes(bytes(data))
+    _edit(image, 2, {7: 300}, summed=64)  # rdb_PartitionList
+
+
+def _fshd_in_entry(image):
+    _own_fshd(image, 300)
+
+
+def _lseg_in_entry(image):
+    _edit(image, 300, {0: int.from_bytes(b"LSEG", "big"), 1: 64, 3: 7, 4: NO_BLK},
+          summed=64)
+    _own_fshd(image, 5, seg_list=300)
+
+
+@pytest.mark.parametrize("read_only", [False, True], ids=["write", "read"])
+@pytest.mark.parametrize("link", [_part_in_entry, _fshd_in_entry, _lseg_in_entry],
+                         ids=["PART", "FSHD", "LSEG"])
+def test_0x76_entry_over_an_own_rdb_block_is_refused(tmp_path, monkeypatch, link,
+                                                     read_only):
+    image = _parceiro_76(tmp_path, (1, 15))
+    link(image)
+    _no_second_open(monkeypatch)
+    with pytest.raises(ValueError) as caught:
+        _open_as(image, read_only=read_only, partition="DH1")
+    assert str(caught.value) == (
+        f"{OVERLAP}: {ENTRY_AT_256} overlaps block 300 of the disk's own RDB")
+    assert _open_as(image, partition="DH0") == (16, 256)
+
+
+def test_own_rdb_blocks_are_compared_as_512_byte_sectors(tmp_path, monkeypatch):
+    # 1024-byte blocks: the own PART block moves to block 150, sector 300.
+    image = _parceiro_76(tmp_path, (1, 7), own_sector=6, own_bytes=1024,
+                         inner_bytes=1024)
+    data = bytearray(image.read_bytes())
+    data[150 * 1024:151 * 1024] = data[1024:2048]
+    image.write_bytes(bytes(data))
+    _edit(image, 6, {7: 150}, summed=64)
+    _no_second_open(monkeypatch)
+    with pytest.raises(ValueError) as caught:
+        _open_as(image, partition="DH1")
+    assert str(caught.value) == (
+        f"{OVERLAP}: {ENTRY_AT_256} overlaps block 150 of the disk's own RDB")
+
+
+@pytest.mark.parametrize("read_only", [False, True], ids=["write", "read"])
+def test_0x76_entry_over_the_own_rdb_reserved_blocks_is_refused(
+        tmp_path, monkeypatch, read_only):
+    # The own RDB reserves blocks 0-15 and uses none in the entry on sectors
+    # 8-167; DH0 lies past it, on sectors 176-255.
+    data = _rdb_image(tmp_path / "own.hdf", 640, "DH0", (11, 15))
+    rdsk = bytes(data[:512])
+    data[:512] = bytes(512)
+    data[2 * 512:3 * 512] = rdsk
+    data[8 * 512:168 * 512] = _rdb_image(tmp_path / "inner.hdf", 160, "DH1", (1, 9))
+    _entry(data, 0, 0x76, 8, 160)
+    data[510:512] = b"\x55\xaa"
+    image = tmp_path / "parceiro76.hdf"
+    image.write_bytes(bytes(data))
+    _no_second_open(monkeypatch)
+    with pytest.raises(ValueError) as caught:
+        _open_as(image, read_only=read_only, partition="DH1")
+    assert str(caught.value) == (
+        f"{OVERLAP}: MBR partition [0] (type 0x76, start sector 8) overlaps "
+        f"reserved blocks 0-15 of the disk's own RDB")
+    assert _open_as(image, partition="DH0") == (176, 256)
 
 
 def test_0x76_entry_beside_the_own_rdb_partitions_opens(tmp_path, monkeypatch):
