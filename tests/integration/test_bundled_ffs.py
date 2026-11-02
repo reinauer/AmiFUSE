@@ -52,18 +52,12 @@ def _require_machine68k():
 
 @pytest.fixture
 def no_user_driver(monkeypatch, tmp_path):
-    """An empty user drivers folder and no dev fallback.
-
-    The dev fallback is CI's AmiFUSE-testing clone. A subprocess still sees
-    it, but it comes after the bundled handler, which serves DOS0-DOS7.
-    """
+    """An empty user drivers folder."""
     home = tmp_path / "home"
     home.mkdir()
     for name in ("HOME", "USERPROFILE"):
         monkeypatch.setenv(name, str(home))
     monkeypatch.setenv("LOCALAPPDATA", str(home / "AppData" / "Local"))
-    monkeypatch.setattr(
-        driver_resolver, "DEV_FALLBACK_DRIVER", tmp_path / "no-dev" / "FastFileSystem")
     assert not (driver_resolver.user_driver_dir() / "FastFileSystem").exists()
 
 
@@ -304,7 +298,7 @@ class TestCliWithoutDriver:
 
     def test_inspect_names_the_bundled_handler(self, tmp_path, no_user_driver):
         """In the environment the commands above run in, the bundled
-        handler serves DOS1, not the dev fallback CI has beside the repo."""
+        handler serves DOS1."""
         result = _amifuse("inspect", "--json", str(_seed_adf(tmp_path, "DOS1")))
         assert result.returncode == 0, result.stdout + result.stderr
         driver = json.loads(result.stdout)["driver"]

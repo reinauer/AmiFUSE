@@ -409,7 +409,7 @@ scripts. Tests are organized into two layers:
 
 - `tests/unit/test_driver_resolver.py` checks the bundled handler against its
   provenance file and licence, the driver order (`--driver`, RDB, your drivers
-  folder, bundled, dev fallback) and how the banner, `doctor` and `inspect`
+  folder, bundled) and how the banner, `doctor` and `inspect`
   report it, and that the DOS ranges written in the help text and the README
   match the provenance file.
 - `tools/readme_smoke.py` runs the README's `amifuse mount workbench.adf`

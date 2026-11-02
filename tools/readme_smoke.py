@@ -327,18 +327,17 @@ def _mount_results() -> List[ExampleResult]:
 
 @contextlib.contextmanager
 def _bundled_driver_only():
-    """Point the user's drivers folder at an empty folder and drop the dev
-    fallback, so the bundled FastFileSystem serves the example."""
+    """Point the user's drivers folder at an empty folder, so the bundled
+    FastFileSystem serves the example."""
     from amifuse import driver_resolver
 
-    saved = driver_resolver.user_driver_dir, driver_resolver.DEV_FALLBACK_DRIVER
+    saved = driver_resolver.user_driver_dir
     with tempfile.TemporaryDirectory(prefix="amifuse_readme_drivers_") as empty:
         driver_resolver.user_driver_dir = lambda: Path(empty)
-        driver_resolver.DEV_FALLBACK_DRIVER = Path(empty) / "no-dev" / "FastFileSystem"
         try:
             yield
         finally:
-            driver_resolver.user_driver_dir, driver_resolver.DEV_FALLBACK_DRIVER = saved
+            driver_resolver.user_driver_dir = saved
 
 
 def _expect_bundled_adf_mount(info: Dict[str, object], module, image: Path) -> str:

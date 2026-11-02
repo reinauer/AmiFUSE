@@ -431,7 +431,6 @@ Without `--driver`, AmiFUSE picks the driver in this order:
    Windows, `~/.local/share/amifuse/drivers` elsewhere), for DOS0-DOS7. Place
    the one from AmigaOS 3.2 there to use it instead of the bundled one.
 3. The bundled FastFileSystem, for DOS0-DOS7.
-4. In a development checkout, `../AmiFUSE-testing/drivers/FastFileSystem`.
 
 The mount banner, `amifuse doctor` and `amifuse inspect` name the driver in use;
 `inspect` names it for an ADF and for each partition of a hard disk image.

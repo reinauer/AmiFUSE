@@ -5001,9 +5001,8 @@ def resolve_driver(
 
     Order: --driver; the RDB's driver for the partition's exact DOS type;
     then, for DOS0-DOS7 volumes, driver_resolver.find_folder_driver() (your
-    drivers folder, the bundled FastFileSystem, the dev fallback). An ISO
-    needs --driver. part_info is get_partition_info()'s result when the
-    caller has it.
+    drivers folder, the bundled FastFileSystem). An ISO needs --driver.
+    part_info is get_partition_info()'s result when the caller has it.
 
     Raises DriverNotFound. Errors reading the RDB propagate. Only an RDB
     extraction is temporary, so only that is the caller's to delete.

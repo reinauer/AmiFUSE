@@ -1,19 +1,21 @@
 """Unit tests for filesystem driver resolution and the bundled FastFileSystem.
 
 Covers the bundled files and their provenance record, the folder lookup in
-amifuse.driver_resolver (your drivers folder, the bundled FastFileSystem,
-the dev fallback), fuse_fs.resolve_driver() in front of it (--driver, then
-the RDB), and how doctor and inspect report the result.
+amifuse.driver_resolver (your drivers folder, the bundled FastFileSystem),
+fuse_fs.resolve_driver() in front of it (--driver, then the RDB), and how
+doctor and inspect report the result.
 
 Every test that resolves a driver points the user's drivers folder at
-tmp_path and disables the dev fallback, through the user_driver_dir
-fixture in conftest.py or the same patches.
+tmp_path, through the user_driver_dir fixture in conftest.py or the same
+patches.
 """
 
 import argparse
 import hashlib
 import json
+import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -145,7 +147,7 @@ class TestFixedTextMatchesProvenance:
 
 
 # ---------------------------------------------------------------------------
-# B. Folder lookup -- user, bundled, dev fallback
+# B. Folder lookup -- user, bundled
 # ---------------------------------------------------------------------------
 
 
@@ -206,21 +208,6 @@ class TestFolderLookup:
         """A 0-byte file in the drivers folder does not hide the bundled one."""
         (user_driver_dir / "FastFileSystem").write_bytes(b"")
         assert driver_resolver.find_folder_driver(_dos(1), "s").source == "bundled"
-
-    def test_dev_fallback_comes_last(
-            self, user_driver_dir, monkeypatch, tmp_path, bundled_dos0_to_dos5):
-        """The dev fallback serves only what nothing before it serves."""
-        dev = tmp_path / "AmiFUSE-testing" / "drivers" / "FastFileSystem"
-        dev.parent.mkdir(parents=True)
-        dev.write_bytes(b"dev")
-        monkeypatch.setattr(driver_resolver, "DEV_FALLBACK_DRIVER", dev)
-
-        assert driver_resolver.find_folder_driver(_dos(1), "s").source == "bundled"
-        resolved = driver_resolver.find_folder_driver(_dos(7), "s")
-        assert resolved.source == "dev_fallback"
-        assert resolved.description == f"{dev} (dev fallback)"
-        user = _user_copy(user_driver_dir)
-        assert driver_resolver.find_folder_driver(_dos(7), "s").path == user
 
     @pytest.mark.parametrize("state", ["missing", "empty"])
     def test_broken_install_names_the_bundled_path(
@@ -318,8 +305,6 @@ class TestFolderLookup:
         monkeypatch.setattr(sys, "platform", "win32")
         monkeypatch.delenv("LOCALAPPDATA", raising=False)
         monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
-        monkeypatch.setattr(
-            driver_resolver, "DEV_FALLBACK_DRIVER", tmp_path / "no-dev" / "FastFileSystem")
         folder = tmp_path / ".local" / "share" / "amifuse" / "drivers"
         assert driver_resolver.user_driver_dir() == folder
         folder.mkdir(parents=True)
@@ -370,11 +355,9 @@ class TestDosRange:
 @pytest.fixture
 def no_home(monkeypatch, tmp_path):
     """No home folder: Path.home() raises, as on Windows without these
-    variables, so there is no drivers folder; no dev fallback either."""
+    variables, so there is no drivers folder."""
     for name in ("LOCALAPPDATA", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "HOME"):
         monkeypatch.delenv(name, raising=False)
-    monkeypatch.setattr(
-        driver_resolver, "DEV_FALLBACK_DRIVER", tmp_path / "no-dev" / "FastFileSystem")
     try:
         Path.home()
     except RuntimeError:
@@ -426,13 +409,66 @@ class TestNoHomeFolder:
         assert "in your drivers folder (no home folder found)" in data["note"]
 
 
+class TestDevelopmentCheckout:
+    """A checkout with AmiFUSE-testing beside it resolves as an installed
+    copy does, also when an installed copy would fail. CI has this layout."""
+
+    def _resolve(self, tmp_path, dos, damage):
+        """Copy the package into a checkout with the sibling fixture repo,
+        apply damage to its drivers folder, and resolve there."""
+        checkout = tmp_path / "AmiFUSE"
+        package = checkout / "amifuse"
+        shutil.copytree(
+            Path(driver_resolver.__file__).parent, package,
+            ignore=shutil.ignore_patterns("__pycache__"))
+        fixture_handler = tmp_path / "AmiFUSE-testing" / "drivers" / "FastFileSystem"
+        fixture_handler.parent.mkdir(parents=True)
+        fixture_handler.write_bytes(b"$VER: fs 47.4 (16.6.2020)\x00")
+        damage(package / "drivers")
+
+        home = tmp_path / "home"
+        env = dict(os.environ, HOME=str(home), USERPROFILE=str(home),
+                   LOCALAPPDATA=str(home / "AppData" / "Local"),
+                   PYTHONPATH=str(checkout))
+        script = (
+            "from amifuse import driver_resolver as d\n"
+            f"assert d.__file__.startswith({str(checkout)!r}), d.__file__\n"
+            "try:\n"
+            f"    print(d.find_folder_driver(d.DOS_BASE + {dos}, 'subject').source)\n"
+            "except d.DriverNotFound as exc:\n"
+            "    print(exc)\n"
+        )
+        proc = subprocess.run([sys.executable, "-c", script], env=env, cwd=tmp_path,
+                              capture_output=True, text=True, timeout=60)
+        assert proc.returncode == 0, proc.stderr
+        return proc.stdout
+
+    def test_bundled_handler_serves_it(self, tmp_path):
+        assert self._resolve(tmp_path, 1, lambda drivers: None).strip() == "bundled"
+
+    def test_missing_bundled_handler_is_reported(self, tmp_path):
+        out = self._resolve(
+            tmp_path, 1, lambda drivers: (drivers / "FastFileSystem.OS3").unlink())
+        assert "The bundled FastFileSystem is missing or damaged" in out
+
+    def test_dos_type_the_bundled_handler_lacks_is_reported(self, tmp_path):
+        def narrow(drivers):
+            record = drivers / "FastFileSystem.OS3.json"
+            info = json.loads(record.read_text(encoding="utf-8"))
+            info["dos_types"] = ["DOS0", "DOS1"]
+            record.write_text(json.dumps(info), encoding="utf-8")
+
+        out = self._resolve(tmp_path, 7, narrow)
+        assert "The bundled FastFileSystem supports DOS0-DOS1 only" in out
+
+
 # ---------------------------------------------------------------------------
 # C. fuse_fs.resolve_driver -- --driver and the RDB in front of the lookup
 # ---------------------------------------------------------------------------
 
 
 class TestResolveDriver:
-    """The full order: --driver, RDB entry, user, bundled, dev fallback."""
+    """The full order: --driver, RDB entry, user, bundled."""
 
     def test_driver_option_wins(self, fuse_mock, user_driver_dir, monkeypatch, tmp_path):
         """--driver is used as given; the RDB is not even read."""
@@ -787,23 +823,17 @@ class TestDoctorDriversCheck:
         )
         assert str(user_driver_dir) in check.fix_description
 
-    def test_dev_fallback_does_not_hide_a_broken_install(
+    def test_missing_provenance_record_is_named(
             self, user_driver_dir, monkeypatch, tmp_path):
-        """A missing provenance record warns, naming the record, even when
-        the dev fallback serves every DOS type."""
-        dev = tmp_path / "AmiFUSE-testing" / "drivers" / "FastFileSystem"
-        dev.parent.mkdir(parents=True)
-        dev.write_bytes(b"dev")
-        monkeypatch.setattr(driver_resolver, "DEV_FALLBACK_DRIVER", dev)
         record = tmp_path / "pkg" / "FastFileSystem.OS3.json"
         monkeypatch.setattr(driver_resolver, "BUNDLED_PROVENANCE", record)
         check = _drivers_check()
         assert check.status == "warning"
-        first, rest = check.message.split("; ", 1)
-        assert first.startswith(
+        assert check.message.startswith(
             "Cannot read the bundled FastFileSystem's provenance record: "
             f"{record} (")
-        assert rest == f"DOS0-DOS7: {dev} (dev fallback)"
+        assert check.message.endswith(
+            f"DOS0-DOS7: none; place your own FastFileSystem in {user_driver_dir}")
 
     def test_checksum_mismatch_is_in_the_check(
             self, user_driver_dir, monkeypatch, tmp_path, capsys):
@@ -886,21 +916,6 @@ class TestInspectAdf:
             "tag": None,
             "sha256": hashlib.sha256(data).hexdigest(),
         }
-
-    def test_json_dev_fallback_reports_what_it_can(
-            self, user_driver_dir, monkeypatch, tmp_path, capsys, bundled_dos0_to_dos5):
-        from amifuse.fuse_fs import main
-
-        dev = tmp_path / "AmiFUSE-testing" / "drivers" / "FastFileSystem"
-        dev.parent.mkdir(parents=True)
-        dev.write_bytes(b"$VER: " + HYPERION_VER + b"\x00")
-        monkeypatch.setattr(driver_resolver, "DEV_FALLBACK_DRIVER", dev)
-        main(["inspect", "--json", str(_adf(tmp_path, 7))])
-        driver = json.loads(capsys.readouterr().out)["driver"]
-        assert driver["source"] == "dev_fallback"
-        assert driver["version"] == "fs 47.4 (16.6.2020)"
-        assert driver["tag"] is None
-        assert driver["sha256"] == hashlib.sha256(dev.read_bytes()).hexdigest()
 
     def test_unreadable_user_copy_is_reported(
             self, user_driver_dir, monkeypatch, tmp_path, capsys):
