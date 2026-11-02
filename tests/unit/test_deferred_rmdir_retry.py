@@ -501,3 +501,100 @@ def test_deferred_delete_drops_the_date_utimens_held(make_fs, answer):
 
     assert dates == []
     assert fs._held_dates == {}
+
+
+# An exception in the deferred delete at release() (#328). What the delete
+# settles does not depend on the locks that are freed after it.
+
+
+class _Freed:
+    """Records each free_lock(); the first `raising` of them raise."""
+
+    def __init__(self, volume, raising=0):
+        self.locks = []
+        self.raising = raising
+        volume.free_lock = self
+
+    def __call__(self, lock):
+        self.locks.append(lock)
+        if self.raising:
+            self.raising -= 1
+            raise OSError("free_lock failed")
+
+
+def test_free_lock_raising_after_the_delete_leaves_the_path_gone(make_fs):
+    fs, volume = make_fs(_InUseVolume, dirs={"/", "/d"}, files={"/d/x"})
+    hx = _hold(fs, volume, "/d/x")
+    assert fs.unlink("/d/x") == 0
+    fs._stat_cache["/d/x"] = (0.0, {"st_size": 1})
+    fs._dir_cache["/d"] = (0.0, ["x"])
+    _Freed(volume, raising=1)
+
+    assert fs.release("/d/x", hx) == 0
+
+    assert volume.deleted == ["/d/x"]
+    assert fs._pending_deletes == set()
+    assert "/d/x" not in fs._stat_cache
+    assert "/d" not in fs._dir_cache
+
+
+def test_free_lock_raising_after_the_delete_still_settles_the_parent(make_fs):
+    fs, volume = make_fs(_InUseVolume, dirs={"/", "/d"}, files={"/d/x"})
+    hx = _hold(fs, volume, "/d/x")
+    assert fs.unlink("/d/x") == 0
+    assert fs.rmdir("/d") == 0
+    _Freed(volume, raising=1)
+
+    fs.release("/d/x", hx)
+
+    assert volume.deleted == ["/d/x", "/d"]
+    assert fs._pending_deletes == set()
+    assert fs._pending_dir_deletes == {}
+
+
+def test_free_lock_raising_after_a_refusal_leaves_the_file_shown(make_fs):
+    fs, volume = make_fs(_InUseVolume, dirs={"/", "/d"}, files={"/d/x"})
+    dates = _record_dates(fs)
+    h1 = _hold(fs, volume, "/d/x")
+    h2 = _hold_alias(fs, volume, "/d/x", "/d/X")
+    fs._held_dates["/d/x"] = 1000.0
+    assert fs.unlink("/d/x") == 0
+    _Freed(volume, raising=1)
+
+    fs.release("/d/x", h1)  # refused: the handle under /d/X keeps it in use
+
+    assert h2 in fs._fh_cache
+    assert fs._pending_deletes == set()
+    assert _visible(fs, "/d/x")
+    assert dates == [("/d/x", 1000.0)]
+
+
+def test_delete_object_raising_frees_every_lock_and_keeps_the_path_hidden(make_fs):
+    fs, volume = make_fs(_InUseVolume, dirs={"/", "/d"}, files={"/d/x"})
+    hx = _hold(fs, volume, "/d/x")
+    assert fs.unlink("/d/x") == 0
+    volume.locate_path = lambda path: (0x201, None, [0x200, 0x201])
+    freed = _Freed(volume)
+
+    def raises(lock, name):
+        raise OSError("delete failed")
+
+    volume.delete_object = raises
+
+    assert fs.release("/d/x", hx) == 0
+
+    assert freed.locks == [0x201, 0x200]
+    assert fs._pending_deletes == {"/d/x"}  # no answer: it may yet be deleted
+
+
+def test_each_lock_is_freed_when_one_free_raises(make_fs):
+    fs, volume = make_fs(_InUseVolume, dirs={"/", "/d"}, files={"/d/x"})
+    hx = _hold(fs, volume, "/d/x")
+    assert fs.unlink("/d/x") == 0
+    volume.locate_path = lambda path: (0x201, None, [0x200, 0x201])
+    volume.delete_object = lambda lock, name: (-1, 0)
+    freed = _Freed(volume, raising=1)
+
+    assert fs.release("/d/x", hx) == 0
+
+    assert freed.locks == [0x201, 0x200]
