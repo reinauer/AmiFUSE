@@ -198,15 +198,18 @@ def test_idle_hook_waits_while_calls_are_queued(emu):
         time.sleep(0.01)
     assert ticks == [1]
     gate = threading.Event()
-    threads = [threading.Thread(target=lambda: emu.call(gate.wait, 5))]
+    started = threading.Event()
+    threads = [threading.Thread(
+        target=lambda: emu.call(lambda: (started.set(), gate.wait(5))))]
     threads += [threading.Thread(target=lambda: emu.call(lambda: None)) for _ in range(5)]
     threads[0].start()
-    while emu._queue.qsize() < 1 and time.monotonic() < deadline:
-        time.sleep(0.01)
+    assert started.wait(2)
     for thread in threads[1:]:
         thread.start()
+    deadline = time.monotonic() + 2
     while emu._queue.qsize() < 5 and time.monotonic() < deadline:
         time.sleep(0.01)
+    assert emu._queue.qsize() == 5
     gate.set()
     for thread in threads:
         thread.join(3)
