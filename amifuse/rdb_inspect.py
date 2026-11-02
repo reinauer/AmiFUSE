@@ -995,13 +995,18 @@ def _failed_rdb(amiga_parts: List[MBRPartition], rdb_idx: Optional[int],
     disk's own beside the MBR (DiskRDBError) or an entry's (EntryRDBError),
     shifts the names of the RDBs after it; an entry holding no RDB
     (NoEntryRDBError) shifts none. Raises any other OSError in an entry,
-    such as a device or media error, as it ends open_rdisk. The default
-    open's other errors leave no RDB open whose names could shift.
+    such as a device or media error, as it ends open_rdisk, and one with an
+    errno, a failing read, in the default open of a disk with 0x76 entries:
+    that open stands for a single entry, and its own RDB failures are plain
+    IOErrors without one. Those leave no RDB open whose names could shift.
     """
     if isinstance(error, (DiskRDBError, EntryRDBError)):
         return ("the RDB beside the MBR" if rdb_idx is None else
                 f"the RDB in {rdb_label(amiga_parts, rdb_idx)}")
-    if rdb_idx is not None and not isinstance(error, NoEntryRDBError):
+    if rdb_idx is None:
+        if amiga_parts and error.errno is not None:
+            raise error
+    elif not isinstance(error, NoEntryRDBError):
         raise error
     return None
 
@@ -1013,7 +1018,8 @@ def _disk_names(
     """(mbr_partition_index, RDB offset, mount_names) per RDB that opens,
     each RDB that is found but does not open, named for a message
     (_failed_rdb), and what ended the walk, or None: a device or media
-    error in an entry's RDB.
+    error in an entry's RDB, or in the default open of a disk with a single
+    entry.
 
     After such an error, only the RDBs before that entry are listed, and
     the walk's end holds the error with the (mbr_partition_index, number)
@@ -1126,9 +1132,10 @@ def find_partition(
     raises IOError too if an RDB on the disk is found but does not open,
     the disk's own beside the MBR or an entry's: its partitions are
     unknown, so any name or number may select another partition than with
-    that RDB intact. A device or media error in an entry's RDB ends the
-    lookup with that error; read-only, only if partition is not a name in
-    an RDB before that entry that the entry cannot change (_find_before).
+    that RDB intact. A device or media error in an entry's RDB, or in the
+    default open of a disk with a single entry, ends the lookup with that
+    error; read-only, only if partition is not a name in an RDB before that
+    entry that the entry cannot change (_find_before).
     """
     partition = str(partition)
     rdbs, failed, end = _disk_names(image, block_size)
