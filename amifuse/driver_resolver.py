@@ -7,8 +7,10 @@ partition's DOS type. For DOS0-DOS7 volumes this module picks one, in order:
 1. FastFileSystem in the user's drivers folder (DOS0-DOS7), so a user's own
    FFS, e.g. from AmigaOS 3.2, always wins;
 2. the FastFileSystem bundled with AmiFUSE, for the DOS types its build
-   covers (recorded in its provenance file);
-3. the dev fallback, a sibling AmiFUSE-testing checkout (DOS0-DOS7).
+   covers (recorded in its provenance file).
+
+A development checkout resolves as an installed copy does; a test or a
+developer that wants another handler passes --driver.
 
 It reads no disk image: fuse_fs.resolve_driver() puts --driver and the
 driver stored in the RDB in front of this lookup.
@@ -33,11 +35,6 @@ USER_DRIVER_NAME = "FastFileSystem"
 # Names the drivers folder in messages when there is no home folder for it.
 NO_USER_DRIVER_DIR = "your drivers folder (no home folder found)"
 
-# Development checkouts and CI have AmiFUSE-testing beside AmiFUSE.
-DEV_FALLBACK_DRIVER = (
-    Path(__file__).parent.parent.parent / "AmiFUSE-testing" / "drivers" / USER_DRIVER_NAME
-)
-
 DOS_BASE = 0x444F5300  # "DOS\0"
 _LONG_NAME_TAGS = ("DOS6", "DOS7")
 _DOS_TAG_RE = re.compile(r"DOS[0-7]\Z")
@@ -48,8 +45,8 @@ _VER_RE = re.compile(rb"\$VER:\s*([\x20-\x7e]{1,120})")
 class ResolvedDriver:
     """A filesystem driver and where it came from.
 
-    source is one of "explicit" (--driver), "rdb", "user", "bundled" or
-    "dev_fallback". description follows "Filesystem driver:" in banners.
+    source is one of "explicit" (--driver), "rdb", "user" or "bundled".
+    description follows "Filesystem driver:" in banners.
     version is the driver's $VER text; tag is the bundled release tag.
     Only a temporary driver (an RDB extraction) is the caller's to delete.
     """
@@ -262,14 +259,6 @@ def find_folder_driver(dos_type: int, subject: str, quiet: bool = False) -> Reso
     covered = provenance is not None and tag in provenance["dos_types"]
     if covered and bundled_present():
         return _bundled(provenance, subject, remedy, quiet)
-
-    if _usable(DEV_FALLBACK_DRIVER):
-        version, digest = _identity(
-            DEV_FALLBACK_DRIVER, "the dev fallback FastFileSystem", subject, remedy)
-        return ResolvedDriver(
-            DEV_FALLBACK_DRIVER, "dev_fallback", f"{DEV_FALLBACK_DRIVER} (dev fallback)",
-            version=version, sha256=digest,
-        )
 
     if provenance is not None and not covered:
         long_names = " (long file names)" if tag in _LONG_NAME_TAGS else ""

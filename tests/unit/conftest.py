@@ -54,12 +54,10 @@ def launcher_claim_names(monkeypatch):
 
 @pytest.fixture
 def user_driver_dir(monkeypatch, tmp_path):
-    """An empty user drivers folder under tmp_path, and no dev fallback.
+    """An empty user drivers folder under tmp_path.
 
     The folder comes from LOCALAPPDATA on Windows and HOME elsewhere;
-    USERPROFILE covers tests that pretend a Windows host is another OS. The
-    dev fallback is CI's AmiFUSE-testing clone, which would otherwise serve
-    the volumes the bundled build does not cover.
+    USERPROFILE covers tests that pretend a Windows host is another OS.
     """
     from amifuse import driver_resolver
 
@@ -67,8 +65,6 @@ def user_driver_dir(monkeypatch, tmp_path):
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("USERPROFILE", str(home))
     monkeypatch.setenv("LOCALAPPDATA", str(home / "AppData" / "Local"))
-    monkeypatch.setattr(
-        driver_resolver, "DEV_FALLBACK_DRIVER", tmp_path / "no-dev" / "FastFileSystem")
     folder = driver_resolver.user_driver_dir()
     assert tmp_path in folder.parents
     folder.mkdir(parents=True)

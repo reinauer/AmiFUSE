@@ -35,14 +35,12 @@ def _require_machine68k():
 
 @pytest.fixture
 def no_user_driver(monkeypatch, tmp_path):
-    """An empty user drivers folder and no dev fallback: the bundled handler."""
+    """An empty user drivers folder: the bundled handler."""
     home = tmp_path / "home"
     home.mkdir()
     for name in ("HOME", "USERPROFILE"):
         monkeypatch.setenv(name, str(home))
     monkeypatch.setenv("LOCALAPPDATA", str(home / "AppData" / "Local"))
-    monkeypatch.setattr(
-        driver_resolver, "DEV_FALLBACK_DRIVER", tmp_path / "no-dev" / "FastFileSystem")
 
 
 def _xdftool(image: Path, *args) -> subprocess.CompletedProcess:
