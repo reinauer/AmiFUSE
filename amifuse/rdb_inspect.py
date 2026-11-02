@@ -438,16 +438,9 @@ def _scan_for_rdb(blkdev, block_size: Optional[int] = None):
     return None, None, bad_checksum_blk
 
 
-def _bad_checksum(blk_num: int, block_bytes: int) -> str:
-    """Describe the RDSK block _scan_for_rdb found with a bad checksum.
-
-    amitools sums the whole block, while AmigaOS sums only rdb_SummedLongs
-    longs, so the message says which: an RDB that AmigaOS reads, with other
-    data after those longs, fails here too, as one read with a forced block
-    size other than its own can.
-    """
-    return (f"RDSK block at block {blk_num} fails its checksum over the "
-            f"whole {block_bytes}-byte block")
+def _bad_checksum(blk_num: int) -> str:
+    """Describe the RDSK block _scan_for_rdb found with a bad checksum."""
+    return f"RDSK block at block {blk_num} fails its checksum"
 
 
 def _is_parceiro_checksum(block) -> bool:
@@ -823,7 +816,7 @@ def _locate_rdisk(image, block_size, mbr_partition_index, mbr_info, open_at):
         # 0x76 partitions are not tried in its place.
         error = DiskRDBError if _amiga_partitions(mbr_info) else IOError
         raise error(f"Failed to parse RDB at {image}: "
-                    f"{_bad_checksum(bad_blk, blkdev.block_bytes)}")
+                    f"{_bad_checksum(bad_blk)}")
     if rdb_block is not None and parse_direct:
         try:
             rdisk = _parse_rdb(blkdev, rdb_block)
@@ -898,7 +891,7 @@ def _locate_rdisk(image, block_size, mbr_partition_index, mbr_info, open_at):
                     continue
 
             if rdb_block is None and bad_blk is not None:
-                reason = _bad_checksum(bad_blk, offset_dev.block_bytes)
+                reason = _bad_checksum(bad_blk)
                 skipped.append((mbr_part, f": {reason}"))
                 continue
 
