@@ -3,19 +3,26 @@
 The disk's own RDB, beside the MBR, failing to open does not stop the
 entries' RDBs (#205). Beside the disk's own RDB, an entry whose RDB is found
 but fails to open is reported, while an entry holding no RDB is left out
-(#206).
+(#206). There a partition with a damaged drive name, which no mount without
+--partition reaches, is mounted by its number if that selects it (#325).
 """
 
+import errno
 import json
 import struct
 
 import pytest
+from amitools.fs.DosType import DOS3
 
+from amifuse import rdb_inspect
 from amifuse.driver_runtime import BlockDeviceBackend
+from amifuse.launcher import _enumerate_mount_units
 from amifuse.rdb_inspect import (find_partition_mbr_index, list_partitions,
                                  open_rdisk)
 from tests.unit.test_mbr_rdb_block_size import _make_rdb
 from tests.unit.test_parceiro_partitions import _disk_rdb
+from tests.unit.test_partition_name_before_number import (_damage_first_name,
+                                                          _make_rdb_parts)
 
 
 def _corrupt(image, block):
@@ -297,3 +304,83 @@ def test_launcher_leaves_out_an_entry_holding_no_rdb(tmp_path):
     listed = list_partitions(image)
     assert [p.name for p in listed.partitions] == ["PI0"]
     assert listed.fallback_reason is None
+
+
+def _damage_entry(image, tmp_path, lba, rdb=None):
+    """Give the entry at lba the RDB rdb, by default the one it holds, with
+    its first partition's drive name damaged, so amitools reads it as None."""
+    data = bytearray(image.read_bytes())
+    start = lba * 512
+    if rdb is None:
+        rdb = bytes(data[start:start + 160 * 512])
+    damaged = _damage_first_name(tmp_path, rdb)
+    data[start:start + len(damaged)] = damaged
+    image.write_bytes(bytes(data))
+
+
+def test_launcher_mounts_a_damaged_name_by_its_number(tmp_path):
+    # Without --partition the mount ends with the disk RDB's error, and no
+    # name selects the entry's partition.
+    image = _disk_rdb(tmp_path, ("PI0", None), 2)
+    _corrupt(image, 4)
+    _damage_entry(image, tmp_path, 200)
+
+    units, fallback_reason = _enumerate_mount_units(str(image))
+
+    assert [(u.name, u.label) for u in units] == [("0", "#0")]
+    assert fallback_reason == f"RDB beside the MBR: {_disk_error(image)}"
+    # What the spawned mount gets.
+    backend = BlockDeviceBackend(image, partition_scope=True, partition="0")
+    backend.open()
+    try:
+        assert (backend.mbr_partition_index, backend.partition_number) == (0, 0)
+    finally:
+        backend.close()
+
+
+def test_launcher_mounts_a_damaged_name_beside_a_named_partition(tmp_path):
+    image = _disk_rdb(tmp_path, ("PI0", None), 2)
+    _corrupt(image, 4)
+    _damage_entry(image, tmp_path, 200, _make_rdb_parts(
+        tmp_path, 512, [("PI0", DOS3), ("PI1", DOS3)]))
+
+    units, fallback_reason = _enumerate_mount_units(str(image))
+
+    assert [(u.name, u.label) for u in units] == [("0", "#0"), ("PI1", "PI1")]
+    assert fallback_reason == f"RDB beside the MBR: {_disk_error(image)}"
+
+
+def test_launcher_skips_a_damaged_name_whose_number_selects_another(tmp_path):
+    # Number 0 selects the first RDB with a partition 0, so entry 1's
+    # partition has no selector.
+    image = _disk_rdb(tmp_path, ("PI0", "PI1"), 2)
+    _corrupt(image, 4)
+    _damage_entry(image, tmp_path, 200)
+    _damage_entry(image, tmp_path, 400)
+
+    units, fallback_reason = _enumerate_mount_units(str(image))
+
+    assert [(u.name, u.label) for u in units] == [("0", "#0")]
+    assert fallback_reason == (
+        f"RDB beside the MBR: {_disk_error(image)}\n\n"
+        "A partition was not mounted, as its drive name is damaged.")
+
+
+def test_launcher_counts_a_damaged_name_it_cannot_select(tmp_path, monkeypatch):
+    # A lookup that fails selects nothing. The one mount left is the one
+    # without --partition, whose own error reaches the summary, so every
+    # partition is counted as not mounted.
+    image = _disk_rdb(tmp_path, ("PI0", None), 2)
+    _corrupt(image, 4)
+    _damage_entry(image, tmp_path, 200)
+
+    def find_partition(*args, **kwargs):
+        raise OSError(errno.EIO, "Input/output error")
+
+    monkeypatch.setattr(rdb_inspect, "find_partition", find_partition)
+    units, fallback_reason = _enumerate_mount_units(str(image))
+
+    assert [(u.name, u.label) for u in units] == [(None, "disk image")]
+    assert fallback_reason == (
+        f"RDB beside the MBR: {_disk_error(image)}\n\n"
+        "A partition was not mounted, as its drive name is damaged.")

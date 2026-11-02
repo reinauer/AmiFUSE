@@ -253,7 +253,9 @@ class _MountUnit:
     """One drive to mount in a fan-out.
 
     ``name`` is the ``--partition`` key (the drive name, a repeated one renamed
-    DH0.1). It is ``None`` for the degenerate single-unit case -- an ADF/ISO, a
+    DH0.1, or the number of a partition whose drive name is damaged where a
+    mount without ``--partition`` fails). It is ``None`` for the degenerate
+    single-unit case -- an ADF/ISO, a
     single-partition RDB, or an un-enumerable image -- so the spawned command
     omits ``--partition`` and is byte-for-byte the legacy single-partition path
     (a lone partition IS index 0, which the no-``--partition`` default resolves
@@ -287,6 +289,21 @@ def _aggregate_timeout(n: int) -> float:
     return float(min(15 + 5 * (n - 1), 45))
 
 
+def _number_selects(img: Path, part) -> bool:
+    """Return whether ``--partition <number>`` selects ``part``, as text
+    ``inspect`` checks: a number selects the first RDB with a partition of
+    that number, which may be another RDB, and a partition named as the
+    number comes first. A lookup that fails selects nothing."""
+    from amifuse import rdb_inspect
+    try:
+        ref = rdb_inspect.find_partition(img, None, str(part.index))
+    except OSError as exc:
+        _log(f"Partition number {part.index} lookup failed for {img}: {exc!r}")
+        return False
+    return ref is not None and (ref.mbr_partition_index, ref.number) == (
+        part.mbr_partition_index, part.index)
+
+
 def _enumerate_mount_units(image: str) -> tuple[list[_MountUnit], Optional[str]]:
     """Return ``(units, fallback_reason)`` describing what to mount.
 
@@ -302,6 +319,8 @@ def _enumerate_mount_units(image: str) -> tuple[list[_MountUnit], Optional[str]]
     A partition whose drive name is damaged has no name to pass as
     ``--partition``: it is skipped, and ``fallback_reason`` says so. With no
     readable name at all, partition 0 is mounted as a lone partition is.
+    Where a mount without ``--partition`` fails, such a partition is mounted
+    by its number instead, if that number selects it, and is skipped if not.
 
     Any enumeration failure (non-RDB / unreadable image, IOError from
     ``open_rdisk``) degrades to a single no-``--partition`` unit -- exactly the
@@ -326,9 +345,22 @@ def _enumerate_mount_units(image: str) -> tuple[list[_MountUnit], Optional[str]]
 
     parts = result.partitions
     named = [p for p in parts if p.name is not None]
-    # Where a mount without --partition fails, as beside a disk's own RDB
-    # that fails, a lone named partition keeps its name.
-    if (len(parts) <= 1 and not result.default_open_fails) or not named:
+    if result.default_open_fails:
+        # A mount without --partition fails, as beside a disk's own RDB that
+        # fails: each partition needs its name, even a lone one, or a number
+        # that selects it.
+        units = []
+        for p in parts:
+            if p.name is not None:
+                units.append(_MountUnit(name=p.name, label=p.name))
+            elif _number_selects(img, p):
+                units.append(_MountUnit(name=str(p.index), label=f"#{p.index}"))
+        skipped = len(parts) - len(units)
+        if not units:
+            # Not an empty fan-out, which would report no free drive letter:
+            # the mount itself reports why the disk does not open.
+            units = [_MountUnit(name=None, label="disk image")]
+    elif len(parts) <= 1 or not named:
         # The mount opens partition 0, whatever its drive name.
         label = parts[0].name if parts and parts[0].name else "disk image"
         units = [_MountUnit(name=None, label=label)]
