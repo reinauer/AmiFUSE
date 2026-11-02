@@ -2,7 +2,7 @@ import argparse
 import json
 import os
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Iterator, List, Optional, Tuple, Union
 
@@ -25,6 +25,7 @@ from amitools.util.Win32Disk import image_size, open_image  # type: ignore  # no
 # ADF geometry constants
 ADF_DD_SIZE = 901120   # 80 cylinders * 2 heads * 11 sectors * 512 bytes
 ADF_HD_SIZE = 1802240  # 80 cylinders * 2 heads * 22 sectors * 512 bytes
+ADF_DEFAULT_DOS_TYPE = 0x444F5300  # DOS0: a floppy drive's own, and xdftool's
 
 
 @dataclass
@@ -300,13 +301,7 @@ def detect_adf(image: Path) -> Optional[ADFInfo]:
         return None
 
     # Check file size matches floppy geometry
-    if size == ADF_DD_SIZE:
-        is_hd = False
-        sectors_per_track = 11
-    elif size == ADF_HD_SIZE:
-        is_hd = True
-        sectors_per_track = 22
-    else:
+    if size not in (ADF_DD_SIZE, ADF_HD_SIZE):
         return None
 
     # Read first 4 bytes and check for DOS signature
@@ -330,8 +325,13 @@ def detect_adf(image: Path) -> Optional[ADFInfo]:
     # Build DOS type: 'DOS\x00' = 0x444F5300, 'DOS\x01' = 0x444F5301, etc.
     dos_type = 0x444F5300 | variant
 
-    total_blocks = 80 * 2 * sectors_per_track
+    return _adf_info(size, dos_type)
 
+
+def _adf_info(size: int, dos_type: int) -> ADFInfo:
+    """Return the ADFInfo of a floppy image of a size detect_adf accepts."""
+    is_hd = size == ADF_HD_SIZE
+    sectors_per_track = 22 if is_hd else 11
     return ADFInfo(
         dos_type=dos_type,
         is_hd=is_hd,
@@ -339,8 +339,58 @@ def detect_adf(image: Path) -> Optional[ADFInfo]:
         heads=2,
         sectors_per_track=sectors_per_track,
         block_size=512,
-        total_blocks=total_blocks,
+        total_blocks=80 * 2 * sectors_per_track,
     )
+
+
+def floppy_to_format(
+    image: Path,
+    dos_type: Optional[int] = None,
+    block_size: Optional[int] = None,
+) -> Optional[ADFInfo]:
+    """Return the ADFInfo `amifuse format` gives image, or None for an RDB disk.
+
+    Only format calls this, since only format can use a blank image: every
+    other command goes through detect_adf, which needs a DOS type in block 0.
+
+    A floppy is what mount takes for one, or an image of a floppy's size that
+    is all zeros. dos_type, which is --dos-type, overrides the DOS type in
+    block 0. A blank image has none, so without dos_type it gets DOS0.
+
+    Any other image of a floppy's size may hold anything, so it is formatted
+    only when dos_type asks for it. One with an RDSK block in the blocks
+    open_rdisk scans, or an MBR, is left to the RDB path even then, so that
+    a damaged RDB is not taken for a floppy.
+
+    Raises ValueError for an image of a floppy's size that is none of these
+    and has no dos_type, and OSError if the image cannot be read.
+    """
+    adf_info = detect_adf(image)
+    if adf_info is not None:
+        return adf_info if dos_type is None else replace(adf_info, dos_type=dos_type)
+
+    try:
+        size = image_size(image)
+    except OSError:
+        return None  # The RDB path names the problem, as for any other image.
+    if size not in (ADF_DD_SIZE, ADF_HD_SIZE):
+        return None
+
+    with open_image(image) as f:
+        data = f.read(size)
+    if len(data) == size and not data.strip(b"\0"):
+        return _adf_info(size, ADF_DEFAULT_DOS_TYPE if dos_type is None else dos_type)
+
+    step = block_size or 512
+    if parse_mbr(data[:512]) or any(
+            data[blk * step:blk * step + 4] == b"RDSK" for blk in range(16)):
+        return None
+    if dos_type is None:
+        raise ValueError(
+            f"{image} has the size of a floppy, but block 0 holds no DOS type "
+            "from DOS0 to DOS7, and it has no RDB and is not blank. Use "
+            "--dos-type to format it as a floppy, which overwrites it.")
+    return _adf_info(size, dos_type)
 
 
 # ISO 9660 constants
@@ -1730,6 +1780,17 @@ def block_size_arg(text: str) -> int:
         raise argparse.ArgumentTypeError(
             f"must be a power of two from 512 to 32768, not {text!r}")
     return size
+
+
+def dos_type_arg(text: str) -> int:
+    """argparse type for format's --dos-type: DOS0 to DOS7, as a DOS type.
+
+    These are the types detect_adf accepts, so that mount finds the floppy.
+    """
+    tag = text.upper()
+    if len(tag) != 4 or not tag.startswith("DOS") or tag[3] not in "01234567":
+        raise argparse.ArgumentTypeError(f"must be DOS0 to DOS7, not {text!r}")
+    return ADF_DEFAULT_DOS_TYPE + int(tag[3])
 
 
 def main(argv=None):
