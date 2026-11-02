@@ -125,7 +125,8 @@ class PartitionList:
     ``default_open_fails`` is True when the disk's own RDB beside the MBR
     fails (DiskRDBError), which ends the open without ``--partition``: then
     even a lone partition opens only by name. A read error in an entry
-    ends that open too, but also every lookup by name, so it is not flagged.
+    ends that open only if no RDB before it opens, and then no name
+    resolves before it either, so it is not flagged.
     """
     partitions: List[PartInfo]
     fallback_reason: Optional[str] = None
@@ -1014,17 +1015,31 @@ def _failed_rdb(amiga_parts: List[MBRPartition], rdb_idx: Optional[int],
 
 def _disk_names(
     image: Path, block_size: Optional[int],
-) -> Tuple[List[Tuple[Optional[int], int, List[Optional[str]]]], List[str]]:
+) -> Tuple[List[Tuple[Optional[int], int, List[Optional[str]]]], List[str],
+           Optional[Tuple[OSError, set]]]:
     """(mbr_partition_index, RDB offset, mount_names) per RDB that opens,
-    and each RDB that is found but does not open, named for a message
-    (_failed_rdb, which also raises a device or media error)."""
+    each RDB that is found but does not open, named for a message
+    (_failed_rdb), and what ended the walk, or None: a device or media
+    error in an entry's RDB.
+
+    After such an error, only the RDBs before that entry are listed, and
+    the walk's end holds the error with the (mbr_partition_index, number)
+    of each partition there whose name that entry can change: one with the
+    no-automount flag, which is named after every RDB's others
+    (mount_names).
+    """
     rdbs = []
     rdb_parts = []
     failed = []
+    error = None
     amiga_parts = amiga_rdb_partitions(image)
     for rdb_idx, opened in open_each_rdb(image, block_size, len(amiga_parts)):
         if isinstance(opened, IOError):
-            name = _failed_rdb(amiga_parts, rdb_idx, opened)
+            try:
+                name = _failed_rdb(amiga_parts, rdb_idx, opened)
+            except OSError:
+                error = opened
+                break
             if name is not None:
                 failed.append(name)
             continue
@@ -1035,8 +1050,15 @@ def _disk_names(
         finally:
             rdisk.close()
             blkdev.close()
+    end = None
+    if error is not None:
+        end = error, {
+            (rdb_idx, number)
+            for (rdb_idx, _offset), parts in zip(rdbs, rdb_parts)
+            for number, p in enumerate(parts)
+            if p.get_flags() & PartitionBlock.FLAG_NO_AUTOMOUNT}
     return [(rdb_idx, offset, names) for (rdb_idx, offset), names
-            in zip(rdbs, mount_names(rdb_parts))], failed
+            in zip(rdbs, mount_names(rdb_parts))], failed, end
 
 
 def _refuse_write(refusal: str, failed: List[str], shift: str) -> None:
@@ -1070,6 +1092,28 @@ def _find_in(rdbs, partition: str):
     return None
 
 
+def _find_before(rdbs, partition: str, end):
+    """_find_in for _disk_names' RDBs and the end of its walk.
+
+    If a device or media error ended the walk, raises it unless partition
+    is a name in the RDBs before the failing entry that the entry cannot
+    change. A number raises it too: names outrank numbers, and the entry
+    may hold a partition named as the number.
+    """
+    found = _find_in(rdbs, partition)
+    if end is None:
+        return found
+    error, unsettled = end
+    if found is not None:
+        ref = found[0]
+        # _find_in matches names before numbers, so a partition named as
+        # partition was found by that name.
+        if (ref.name is not None and ref.name.lower() == partition.lower()
+                and (ref.mbr_partition_index, ref.number) not in unsettled):
+            return found
+    raise error
+
+
 def find_partition(
     image: Path, block_size: Optional[int], partition: str, write: bool = False
 ) -> Optional[PartitionRef]:
@@ -1090,24 +1134,28 @@ def find_partition(
     the disk's own beside the MBR or an entry's: its partitions are
     unknown, so any name or number may select another partition than with
     that RDB intact. A device or media error in an entry's RDB ends the
-    lookup, read-only too (_disk_names).
+    lookup with that error; read-only, only if partition is not a name in
+    an RDB before that entry that the entry cannot change (_find_before).
     """
     partition = str(partition)
-    rdbs, failed = _disk_names(image, block_size)
-    auto_rdbs = rdbs
+    rdbs, failed, end = _disk_names(image, block_size)
+    auto_rdbs, auto_end = rdbs, end
     if block_size is not None:
         # The forced size can fail an RDB; the shift that causes is refused
         # below, against the auto-detected RDBs. Only the auto-detected
         # open decides whether an RDB fails.
-        auto_rdbs, failed = _disk_names(image, None)
+        auto_rdbs, failed, auto_end = _disk_names(image, None)
     if write:
+        for walk_end in (end, auto_end):
+            if walk_end is not None:
+                raise walk_end[0]
         _refuse_write(
             f"Partition {partition} is not opened for writing", failed,
             "partition names and numbers may select another partition")
-    found = _find_in(rdbs, partition)
+    found = _find_before(rdbs, partition, end)
     if block_size is None:
         return None if found is None else found[0]
-    auto = _find_in(auto_rdbs, partition)
+    auto = _find_before(auto_rdbs, partition, auto_end)
     # Tell the RDBs apart by offset: the default open, index None, can
     # reach a different RDB at the forced size.
     if auto is None or (found is not None and
