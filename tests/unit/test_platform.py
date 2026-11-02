@@ -687,6 +687,49 @@ class TestValidateMountpoint:
         result = validate_mountpoint(PurePosixPath("/mnt/amiga"))
         assert result is None
 
+    def test_validate_macos_refuses_macintosh_hd_symlink(self, monkeypatch):
+        """/Volumes/Macintosh HD is a symlink to / on a default macOS install."""
+        monkeypatch.setattr("sys.platform", "darwin")
+        monkeypatch.setattr(
+            "amifuse.platform.os.path.islink",
+            lambda path: path == "/Volumes/Macintosh HD",
+        )
+        monkeypatch.setattr("amifuse.platform.os.path.exists", lambda path: True)
+        monkeypatch.setattr("amifuse.platform.os.path.ismount", lambda path: False)
+        from amifuse.platform import get_default_mountpoint, validate_mountpoint
+
+        result = validate_mountpoint(get_default_mountpoint("Macintosh HD"))
+        assert result is not None
+        assert "/Volumes/Macintosh HD is a symbolic link" in result
+        assert "--mountpoint" in result
+        assert "--volname" in result
+
+    def test_validate_macos_refuses_a_dangling_symlink(self, monkeypatch, tmp_path):
+        """os.path.exists is False for a dangling link."""
+        link = tmp_path / "link"
+        link.symlink_to(tmp_path / "missing")
+        monkeypatch.setattr("sys.platform", "darwin")
+        from amifuse.platform import validate_mountpoint
+
+        result = validate_mountpoint(link)
+        assert result is not None
+        assert "symbolic link" in result
+
+    def test_validate_refuses_only_a_macos_mountpoint_that_is_a_link(
+            self, monkeypatch, tmp_path):
+        """A link higher up is fine (/tmp is one on macOS), and only macOS
+        has /Volumes and its link to /."""
+        (tmp_path / "real" / "mnt").mkdir(parents=True)
+        link = tmp_path / "link"
+        link.symlink_to(tmp_path / "real")
+        monkeypatch.setattr("sys.platform", "darwin")
+        from amifuse.platform import validate_mountpoint
+
+        assert "symbolic link" in validate_mountpoint(link)
+        assert validate_mountpoint(link / "mnt") is None
+        monkeypatch.setattr("sys.platform", "linux")
+        assert validate_mountpoint(link) is None
+
     def test_validate_windows_dir_mountpoint_mounted(self, monkeypatch):
         r"""On Windows, non-drive-letter path (C:\mnt\amiga) that is mounted returns error."""
         monkeypatch.setattr("sys.platform", "win32")

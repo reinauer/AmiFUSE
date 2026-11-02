@@ -310,6 +310,16 @@ def validate_mountpoint(mountpoint: Path) -> Optional[str]:
                 f"letter or free it first."
             )
     else:
+        # A drive name can match a symlink in /Volumes: /Volumes/Macintosh HD
+        # points to /. Checked first, as os.path.exists follows the link, and
+        # os.path.ismount below is False for one.
+        if sys.platform.startswith("darwin") and os.path.islink(mp_str):
+            return (
+                f"Mountpoint {mountpoint} is a symbolic link, so a mount there "
+                f"could hide the directory it points to; choose another with "
+                f"--mountpoint (or, for the default mountpoint, another "
+                f"volume name with --volname)."
+            )
         try:
             path_exists = os.path.exists(mp_str)
         except OSError as exc:
