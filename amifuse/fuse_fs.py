@@ -4622,6 +4622,7 @@ class AmigaFuseFS(_FuseOperations):
                 self._pending_deletes.discard(resolved_path)
             delete_succeeded = False
             dropped = False
+            locks = []
             try:
                 dir_path, name = self._split_path(resolved_path)
                 lock_bptr, _, locks = self.bridge.locate_path(dir_path)
@@ -4648,16 +4649,25 @@ class AmigaFuseFS(_FuseOperations):
                             self._drop_refused_delete(resolved_path)
                         else:
                             self._pending_deletes.add(resolved_path)
-                for l in reversed(locks):
-                    self.bridge.free_lock(l)
                 if delete_succeeded:
                     with self._cache_lock:
                         self._stat_cache.pop(resolved_path, None)
                         self._dir_cache.pop(dir_path, None)
             except Exception as e:
                 self._log_op("release", resolved_path, f"deferred delete exception: {type(e).__name__}: {e}")
-                with self._fh_lock:
-                    self._pending_deletes.add(resolved_path)
+                # Hidden again only when the delete got no answer: one the
+                # handler answered is settled above.
+                if not delete_succeeded and not dropped:
+                    with self._fh_lock:
+                        self._pending_deletes.add(resolved_path)
+            finally:
+                # Each lock apart from the delete and from the others: a
+                # lock left held keeps the directory in use until unmount.
+                for l in reversed(locks):
+                    try:
+                        self.bridge.free_lock(l)
+                    except Exception as e:
+                        self._log_op("release", resolved_path, f"free_lock exception: {type(e).__name__}: {e}")
             if dropped:
                 # The file stays, and takes the date utimens() held for it.
                 self._set_held_date(resolved_path)
