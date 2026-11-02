@@ -398,11 +398,14 @@ class HandlerBridge:
         debug: bool = False,
         trace: bool = False,
         partition: Optional[str] = None,
+        driver_name: Optional[str] = None,
         adf_info=None,
         iso_info=None,
     ):
         self._lock = threading.RLock()  # Reentrant lock for thread safety
         self._debug = debug
+        # What load errors call the driver; see load_handler.
+        self._driver_name = driver_name
         self._adf_info = adf_info
         self._iso_info = iso_info
         self.backend = None
@@ -445,7 +448,7 @@ class HandlerBridge:
         if trace:
             self.vh.enable_trace()
         self.mem = self.vh.alloc.get_mem()
-        seg_baddr = self.vh.load_handler(driver)
+        seg_baddr = self.vh.load_handler(driver, self._driver_name)
         # Build DeviceNode/FSSM using seglist bptr. Pass the backend's block
         # size request, so both open the disk the same way.
         ba = BootstrapAllocator(
@@ -5103,7 +5106,8 @@ def resolve_driver(
     if result is not None:
         temp_driver, dt_str, dostype = result
         return ResolvedDriver(
-            temp_driver, "rdb", f"{dt_str}/0x{dostype:08x} (from RDB)", temporary=True)
+            temp_driver, "rdb", f"{dt_str}/0x{dostype:08x} (from RDB)", temporary=True,
+            display_name=f"the {dt_str} (0x{dostype:08x}) driver stored in the RDB")
 
     if part_info is None:
         part_info = get_partition_info(image, block_size, partition)
@@ -5319,6 +5323,7 @@ def mount_fuse(
             bridge = HandlerBridge(
                 image,
                 driver,
+                driver_name=resolved.display_name,
                 block_size=block_size,
                 read_only=not write,
                 debug=debug,
@@ -5625,7 +5630,10 @@ def format_volume(
         except OSError as exc:
             if debug:
                 raise
-            raise SystemExit(f"Error: {exc}") from exc
+            # The refusals read the driver before the loader does.
+            name = resolved.display_name or driver
+            raise SystemExit(
+                f"Error: cannot read {name}: {exc.strerror or exc}") from exc
         if refusal is not None:
             raise SystemExit(refusal)
 
@@ -5633,6 +5641,7 @@ def format_volume(
             bridge = HandlerBridge(
                 image,
                 driver,
+                driver_name=resolved.display_name,
                 block_size=block_size,
                 read_only=False,
                 debug=debug,
@@ -5980,6 +5989,7 @@ def _create_bridge_from_args(args, command: str, read_only: bool = True):
         bridge = HandlerBridge(
             image,
             driver,
+            driver_name=resolved.display_name,
             block_size=block_size,
             read_only=read_only,
             debug=debug,

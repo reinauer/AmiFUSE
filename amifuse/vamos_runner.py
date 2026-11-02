@@ -218,9 +218,27 @@ class VamosHandlerRuntime:
         log_machine.setLevel(logging.INFO)
         self.trace_mgr.setup_cpu_instr_trace(show_regs)
 
-    def load_handler(self, handler_path: Path) -> int:
+    def load_handler(self, handler_path: Path,
+                     driver_name: Optional[str] = None) -> int:
+        """Load the handler and return its seglist.
+
+        Errors name the handler by its path, or by driver_name if given: a
+        driver extracted from the RDB is at a temporary path, gone by the
+        time the error is shown.
+        """
         if not self.slm:
             raise RuntimeError("setup() not called")
+        name = driver_name or f"handler {handler_path}"
+
+        def raise_os_error(exc: OSError):
+            # The file could not be read: a reported refusal. An error that
+            # names the file, by the path the user gave, stands as it is.
+            if exc.filename is not None and driver_name is None:
+                raise exc
+            text = f"Failed to load {name}: {exc.strerror or exc}"
+            raise (OSError(text) if exc.errno is None
+                   else OSError(exc.errno, text)) from exc
+
         # A bad handler file is a user error: raise OSError or ValueError,
         # which mount and format report in one line. The loader returns 0
         # both for a missing file and for one in no format it knows.
@@ -228,16 +246,17 @@ class VamosHandlerRuntime:
             os.stat(handler_path)
         except FileNotFoundError:
             raise FileNotFoundError(
-                f"Failed to load handler {handler_path}: no such file") from None
-        # Any other stat error (e.g. an unreadable folder) names the path.
+                f"Failed to load {name}: no such file") from None
+        except OSError as exc:
+            # E.g. an unreadable folder.
+            raise_os_error(exc)
         if not os.path.isfile(handler_path):
             raise ValueError(
-                f"Failed to load handler {handler_path}: not a regular file")
+                f"Failed to load {name}: not a regular file")
         try:
             seg_baddr = self.slm.seg_loader.load_sys_seglist(str(handler_path))
-        except OSError:
-            # The file could not be read: already a reported refusal.
-            raise
+        except OSError as exc:
+            raise_os_error(exc)
         except Exception as exc:
             # The file is the loader's only input. Its parsers fail on a
             # damaged file with assorted errors (HunkParseError, IndexError,
@@ -245,12 +264,12 @@ class VamosHandlerRuntime:
             # segment does not fit in memory. --debug still shows the
             # original.
             raise ValueError(
-                f"Failed to load handler {handler_path}: "
+                f"Failed to load {name}: "
                 f"{type(exc).__name__}: {exc}"
             ) from exc
         if seg_baddr == 0:
             raise ValueError(
-                f"Failed to load handler {handler_path}: not a loadable "
+                f"Failed to load {name}: not a loadable "
                 f"Amiga executable (HUNK or ELF)"
             )
         self.seglist_baddr = seg_baddr

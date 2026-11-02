@@ -1,10 +1,11 @@
-"""`format`, `mount` and `ls` with a --driver file that cannot be loaded.
+"""`format`, `mount` and `ls` with a driver that cannot be loaded.
 
-Each command names the file in a one-line error and exits 1, without a
-traceback. The image is built here with amitools' rdbtool, so these tests
-need no AmiFUSE-testing checkout.
+Each command names the --driver file, or the driver stored in the RDB, in a
+one-line error and exits 1, without a traceback. The image is built here
+with amitools' rdbtool, so these tests need no AmiFUSE-testing checkout.
 """
 
+import errno
 import os
 import random
 import struct
@@ -27,6 +28,8 @@ DRIVERS = {
     # An ELF magic with a header too short to parse.
     "short_elf": b"\x7fELF" + bytes(4),
 }
+
+RDB_DRIVER = "the PFS3 (0x50465303) driver stored in the RDB"
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -145,6 +148,150 @@ def test_handler_in_unreadable_folder_is_not_missing(runtime, tmp_path):
     try:
         with pytest.raises(PermissionError) as caught:
             runtime.load_handler(path)
+        with pytest.raises(PermissionError) as named:
+            runtime.load_handler(path, RDB_DRIVER)
     finally:
         folder.chmod(0o755)
     assert str(caught.value.filename) == str(path)
+    assert RDB_DRIVER in str(named.value)
+    assert str(path) not in str(named.value)
+
+
+def _failing_loader(runtime, monkeypatch, failure):
+    def load_sys_seglist(*args, **kwargs):
+        raise failure
+
+    monkeypatch.setattr(runtime.slm.seg_loader, "load_sys_seglist", load_sys_seglist)
+
+
+def test_read_error_names_the_driver(runtime, tmp_path, monkeypatch):
+    # A read fails after the open: the error from the loader has no filename.
+    path = tmp_path / "drv.handler"
+    path.write_bytes(DRIVERS["random"])
+    failure = OSError(errno.EIO, "Input/output error")
+    _failing_loader(runtime, monkeypatch, failure)
+    with pytest.raises(OSError) as caught:
+        runtime.load_handler(path)
+    assert caught.value.errno == errno.EIO
+    assert caught.value.__cause__ is failure
+    assert str(path) in str(caught.value)
+    assert "Input/output error" in str(caught.value)
+
+
+def test_read_error_without_an_errno_names_the_driver(runtime, tmp_path,
+                                                      monkeypatch):
+    path = tmp_path / "drv.handler"
+    path.write_bytes(DRIVERS["random"])
+    _failing_loader(runtime, monkeypatch, OSError("read failed"))
+    with pytest.raises(OSError) as caught:
+        runtime.load_handler(path)
+    assert str(caught.value) == f"Failed to load handler {path}: read failed"
+
+
+@pytest.mark.parametrize("filename", [None, "the-temporary-path"])
+def test_read_error_uses_the_drivers_name_over_its_path(
+        runtime, tmp_path, monkeypatch, filename):
+    path = tmp_path / "drv.handler"
+    path.write_bytes(DRIVERS["random"])
+    _failing_loader(runtime, monkeypatch,
+                    OSError(errno.EIO, "Input/output error", filename))
+    with pytest.raises(OSError) as caught:
+        runtime.load_handler(path, RDB_DRIVER)
+    assert caught.value.errno == errno.EIO
+    assert RDB_DRIVER in str(caught.value)
+    assert str(path) not in str(caught.value)
+    assert "the-temporary-path" not in str(caught.value)
+
+
+@pytest.mark.parametrize("kind,error,reason", [
+    ("missing", FileNotFoundError, "no such file"),
+    ("directory", ValueError, "not a regular file"),
+    ("damaged", ValueError, "not a loadable Amiga executable (HUNK or ELF)"),
+])
+def test_load_errors_use_the_drivers_name_over_its_path(runtime, tmp_path, kind,
+                                                        error, reason):
+    path = tmp_path / "drv.handler"
+    if kind == "directory":
+        path.mkdir()
+    elif kind == "damaged":
+        path.write_bytes(DRIVERS["random"])
+    with pytest.raises(error) as caught:
+        runtime.load_handler(path, RDB_DRIVER)
+    assert str(caught.value) == f"Failed to load {RDB_DRIVER}: {reason}"
+
+
+def test_parser_error_uses_the_drivers_name_over_its_path(runtime, tmp_path):
+    path = tmp_path / "drv.handler"
+    path.write_bytes(DRIVERS["damaged_hunk"])
+    with pytest.raises(ValueError) as caught:
+        runtime.load_handler(path, RDB_DRIVER)
+    assert str(caught.value).startswith(f"Failed to load {RDB_DRIVER}: ")
+    assert str(path) not in str(caught.value)
+
+
+@pytest.fixture
+def rdb_image(tmp_path):
+    """A disk whose RDB stores a damaged driver for its partition's DOS type."""
+    path = tmp_path / "rdbdriver.hdf"
+    junk = tmp_path / "stored.handler"
+    junk.write_bytes(DRIVERS["random"])
+    proc = subprocess.run(
+        [sys.executable, "-m", "amitools.tools.rdbtool", str(path),
+         "create", "size=8Mi", "+", "init", "rdb_cyls=2",
+         "+", "add", "size=6MiB", "name=DH0", "fs=PFS3",
+         "+", "fsadd", str(junk), "fs=PFS3"],
+        cwd=AMITOOLS_ROOT if AMITOOLS_ROOT.is_dir() else None,
+        capture_output=True, text=True, check=False,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    return path
+
+
+def _assert_names_the_rdb_driver(proc: subprocess.CompletedProcess):
+    output = proc.stdout + proc.stderr
+    assert proc.returncode == 1, output
+    assert "Traceback" not in output, output
+    assert f"Failed to load {RDB_DRIVER}: not a loadable" in proc.stderr, output
+    assert "amifuse_" not in output, output
+
+
+def test_rdb_driver_is_named_by_ls(rdb_image):
+    _assert_names_the_rdb_driver(_amifuse("ls", str(rdb_image)))
+
+
+def test_rdb_driver_is_named_by_format(rdb_image):
+    _assert_names_the_rdb_driver(_amifuse("format", str(rdb_image), "DH0", "Vol"))
+
+
+def test_rdb_driver_is_named_by_mount(rdb_image, tmp_path, monkeypatch):
+    # The load fails before FUSE, which is stubbed out.
+    from amifuse import fuse_fs, platform
+
+    monkeypatch.setattr(fuse_fs, "_require_fuse", lambda: object)
+    monkeypatch.setattr(platform, "check_fuse_available", lambda: None)
+    with pytest.raises(SystemExit) as caught:
+        fuse_fs.main(["mount", str(rdb_image), "--foreground",
+                      "--mountpoint", str(tmp_path / "mnt")])
+    message = str(caught.value.code)
+    assert message.startswith(f"Cannot mount {rdb_image}: Failed to load {RDB_DRIVER}: ")
+    assert "amifuse_" not in message
+
+
+@pytest.mark.parametrize("from_rdb", [True, False])
+def test_format_names_the_driver_it_cannot_read(rdb_image, tmp_path, monkeypatch,
+                                                from_rdb):
+    # format reads the driver for its PFS3 refusals, before the loader.
+    from amifuse import fuse_fs
+
+    def unreadable(*args):
+        raise OSError(errno.EIO, "Input/output error")
+
+    monkeypatch.setattr(fuse_fs, "_pfs3_format_refusal", unreadable)
+    args = ["format", str(rdb_image), "DH0", "Vol"]
+    name = RDB_DRIVER
+    if not from_rdb:
+        name = tmp_path / "stored.handler"
+        args += ["--driver", str(name)]
+    with pytest.raises(SystemExit) as caught:
+        fuse_fs.main(args)
+    assert caught.value.code == f"Error: cannot read {name}: Input/output error"
