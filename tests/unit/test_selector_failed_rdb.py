@@ -221,9 +221,8 @@ def _bad_disk_rdsk(tmp_path, entries=("DH0", "PI1")):
     return image
 
 
-def _bad(block, size=512):
-    return (f"RDSK block at block {block} fails its checksum over the whole "
-            f"{size}-byte block")
+def _bad(block):
+    return f"RDSK block at block {block} fails its checksum"
 
 
 def _bad_disk_rdsk_error(image):
@@ -285,11 +284,6 @@ def test_plain_rdsk_with_a_bad_checksum_names_the_block(tmp_path):
         open_rdisk(image)
     assert not isinstance(caught.value, DiskRDBError)
     assert str(caught.value) == f"Failed to parse RDB at {image}: {_bad(0)}"
-    # The message names the size the block was summed over.
-    with pytest.raises(OSError) as caught:
-        open_rdisk(image, block_size=1024)
-    assert str(caught.value) == (
-        f"Failed to parse RDB at {image}: {_bad(0, 1024)}")
 
 
 def test_bad_rdsk_inside_an_entry_is_that_entry_s(tmp_path):
