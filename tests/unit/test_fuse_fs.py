@@ -11,6 +11,7 @@ import errno
 import io
 import json
 import os
+import re
 import signal
 import sys
 import tempfile
@@ -208,6 +209,37 @@ class TestMountFuseOptions:
         monkeypatch.setitem(sys.modules, "amitools.fs.DosType", fake_dostype)
 
         return captured
+
+    @pytest.mark.parametrize("name, shown", [
+        ("Work,allow_other", "Work_allow_other"),
+        ("Work\\", "Work_"),
+        ("Work\\,allow_other", "Work__allow_other"),
+        ("Work\0dropped", "Work_dropped"),
+    ], ids=["comma", "trailing-backslash", "escaped-comma", "nul"])
+    @pytest.mark.parametrize("given", [False, True], ids=["image", "volname-option"])
+    def test_a_volume_name_cannot_change_mount_options(
+        self, monkeypatch, mock_mount_fuse_deps, name, shown, given
+    ):
+        """The options split as they should, as libfuse and WinFsp parse them."""
+        from amifuse import fuse_fs, platform
+
+        monkeypatch.setattr(
+            platform, "get_mount_options", lambda **kw: {"volname": kw["volname"]}
+        )
+        fuse_fs.HandlerBridge.return_value.volume_name.return_value = name
+        fuse_fs.mount_fuse(
+            Path("test.hdf"), Path("driver"), Path("/mnt/x"), None,
+            volname_opt=name if given else None, foreground=True,
+        )
+        kwargs = mock_mount_fuse_deps["fuse_kwargs"]
+        assert kwargs["fsname"] == f"amifuse:{shown}"
+        assert kwargs["volname"] == shown
+        # fusepy's option string, here with the option after each name.
+        joined = ",".join([f"fsname={kwargs['fsname']}", "default_permissions",
+                           f"volname={kwargs['volname']}", "local"])
+        options = re.sub(r"\\(.)", "", joined.split("\0")[0], flags=re.S).split(",")
+        assert options == [f"fsname=amifuse:{shown}", "default_permissions",
+                           f"volname={shown}", "local"]
 
     @pytest.mark.parametrize("host", ["win32", "linux"])
     @pytest.mark.parametrize("debug", [False, True])

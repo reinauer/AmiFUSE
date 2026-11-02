@@ -5267,7 +5267,7 @@ def mount_fuse(
             raise SystemExit("Filesystem handler crashed during startup; mount aborted.")
 
         # Let default signal handling work - FUSE will call destroy() on unmount
-        volname = volname_opt or bridge.volume_name()
+        volname = plat.fuse_option_value(volname_opt or bridge.volume_name())
         if _handler_has_crashed(bridge):
             _close_bridge(bridge)
             raise SystemExit("Filesystem handler crashed during startup; mount aborted.")

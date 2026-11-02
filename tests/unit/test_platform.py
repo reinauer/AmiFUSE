@@ -288,6 +288,24 @@ class TestGetUnmountCommand:
 # ---------------------------------------------------------------------------
 
 
+class TestFuseOptionValue:
+    """Tests for fuse_option_value(value)."""
+
+    @pytest.mark.parametrize("value, expected", [
+        ("Work", "Work"),
+        ("Games & Demos=1 (\xe9)", "Games & Demos=1 (\xe9)"),
+        ("Games,Demos", "Games_Demos"),
+        ("back\\slash", "back_slash"),
+        ("nul\0byte", "nul_byte"),
+        ("new\nline", "new_line"),
+        ("del\x7fete", "del_ete"),
+    ])
+    def test_fuse_option_value(self, value, expected):
+        from amifuse.platform import fuse_option_value
+
+        assert fuse_option_value(value) == expected
+
+
 class TestGetMountOptions:
     """Tests for get_mount_options(volname, ...)."""
 
