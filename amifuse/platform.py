@@ -12,6 +12,7 @@ Platform-specific implementations:
 """
 
 import errno
+import json
 import logging
 import os
 import posixpath
@@ -19,8 +20,10 @@ import re
 import signal
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import List, Optional, Set, TYPE_CHECKING
@@ -588,6 +591,7 @@ def find_amifuse_mounts():
         mounts = _find_amifuse_mounts_unix()
 
     mounts = _deduplicate_fusepy_children(mounts)
+    _apply_mount_records(mounts)
     _enrich_null_mountpoints(mounts)
     return mounts
 
@@ -678,12 +682,13 @@ def _parse_mount_tokens(tokens):
             # path (`/Volumes/Games --write WHD`), and a "--" in the run
             # counts as one. What `ps` can't settle: a mountpoint like
             # "/Volumes/Games --write" looks exactly like a real --write.
-            # Only the exact argv (/proc/<pid>/cmdline, sysctl
-            # KERN_PROCARGS2) would. A wrong reading shows the shorter path
-            # in `status`, and `amifuse unmount` of that path can take
-            # another program's FUSE-T mount for AmiFUSE's or, in its kill
-            # fallback on Linux/macOS, pick the wrong AmiFUSE process (as
-            # `main` already could for the `--mountpoint X` form).
+            # A mount that is up has a mount record, which replaces this
+            # reading. Before that, or when no record could be written, a
+            # wrong reading shows the shorter path in `status`, and `amifuse
+            # unmount` of that path can take another program's FUSE-T mount
+            # for AmiFUSE's or, in its kill fallback on Linux/macOS, pick
+            # the wrong AmiFUSE process (as `main` already could for the
+            # `--mountpoint X` form).
             in_run = in_run and option not in _MOUNT_VALUE_OPTIONS
             if option == "--" and mountpoint is not None:
                 run += in_run
@@ -940,6 +945,114 @@ def _find_amifuse_mounts_cim():
         })
 
     return mounts
+
+
+# ---------------------------------------------------------------------------
+# Mount records
+# ---------------------------------------------------------------------------
+#
+# `ps` shows a mount's command line, which holds no path for a default
+# mountpoint, a path relative to a working directory that a daemon has left,
+# and a path with spaces only in pieces. So a mount that is up records its
+# absolute mountpoint in <pid>.json, and process discovery prefers that. A
+# record counts only for a running `amifuse mount` process of that pid, so
+# one left by a killed mount does nothing.
+
+
+def _mount_record_dir() -> Optional[Path]:
+    """Return this user's directory of mount records, or None on Windows.
+
+    The Windows process discovery reads the mountpoint another way.
+    """
+    if not hasattr(os, "getuid"):
+        return None
+    base = os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir()
+    return Path(base) / f"amifuse-{os.getuid()}"
+
+
+def _is_private_dir(path: Path) -> bool:
+    """Tell whether only this user can write to directory ``path``.
+
+    The directory may be under a shared /tmp, where anyone can create it
+    first, and a record decides what `amifuse unmount` may unmount.
+    """
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return False
+    return (stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid()
+            and not info.st_mode & 0o077)
+
+
+def _read_mount_records() -> dict:
+    """Return the readable mount records, as {pid: record}."""
+    directory = _mount_record_dir()
+    if directory is None or not _is_private_dir(directory):
+        return {}
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return {}
+    records = {}
+    for name in names:
+        stem, _, suffix = name.partition(".")
+        if suffix != "json" or not stem.isdigit():
+            continue
+        try:
+            with open(directory / name, encoding="utf-8") as stream:
+                record = json.load(stream)
+        except (OSError, ValueError):
+            continue
+        if (isinstance(record, dict) and record.get("pid") == int(stem)
+                and isinstance(record.get("mountpoint"), str)):
+            records[int(stem)] = record
+    return records
+
+
+def write_mount_record(record: dict) -> None:
+    """Record this process's mount, and drop the records of dead processes.
+
+    ``record`` holds the absolute mountpoint and image, and the partition.
+    A mount goes on without a record: process discovery falls back to `ps`.
+    """
+    directory = _mount_record_dir()
+    if directory is None:
+        return
+    pid = os.getpid()
+    try:
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        if not _is_private_dir(directory):
+            return
+        for other in _read_mount_records():
+            if not _pid_exists(other):
+                (directory / f"{other}.json").unlink(missing_ok=True)
+        temp = directory / f"{pid}.tmp"
+        with open(temp, "w", encoding="utf-8") as stream:
+            json.dump(dict(record, pid=pid), stream)
+        os.replace(temp, directory / f"{pid}.json")
+    except OSError as exc:
+        logger.debug("Could not write a mount record: %s", exc)
+
+
+def remove_mount_record() -> None:
+    """Remove this process's mount record, if it has one."""
+    directory = _mount_record_dir()
+    if directory is None:
+        return
+    try:
+        (directory / f"{os.getpid()}.json").unlink(missing_ok=True)
+    except OSError as exc:
+        logger.debug("Could not remove a mount record: %s", exc)
+
+
+def _apply_mount_records(mounts) -> None:
+    """Replace what `ps` showed of each process with its mount record."""
+    records = _read_mount_records()
+    for mount in mounts:
+        record = records.get(mount["pid"])
+        if record is not None:
+            mount["mountpoint"] = record["mountpoint"]
+            mount["image"] = record.get("image") or mount.get("image")
 
 
 # ---------------------------------------------------------------------------
@@ -1452,10 +1565,10 @@ def is_amifuse_mount_macos(mountpoint, mount_table=None) -> bool:
 
     It is when `mount` lists it with the source AmiFUSE sets (macFUSE). A
     FUSE-T mount, whose source doesn't name AmiFUSE, is when a running
-    AmiFUSE process was given its path, or when it is dead and nothing
-    serves it any more. Anything else (another disk or share, or a path the
-    table doesn't list) is not, so no caller mistakes the user's own volume
-    for an AmiFUSE mount.
+    AmiFUSE process recorded it or was given its path, or when it is dead and
+    nothing serves it any more. Anything else (another disk or share, or a
+    path the table doesn't list) is not, so no caller mistakes the user's own
+    volume for an AmiFUSE mount.
 
     Args:
         mountpoint: The path to check.
@@ -1472,11 +1585,12 @@ def is_amifuse_mount_macos(mountpoint, mount_table=None) -> bool:
     if not _is_fuse_t_source(source):
         return False
     path = Path(os.fspath(mountpoint))
-    # Process discovery pairs a mount started without --mountpoint only with
-    # a volume the table names as AmiFUSE's, so this finds just the processes
-    # given this path on their command lines. The caller's parent is left
-    # out: a wrapper such as `sudo` or `uv run` repeats the command line of
-    # the `amifuse mount` checking its own path.
+    # Process discovery pairs a mount with no mount record and no
+    # --mountpoint only with a volume the table names as AmiFUSE's, so this
+    # finds just the processes that recorded this path or were given it on
+    # their command lines. The caller's parent is left out: a wrapper such
+    # as `sudo` or `uv run` repeats the command line of the `amifuse mount`
+    # checking its own path.
     parent = os.getppid()
     if any(pid != parent for pid in _find_mount_owner_pids(path)):
         return True
@@ -1488,7 +1602,7 @@ def _enrich_mountpoints_macos(null_mounts, all_mounts):
     """Scan /Volumes/ for amifuse mount points and assign to null mounts.
 
     Takes only the entries in /Volumes/ that `mount` lists as AmiFUSE mounts,
-    so on FUSE-T a mount started without --mountpoint stays unpaired.
+    so on FUSE-T a mount without a mount record stays unpaired.
     """
     volumes_dir = "/Volumes"
     if not os.path.isdir(volumes_dir):

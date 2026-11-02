@@ -2772,6 +2772,7 @@ class AmigaFuseFS(_FuseOperations):
         self._debug = debug
         self._mountpoint = mountpoint
         self._unmount_control = None
+        self._mount_record = None  # for platform.write_mount_record
         self._uid = getattr(os, 'getuid', lambda: 0)()
         self._gid = getattr(os, 'getgid', lambda: 0)()
         self._stat_cache: Dict[str, Tuple[float, Dict]] = {}  # path -> (timestamp, stat_result)
@@ -4778,6 +4779,9 @@ class AmigaFuseFS(_FuseOperations):
         if self._unmount_control is not None:
             self._unmount_control.start()
         self._start_timer_thread()
+        if self._mount_record is not None:
+            from .platform import write_mount_record
+            write_mount_record(self._mount_record)
         self._report_ready()
         if sys.platform.startswith("win") and self._mountpoint:
             from .platform import notify_shell_drive_change
@@ -5349,9 +5353,9 @@ def mount_fuse(
         if foreground:
             print("[amifuse] interactive mode; press Ctrl+C to unmount")
         elif sys.platform.startswith("darwin"):
-            # On FUSE-T, `amifuse unmount` refuses a mount it can't tie to
-            # this process (no --mountpoint, or one with a space, which `ps`
-            # doesn't keep whole); `umount` works on both macOS backends.
+            # On FUSE-T, `amifuse unmount` needs this mount's record to tie
+            # it to this process, and writing one can fail; `umount` works
+            # on both macOS backends.
             print("[amifuse] daemon mode; unmount with: umount "
                   + shlex.quote(str(mountpoint)))
         else:
@@ -5453,6 +5457,12 @@ def mount_fuse(
         try:
             operations = AmigaFuseFS(bridge, debug=debug, icons=icons, mountpoint=mountpoint,
                                      ready_fd=ready_fd)
+            # Absolute now: the working directory changes once mounted.
+            operations._mount_record = {
+                "mountpoint": os.path.abspath(mountpoint),
+                "image": os.path.abspath(image),
+                "partition": partition,
+            }
             if sys.platform.startswith("win"):
                 from .windows_unmount import UnmountControl
                 control = UnmountControl()
@@ -5475,6 +5485,7 @@ def mount_fuse(
             # destroy() stops it, but a mount can end without destroy().
             if operations is not None:
                 operations._stop_timer_thread()
+            plat.remove_mount_record()
             _close_bridge(bridge)
             # Clean up temp volume icon file
             if temp_volicon is not None and temp_volicon.exists():
