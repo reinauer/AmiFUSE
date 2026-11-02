@@ -5904,8 +5904,30 @@ def _format_protection(prot_bits: int) -> str:
     return str(prot)
 
 
+def _not_walked_reason(ent):
+    """Why _ls_recursive lists directory entry `ent` but stays out of it, or None.
+
+    A link may lead back to a directory the walk is inside, so it would never
+    end. The handler follows a hard link, and refuses a soft link in a path.
+    The names come from the disk, where a colon or a slash can be: a slash
+    would split the name, and `q:` is the root of the volume, which holds
+    `q:` again.
+    """
+    if ent.get("dir_type") == 3:  # ST_SOFTLINK
+        return "it is a soft link"
+    if ent.get("dir_type") == 4:  # ST_LINKDIR
+        return "it is a hard link to a directory"
+    if "/" in ent["name"]:
+        return "a slash separates AmigaDOS path components"
+    return _unsendable_path_reason(ent["name"])
+
+
 def _ls_recursive(bridge, root_path: str) -> list:
-    """Recursively list all entries under root_path."""
+    """Recursively list all entries under root_path.
+
+    A directory it can't go into is listed, without its contents, and named
+    on stderr.
+    """
     entries = []
     stack = [root_path]
     while stack:
@@ -5926,7 +5948,12 @@ def _ls_recursive(bridge, root_path: str) -> list:
                 "protection_bits": prot_bits,
             })
             if is_dir:
-                dir_children.append(child)
+                reason = _not_walked_reason(ent)
+                if reason is None:
+                    dir_children.append(child)
+                else:
+                    print(f"Warning: contents of {child} not listed ({reason})",
+                          file=sys.stderr)
         # Traverse in sorted order for deterministic output
         stack.extend(reversed(sorted(dir_children)))
     return entries
