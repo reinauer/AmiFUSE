@@ -95,7 +95,7 @@ def test_filesystem_list_loop_ends_the_list(tmp_path):
         "Filesystem list loops back to block 2 "
         "(remaining filesystem entries skipped)",
     ]
-    assert damaged == [(DOS3, warnings[0]), (None, warnings[1])]
+    assert damaged == [(DOS3, warnings[0], 0), (None, warnings[1], 1)]
 
 
 @pytest.mark.timeout(10)
@@ -112,7 +112,7 @@ def test_lseg_chain_loop_drops_the_driver(tmp_path, from_blk):
         "Filesystem #0 (DOS3/0x444f5303): LSEG chain loops back to block 3 "
         "(driver data unavailable)",
     ]
-    assert damaged == [(DOS3, warnings[0])]
+    assert damaged == [(DOS3, warnings[0], 0)]
 
 
 @pytest.mark.timeout(10)
@@ -134,7 +134,8 @@ def test_lseg_chain_loop_after_a_damaged_entry(tmp_path):
         f"Filesystem #1 (DOS1/0x444f5301): LSEG chain loops back to block "
         f"{lseg} (driver data unavailable)",
     ]
-    assert [dos_type for dos_type, _ in damaged] == [DOS3, DOS1]
+    assert [(dos_type, num) for dos_type, _, num in damaged] == [(DOS3, 0),
+                                                                 (DOS1, 1)]
 
 
 @pytest.mark.timeout(10)

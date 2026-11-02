@@ -87,7 +87,7 @@ def test_filesystem_link_past_the_end_ends_the_list(tmp_path):
         f"Filesystem list links to block {PAST_END}, past the end of the "
         f"device (remaining filesystem entries skipped)",
     ]
-    assert damaged == [(None, warnings[0])]
+    assert damaged == [(None, warnings[0], 1)]
 
 
 def test_lseg_link_past_the_end_drops_the_driver(tmp_path):
@@ -102,7 +102,7 @@ def test_lseg_link_past_the_end_drops_the_driver(tmp_path):
         f"Filesystem #0 (DOS3/0x444f5303): LSEG chain links to block "
         f"{PAST_END}, past the end of the device (driver data unavailable)",
     ]
-    assert damaged == [(DOS3, warnings[0])]
+    assert damaged == [(DOS3, warnings[0], 0)]
 
 
 def test_link_past_a_0x76_entrys_end(tmp_path):
@@ -125,7 +125,7 @@ def test_link_past_a_0x76_entrys_end(tmp_path):
         f"Filesystem list links to block {slice_blocks + 10}, past the end "
         f"of the device (remaining filesystem entries skipped)",
     ]
-    assert damaged == [(None, warnings[0])]
+    assert damaged == [(None, warnings[0], 1)]
 
 
 def test_inspect_reports_the_link(tmp_path, capsys):

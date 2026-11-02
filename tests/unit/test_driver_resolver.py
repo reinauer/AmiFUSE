@@ -702,7 +702,7 @@ class TestRdbImages:
         blkdev, rdisk, _ = open_rdisk(image)
         try:
             assert [fs.fshd.dos_type for fs in rdisk.fs] == [_dos(3)]
-            assert [dos_type for dos_type, _ in rdisk.damaged_fs] == [None]
+            assert [dos_type for dos_type, _, _ in rdisk.damaged_fs] == [None]
         finally:
             rdisk.close()
             blkdev.close()

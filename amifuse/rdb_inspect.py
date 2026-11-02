@@ -599,9 +599,9 @@ def _lenient_rdisk_open(rdisk) -> List[str]:
     A partition list that ends so is also recorded, by its warning, in
     rdisk.damaged_part_list, otherwise None: the partitions after it are
     unknown. Each filesystem entry it drops is also recorded in
-    rdisk.damaged_fs as (DOS type, warning); the DOS type is None when the
-    header is unreadable or the list loops or links past the end, hiding
-    the entries after it.
+    rdisk.damaged_fs as (DOS type, warning, entry's number); the DOS type is
+    None when the header is unreadable or the list loops or links past the
+    end, hiding the entries after it.
     """
     from amitools.fs.block.Block import Block
     from amitools.fs.block.rdb.PartitionBlock import PartitionBlock
@@ -663,7 +663,7 @@ def _lenient_rdisk_open(rdisk) -> List[str]:
                 f"Filesystem list loops back to block {fs_blk} "
                 f"(remaining filesystem entries skipped)"
             )
-            rdisk.damaged_fs.append((None, warnings[-1]))
+            rdisk.damaged_fs.append((None, warnings[-1], num))
             break
         if fs_blk >= rdisk.rawblk.num_blocks:
             # Not read: it would raise the IOError of a failing read.
@@ -671,7 +671,7 @@ def _lenient_rdisk_open(rdisk) -> List[str]:
                 f"Filesystem list links to block {fs_blk}, past the end of "
                 f"the device (remaining filesystem entries skipped)"
             )
-            rdisk.damaged_fs.append((None, warnings[-1]))
+            rdisk.damaged_fs.append((None, warnings[-1], num))
             break
         seen.add(fs_blk)
         # Not FileSystem.read(): its LSEG walk has no bound.
@@ -682,7 +682,7 @@ def _lenient_rdisk_open(rdisk) -> List[str]:
                 f"Corrupt filesystem header at block {fs_blk} "
                 f"(remaining filesystem entries skipped)"
             )
-            rdisk.damaged_fs.append((None, warnings[-1]))
+            rdisk.damaged_fs.append((None, warnings[-1], fs.num))
             break
         dt = fs.fshd.dos_type
         dt_str = DosType.num_to_tag_str(dt)
@@ -691,7 +691,7 @@ def _lenient_rdisk_open(rdisk) -> List[str]:
                 f"Filesystem #{fs.num} ({dt_str}/0x{dt:08x}): "
                 f"{problem} (driver data unavailable)"
             )
-            rdisk.damaged_fs.append((dt, warnings[-1]))
+            rdisk.damaged_fs.append((dt, warnings[-1], fs.num))
             fs_blk = fs.fshd.next
             continue
         if parceiro_count > 0:
@@ -1811,11 +1811,25 @@ def format_mbr_table(mbr_info: MBRInfo) -> List[str]:
     return lines
 
 
+def filesystem_entry(rdisk: RDisk, num: int):
+    """The filesystem entry the report shows as FS #num.
+
+    The lenient parse numbers entries by their place in the RDB's list,
+    dropped ones included, so this is not rdisk.get_filesystem(), which
+    indexes the entries kept. Raises IndexError saying why there is none.
+    """
+    for fs in rdisk.fs:
+        if fs.num == num:
+            return fs
+    for dos_type, warning, damaged_num in getattr(rdisk, "damaged_fs", ()):
+        # A DOS type of None hid the entries after that one too.
+        if num == damaged_num or (dos_type is None and num > damaged_num):
+            raise IndexError(f"Cannot extract filesystem #{num}: {warning}")
+    raise IndexError(f"No filesystem #{num} in RDB.")
+
+
 def extract_fs(rdisk: RDisk, index: int, out_path: Path) -> Path:
-    fs = rdisk.get_filesystem(index)
-    if fs is None:
-        raise IndexError(f"Filesystem #{index} not found")
-    data = fs.get_data()
+    data = filesystem_entry(rdisk, index).get_data()
     out_path.write_bytes(data)
     return out_path
 
@@ -1875,7 +1889,7 @@ def main(argv=None):
         "--extract-fs",
         type=int,
         metavar="N",
-        help="Extract filesystem entry N (0-based) to a host file.",
+        help="Extract filesystem entry N (0-based), the report's FS #N, to a host file.",
     )
     parser.add_argument(
         "--out",
@@ -1920,9 +1934,10 @@ def main(argv=None):
         # Extract from first RDB (use --mbr-partition for specific one in future)
         blkdev, rdisk, _ = open_rdisk(args.image, block_size=args.block_size)
         try:
-            fs_obj = rdisk.get_filesystem(args.extract_fs)
-            if fs_obj is None:
-                raise SystemExit(f"No filesystem #{args.extract_fs} in RDB.")
+            try:
+                fs_obj = filesystem_entry(rdisk, args.extract_fs)
+            except IndexError as exc:
+                raise SystemExit(str(exc))
             dt = fs_obj.fshd.dos_type
             default_name = f"fs{args.extract_fs}_{DosType.num_to_tag_str(dt)}.bin"
             out_path = args.out or Path(default_name)
