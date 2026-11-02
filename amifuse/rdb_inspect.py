@@ -134,6 +134,24 @@ class PartitionList:
     default_open_fails: bool = False
 
 
+def escape_text(text) -> str:
+    """Return a string from an image for printing to a terminal.
+
+    The image chooses its bytes, so a character outside 0x20-0x7E is shown
+    escaped, e.g. "\\x1b", and never reaches the terminal. A backslash is
+    escaped too, as "\\x5c", so that an escape cannot be faked.
+    """
+    return "".join(
+        ch if " " <= ch <= "~" and ch != "\\" else f"\\x{ord(ch):02x}"
+        for ch in str(text)
+    )
+
+
+def dos_type_tag(dos_type: int) -> str:
+    """Return a DOS type's tag, e.g. "PFS3", for printing (escape_text)."""
+    return escape_text(DosType.num_to_tag_str(dos_type))
+
+
 def detect_mbr(image: Path) -> Optional[MBRInfo]:
     """Detect and parse MBR partition table.
 
@@ -685,7 +703,7 @@ def _lenient_rdisk_open(rdisk) -> List[str]:
             rdisk.damaged_fs.append((None, warnings[-1]))
             break
         dt = fs.fshd.dos_type
-        dt_str = DosType.num_to_tag_str(dt)
+        dt_str = dos_type_tag(dt)
         if problem is not None:
             warnings.append(
                 f"Filesystem #{fs.num} ({dt_str}/0x{dt:08x}): "
@@ -1276,18 +1294,20 @@ def find_partition(
     if auto is None or (found is not None and
                         (found[1], found[0].number) == (auto[1], auto[0].number)):
         return None if found is None else found[0]
+    # inspect looks up the names in the image, so partition can be one.
+    shown = escape_text(partition)
     if auto[1] not in {offset for _idx, offset, _names in rdbs}:
         raise IOError(
-            f"Partition {partition} is in an RDB that does not open "
+            f"Partition {shown} is in an RDB that does not open "
             f"with {block_size}-byte blocks"
         )
     if found is None:
         raise IOError(
-            f"Partition {partition} is not found with {block_size}-byte "
+            f"Partition {shown} is not found with {block_size}-byte "
             f"blocks, as an RDB on this disk does not open with them"
         )
     raise IOError(
-        f"Partition {partition} names another partition with {block_size}-byte "
+        f"Partition {shown} names another partition with {block_size}-byte "
         f"blocks, as an RDB on this disk does not open with them"
     )
 
@@ -1486,7 +1506,7 @@ def format_fs_summary(rdisk: RDisk):
     lines = []
     for fs in rdisk.fs:
         dt = fs.fshd.dos_type
-        dt_str = DosType.num_to_tag_str(dt)
+        dt_str = dos_type_tag(dt)
         lines.append(
             f"FS #{fs.num}: {dt_str}/0x{dt:08x} version={fs.fshd.get_version_string()} "
             f"size={len(fs.get_data())} flags={fs.get_flags_info()}"
@@ -1642,6 +1662,8 @@ def format_rdisk_report(rdisk: RDisk, full: bool = False) -> List[str]:
                 + line[len(prefix):] if line.startswith(prefix) else line
                 for line in lines
             ]
+    # amitools builds these lines with the image's drive names and DOS types.
+    lines = [escape_text(line) for line in lines]
     fs_lines = format_fs_summary(rdisk)
     if fs_lines:
         lines.append("")
@@ -1924,7 +1946,8 @@ def main(argv=None):
             if fs_obj is None:
                 raise SystemExit(f"No filesystem #{args.extract_fs} in RDB.")
             dt = fs_obj.fshd.dos_type
-            default_name = f"fs{args.extract_fs}_{DosType.num_to_tag_str(dt)}.bin"
+            # By number: the tag's characters come from the image.
+            default_name = f"fs{args.extract_fs}_{dt:08x}.bin"
             out_path = args.out or Path(default_name)
             saved_to = extract_fs(rdisk, args.extract_fs, out_path)
             print(f"Wrote filesystem #{args.extract_fs} ({hex(dt)}) to {saved_to}")

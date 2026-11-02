@@ -210,8 +210,9 @@ class BlockDeviceBackend:
         start = env.low_cyl * cyl_blocks
         end = (env.high_cyl + 1) * cyl_blocks
         reserved_end = self.rdb.rdb.log_drv.rdb_blk_hi + 1
-        from .rdb_inspect import partition_label
-        name = partition_label(part)
+        # Only messages use the name, and the image chooses its bytes.
+        from .rdb_inspect import escape_text, partition_label
+        name = escape_text(partition_label(part))
         if env.surfaces <= 0 or env.blk_per_trk <= 0 or end <= start:
             raise ValueError(f"Partition {name} has invalid geometry")
         if (start < reserved_end
@@ -390,6 +391,9 @@ class BlockDeviceBackend:
             raise RDBContentError(f"{where} is not valid as a {size}-byte block")
         rdisk = _parse_rdb(base, rdb_block)
         try:
+            # Messages name the partitions, and the image chooses the names.
+            from .rdb_inspect import escape_text, partition_label
+
             own = "of the disk's own RDB"
             ranges = []
             for part in rdisk.parts:
@@ -397,7 +401,7 @@ class BlockDeviceBackend:
                 cyl_bytes = env.surfaces * env.blk_per_trk * size
                 ranges.append((env.low_cyl * cyl_bytes,
                                (env.high_cyl + 1) * cyl_bytes,
-                               f"partition {part.get_drive_name()} {own}"))
+                               f"partition {escape_text(partition_label(part))} {own}"))
             low, high = rdb_block.log_drv.rdb_blk_lo, rdb_block.log_drv.rdb_blk_hi
             ranges.append((low * size, (high + 1) * size,
                            f"reserved blocks {low}-{high} {own}"))

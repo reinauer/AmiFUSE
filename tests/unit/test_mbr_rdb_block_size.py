@@ -21,7 +21,10 @@ from amifuse.rdb_inspect import open_rdisk
 
 
 def _make_rdb(tmp_path, block_bytes, drive="DH0"):
-    rdb_image = tmp_path / f"rdb-{drive}.hdf"
+    # Other tests open rdb-DH0.hdf by name; a name with control bytes goes
+    # in hex, since Windows refuses them in a file name.
+    shown = drive if drive.isprintable() else drive.encode().hex()
+    rdb_image = tmp_path / f"rdb-{shown}.hdf"
     raw = RawBlockDevice(str(rdb_image), read_only=False, block_bytes=block_bytes)
     with ExitStack() as cleanup:
         raw.create(160)
