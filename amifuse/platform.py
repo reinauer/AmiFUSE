@@ -966,6 +966,22 @@ def _deduplicate_fusepy_children(mounts: list) -> list:
 # ---------------------------------------------------------------------------
 
 
+# How old a temporary file must be before a sweep may remove it, in seconds.
+# Far longer than it takes to load an extracted driver.
+_STALE_TEMP_AGE = 3600
+
+
+def _left_by_ended_run(pid: int, mtime: float) -> bool:
+    """Tell if a temporary file named for PID, last changed at mtime, is stale.
+
+    It is stale only if that process is gone and the file is older than
+    _STALE_TEMP_AGE. The age covers a daemon mount whose parent, the process
+    named, is killed before the child it forked has loaded the driver. A PID
+    in use again only keeps a file for longer.
+    """
+    return time.time() - mtime > _STALE_TEMP_AGE and not _pid_exists(pid)
+
+
 def _pid_exists(pid: int) -> bool:
     """Check if a process with the given PID exists."""
     if sys.platform.startswith("win"):

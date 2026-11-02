@@ -5056,39 +5056,31 @@ def _entry_partitions_hint(names: List[str]) -> str:
 # The PID that extracted the driver, then mkstemp's random part, whose
 # alphabet has no "-", and the DOS type. Earlier versions wrote no PID.
 _EXTRACTED_DRIVER_NAME = re.compile(r"amifuse_(\d{1,9})-\w+_[0-9a-f]{8}\.handler")
-# Far longer than it takes to load an extracted driver, in seconds.
-_EXTRACTED_DRIVER_MAX_AGE = 3600
 
 
 def _remove_stale_drivers() -> None:
     """Remove extracted drivers that killed runs left in the temp directory.
 
-    Such a file is removed only if the process in its name is gone and the
-    file is older than _EXTRACTED_DRIVER_MAX_AGE. A file is used only from
-    its extraction until the bridge has loaded it, and the age covers a
-    daemon mount whose parent, the process named, is killed before the
-    child it forked gets there. A PID in use again only keeps a file for
-    longer. A file of another name is left alone, as nothing says whether
-    a run still needs it. A file that can't be removed is left for a later
-    run.
+    A file is used only from its extraction until the bridge has loaded it,
+    so one that _left_by_ended_run calls stale is removed. A file of another
+    name is left alone, as nothing says whether a run still needs it. A file
+    that can't be removed is left for a later run.
     """
     import tempfile
-    from .platform import _pid_exists
+    from .platform import _left_by_ended_run
 
     temp_dir = tempfile.gettempdir()
     try:
         names = os.listdir(temp_dir)
     except OSError:
         return
-    now = time.time()
     for name in names:
         match = _EXTRACTED_DRIVER_NAME.fullmatch(name)
         if match is None:
             continue
         path = os.path.join(temp_dir, name)
         try:
-            age = now - os.lstat(path).st_mtime
-            if age > _EXTRACTED_DRIVER_MAX_AGE and not _pid_exists(int(match[1])):
+            if _left_by_ended_run(int(match[1]), os.lstat(path).st_mtime):
                 os.unlink(path)
         except OSError:
             pass
