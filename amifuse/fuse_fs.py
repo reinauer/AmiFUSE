@@ -12,6 +12,7 @@ import itertools
 import math
 import operator
 import os
+import re
 import shlex
 import signal
 import subprocess
@@ -402,6 +403,7 @@ class HandlerBridge:
         driver_name: Optional[str] = None,
         adf_info=None,
         iso_info=None,
+        remove_driver: bool = False,
     ):
         self._lock = threading.RLock()  # Reentrant lock for thread safety
         self._debug = debug
@@ -409,6 +411,8 @@ class HandlerBridge:
         self._driver_name = driver_name
         self._adf_info = adf_info
         self._iso_info = iso_info
+        # driver is a temporary file, removed once it is loaded.
+        self._remove_driver = remove_driver
         self.backend = None
         self.vh = None
         self._closed = False
@@ -450,6 +454,15 @@ class HandlerBridge:
             self.vh.enable_trace()
         self.mem = self.vh.alloc.get_mem()
         seg_baddr = self.vh.load_handler(driver, self._driver_name)
+        # Nothing reads the file again. Removing an extracted driver before
+        # any handler code runs leaves nothing behind when the process is
+        # killed, as while a handler hangs: a kill skips the caller's
+        # cleanup, which is left to report a removal that fails here.
+        if self._remove_driver:
+            try:
+                Path(driver).unlink(missing_ok=True)
+            except OSError:
+                pass
         # Build DeviceNode/FSSM using seglist bptr. Pass the backend's block
         # size request, so both open the disk the same way.
         ba = BootstrapAllocator(
@@ -5040,6 +5053,47 @@ def _entry_partitions_hint(names: List[str]) -> str:
             f"{', '.join(shown)}. Open one with --partition {shown[0]}.")
 
 
+# The PID that extracted the driver, then mkstemp's random part, whose
+# alphabet has no "-", and the DOS type. Earlier versions wrote no PID.
+_EXTRACTED_DRIVER_NAME = re.compile(r"amifuse_(\d{1,9})-\w+_[0-9a-f]{8}\.handler")
+# Far longer than it takes to load an extracted driver, in seconds.
+_EXTRACTED_DRIVER_MAX_AGE = 3600
+
+
+def _remove_stale_drivers() -> None:
+    """Remove extracted drivers that killed runs left in the temp directory.
+
+    Such a file is removed only if the process in its name is gone and the
+    file is older than _EXTRACTED_DRIVER_MAX_AGE. A file is used only from
+    its extraction until the bridge has loaded it, and the age covers a
+    daemon mount whose parent, the process named, is killed before the
+    child it forked gets there. A PID in use again only keeps a file for
+    longer. A file of another name is left alone, as nothing says whether
+    a run still needs it. A file that can't be removed is left for a later
+    run.
+    """
+    import tempfile
+    from .platform import _pid_exists
+
+    temp_dir = tempfile.gettempdir()
+    try:
+        names = os.listdir(temp_dir)
+    except OSError:
+        return
+    now = time.time()
+    for name in names:
+        match = _EXTRACTED_DRIVER_NAME.fullmatch(name)
+        if match is None:
+            continue
+        path = os.path.join(temp_dir, name)
+        try:
+            age = now - os.lstat(path).st_mtime
+            if age > _EXTRACTED_DRIVER_MAX_AGE and not _pid_exists(int(match[1])):
+                os.unlink(path)
+        except OSError:
+            pass
+
+
 def extract_embedded_driver(
     image: Path, block_size: Optional[int], partition: Optional[str]
 ) -> Optional[Tuple[Path, str, int]]:
@@ -5078,10 +5132,13 @@ def extract_embedded_driver(
             if fs.fshd.dos_type == target_dostype:
                 # Found matching filesystem - extract to temp file
                 data = fs.get_data()
+                _remove_stale_drivers()
                 # Create temp file that persists until program exits. It is
                 # named by number: the tag's characters come from the image.
+                # The PID is for _remove_stale_drivers.
                 fd, temp_path = tempfile.mkstemp(
-                    suffix=f"_{target_dostype:08x}.handler", prefix="amifuse_")
+                    suffix=f"_{target_dostype:08x}.handler",
+                    prefix=f"amifuse_{os.getpid()}-")
                 try:
                     # The file object closes fd even if a write fails, and
                     # retries short writes until all of data is written.
@@ -5383,6 +5440,7 @@ def mount_fuse(
                 partition=partition,
                 adf_info=adf_info,
                 iso_info=iso_info,
+                remove_driver=resolved.temporary,
             )
         except (OSError, ValueError) as exc:
             # Lock conflicts and invalid partitions are expected refusals.
@@ -5398,18 +5456,6 @@ def mount_fuse(
         if _handler_has_crashed(bridge):
             _close_bridge(bridge)
             raise SystemExit("Filesystem handler crashed during startup; mount aborted.")
-
-        # The bridge has loaded the handler, and nothing reads its file
-        # again. Removing an extracted one now leaves nothing behind when
-        # the process is killed: a handler crash ends a Windows mount by
-        # TerminateProcess, which skips the cleanup below. A failed removal
-        # is left to that cleanup, which reports it.
-        if temp_driver is not None:
-            try:
-                temp_driver.unlink(missing_ok=True)
-                temp_driver = None
-            except OSError:
-                pass
 
         # Pre-generate volume icon if platform requires it at mount time
         temp_volicon = None
@@ -5704,6 +5750,7 @@ def format_volume(
                 debug=debug,
                 partition=partition,
                 adf_info=adf_info,
+                remove_driver=resolved.temporary,
             )
         except (OSError, ValueError) as exc:
             # Any OSError or ValueError from the whole constructor: opening
@@ -6053,6 +6100,7 @@ def _create_bridge_from_args(args, command: str, read_only: bool = True):
             partition=partition,
             adf_info=adf_info,
             iso_info=iso_info,
+            remove_driver=resolved.temporary,
         )
     except SystemExit as e:
         if temp_driver is not None:

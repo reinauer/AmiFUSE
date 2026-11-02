@@ -4,10 +4,12 @@ These tests exercise code paths that unit tests with mocked machine68k
 cannot cover: actual handler startup, packet exchange, resource lifecycle.
 """
 
+import tempfile
+
 import pytest
 from pathlib import Path
 
-from amifuse.fuse_fs import HandlerBridge
+from amifuse.fuse_fs import HandlerBridge, resolve_driver
 from amifuse.startup_runner import OFFSET_CURRENT
 
 pytestmark = pytest.mark.integration
@@ -25,6 +27,20 @@ class TestHandlerBridgeStartup:
         try:
             entries = bridge.list_dir_path("/")
             assert isinstance(entries, list)
+        finally:
+            bridge.close()
+
+    def test_handler_runs_after_its_extracted_file_is_removed(
+            self, pfs3_image, tmp_path, monkeypatch):
+        """Nothing reads the driver from the RDB again once it is loaded."""
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        resolved = resolve_driver(pfs3_image, None, None, None)
+        assert resolved.temporary
+        bridge = HandlerBridge(pfs3_image, resolved.path,
+                               remove_driver=resolved.temporary)
+        try:
+            assert not resolved.path.exists()
+            assert bridge.list_dir_path("/")
         finally:
             bridge.close()
 

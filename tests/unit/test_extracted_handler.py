@@ -2,14 +2,20 @@
 
 An extracted handler is removed on every exit from mount, and the DOS type
 the image supplies reaches neither the temp file's name nor the terminal
-unescaped.
+unescaped. The bridge removes it once loaded, before any handler code runs,
+and an extraction removes what killed runs left, but no file a running
+AmiFUSE may still need (#300).
 """
 
 import errno
+import os
+import subprocess
+import sys
 import tempfile
+import time
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, Mock
 
 import pytest
 
@@ -305,3 +311,209 @@ def test_format_prints_dos_type_escaped(monkeypatch, capsys, tmp_path, temp_dir,
     assert "DOS type: \\x1b[2J (0x1b5b324a)" in out
     assert "\x1b" not in out
     assert list(temp_dir.iterdir()) == []
+
+
+@pytest.fixture
+def bridge_start(monkeypatch, tmp_path):
+    """Run HandlerBridge's constructor as far as the bootstrap, which is ahead
+    of any handler code, and stop it there.
+
+    Returns start(**kwargs); start.handler is the driver file, and start.seen
+    says whether it existed at the load and at the bootstrap.
+    """
+    image = tmp_path / "disk.adf"
+    image.write_bytes(bytes(1024))
+    info = SimpleNamespace(block_size=512, cylinders=1, heads=1,
+                           sectors_per_track=2, total_blocks=2)
+    handler = tmp_path / "driver.handler"
+    handler.write_bytes(HANDLER)
+    seen = {}
+
+    def load_handler(driver):
+        seen["load"] = Path(driver).exists()
+        return 1
+
+    def alloc_all(**kwargs):
+        seen["bootstrap"] = handler.exists()
+        raise RuntimeError("stop before the handler")
+
+    runtime = Mock()
+    runtime.load_handler.side_effect = load_handler
+    bootstrap = Mock()
+    bootstrap.alloc_all.side_effect = alloc_all
+    monkeypatch.setattr(fuse_fs, "VamosHandlerRuntime", lambda: runtime)
+    monkeypatch.setattr(fuse_fs, "BootstrapAllocator", Mock(return_value=bootstrap))
+
+    def start(**kwargs):
+        with pytest.raises(RuntimeError, match="stop before the handler"):
+            fuse_fs.HandlerBridge(image, handler, adf_info=info, **kwargs)
+
+    start.handler, start.seen = handler, seen
+    return start
+
+
+def test_bridge_removes_a_temporary_driver_before_the_handler_runs(bridge_start):
+    bridge_start(remove_driver=True)
+    assert bridge_start.seen == {"load": True, "bootstrap": False}
+
+
+def test_bridge_keeps_the_users_driver(bridge_start):
+    bridge_start(remove_driver=False)
+    assert bridge_start.seen == {"load": True, "bootstrap": True}
+
+
+def test_removal_that_fails_does_not_stop_the_bridge(bridge_start, monkeypatch):
+    def unlink(self, missing_ok=False):
+        raise PermissionError(errno.EACCES, "Access is denied", str(self))
+
+    monkeypatch.setattr(Path, "unlink", unlink)
+    bridge_start(remove_driver=True)
+    assert bridge_start.seen == {"load": True, "bootstrap": True}
+
+
+@pytest.mark.parametrize("driver", [None, "user.handler"])
+def test_file_command_has_only_an_extracted_driver_removed(
+        monkeypatch, tmp_path, temp_dir, extracted, driver):
+    image = tmp_path / "work.hdf"
+    image.write_bytes(b"")
+    if driver is not None:
+        driver = tmp_path / driver
+    args = SimpleNamespace(image=image, driver=driver, partition="DH0",
+                           block_size=None, debug=False, json=False)
+    monkeypatch.setattr(rdb_inspect, "detect_adf", lambda image: None)
+    monkeypatch.setattr(rdb_inspect, "detect_iso", lambda image: None)
+    monkeypatch.setattr(fuse_fs, "HandlerBridge", MagicMock())
+
+    bridge, temp_driver = fuse_fs._create_bridge_from_args(args, "ls")
+    fuse_fs._cleanup_bridge(None, temp_driver)
+
+    assert fuse_fs.HandlerBridge.call_args.kwargs["remove_driver"] is (driver is None)
+
+
+def test_format_has_an_extracted_driver_removed(monkeypatch, tmp_path, temp_dir,
+                                                extracted):
+    image = tmp_path / "work.hdf"
+    image.write_bytes(b"")
+    _bridge_refused(monkeypatch, None)
+
+    with pytest.raises(SystemExit):
+        fuse_fs.format_volume(image, None, None, "DH0")
+
+    assert fuse_fs.HandlerBridge.call_args.kwargs["remove_driver"] is True
+
+
+def _stale(temp_dir, pid, age=7200):
+    """A file as a run of the given PID extracts it, age seconds old."""
+    path = temp_dir / f"amifuse_{pid}-k3x9_1b2_50465303.handler"
+    path.write_bytes(HANDLER)
+    when = time.time() - age
+    os.utime(path, (when, when))
+    return path
+
+
+def _ended_pid():
+    proc = subprocess.Popen([sys.executable, "-c", ""])
+    proc.wait()
+    return proc.pid
+
+
+def test_extraction_removes_what_a_killed_run_left(temp_dir, extracted):
+    left = _stale(temp_dir, _ended_pid())
+
+    path, _tag, _number = fuse_fs.extract_embedded_driver(
+        Path("work.hdf"), None, "DH0")
+
+    assert list(temp_dir.iterdir()) == [path]
+    assert left != path
+    path.unlink()
+
+
+def test_name_of_an_extraction_is_one_the_sweep_knows(monkeypatch, temp_dir,
+                                                      extracted):
+    path, _tag, _number = fuse_fs.extract_embedded_driver(
+        Path("work.hdf"), None, "DH0")
+    assert path.name.startswith(f"amifuse_{os.getpid()}-")
+    os.utime(path, (0, 0))
+    monkeypatch.setattr(platform, "_pid_exists", lambda pid: pid != os.getpid())
+
+    fuse_fs._remove_stale_drivers()
+
+    assert not path.exists()
+
+
+def test_sweep_keeps_the_file_of_a_running_process(temp_dir):
+    # However old the file, as when a handler hangs in its startup.
+    proc = subprocess.Popen([sys.executable, "-c", "input()"],
+                            stdin=subprocess.PIPE)
+    try:
+        path = _stale(temp_dir, proc.pid)
+        fuse_fs._remove_stale_drivers()
+        assert path.exists()
+    finally:
+        proc.communicate(b"\n")
+
+    fuse_fs._remove_stale_drivers()
+    assert not path.exists()
+
+
+def test_sweep_keeps_a_recent_file_of_an_ended_process(temp_dir):
+    # A daemon mount's parent is named, and it may be killed before the child
+    # it forked has loaded the file.
+    path = _stale(temp_dir, _ended_pid(), age=60)
+    fuse_fs._remove_stale_drivers()
+    assert path.exists()
+
+
+@pytest.mark.parametrize("name", [
+    "amifuse_k3x9a1b2_50465303.handler",  # An earlier version's: no PID.
+    "amifuse_12345678_50465303.handler",  # Still none: all digits by chance.
+    "amifuse_k3x9a1b2",  # The vamos scratch folder's name.
+    "amifuse_123-abc.handler",
+    "amifuse_123-abc_50465303.handler.bak",
+    "amifuse_volicon_123-abc_50465303.handler",
+    "amifuse_1000000000-abc_50465303.handler",  # Beyond any PID in use.
+])
+def test_sweep_leaves_other_names_alone(temp_dir, monkeypatch, name):
+    monkeypatch.setattr(platform, "_pid_exists", lambda pid: False)
+    path = temp_dir / name
+    path.write_bytes(HANDLER)
+    os.utime(path, (0, 0))
+
+    fuse_fs._remove_stale_drivers()
+
+    assert path.exists()
+
+
+def test_extraction_goes_on_when_the_sweep_cannot(monkeypatch, temp_dir, extracted):
+    left = _stale(temp_dir, _ended_pid())
+    real_unlink = os.unlink
+    refused = []
+
+    def unlink(path, **kwargs):
+        if Path(path) == left:
+            refused.append(left)
+            raise PermissionError(errno.EACCES, "Access is denied", str(path))
+        real_unlink(path, **kwargs)
+
+    monkeypatch.setattr(os, "unlink", unlink)
+
+    path, _tag, _number = fuse_fs.extract_embedded_driver(
+        Path("work.hdf"), None, "DH0")
+
+    assert refused == [left]
+    assert sorted(temp_dir.iterdir()) == sorted([left, path])
+    path.unlink()
+
+
+def test_extraction_goes_on_without_a_listing_of_the_temp_directory(
+        monkeypatch, temp_dir, extracted):
+    def listdir(path):
+        raise PermissionError(errno.EACCES, "Access is denied", str(path))
+
+    monkeypatch.setattr(os, "listdir", listdir)
+
+    path, _tag, _number = fuse_fs.extract_embedded_driver(
+        Path("work.hdf"), None, "DH0")
+
+    assert path.name.startswith(f"amifuse_{os.getpid()}-")
+    path.unlink()

@@ -164,34 +164,22 @@ def mount(monkeypatch, tmp_path):
                            fuse=fuse, run=run)
 
 
-def test_extracted_handler_is_gone_once_the_bridge_is_up(mount):
-    """A mount killed while FUSE runs leaves no extracted handler behind."""
-    seen = []
-    mount.fuse.side_effect = lambda *a, **kw: seen.append(mount.handler.exists())
-
+def test_bridge_removes_the_extracted_handler(mount):
+    """A mount killed after the load leaves no extracted handler behind."""
     mount.run()
 
     assert mount.handler_at_load == [True]
-    assert seen == [False]
+    assert fuse_fs.HandlerBridge.call_args.kwargs["remove_driver"] is True
 
 
-def test_failed_early_removal_is_retried_at_the_end(monkeypatch, capsys, mount):
-    """A handler the early removal cannot remove is removed at the end."""
-    real_unlink = Path.unlink
-    calls = []
+def test_failed_early_removal_is_retried_at_the_end(capsys, mount):
+    """A handler the bridge cannot remove is removed at the end."""
+    seen = []
+    mount.fuse.side_effect = lambda *a, **kw: seen.append(mount.handler.exists())
 
-    def unlink(self, missing_ok=False):
-        if self == mount.handler:
-            calls.append(self)
-            if len(calls) == 1:
-                raise PermissionError(errno.EACCES, "Access is denied", str(self))
-        real_unlink(self, missing_ok=missing_ok)
+    mount.run()  # This bridge is a mock, which leaves the file as a failure does.
 
-    monkeypatch.setattr(Path, "unlink", unlink)
-
-    mount.run()
-
-    assert len(calls) == 2
+    assert seen == [True]
     assert not mount.handler.exists()
     assert "could not remove" not in capsys.readouterr().err
 
