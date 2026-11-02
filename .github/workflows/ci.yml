@@ -157,14 +157,12 @@ jobs:
           pip install -e "." --no-deps
 
       - name: Verify machine68k
-        run: |
-          python -c "import machine68k; print(f'machine68k {machine68k.__version__}')"
-          python -c "import machine68k; machine68k.CPU(1); print('CPU probe OK')"
-        continue-on-error: true
+        run: python -c "import machine68k; machine68k.CPU(1); print('CPU probe OK')"
 
       - name: Run integration tests
         env:
           AMIFUSE_FIXTURE_ROOT: ${{ github.workspace }}/../AmiFUSE-testing
+          AMIFUSE_REQUIRE_M68K: "1"
         run: pytest tests/integration/ -v --timeout=60
 
   tools-smoke:
@@ -298,10 +296,10 @@ jobs:
               print('fusepy: OK (FUSE class imported)')
           except EnvironmentError as e:
               print(f'fusepy: FUSE backend not found: {e}')
-              sys.exit(0)
+              sys.exit(1)
           except ImportError:
               print('fusepy: not installed')
-              sys.exit(0)
+              sys.exit(1)
           # Verify /dev/fuse accessible on Linux
           if sys.platform.startswith('linux'):
               if os.path.exists('/dev/fuse'):
@@ -313,14 +311,17 @@ jobs:
                       print('/dev/fuse: read-write access OK')
                   except PermissionError as e:
                       print(f'/dev/fuse: access denied: {e}')
+                      sys.exit(1)
               else:
                   print('/dev/fuse: NOT FOUND')
+                  sys.exit(1)
           "
-        continue-on-error: true
 
       - name: Run mount tests
         env:
           AMIFUSE_FIXTURE_ROOT: ${{ github.workspace }}/../AmiFUSE-testing
+          AMIFUSE_REQUIRE_M68K: "1"
+          AMIFUSE_REQUIRE_FUSE: "1"
         run: pytest tests/integration/ -m fuse -v --timeout=60
 
       - name: Cleanup stale mounts (Linux)

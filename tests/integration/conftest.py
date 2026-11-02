@@ -29,6 +29,54 @@ def _machine68k_works() -> bool:
         return False
 
 
+def _fuse_problem() -> str | None:
+    """Return why FUSE mounts can't run here, or None if they can.
+
+    - Import `fuse` (fusepy). fusepy raises EnvironmentError at import time
+      when libfuse/WinFSP is not installed. ImportError means fusepy itself
+      is missing.
+    - On Linux only: secondary check for fusermount/fusermount3 binary
+      (needed for unmount, not strictly for mount, but indicates fuse3 is
+      properly installed).
+
+    Does NOT use platform.check_fuse_available() -- that function only
+    checks WinFSP on Windows and is a no-op on macOS/Linux.
+    """
+    # Primary check: can fusepy find a FUSE library?
+    try:
+        from fuse import FUSE  # noqa: F401
+    except EnvironmentError as exc:
+        # libfuse/WinFSP not installed
+        return f"FUSE backend not available: {exc}"
+    except ImportError:
+        # fusepy itself not installed
+        return "fusepy not installed (pip install fusepy)"
+
+    # Secondary check on Linux: verify fusermount binary exists
+    if sys.platform.startswith("linux"):
+        if not (shutil.which("fusermount") or shutil.which("fusermount3")):
+            return "Neither fusermount nor fusermount3 found on PATH"
+
+    return None
+
+
+def _exit_if_required_backend_is_missing():
+    """Stop the run when CI requires a backend that doesn't work here.
+
+    Without these variables a missing backend skips the tests that need it,
+    and pytest exits 0. CI sets them so that a green job means its tests ran.
+    They cover every skip for the same reason, including the probes in
+    the test modules that aren't integration-marked, by ending the run here.
+    """
+    if os.environ.get("AMIFUSE_REQUIRE_M68K") and not _machine68k_works():
+        pytest.exit("AMIFUSE_REQUIRE_M68K is set, but the machine68k CPU "
+                    "does not work", returncode=1)
+    if os.environ.get("AMIFUSE_REQUIRE_FUSE"):
+        problem = _fuse_problem()
+        if problem is not None:
+            pytest.exit(f"AMIFUSE_REQUIRE_FUSE is set: {problem}", returncode=1)
+
+
 _m68k_checked = False
 _m68k_available = False
 
@@ -41,6 +89,8 @@ def pytest_collection_modifyitems(config, items):
     either (help, doctor) should use tests/unit/ instead.
     """
     global _m68k_checked, _m68k_available
+
+    _exit_if_required_backend_is_missing()
 
     has_integration = any(
         item.get_closest_marker("integration") is not None for item in items
@@ -100,36 +150,11 @@ def ofs_adf_image():
 def fuse_available():
     """Detect FUSE backend availability; skip all fuse-marked tests if absent.
 
-    Detection strategy:
-    - Import `fuse` (fusepy). fusepy raises EnvironmentError at import time
-      when libfuse/WinFSP is not installed. ImportError means fusepy itself
-      is missing.
-    - On Linux only: secondary check for fusermount/fusermount3 binary
-      (needed for unmount, not strictly for mount, but indicates fuse3 is
-      properly installed).
-
-    Does NOT use platform.check_fuse_available() -- that function only
-    checks WinFSP on Windows and is a no-op on macOS/Linux.
-
     Returns the platform name string ('darwin', 'linux', 'win32').
     """
-    # Primary check: can fusepy find a FUSE library?
-    try:
-        from fuse import FUSE  # noqa: F401
-    except EnvironmentError as exc:
-        # libfuse/WinFSP not installed
-        pytest.skip(f"FUSE backend not available: {exc}")
-    except ImportError:
-        # fusepy itself not installed
-        pytest.skip("fusepy not installed (pip install fusepy)")
-
-    # Secondary check on Linux: verify fusermount binary exists
-    if sys.platform.startswith("linux"):
-        has_fusermount = (
-            shutil.which("fusermount") or shutil.which("fusermount3")
-        )
-        if not has_fusermount:
-            pytest.skip("Neither fusermount nor fusermount3 found on PATH")
+    problem = _fuse_problem()
+    if problem is not None:
+        pytest.skip(problem)
 
     return sys.platform
 
