@@ -278,7 +278,7 @@ python -m pip install -e './amitools[vamos]'
 python -m pip install -e '.[windows]'
 ```
 
-The published `amitools-amifuse 0.8.0.post10` dependency includes
+The published `amitools-amifuse 0.8.0.post11` dependency includes
 physical-disk support and partition range locks; the source installation
 above is only needed to test unreleased amitools changes.
 
