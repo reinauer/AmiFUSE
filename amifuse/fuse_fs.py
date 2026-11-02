@@ -341,6 +341,13 @@ def _raise_if_handler_crashed(obj, context: str):
         raise SystemExit(f"Filesystem handler crashed during {context}.")
 
 
+# The bridge's FileInfoBlock is 4 bytes longer than the struct's 260. Its
+# fib_FileName holds 108 bytes, but SmartFilesystem copies a volume name of up
+# to 255 characters into it whole when the root is examined, as a BSTR at
+# offset 8 (#287).
+_FIB_SIZE = 8 + 256
+
+
 def _parse_fib(mem, fib_addr: int) -> Dict:
     """Decode a FileInfoBlock into a simple dict.
 
@@ -355,6 +362,10 @@ def _parse_fib(mem, fib_addr: int) -> Dict:
       fib_Date: DateStamp (ds_Days, ds_Minute, ds_Tick: 3 LONGs) at 132
 
     "mtime" is fib_Date as host time.
+
+    A name is read no further than fib_FileName, so a longer one gives its
+    first 107 characters: the handler fills in the fields after it too, and
+    SmartFilesystem's empty fib_Comment puts a NUL into a name that reaches it.
     """
     dir_type = mem.r32s(fib_addr + 4)   # fib_DirEntryType (signed LONG)
     protection = mem.r32(fib_addr + 116)  # fib_Protection (LONG)
@@ -1396,12 +1407,12 @@ class HandlerBridge:
             self._fib_mem = None
         if self._fib_mem is None:
             self._fib_mem = self.vh.alloc.alloc_struct(
-                FileInfoBlockStruct, label="FUSE_FIB"
+                FileInfoBlockStruct, size=_FIB_SIZE, label="FUSE_FIB"
             )
             if self._debug:
-                fib_end = self._fib_mem.addr + FileInfoBlockStruct.get_size()
-                print(f"[amifuse] FIB allocated at 0x{self._fib_mem.addr:x}-0x{fib_end:x} (size={FileInfoBlockStruct.get_size()})")
-        self.mem.w_block(self._fib_mem.addr, b"\x00" * FileInfoBlockStruct.get_size())
+                fib_end = self._fib_mem.addr + _FIB_SIZE
+                print(f"[amifuse] FIB allocated at 0x{self._fib_mem.addr:x}-0x{fib_end:x} (size={_FIB_SIZE})")
+        self.mem.w_block(self._fib_mem.addr, b"\x00" * _FIB_SIZE)
         return self._fib_mem
 
     def _alloc_read_buf(self, size: int):
