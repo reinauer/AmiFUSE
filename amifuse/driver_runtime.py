@@ -101,6 +101,22 @@ def _fsync_to_stable_storage(fd):
         os.fsync(fd)
 
 
+# FAT\0 to FAT\2: the DOS types of a FAT95 partition, whose filesystem is the
+# one an MBR FAT entry holds, seen from AmigaOS.
+_FAT_DOS_TYPES = range(0x46415400, 0x46415403)
+
+
+def _mbr_entry_label(entry):
+    """Name an MBR entry as inspect's table lists it."""
+    return (f"MBR partition [{entry.index}] (type 0x{entry.partition_type:02X}, "
+            f"start sector {entry.start_lba})")
+
+
+def _mbr_overlap(what, other):
+    return ValueError(f"Overlapping MBR containers cannot be shared: "
+                      f"{what} overlaps {other}")
+
+
 class BlockDeviceBackend:
     """Thin wrapper around a host file to provide block reads/writes."""
 
@@ -214,16 +230,18 @@ class BlockDeviceBackend:
                     continue
                 if (container.start_lba < other.start_lba + other.num_sectors
                         and other.start_lba < container.start_lba + container.num_sectors):
-                    raise ValueError("Overlapping MBR containers cannot be shared")
+                    raise _mbr_overlap(_mbr_entry_label(container),
+                                       _mbr_entry_label(other))
             self._check_disk_rdb(container, name)
         elif mbr_info is not None:
             # A Parceiro disk's own RDB lies beside the MBR, as does an RDB
             # at block 0 whose sector also holds an MBR table, so a partition
-            # must not reach into an MBR entry. Any other entry starting at
-            # the partition's first sector is that entry's Amiga view (a
+            # must not reach into an MBR entry. A FAT partition starting at
+            # any other entry's first sector is that entry's Amiga view (a
             # FAT\1 partition over a FAT32 entry), which may run past the
-            # entry's end. A 0x76 entry starts with its own RDB, and an
-            # extended entry with the table of its own partitions.
+            # entry's end; a partition of another type would overwrite the
+            # entry's filesystem. A 0x76 entry starts with its own RDB, and
+            # an extended entry with the table of its own partitions.
             from .rdb_inspect import MBR_SECTOR_SIZE, MBR_TYPE_AMIGA_RDB
             no_view = (MBR_TYPE_AMIGA_RDB, 0x05, 0x0F, 0x85)
             byte_start = (offset + start) * self.block_size
@@ -233,11 +251,13 @@ class BlockDeviceBackend:
                     continue
                 entry_start = entry.start_lba * MBR_SECTOR_SIZE
                 entry_end = entry_start + entry.num_sectors * MBR_SECTOR_SIZE
-                if (entry.partition_type not in no_view
+                if (env.dos_type in _FAT_DOS_TYPES
+                        and entry.partition_type not in no_view
                         and entry_start == byte_start):
                     continue
                 if byte_start < entry_end and entry_start < byte_end:
-                    raise ValueError("Overlapping MBR containers cannot be shared")
+                    raise _mbr_overlap(f"partition {name}",
+                                       _mbr_entry_label(entry))
         if isinstance(self.host_lock, PartitionFileLock):
             try:
                 self.host_lock.lock_range((offset + start) * self.block_size,
@@ -273,7 +293,8 @@ class BlockDeviceBackend:
 
     def _check_disk_rdb(self, container, name):
         """Refuse a 0x76 container that overlaps a partition of the disk's
-        own RDB, which lies beside the MBR and lists no MBR entries."""
+        own RDB, which lies beside the MBR and lists no MBR entries, or the
+        RDB's own blocks, which a write into the container would overwrite."""
         from .rdb_inspect import MBR_SECTOR_SIZE
         try:
             ranges = self._disk_rdb_ranges()
@@ -286,12 +307,13 @@ class BlockDeviceBackend:
             ) from exc
         start = container.start_lba * MBR_SECTOR_SIZE
         end = start + container.num_sectors * MBR_SECTOR_SIZE
-        if any(start < part_end and part_start < end
-               for part_start, part_end in ranges):
-            raise ValueError("Overlapping MBR containers cannot be shared")
+        for range_start, range_end, what in ranges:
+            if start < range_end and range_start < end:
+                raise _mbr_overlap(_mbr_entry_label(container), what)
 
     def _disk_rdb_ranges(self):
-        """Byte ranges of the partitions of the disk's own RDB, if any.
+        """(start, end, name) in bytes of each partition of the disk's own
+        RDB, if any, of its reserved blocks, and of each block it uses.
 
         The RDB is found as open_rdisk finds it: the first valid RDSK block
         of a size _scan_for_rdb accepts, in 512-byte sectors 0-15, and none
@@ -363,12 +385,19 @@ class BlockDeviceBackend:
             raise RDBContentError(f"{where} is not valid as a {size}-byte block")
         rdisk = _parse_rdb(base, rdb_block)
         try:
+            own = "of the disk's own RDB"
             ranges = []
             for part in rdisk.parts:
                 env = part.part_blk.dos_env
                 cyl_bytes = env.surfaces * env.blk_per_trk * size
                 ranges.append((env.low_cyl * cyl_bytes,
-                               (env.high_cyl + 1) * cyl_bytes))
+                               (env.high_cyl + 1) * cyl_bytes,
+                               f"partition {part.get_drive_name()} {own}"))
+            low, high = rdb_block.log_drv.rdb_blk_lo, rdb_block.log_drv.rdb_blk_hi
+            ranges.append((low * size, (high + 1) * size,
+                           f"reserved blocks {low}-{high} {own}"))
+            ranges += [(block * size, (block + 1) * size, f"block {block} {own}")
+                       for block in rdisk.get_used_blocks()]
             return ranges
         finally:
             rdisk.close()
