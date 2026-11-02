@@ -589,14 +589,19 @@ def _lenient_rdisk_open(rdisk) -> List[str]:
     LSEG blocks with Parceiro-style checksums (off by exactly one) are
     accepted and the filesystem driver data is made available.
 
-    A filesystem list or LSEG chain that links back to a block it has
-    already read, or past the end of the device, ends there, with a
-    warning; the link is not read.
+    A partition list, filesystem list or LSEG chain that links back to a
+    block it has already read, or past the end of the device, ends there,
+    with a warning; the link is not read. Only an RDB's first link to a
+    partition is read even past the end, and fails the RDB: with no
+    partition read, there is nothing to keep.
 
     Returns a list of warning strings (empty if everything parsed cleanly).
-    Each filesystem entry it drops is also recorded in rdisk.damaged_fs as
-    (DOS type, warning); the DOS type is None when the header is unreadable
-    or the list loops or links past the end, hiding the entries after it.
+    A partition list that ends so is also recorded, by its warning, in
+    rdisk.damaged_part_list, otherwise None: the partitions after it are
+    unknown. Each filesystem entry it drops is also recorded in
+    rdisk.damaged_fs as (DOS type, warning); the DOS type is None when the
+    header is unreadable or the list loops or links past the end, hiding
+    the entries after it.
     """
     from amitools.fs.block.Block import Block
     from amitools.fs.block.rdb.PartitionBlock import PartitionBlock
@@ -613,11 +618,30 @@ def _lenient_rdisk_open(rdisk) -> List[str]:
     warnings = []
     rdisk.damaged_fs = []
 
-    # Read partitions (critical — fail on errors)
+    # Read partitions (critical — fail on errors, but keep those before a
+    # broken link)
     part_blk = rdb.part_list
     rdisk.parts = []
+    rdisk.damaged_part_list = None
     num = 0
+    seen = set()
     while part_blk != Block.no_blk:
+        if part_blk in seen:
+            warnings.append(
+                f"Partition list loops back to block {part_blk} "
+                f"(remaining partitions skipped)"
+            )
+            rdisk.damaged_part_list = warnings[-1]
+            break
+        if rdisk.parts and part_blk >= rdisk.rawblk.num_blocks:
+            # Not read: it would raise the IOError of a failing read.
+            warnings.append(
+                f"Partition list links to block {part_blk}, past the end of "
+                f"the device (remaining partitions skipped)"
+            )
+            rdisk.damaged_part_list = warnings[-1]
+            break
+        seen.add(part_blk)
         p = Partition(rdisk.rawblk, part_blk, num, rdb.log_drv.cyl_blks, rdisk)
         num += 1
         if not p.read():
@@ -687,10 +711,11 @@ def _lenient_rdisk_open(rdisk) -> List[str]:
 def _parse_rdb(dev, rdb_block) -> RDisk:
     """Parse the RDB that _scan_for_rdb found on dev.
 
-    Uses the lenient parse, which reads the partitions as strictly as
-    RDisk.open() and tolerates corrupt filesystem blocks. Raises
-    RDBContentError, saying why, if it fails or the RDB uses another block
-    size than dev. Other OSErrors, such as a failing read, propagate.
+    Uses the lenient parse, which reads each partition as strictly as
+    RDisk.open(), ends a broken partition list, and tolerates corrupt
+    filesystem blocks. Raises RDBContentError, saying why, if it fails or
+    the RDB uses another block size than dev. Other OSErrors, such as a
+    failing read, propagate.
     """
     if rdb_block.block_size != dev.block_bytes:
         # Only a forced block size gets here: otherwise _scan_for_rdb has
@@ -700,9 +725,10 @@ def _parse_rdb(dev, rdb_block) -> RDisk:
             f"RDB uses {rdb_block.block_size}-byte blocks, "
             f"but the device was opened with {dev.block_bytes}-byte blocks"
         )
-    # Not RDisk.open(): its walk of an LSEG chain has no bound, so a chain
-    # that links back on itself never ends. The lenient parse reads the
-    # partitions as strictly, and stops at such a loop with a warning.
+    # Not RDisk.open(): its walks of the partition list and of an LSEG chain
+    # have no bound, so one that links back on itself never ends. The
+    # lenient parse reads each partition as strictly, and stops at such a
+    # loop with a warning.
     rdisk = RDisk(dev)
     rdisk.rdb = rdb_block
     rdisk.rdb_warnings = _lenient_rdisk_open(rdisk)
@@ -781,6 +807,8 @@ def open_rdisk(
     Tolerates corrupt filesystem driver (LSEG) blocks in the RDB — partition
     data is parsed strictly, but corrupt FS entries are skipped with warnings
     stored in ``rdisk.rdb_warnings``, and recorded in ``rdisk.damaged_fs``.
+    A partition list that loops or links on past the end of the device
+    ends there with a warning, recorded in ``rdisk.damaged_part_list``.
 
     Args:
         image: Path to the disk image
@@ -1077,15 +1105,32 @@ def _failed_rdb(amiga_parts: List[MBRPartition], rdb_idx: Optional[int],
     return None
 
 
+def _opened_rdb(mbr_ctx: Optional[MBRContext]) -> str:
+    """Name an RDB that opened. Unlike rdb_label, tells a plain disk's RDB
+    and a single entry's, both index None in open_each_rdb, apart."""
+    if _is_entry_rdb(mbr_ctx):
+        return f"RDB in MBR partition [{mbr_ctx.mbr_partition.index}]"
+    return "RDB" if mbr_ctx is None else "RDB beside the MBR"
+
+
+def _cut_short_rdb(rdisk: RDisk, mbr_ctx: Optional[MBRContext]) -> Optional[str]:
+    """Name an RDB that opened with a partition list that ends at a broken
+    link, for a message as _failed_rdb's, else None. The partitions after
+    that link are unknown, so it counts as an RDB that fails."""
+    if getattr(rdisk, "damaged_part_list", None) is None:
+        return None
+    return f"the rest of the partition list of the {_opened_rdb(mbr_ctx)}"
+
+
 def _disk_names(
     image: Path, block_size: Optional[int],
 ) -> Tuple[List[Tuple[Optional[int], int, List[Optional[str]]]], List[str],
            Optional[Tuple[OSError, set]]]:
     """(mbr_partition_index, RDB offset, mount_names) per RDB that opens,
-    each RDB that is found but does not open, named for a message
-    (_failed_rdb), and what ended the walk, or None: a device or media
-    error in an entry's RDB, or in the default open of a disk with a single
-    entry.
+    each RDB that is found but does not open or opens with its partition
+    list cut short, named for a message (_failed_rdb, _cut_short_rdb), and
+    what ended the walk, or None: a device or media error in an entry's RDB,
+    or in the default open of a disk with a single entry.
 
     After such an error, only the RDBs before that entry are listed, and
     the walk's end holds the error with the (mbr_partition_index, number)
@@ -1112,6 +1157,9 @@ def _disk_names(
         try:
             rdbs.append((rdb_idx, _rdb_offset(blkdev, rdisk, mbr_ctx)))
             rdb_parts.append(list(rdisk.parts))
+            name = _cut_short_rdb(rdisk, mbr_ctx)
+            if name is not None:
+                failed.append(name)
         finally:
             rdisk.close()
             blkdev.close()
@@ -1196,12 +1244,13 @@ def find_partition(
     Raises IOError if a forced block_size rules out an RDB, so that the
     partition found differs from the one auto-detection finds. With write,
     raises IOError too if an RDB on the disk is found but does not open,
-    the disk's own beside the MBR or an entry's: its partitions are
-    unknown, so any name or number may select another partition than with
-    that RDB intact. A device or media error in an entry's RDB, or in the
-    default open of a disk with a single entry, ends the lookup with that
-    error; read-only, only if partition is not a name in an RDB before that
-    entry that the entry cannot change (_find_before).
+    the disk's own beside the MBR or an entry's, or opens with its
+    partition list cut short: its partitions are unknown, so any name or
+    number may select another partition than with that RDB intact. A
+    device or media error in an entry's RDB, or in the default open of a
+    disk with a single entry, ends the lookup with that error; read-only,
+    only if partition is not a name in an RDB before that entry that the
+    entry cannot change (_find_before).
     """
     partition = str(partition)
     rdbs, failed, end = _disk_names(image, block_size)
@@ -1249,8 +1298,9 @@ def _default_rdb(
     """(RDB offset, or None) of the first RDB that opens, which the open
     without --partition reaches, and each RDB before it that is found but
     does not open (_failed_rdb, which also raises a device or media
-    error). An RDB after it cannot move that open. The disk's own RDB
-    failing (DiskRDBError) ends that open, so no RDB is reached."""
+    error), and the RDB reached if its partition list is cut short
+    (_cut_short_rdb). An RDB after it cannot move that open. The disk's
+    own RDB failing (DiskRDBError) ends that open, so no RDB is reached."""
     amiga_parts = amiga_rdb_partitions(image)
     failed = []
     for rdb_idx, opened in open_each_rdb(image, block_size, len(amiga_parts)):
@@ -1263,6 +1313,9 @@ def _default_rdb(
             continue
         blkdev, rdisk, mbr_ctx = opened
         try:
+            name = _cut_short_rdb(rdisk, mbr_ctx)
+            if name is not None:
+                failed.append(name)
             return _rdb_offset(blkdev, rdisk, mbr_ctx), failed
         finally:
             rdisk.close()
@@ -1276,9 +1329,10 @@ def check_default_write(image: Path, block_size: Optional[int] = None) -> None:
     The open without it reaches partition 0 of the first RDB that opens
     (open_rdisk). Raises IOError if an RDB before that one is found but
     does not open, so that it may be another RDB's partition than with
-    that RDB intact; like find_partition, only the auto-detected open
-    decides whether an RDB fails. With a forced block_size, raises IOError
-    too if the open reaches another RDB than the auto-detected one.
+    that RDB intact, or if that one's own partition list is cut short;
+    like find_partition, only the auto-detected open decides whether an
+    RDB fails. With a forced block_size, raises IOError too if the open
+    reaches another RDB than the auto-detected one.
     """
     offset, failed = _default_rdb(image, None)
     _refuse_write("No partition is opened for writing without --partition",
@@ -1375,9 +1429,10 @@ def list_partitions(
     Returns:
         A :class:`PartitionList`. ``.partitions`` is in stable RDB order
         (normally >= 1 entry); ``.fallback_reason`` is ``None`` unless an
-        RDB failed to open: the disk's own RDB beside the MBR or a 0x76
-        entry's, each named on its own line with its error. An entry that
-        holds no RDB is not named.
+        RDB failed to open, the disk's own RDB beside the MBR or a 0x76
+        entry's, or opened with its partition list cut short, each named on
+        its own line with its error. An entry that holds no RDB is not
+        named.
     """
     amiga_parts = amiga_rdb_partitions(image)
 
@@ -1397,10 +1452,13 @@ def list_partitions(
             if not isinstance(opened, NoEntryRDBError):
                 failures.append(f"{rdb_label(amiga_parts, rdb_idx)}: {opened}")
             continue
-        blkdev, rdisk, _mbr_ctx = opened
+        blkdev, rdisk, mbr_ctx = opened
         try:
             rdb_parts.append(list(rdisk.parts))
             rdb_indices.append(rdb_idx)
+            damaged = getattr(rdisk, "damaged_part_list", None)
+            if damaged is not None:
+                failures.append(f"{_opened_rdb(mbr_ctx)}: {damaged}")
         finally:
             rdisk.close()
             blkdev.close()
