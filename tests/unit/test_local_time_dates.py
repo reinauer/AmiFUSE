@@ -10,6 +10,7 @@ import errno
 import math
 import os
 import struct
+import threading
 import time
 
 import pytest
@@ -228,3 +229,37 @@ def test_utimens_leaving_the_date_sends_nothing(fuse_mock):
     assert ops.utimens("/f", (2e9, 1e9)) == 0
     assert ops.utimens("/f", (2e9, 1e9 + 1)) == 0
     assert volume.sent == [(0, "f", 1e9 + 1)]
+
+
+def _open_on(ops, path, fh_addr=0x1000):
+    """An open file handle on path, as open() leaves it."""
+    handle = ops._next_fh
+    ops._next_fh += 1
+    ops._fh_cache[handle] = {
+        "fh_addr": fh_addr, "parent_lock": 0, "pos": None, "lock": threading.Lock(),
+        "closed": False, "dirty": False, "path": path,
+    }
+    return handle
+
+
+@pytest.mark.parametrize("reply, error", [
+    ((0, 214), errno.EROFS),
+    ((0, 202), errno.EBUSY),
+    ((0, -1), errno.EIO),  # no reply
+])
+def test_date_refused_at_release_goes_to_stderr(fuse_mock, capfd, reply, error):
+    """release() returns 0 to a close() that has already returned (#301)."""
+    from amifuse.fuse_fs import AmigaFuseFS
+
+    volume = _DateVolume(reply)
+    volume.close_file = lambda fh_addr: None
+    ops = AmigaFuseFS(volume, debug=False, icons=False)
+    handle = _open_on(ops, "/f")
+    assert ops.utimens("/f", (1.0, 2e9)) == 0
+    assert volume.sent == []
+
+    assert ops.release("/f", handle) == 0
+
+    assert volume.sent == [(0, "f", 2e9)]
+    assert capfd.readouterr().err == (
+        f"[amifuse] could not set the date of /f (errno {error})\n")
