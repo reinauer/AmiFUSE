@@ -15,6 +15,7 @@ import errno
 import logging
 import os
 import posixpath
+import re
 import signal
 import shlex
 import shutil
@@ -393,6 +394,21 @@ def format_stale_mountpoint_error(mountpoint: Path) -> str:
         f"Mountpoint {mountpoint} looks like a stale or broken mount. "
         f"Stop the amifuse process to unmount (Ctrl+C)."
     )
+
+
+def fuse_option_value(value: str) -> str:
+    """Replace what could end ``value`` or change the options around it.
+
+    fusepy joins the options with commas into one -o argument and escapes
+    nothing, and a volume name comes from the image. So each comma would
+    start another option, and a NUL would end the argument and drop the
+    options after it. A backslash is the escape of libfuse and WinFsp: at
+    the end of a value it would take the comma that follows and join the
+    next option to the value. Escaping the comma is no way out: macFUSE's
+    mount_macfuse (5.3.3) splits at every comma, escaped or not, to check the
+    options and set their flags. Other control characters go the same way.
+    """
+    return re.sub(r"[,\\\x00-\x1f\x7f]", "_", value)
 
 
 def get_mount_options(volname: str, volicon_path: Optional[str] = None,
