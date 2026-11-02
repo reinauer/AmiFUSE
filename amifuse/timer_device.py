@@ -280,8 +280,9 @@ class AmiFuseTimerDevice(TimerDevice):
     def next_delay(self) -> float:
         """The earliest end of a pending Delay() on the device clock, or inf.
 
-        Unlike a timer request, a Delay() always ends: the bridge sleeps to
-        it however far off it is (HandlerBridge._sleep_to_delay).
+        Unlike a timer request, a Delay() ends: the bridge sleeps to it
+        however far off it is, within its limits for a packet wait
+        (HandlerBridge._sleep_to_delay).
         """
         return min(self._delays.values(), default=math.inf)
 

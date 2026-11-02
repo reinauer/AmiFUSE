@@ -768,6 +768,10 @@ class HandlerBridge:
     # request falls due; see _sleep_to_timer_in_packet_wait.
     _PACKET_TIMER_WAIT = 1.0
 
+    # How long a packet wait without a deadline may sleep to Delay()s in all;
+    # see _sleep_to_delay.
+    _DELAY_WAIT = 15.0
+
     # Emulated cycles the handler and its children run per scheduler call
     # before the bridge looks at the reply port again.
     _RUN_CHUNK_CYCLES = 1_000_000
@@ -804,13 +808,14 @@ class HandlerBridge:
         """Sleep until a pending Delay() ends, for a wait in which every task waits.
 
         A timer request may never fall due within the wait, but a Delay()
-        always ends: a handler that calls Delay() while it serves a packet,
-        or polls a child with short ones, replies afterwards. So while a
-        task delays, the wait sleeps to the earliest deadline, the delay's
-        or a timer request's, however far off, replies to what fell due and
-        runs on. A deadline, on the time.monotonic() clock, cuts the sleep
-        short; the wait then ends at its top. Returns whether a task was
-        delaying.
+        ends: a handler that calls Delay() while it serves a packet, or
+        polls a child with short ones, replies afterwards. So while a task
+        delays, the wait sleeps to the earliest deadline, the delay's or a
+        timer request's, however far off, replies to what fell due and runs
+        on. A deadline, on the time.monotonic() clock, cuts the sleep short.
+        _run_until_replies passes the wait's own, or _DELAY_WAIT from its
+        start: a task may also delay in a loop that never ends, and the wait
+        holds the emulation thread. Returns whether a task was delaying.
         """
         timer = self._timer_device()
         if timer is None or timer.next_delay() == math.inf:
@@ -965,10 +970,11 @@ class HandlerBridge:
         task waits without a reply, the wait sleeps to the next timer
         deadline if it comes within _PACKET_TIMER_WAIT of the wait's start,
         replies to it and runs on: a handler may reply only once its own
-        timer fires, or a child may wait on one. A Delay() always ends, so
-        while a task delays the wait sleeps to the next deadline however
-        far off (_sleep_to_delay). Between packets, a mount's timer thread
-        replies to them (run_due_timers). The limits count
+        timer fires, or a child may wait on one. While a task delays, the
+        wait sleeps to the next deadline however far off, but without a
+        deadline of its own for _DELAY_WAIT in all, as a task may delay in a
+        loop that never ends (_sleep_to_delay). Between packets, a mount's
+        timer thread replies to them (run_due_timers). The limits count
         cycles, not time: Delay() waits as a task and spends no cycles. A
         deadline, on the time.monotonic() clock, also ends the wait before
         the next run once it has passed, whatever limit the handler has
@@ -990,6 +996,9 @@ class HandlerBridge:
         timer = self._timer_device()
         timer_wait_until = (
             -math.inf if timer is None else timer.clock() + self._PACKET_TIMER_WAIT
+        )
+        delay_until = (
+            time.monotonic() + self._DELAY_WAIT if deadline is None else deadline
         )
         busy_limit = self._MAX_BUSY_CYCLES
 
@@ -1057,9 +1066,11 @@ class HandlerBridge:
             self._idle_busy_cycles = 0
             if result == RunResult.DONE:
                 break
-            # Every task waits: only time can bring the reply now. A Delay()
-            # always ends: the wait sleeps to it, however far off.
-            if self._sleep_to_delay(deadline):
+            # Every task waits: only time can bring the reply now. The wait
+            # sleeps to a Delay(), however far off, until delay_until. Past
+            # that the sleep returns at once, so the check is here too: the
+            # wait would spin, as the loop's top sees only its own deadline.
+            if time.monotonic() < delay_until and self._sleep_to_delay(delay_until):
                 continue
             idle_iters += 1
             # A timer request is slept to only within the wait's window.
