@@ -5444,14 +5444,42 @@ def _pfs3_volume_name_refusal(dostype: int, driver: Path,
             "stores at most 31. Use a shorter name.")
 
 
+def _refuse_long_volume_name(volname: str) -> None:
+    """Refuse a volume name that cannot be sent to the handler.
+
+    The handler gets the name as a BSTR, whose length is a single byte, so
+    a longer name cannot be sent. The length is counted as the BSTR encodes
+    it, one byte per character. Shorter names are mostly the handler's to
+    judge, and handlers differ: FastFileSystem refuses more than 30
+    characters and SmartFilesystem stores all 255. pfs3aio holds 31 but
+    answers success for more and leaves a damaged volume, so format_volume
+    refuses a longer name once it knows the driver.
+    """
+    length = len(volname.encode("latin-1", errors="replace"))
+    if length > 255:
+        raise SystemExit(
+            f"Error: volume name is {length} characters long; at most 255 are allowed.")
+
+
 def format_volume(
     image: Path,
     driver: Optional[Path],
     block_size: Optional[int],
-    partition: str,
-    volname: str = "Empty",
+    partition: Optional[str],
+    volname: Optional[str] = None,
     debug: bool = False,
+    dos_type: Optional[int] = None,
 ):
+    """Format a partition of an RDB disk, or a floppy image.
+
+    A floppy has no partitions, so partition is its volume name if volname
+    is None, as in `amifuse format floppy.adf Name`. A name in both places
+    is refused for a floppy. dos_type, which only a floppy takes, replaces
+    the DOS type in its block 0. rdb_inspect.floppy_to_format says what
+    counts as a floppy here.
+    """
+    from .rdb_inspect import floppy_to_format
+
     bridge = None
 
     # Name a missing image or a directory plainly, as the file commands do.
@@ -5461,14 +5489,32 @@ def format_volume(
         if image.is_dir():
             raise SystemExit(f"Error: image is a directory: {image}")
 
-    # Get partition dostype from RDB
+    # Get the floppy's or the partition's dostype
     try:
-        part_info = get_partition_info(image, block_size, partition)
+        adf_info = floppy_to_format(image, dos_type, block_size)
+        if adf_info is not None:
+            part_info = {"name": "DF0", "dostype": adf_info.dos_type,
+                         "block_size": adf_info.block_size}
+        elif dos_type is not None:
+            raise SystemExit(
+                "Error: --dos-type is only for a floppy image (901120 or "
+                "1802240 bytes); a partition has its DOS type in the RDB.")
+        else:
+            part_info = get_partition_info(image, block_size, partition)
     except (OSError, ValueError) as exc:
         # A missing or unreadable image, or one without a usable RDB.
         if debug:
             raise
         raise SystemExit(f"Error: {exc}") from exc
+    if adf_info is not None:
+        if partition is not None and volname is not None:
+            raise SystemExit(
+                f"Error: {image} is a floppy image, which has no partitions. "
+                "Use: amifuse format <image> <name>")
+        volname = partition if volname is None else volname
+        partition = None
+    volname = "Empty" if volname is None else volname
+    _refuse_long_volume_name(volname)
     dostype = part_info["dostype"]
     if dostype is None:
         raise SystemExit(f"Could not determine dostype for partition '{partition}'.")
@@ -5476,7 +5522,8 @@ def format_volume(
 
     # Resolve driver
     try:
-        resolved = resolve_driver(image, driver, block_size, partition, part_info=part_info)
+        resolved = resolve_driver(
+            image, driver, block_size, partition, adf_info=adf_info, part_info=part_info)
     except DriverNotFound as exc:
         raise SystemExit(str(exc)) from None
     except (OSError, ValueError) as exc:
@@ -5491,7 +5538,11 @@ def format_volume(
         # Inside the try, so that a failing print, such as a volume name
         # the console cannot encode, still removes an extracted driver.
         print(__banner__)
-        print(f"Formatting partition '{partition}' in {image}")
+        if adf_info is not None:
+            floppy_type = "HD" if adf_info.is_hd else "DD"
+            print(f"Formatting {floppy_type} floppy image {image}")
+        else:
+            print(f"Formatting partition '{partition}' in {image}")
         print(f"Filesystem driver: {driver_desc}")
         print(f"Volume name: {volname}")
         print(f"DOS type: {dt_str} (0x{dostype:08x})")
@@ -5516,6 +5567,7 @@ def format_volume(
                 read_only=False,
                 debug=debug,
                 partition=partition,
+                adf_info=adf_info,
             )
         except (OSError, ValueError) as exc:
             # Any OSError or ValueError from the whole constructor: opening
@@ -5594,7 +5646,10 @@ def format_volume(
         except OSError as exc:
             raise SystemExit(f"Format failed: {exc}") from exc
 
-        print(f"Format complete. Volume '{volname}' created on partition '{partition}'.")
+        if adf_info is not None:
+            print(f"Format complete. Volume '{volname}' created on {image}.")
+        else:
+            print(f"Format complete. Volume '{volname}' created on partition '{partition}'.")
     finally:
         try:
             if bridge is not None:
@@ -7181,24 +7236,17 @@ def cmd_mount(args):
 def cmd_format(args):
     """Handle the 'format' subcommand."""
     _validate_driver_path(args.driver)
-    # The handler gets the name as a BSTR, whose length is a single byte, so
-    # a longer name cannot be sent: refuse it before the image is opened.
-    # The length is counted as the BSTR encodes it, one byte per character.
-    # Shorter names are mostly the handler's to judge, and handlers differ:
-    # FastFileSystem refuses more than 30 characters and SmartFilesystem
-    # stores all 255. pfs3aio holds 31 but answers success for more and
-    # leaves a damaged volume, so format_volume refuses a longer name once
-    # it knows the driver.
-    length = len(args.volname.encode("latin-1", errors="replace"))
-    if length > 255:
-        raise SystemExit(
-            f"Error: volume name is {length} characters long; at most 255 are allowed.")
+    # Refuse a name that cannot be sent before the image is opened. A
+    # floppy's name is in args.partition; format_volume refuses that one.
+    if args.volname is not None:
+        _refuse_long_volume_name(args.volname)
 
     format_volume(
         args.image, args.driver, args.block_size,
         partition=args.partition,
         volname=args.volname,
         debug=args.debug,
+        dos_type=getattr(args, "dos_type", None),
     )
 
 
@@ -7462,7 +7510,7 @@ commands:
         version=__banner__,
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
-    from .rdb_inspect import block_size_arg
+    from .rdb_inspect import block_size_arg, dos_type_arg
 
     # inspect subcommand
     inspect_parser = subparsers.add_parser(
@@ -7576,14 +7624,22 @@ commands:
 
     # format subcommand
     format_parser = subparsers.add_parser(
-        "format", help="Format an Amiga partition."
+        "format", help="Format an Amiga partition or floppy image."
     )
     format_parser.add_argument("image", type=Path, help="Disk image file")
-    format_parser.add_argument("partition", type=str, help="Partition name (e.g. DH0) or index.")
-    format_parser.add_argument("volname", nargs="?", default="Empty", help="Volume name (default: Empty)")
+    format_parser.add_argument(
+        "partition", type=str,
+        help="Partition name (e.g. DH0) or index; for a floppy image, the volume name.")
+    format_parser.add_argument("volname", nargs="?", help="Volume name (default: Empty)")
     format_parser.add_argument("--driver", type=Path, help="Filesystem binary (default: RDB, your drivers folder, then the bundled FastFileSystem for DOS0-7)")
     format_parser.add_argument(
         "--block-size", type=block_size_arg, help="Override block size (defaults to auto/512)."
+    )
+    format_parser.add_argument(
+        "--dos-type", type=dos_type_arg,
+        help="DOS type of a floppy image, DOS0 to DOS7 (default: the one in "
+             "block 0, or DOS0 for a blank image). Needed to overwrite an "
+             "image of a floppy's size that is neither.",
     )
     format_parser.add_argument(
         "--debug", action="store_true", help="Enable debug logging."

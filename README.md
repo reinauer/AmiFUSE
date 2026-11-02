@@ -139,6 +139,8 @@ amifuse uses subcommands for different operations:
 amifuse inspect <image>                    # Inspect RDB partitions
 amifuse mount <image>                      # Mount a filesystem
 amifuse unmount <mountpoint>               # Unmount a filesystem
+amifuse format <image> <partition> [name]  # Format a hard disk partition
+amifuse format <floppy.adf> <name>         # Format a floppy image
 amifuse doctor                             # Check dependencies and configuration
 amifuse register                           # Add Windows Explorer context menu entries
 amifuse unregister                         # Remove Windows Explorer context menu entries
@@ -282,6 +284,27 @@ The published `amitools-amifuse 0.8.0.post11` dependency includes
 physical-disk support and partition range locks; the source installation
 above is only needed to test unreleased amitools changes.
 
+### Formatting
+
+`amifuse format` erases a partition or a floppy image without asking, using the
+filesystem driver `mount` would use. Name a partition on a hard disk image, and
+only the new volume name for a floppy image, which has no partitions:
+
+```bash
+amifuse format disk.hdf DH0 Work
+amifuse format floppy.adf Work
+amifuse format floppy.adf Work --dos-type DOS3
+```
+
+A floppy image is a file of 901120 (DD) or 1802240 (HD) bytes. `format` keeps the
+DOS type in its block 0 unless `--dos-type` (DOS0 to DOS7) gives another. An
+all-zero file of those sizes, for example from
+`dd if=/dev/zero of=floppy.adf bs=512 count=1760`, has no DOS type and gets DOS0
+unless `--dos-type` says otherwise. Only `format` accepts such a file: format it
+before using it with any other command. A file of those sizes with an RDB is
+treated as a hard disk image; one with other contents is formatted only with
+`--dos-type`, since nothing shows that it holds a floppy.
+
 ### Diagnosing Issues
 
 `amifuse doctor` checks that all dependencies (Python, FUSE provider, handlers)
@@ -394,7 +417,7 @@ driver-info --base 0x200000 pfs3aio
 
 - **HDF/RDB** - Hard disk images with Rigid Disk Block. Filesystem drivers can be embedded in the RDB or specified via `--driver`. An FFS/OFS partition whose RDB has no driver for its DOS type uses the [bundled FastFileSystem](#bundled-fastfilesystem).
 - **Emu68-style MBR images** - Disk images with MBR partition table containing an RDB partition, as used by Emu68 on Raspberry Pi.
-- **ADF** - Amiga Disk File floppy images (DD and HD). ADFs contain no driver, so DOS0-7 floppies use the [bundled FastFileSystem](#bundled-fastfilesystem) unless your drivers folder holds your own.
+- **ADF** - Amiga Disk File floppy images (DD and HD). ADFs contain no driver, so DOS0-7 floppies use the [bundled FastFileSystem](#bundled-fastfilesystem) unless your drivers folder holds your own. A blank file of a floppy's size can be [formatted](#formatting) into one.
 
 ## Supported Filesystems
 
