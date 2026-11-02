@@ -857,6 +857,105 @@ def test_unmount_wait_drains_io_replies_once_the_handler_waits(
     assert not handler.ports.has_msg(io_port)
 
 
+def test_unmount_wait_leaves_a_handler_at_work_its_io_reply_on_a_late_reply(
+        bridge, short_limits):
+    # #240: the wait gets one packet's reply, and that ends the short
+    # limit, while the handler goes on with the other packet still out.
+    b, handler = bridge
+    fh = _open(b, handler, "/grow", 0x5550)
+    handler.delay = lambda pkt_type, name: (
+        NEVER if pkt_type in (ACTION_SET_FILE_SIZE, ACTION_LOCATE_OBJECT) else 0)
+    assert b.set_handle_size(fh, 0x7FFFFFFF) == -1
+    assert b.locate(0, "late") == (0, -1)
+    io_port, io_msg = _io_reply_port(b, handler)
+    ports = handler.ports
+    runs, got = [0], []
+
+    def run(max_cycles=None):
+        runs[0] += 1
+        if runs[0] == 1:
+            ports.put_msg(io_port, io_msg)  # SendIO()
+            handler.answer_now(ACTION_LOCATE_OBJECT)
+            handler.run(max_cycles)
+            return BUSY
+        if ports.has_msg(io_port):
+            got.append(ports.get_msg(io_port))  # GetMsg(), then the answer
+            handler.answer_now(ACTION_SET_FILE_SIZE)
+        return handler.run(max_cycles)
+    b.launcher.run = run
+
+    assert b.wait_for_pending() == []
+    assert got == [io_msg]
+
+
+def test_a_wait_that_ends_on_a_reply_leaves_a_handler_at_work_its_io_reply(bridge):
+    # #240: two packets are queued. The handler answers the first and, in
+    # the same burst, starts on the second with a SendIO(). The burst ends
+    # before it takes the reply, and the first answer ends the wait.
+    b, handler = bridge
+    handler.answer = lambda pkt_type, args, name: (0x400, 0)
+    handler.delay = lambda pkt_type, name: NEVER if name == "second" else 0
+    io_port, io_msg = _io_reply_port(b, handler)
+    ports = handler.ports
+    runs, got = [0], []
+
+    def run(max_cycles=None):
+        runs[0] += 1
+        if runs[0] == 1:
+            ports.put_msg(io_port, io_msg)
+            handler.run(max_cycles)
+            return BUSY
+        handler.run(max_cycles)
+        if ports.has_msg(io_port):
+            got.append(ports.get_msg(io_port))
+            handler.answer_now(ACTION_LOCATE_OBJECT)
+        return handler.run(max_cycles)
+    b.launcher.run = run
+
+    assert b.locate(0, "first") == (0x400, 0)
+    assert b.locate(0, "second") == (0x400, 0)
+    assert got == [io_msg]
+
+
+def test_a_wait_that_runs_out_leaves_a_handler_at_work_its_io_reply(
+        bridge, short_limits):
+    # The IO reply stays through the waits that end with the handler at
+    # work, and goes with the first that leaves it waiting.
+    b, handler = bridge
+    handler.delay = lambda pkt_type, name: NEVER
+    io_port, io_msg = _io_reply_port(b, handler)
+    ports = handler.ports
+    ports.put_msg(io_port, io_msg)
+    result = [BUSY]
+
+    def run(max_cycles=None):
+        handler.run(max_cycles)
+        return result[0]
+    b.launcher.run = run
+
+    assert b.locate(0, "ran-out") == (0, -1)
+    assert b._busy_ran_out
+    assert ports.has_msg(io_port)
+
+    result[0] = PARKED
+    assert b.locate(0, "parked") == (0, -1)
+    assert not b._busy_ran_out
+    assert not ports.has_msg(io_port)
+
+
+def test_startup_rounds_that_end_busy_leave_the_handler_its_io_reply(bridge):
+    # #240: PFS3's deferred validation can outlast every round, and the
+    # next packet's wait runs it on.
+    b, handler = bridge
+    io_port, io_msg = _io_reply_port(b, handler)
+    handler.ports.put_msg(io_port, io_msg)
+    b.launcher.run = lambda max_cycles=None: BUSY
+
+    b._flush_pending_signals()
+
+    assert handler.ports.has_msg(io_port)
+
+
 def test_unmount_names_the_packets_still_out_when_the_flush_fails(
         bridge, short_limits, capsys):
     # Still at work on the grow, a handler that takes packets in order

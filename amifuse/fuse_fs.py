@@ -946,7 +946,7 @@ class HandlerBridge:
     # caught in a loop fails later than it did then.
     _SHORT_BUSY_CYCLES = 10_000_000
 
-    def _run_until_replies(self, max_iters: int = 50, cycles: Optional[int] = None, sleep_base: float = 0.0005, sleep_max: float = 0.01, drain_non_essential: bool = True,
+    def _run_until_replies(self, max_iters: int = 50, cycles: Optional[int] = None, sleep_base: float = 0.0005, sleep_max: float = 0.01,
                            deadline: Optional[float] = None):
         """Run the handler until at least one reply is queued.
 
@@ -980,6 +980,12 @@ class HandlerBridge:
         the next run once it has passed, whatever limit the handler has
         then; a handler still at work then gets the short limit next, as
         when a limit runs out, without the warning.
+
+        The other ports are drained only after a wait that leaves the
+        handler waiting, as the idle timers do (run_due_timers): in the
+        middle of its work, a SendIO() reply it has not taken yet is still
+        its own (#240). A wait can end so on a reply, too, since a handler
+        may answer a packet and go straight on to the next.
 
         Known limit: a packet whose wait ran out, or ended at its
         deadline, stays queued, or held by the handler, until the handler
@@ -1110,7 +1116,7 @@ class HandlerBridge:
         # Drain stray IO replies that accumulated during packet processing:
         # SendIO queues them at once. timer.device replies stay, since they
         # come only when due and the handler takes them.
-        if drain_non_essential:
+        if not busy and not self._busy_ran_out:
             pmgr = self.vh.slm.exec_impl.port_mgr
             self._drain_non_essential_ports(pmgr)
 
@@ -1124,8 +1130,9 @@ class HandlerBridge:
         pending timer request as if its time had passed and runs the
         handler until it waits again, until a round replied to nothing and
         the handler still waits: what is left needs real time or a packet.
-        Stray replies are drained afterwards; timer.device replies stay for
-        the handler, since they come only when due.
+        Stray replies are drained afterwards, unless the rounds ran out with
+        the handler still at work (#240); timer.device replies stay for the
+        handler, since they come only when due.
         """
         if self.state.crashed or self.state.exited:
             return
@@ -1144,7 +1151,8 @@ class HandlerBridge:
             if result == RunResult.IDLE and not replied:
                 break
         # Drain stray replies from non-essential ports (disk change etc.).
-        self._drain_non_essential_ports(self.vh.slm.exec_impl.port_mgr)
+        if result != RunResult.BUSY:
+            self._drain_non_essential_ports(self.vh.slm.exec_impl.port_mgr)
 
     def _update_handler_port_from_startup(self):
         pkt = DosPacketStruct(self.mem, self.state.stdpkt_addr)
@@ -1266,11 +1274,7 @@ class HandlerBridge:
         seconds have passed. Each wait also ends at that deadline: a
         handler that parks during a wait has the full busy limit for the
         rest of it. Late replies are given back as in
-        _run_until_reply. The other ports are drained only after a wait
-        that leaves the handler waiting, as the idle timers do
-        (run_due_timers): in the middle of its work, a SendIO() reply it
-        has not taken yet is still its own (#240).
-        Returns the names of the packets still out.
+        _run_until_reply. Returns the names of the packets still out.
         """
         with self._lock:
             deadline = time.monotonic() + timeout
@@ -1278,11 +1282,8 @@ class HandlerBridge:
                    and time.monotonic() < deadline):
                 sent = dict(self._pending_packets())
                 self._busy_ran_out = True
-                replies = self._run_until_replies(
-                    deadline=deadline, drain_non_essential=False)
+                replies = self._run_until_replies(deadline=deadline)
                 self._log_replies("pending", replies)
-                if not self.state.crashed and not self._busy_ran_out:
-                    self._drain_non_essential_ports(self.vh.slm.exec_impl.port_mgr)
                 for _, reply_pkt, res1, _ in replies:
                     self._give_back_late_reply(sent.get(reply_pkt), res1)
                 if replies:
