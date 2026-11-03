@@ -1,4 +1,6 @@
 """Integration test conftest -- machine68k probe + fixture providers."""
+from __future__ import annotations
+
 import os
 import shutil
 import string
