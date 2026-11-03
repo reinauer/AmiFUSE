@@ -37,10 +37,50 @@ def test_every_failing_rdb_of_a_disk_is_named(tmp_path, capsys):
     image = _make_mbr(tmp_path, [(63, _make_rdb(tmp_path, 1024, "DH0")),
                                  (385, bytes(160 * 512))])
     assert _no_rdb_opens(["--json", str(image)], capsys).splitlines() == [
-        f"Error: No RDB on this disk opens: {image}",
+        f"Error: MBR with 2 Amiga partition(s) found, but none contain a "
+        f"valid RDB: {image}",
         f"MBR partition [0]: MBR partition 0 does not contain a valid RDB: "
         f"{image}; partition 0 at LBA 63 is not aligned to the RDB's "
         f"1024-byte blocks",
         f"MBR partition [1]: MBR partition 1 does not contain a valid RDB: "
         f"{image}",
     ]
+
+
+def _text_error(image, capsys):
+    with pytest.raises(SystemExit) as caught:
+        rdb_inspect.main([str(image)])
+    capsys.readouterr()
+    return str(caught.value)
+
+
+def _layout(tmp_path, layout):
+    from tests.unit.test_disk_rdb_beside_entries import _broken_disk_rdb
+
+    empty = bytes(160 * 512)
+    return {
+        "one empty entry": lambda: _make_mbr(tmp_path, [(64, empty)]),
+        "two empty entries": lambda: _make_mbr(
+            tmp_path, [(64, empty), (400, empty)]),
+        "misaligned and empty entries": lambda: _make_mbr(
+            tmp_path, [(63, _make_rdb(tmp_path, 1024, "DH0")), (385, empty)]),
+        "own RDB beside two empty entries": lambda: _broken_disk_rdb(
+            tmp_path, (None, None)),
+        "own RDB beside one empty entry": lambda: _broken_disk_rdb(
+            tmp_path, (None,)),
+    }[layout]()
+
+
+@pytest.mark.parametrize("layout", [
+    "one empty entry",
+    "two empty entries",
+    "misaligned and empty entries",
+    "own RDB beside two empty entries",
+    "own RDB beside one empty entry",
+])
+def test_first_line_is_the_error_text_mode_ends_with(tmp_path, capsys, layout):
+    image = _layout(tmp_path, layout)
+
+    first = _no_rdb_opens(["--json", str(image)], capsys).splitlines()[0]
+
+    assert first == _text_error(image, capsys)
