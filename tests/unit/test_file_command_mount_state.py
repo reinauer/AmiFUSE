@@ -233,11 +233,12 @@ def test_crash_during_the_command_is_an_error(command_context, capsys, command, 
     assert output.read_bytes() == b"keep existing output"
 
 
-def _backend(drive_names, partition_number=None):
+def _backend(drive_names, partition_number=None, partition_name=None):
     parts = [SimpleNamespace(num=num, get_drive_name=lambda name=name: name)
              for num, name in enumerate(drive_names)]
     return SimpleNamespace(
         partition_number=partition_number,
+        partition_name=partition_name,
         rdb=SimpleNamespace(
             get_partition=lambda n: parts[n] if n < len(parts) else None))
 
@@ -261,6 +262,34 @@ def test_volume_name_falls_back_to_the_opened_partition():
     assert _bridge_without_a_root_name(backend).volume_name() == "DH1"
 
 
+def test_volume_name_of_a_repeated_drive_name_is_the_one_it_mounts_as():
+    """--partition DH0.1 names the second DH0 as the banner does."""
+    from amitools.fs.FSString import FSString
+
+    backend = _backend([FSString("DH0"), FSString("DH0")], partition_number=1,
+                       partition_name="DH0.1")
+    assert _bridge_without_a_root_name(backend).volume_name() == "DH0.1"
+
+
+def test_backend_keeps_the_name_it_found_the_partition_by(tmp_path):
+    from amitools.fs.DosType import DOS3
+
+    from amifuse.driver_runtime import BlockDeviceBackend
+    from amifuse.fuse_fs import get_partition_info
+    from tests.unit.test_repeated_partition_names import _image
+
+    image = _image(tmp_path, [("DH0", DOS3), ("DH0", DOS3)])
+    for selector, number in (("DH0.1", 1), ("1", 1), ("DH0", 0)):
+        backend = BlockDeviceBackend(image, partition_scope=True,
+                                     partition=selector)
+        backend.open()
+        try:
+            assert (backend.partition_number, backend.partition_name) == (
+                number, get_partition_info(image, None, selector)["name"])
+        finally:
+            backend.close()
+
+
 @pytest.mark.parametrize("empty", ["fsstring", None])
 def test_volume_name_of_a_partition_without_a_drive_name(empty):
     """An empty or damaged name gets the label inspect gives that partition."""
@@ -272,8 +301,8 @@ def test_volume_name_of_a_partition_without_a_drive_name(empty):
 
 
 @pytest.mark.parametrize("backend", [
-    SimpleNamespace(partition_number=None, rdb=None),
-    SimpleNamespace(partition_number=None,
+    SimpleNamespace(partition_number=None, partition_name=None, rdb=None),
+    SimpleNamespace(partition_number=None, partition_name=None,
                     rdb=SimpleNamespace(get_partition=lambda n: None)),
 ], ids=["no-rdb", "no-partition"])
 def test_volume_name_never_comes_from_the_root_listing(backend):
