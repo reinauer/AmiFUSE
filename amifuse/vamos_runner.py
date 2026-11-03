@@ -224,18 +224,20 @@ class VamosHandlerRuntime:
 
         Errors name the handler by its path, or by driver_name if given: a
         driver extracted from the RDB is at a temporary path, gone by the
-        time the error is shown.
+        time the error is shown. Such a driver was read from the image
+        without error, so a file error is its temporary copy's, and says so.
         """
         if not self.slm:
             raise RuntimeError("setup() not called")
         name = driver_name or f"handler {handler_path}"
+        copy = ": cannot read its temporary copy" if driver_name else ""
 
         def raise_os_error(exc: OSError):
             # The file could not be read: a reported refusal. An error that
             # names the file, by the path the user gave, stands as it is.
             if exc.filename is not None and driver_name is None:
                 raise exc
-            text = f"Failed to load {name}: {exc.strerror or exc}"
+            text = f"Failed to load {name}{copy}: {exc.strerror or exc}"
             raise (OSError(text) if exc.errno is None
                    else OSError(exc.errno, text)) from exc
 
@@ -246,7 +248,7 @@ class VamosHandlerRuntime:
             os.stat(handler_path)
         except FileNotFoundError:
             raise FileNotFoundError(
-                f"Failed to load {name}: no such file") from None
+                f"Failed to load {name}{copy}: no such file") from None
         except OSError as exc:
             # E.g. an unreadable folder.
             raise_os_error(exc)
