@@ -1305,7 +1305,7 @@ class HandlerBridge:
 
     # Bridge memory taken out of use while a packet still out points to it;
     # see _free_retired. The small buffers: the FIB, the BSTRs, the
-    # buffer of the write of no bytes and the DateStamp, at most 260 bytes
+    # buffer of the write of no bytes and the DateStamp, at most 264 bytes
     # each.
     _retired = ()
     # The read and write buffers, up to IO_CHUNK each.
