@@ -1209,3 +1209,31 @@ def test_write_fails_naming_an_end_never_answered(
     assert not handler.taken(ACTION_FLUSH)
     # The 60 busy runs of END's own wait, and one bound for the flush.
     assert now[0] - ended_at[0] == 59 + fs.HandlerBridge._PENDING_WAIT
+
+
+def test_flush_skips_a_handler_still_at_work_when_a_reply_meets_the_deadline(
+        bridge, short_limits, monkeypatch):
+    # The last wait takes one grow's reply just as the deadline passes,
+    # which leaves the other grow out with the handler still at work on
+    # it: no flush goes to it then.
+    b, handler = bridge
+    now = _busy_for_good(b, handler, monkeypatch)
+    fh = _open(b, handler, "/grow2", 0x5560)
+    assert b.set_handle_size(fh, 0x7FFFFFFF) == -1
+    second = handler.waiting[-1]
+    start = now[0]
+    runs = b.launcher.run
+
+    def run(max_cycles=None):
+        if now[0] + 1.0 >= start + fs.HandlerBridge._PENDING_WAIT:
+            second[0] = 0  # answered in the run that reaches the deadline
+        return runs(max_cycles)
+    b.launcher.run = run
+
+    with pytest.raises(OSError, match="ACTION_SET_FILE_SIZE"):
+        b.flush_volume()
+
+    assert ("answer", ACTION_SET_FILE_SIZE) in [
+        (kind, pkt_type) for kind, pkt_type, *_ in handler.events]
+    assert not handler.taken(ACTION_FLUSH)
+    assert now[0] - start == fs.HandlerBridge._PENDING_WAIT
