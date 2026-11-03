@@ -153,7 +153,8 @@ def test_handler_in_unreadable_folder_is_not_missing(runtime, tmp_path):
     finally:
         folder.chmod(0o755)
     assert str(caught.value.filename) == str(path)
-    assert RDB_DRIVER in str(named.value)
+    assert named.value.strerror == (f"Failed to load {RDB_DRIVER}: cannot "
+                                    "read its temporary copy: Permission denied")
     assert str(path) not in str(named.value)
 
 
@@ -198,13 +199,16 @@ def test_read_error_uses_the_drivers_name_over_its_path(
     with pytest.raises(OSError) as caught:
         runtime.load_handler(path, RDB_DRIVER)
     assert caught.value.errno == errno.EIO
-    assert RDB_DRIVER in str(caught.value)
+    assert caught.value.strerror == (f"Failed to load {RDB_DRIVER}: cannot "
+                                     "read its temporary copy: Input/output error")
     assert str(path) not in str(caught.value)
     assert "the-temporary-path" not in str(caught.value)
 
 
 @pytest.mark.parametrize("kind,error,reason", [
-    ("missing", FileNotFoundError, "no such file"),
+    # The file is the copy the RDB was read into: one that's gone is the
+    # copy's fault, the bytes in it the image's.
+    ("missing", FileNotFoundError, "cannot read its temporary copy: no such file"),
     ("directory", ValueError, "not a regular file"),
     ("damaged", ValueError, "not a loadable Amiga executable (HUNK or ELF)"),
 ])
@@ -288,7 +292,7 @@ def test_format_names_the_driver_it_cannot_read(rdb_image, tmp_path, monkeypatch
 
     monkeypatch.setattr(fuse_fs, "_pfs3_format_refusal", unreadable)
     args = ["format", str(rdb_image), "DH0", "Vol"]
-    name = RDB_DRIVER
+    name = f"the temporary copy of {RDB_DRIVER}"
     if not from_rdb:
         name = tmp_path / "stored.handler"
         args += ["--driver", str(name)]

@@ -5630,8 +5630,13 @@ def format_volume(
         except OSError as exc:
             if debug:
                 raise
-            # The refusals read the driver before the loader does.
-            name = resolved.display_name or driver
+            # The refusals read the driver before the loader does. One from
+            # the RDB was read from the image without error: the file that
+            # failed is its temporary copy.
+            if resolved.display_name:
+                name = f"the temporary copy of {resolved.display_name}"
+            else:
+                name = driver
             raise SystemExit(
                 f"Error: cannot read {name}: {exc.strerror or exc}") from exc
         if refusal is not None:
