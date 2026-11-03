@@ -709,7 +709,10 @@ class TestValidateMountpoint:
     def test_validate_macos_refuses_a_dangling_symlink(self, monkeypatch, tmp_path):
         """os.path.exists is False for a dangling link."""
         link = tmp_path / "link"
-        link.symlink_to(tmp_path / "missing")
+        try:
+            link.symlink_to(tmp_path / "missing")
+        except OSError:
+            pytest.skip("symlink creation is unavailable")
         monkeypatch.setattr("sys.platform", "darwin")
         from amifuse.platform import validate_mountpoint
 
@@ -723,7 +726,10 @@ class TestValidateMountpoint:
         has /Volumes and its link to /."""
         (tmp_path / "real" / "mnt").mkdir(parents=True)
         link = tmp_path / "link"
-        link.symlink_to(tmp_path / "real")
+        try:
+            link.symlink_to(tmp_path / "real")
+        except OSError:
+            pytest.skip("symlink creation is unavailable")
         monkeypatch.setattr("sys.platform", "darwin")
         from amifuse.platform import validate_mountpoint
 
