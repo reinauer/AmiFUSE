@@ -4302,8 +4302,10 @@ class AmigaFuseFS(_FuseOperations):
         A refusal has nowhere to go but stderr: utimens() returned 0 long
         ago, the date can only be set after the handle ends, since a handler
         stamps a file it closes, and close() does not wait for release().
-        The program that asked never hears of it. A daemon mount's stderr is
-        /dev/null (_report_ready), so the line takes --interactive to see.
+        The program that asked never hears of it. On macOS and Linux a
+        daemon mount's stderr is /dev/null (_report_ready), so there the
+        line takes --interactive to see. On Windows it reaches the console,
+        or mount-<letter>.log for a mount the launcher starts.
         """
         with self._fh_lock:
             if path not in self._held_dates or self._has_open_file(path):
