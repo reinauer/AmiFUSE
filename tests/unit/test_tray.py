@@ -275,21 +275,25 @@ class TestAutoExit:
         icon = _FakeIcon("test", None, "test")
         tray_app._icon = icon
 
-        # Run poll loop until it stops the icon
-        def stop_eventually():
-            time.sleep(0.2)
-            tray_app._stop_event.set()
-
-        t = threading.Thread(target=stop_eventually, daemon=True)
-        t.start()
-        tray_app._poll_loop()
-        t.join(timeout=1)
+        # The loop stops the icon on _stop_event too, so a stop only shows
+        # the grace period ended if the loop returned before the event was
+        # set. The event is only a safety net for a loop that never ends.
+        safety_net = threading.Timer(10, tray_app._stop_event.set)
+        safety_net.daemon = True
+        safety_net.start()
+        try:
+            tray_app._poll_loop()
+            assert not tray_app._stop_event.is_set()
+        finally:
+            safety_net.cancel()
 
         assert icon._stopped
 
     def test_auto_exit_cancelled_by_new_mount(self, tray_app, fake_pystray, monkeypatch):
         """Mount appears during grace period -> timer reset."""
-        tray_app.GRACE_PERIOD = 0.1
+        # Long enough that no stall of a CI runner between the two empty
+        # polls can end it (#385); the loop ends on _stop_event below.
+        tray_app.GRACE_PERIOD = 10
         tray_app.POLL_INTERVAL = 0.01
 
         call_count = 0
