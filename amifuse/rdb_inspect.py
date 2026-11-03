@@ -684,6 +684,22 @@ def _no_rdb_opens_message(image: Path) -> str:
     return f"No RDB on this disk opens: {image}"
 
 
+def _nothing_opens_message(image: Path, amiga_parts, failures) -> str:
+    """The error print_inspect_report ends with when no RDB opens.
+
+    failures are the (rdb_idx, error) pairs open_each_rdb gave, with None
+    for the disk's own RDB. rdb-inspect --json gives the same line first.
+    """
+    own = [error for rdb_idx, error in failures if rdb_idx is None]
+    if len(amiga_parts) > 1:
+        if own:
+            return _no_rdb_opens_message(image)
+        return _no_valid_rdb_message(image, len(amiga_parts))
+    if own and not (amiga_parts and isinstance(own[0], DiskRDBError)):
+        return str(own[0])
+    return _no_rdb_opens_message(image)
+
+
 def _disk_rdb_context(mbr_info: MBRInfo) -> MBRContext:
     """The MBRContext of a disk's own RDB beside its MBR (Parceiro-style)."""
     return MBRContext(
@@ -1736,10 +1752,11 @@ def main(argv=None):
                 rdisk.close()
                 blkdev.close()
         if not all_rdbs:
-            if len(failures) == 1:
-                raise SystemExit(f"Error: {failures[0][1]}")
+            summary = _nothing_opens_message(args.image, amiga_parts, failures)
+            if [summary] == [str(error) for _, error in failures]:
+                raise SystemExit(f"Error: {summary}")
             raise SystemExit("\n".join(
-                [f"Error: {_no_rdb_opens_message(args.image)}"]
+                [f"Error: {summary}"]
                 + [f"{rdb_label(amiga_parts, rdb_idx)}: {error}"
                    for rdb_idx, error in failures]))
         if len(all_rdbs) == 1:
