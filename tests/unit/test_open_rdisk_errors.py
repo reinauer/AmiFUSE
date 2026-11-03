@@ -203,7 +203,7 @@ def test_unreadable_partition_is_skipped(tmp_path, devices, past_eof, reason,
 
 
 # A partition list pointing at block 200 of a 160-block RDB makes the
-# strict RDisk.open() raise rather than return False.
+# lenient parse's partition read raise rather than return False.
 def test_partition_list_past_image_end_fails_to_parse(tmp_path, devices):
     rdb = _make_rdb(tmp_path, 512)
     image = tmp_path / "rdb-DH0.hdf"
