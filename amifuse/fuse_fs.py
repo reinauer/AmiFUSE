@@ -1888,12 +1888,16 @@ class HandlerBridge:
                     part = self.backend.rdb.get_partition(
                         self.backend.partition_number or 0)
                 if part is not None:
-                    # An FSString is true even when empty, and None for a
-                    # damaged name; callers expect a str (verify --json
-                    # serializes it).
-                    name = part.get_drive_name()
-                    self._volname = (str(name) if name is not None else ""
-                                     ) or f"#{part.num}"
+                    # The name --partition found it by first, as the mount
+                    # banner and the default mountpoint use it: DH0.1 for a
+                    # repeated DH0. An FSString is true even when empty, and
+                    # None for a damaged name; callers expect a str (verify
+                    # --json serializes it).
+                    name = self.backend.partition_name
+                    if not name:
+                        drive_name = part.get_drive_name()
+                        name = str(drive_name) if drive_name is not None else ""
+                    self._volname = name or f"#{part.num}"
                     return self._volname
             except Exception:
                 pass

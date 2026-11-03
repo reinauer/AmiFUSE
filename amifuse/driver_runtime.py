@@ -122,8 +122,11 @@ class BlockDeviceBackend:
         self.host_lock = HostFileLock(image, read_only=read_only)
         self.partition_scope = partition_scope and adf_info is None and iso_info is None
         self.partition = partition
-        # The partition's number in its RDB, once open() has found it.
+        # The partition's number in its RDB, once open() has found it, and
+        # the name it mounts as there (DH0.1 for a repeated DH0; None for a
+        # damaged drive name).
         self.partition_number = None
+        self.partition_name = None
         self._block_range = None
         self._fsync_error = None
         # Physical disks keep their existing whole-device exclusion policy.
@@ -161,6 +164,7 @@ class BlockDeviceBackend:
                     write=not self.read_only)
                 self.mbr_partition_index = ref.mbr_partition_index if ref else None
                 self.partition_number = ref.number if ref else None
+                self.partition_name = ref.name if ref else None
             elif self.partition_scope and not self.read_only:
                 from .rdb_inspect import check_default_write
                 check_default_write(self.image, self._requested_block_size)
