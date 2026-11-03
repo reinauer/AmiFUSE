@@ -974,3 +974,21 @@ def test_unmount_names_the_packets_still_out_when_the_flush_fails(
     assert "ACTION_SET_FILE_SIZE" in warning and "ACTION_FLUSH" in warning
     assert "flush failed" in out
     assert "Unmount completed with errors." in out
+
+
+def test_a_wait_past_its_deadline_leaves_a_handler_still_at_work_its_io_reply(
+        bridge):
+    # A wait_for_pending wait whose deadline has passed before it runs the
+    # handler, after an earlier wait ran out: the handler is still at work,
+    # so a reply on its own port stays for it to take.
+    b, handler = bridge
+    io_port, io_msg = _io_reply_port(b, handler)
+    handler.ports.put_msg(io_port, io_msg)
+    runs = []
+    b.launcher.run = lambda max_cycles=None: runs.append(max_cycles)
+    b._busy_ran_out = True
+
+    b._run_until_replies(deadline=fs.time.monotonic() - 1)
+
+    assert handler.ports.has_msg(io_port)
+    assert runs == []
