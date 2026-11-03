@@ -1289,9 +1289,12 @@ class HandlerBridge:
         seconds have passed. Each wait also ends at that deadline: a
         handler that parks during a wait has the full busy limit for the
         rest of it. Late replies are given back as in
-        _run_until_reply. Returns the names of the packets still out.
+        _run_until_reply. _pending_wait_parked says whether it stopped
+        because the handler parked or exited, not at the deadline or with no
+        packet left. Returns the names of the packets still out.
         """
         with self._lock:
+            self._pending_wait_parked = False
             deadline = time.monotonic() + timeout
             while (self._pending_packets() and not self.state.crashed
                    and time.monotonic() < deadline):
@@ -1304,9 +1307,13 @@ class HandlerBridge:
                 if replies:
                     self._free_retired(self._held_args())
                 if not replies and not self._busy_ran_out:
+                    self._pending_wait_parked = True
                     break  # parked, or exited: nothing more comes
             return [_packet_type_name(pkt_type)
                     for pkt_type, _ in self._pending_packets().values()]
+
+    # Whether the last wait_for_pending stopped at a park; see there.
+    _pending_wait_parked = False
 
     # Bridge memory taken out of use while a packet still out points to it;
     # see _free_retired. The small buffers: the FIB, the BSTRs, the
@@ -2649,7 +2656,9 @@ class HandlerBridge:
                 raise OSError("handler crashed before volume flush")
             if wait_pending:
                 unanswered = self.wait_for_pending()
-                if unanswered and not self._busy_ran_out:
+                # Not after a wait that ended at its deadline: a reply taken
+                # there leaves _busy_ran_out clear with the handler at work.
+                if unanswered and self._pending_wait_parked:
                     try:
                         self._flush_now()
                     except OSError:
