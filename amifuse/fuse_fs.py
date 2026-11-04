@@ -3835,47 +3835,43 @@ class AmigaFuseFS(_FuseOperations):
         if not name:
             raise FuseOSError(errno.EINVAL)
         lock_bptr, _, locks = self.bridge.locate_path(dir_path)
-        # For root directory, get a proper lock
-        if dir_path == "/" and lock_bptr == 0:
-            lock_bptr, _ = self.bridge.locate(0, "")
-            if lock_bptr:
-                locks.append(lock_bptr)
-        if lock_bptr == 0:
-            self._log_op("unlink", path, f"parent dir not found: {dir_path}")
-            raise FuseOSError(errno.ENOENT)
-        res1, res2 = self.bridge.delete_object(lock_bptr, name)
-        self._log_op("unlink", path, f"delete_object res1={res1} res2={res2}")
-        if res1 == 0:
-            if res2 == 202:
-                # ERROR_OBJECT_IN_USE: file has an active handle (WinFSP calls
-                # unlink before release). Defer deletion to release().
-                with self._fh_lock:
-                    has_handle = any(v.get("path") == path for v in self._fh_cache.values())
+        try:
+            # For root directory, get a proper lock
+            if dir_path == "/" and lock_bptr == 0:
+                lock_bptr, _ = self.bridge.locate(0, "")
+                if lock_bptr:
+                    locks.append(lock_bptr)
+            if lock_bptr == 0:
+                self._log_op("unlink", path, f"parent dir not found: {dir_path}")
+                raise FuseOSError(errno.ENOENT)
+            res1, res2 = self.bridge.delete_object(lock_bptr, name)
+            self._log_op("unlink", path, f"delete_object res1={res1} res2={res2}")
+            if res1 == 0:
+                if res2 == 202:
+                    # ERROR_OBJECT_IN_USE: file has an active handle (WinFSP calls
+                    # unlink before release). Defer deletion to release().
+                    with self._fh_lock:
+                        has_handle = any(v.get("path") == path for v in self._fh_cache.values())
+                        if has_handle:
+                            self._pending_deletes.add(path)
                     if has_handle:
-                        self._pending_deletes.add(path)
-                if has_handle:
-                    with self._cache_lock:
-                        # A file held on an exclusive lock keeps its pinned
-                        # entry: getattr() reports it through the handle,
-                        # and read() stops at its size, until release()
-                        # (#263).
-                        if path not in self._pinned_stats:
-                            self._stat_cache.pop(path, None)
-                        self._dir_cache.pop(dir_path, None)
-                    for l in reversed(locks):
-                        self.bridge.free_lock(l)
-                    return 0
-            # Free locks before raising (fixes a lock leak on error)
-            for l in reversed(locks):
-                self.bridge.free_lock(l)
-            raise FuseOSError(errno.EIO)
-        with self._cache_lock:
-            self._stat_cache.pop(path, None)
-            self._dir_cache.pop(dir_path, None)
-        self._pinned_stats.discard(path)
-        for l in reversed(locks):
-            self.bridge.free_lock(l)
-        return 0
+                        with self._cache_lock:
+                            # A file held on an exclusive lock keeps its pinned
+                            # entry: getattr() reports it through the handle,
+                            # and read() stops at its size, until release()
+                            # (#263).
+                            if path not in self._pinned_stats:
+                                self._stat_cache.pop(path, None)
+                            self._dir_cache.pop(dir_path, None)
+                        return 0
+                raise FuseOSError(errno.EIO)
+            with self._cache_lock:
+                self._stat_cache.pop(path, None)
+                self._dir_cache.pop(dir_path, None)
+            self._pinned_stats.discard(path)
+            return 0
+        finally:
+            self._free_locks("unlink", path, locks)
 
     def rmdir(self, path):
         """Remove a directory, deferring if children have pending deletes."""
@@ -4633,6 +4629,19 @@ class AmigaFuseFS(_FuseOperations):
             raise FuseOSError(errno.EROFS)
         return 0
 
+    def _free_locks(self, op: str, path: str, locks) -> None:
+        """Free each of locks, apart from the others.
+
+        A lock left held keeps its directory in use until unmount, so one
+        free that fails is logged and doesn't stop the rest, or change what
+        the delete it follows has settled.
+        """
+        for l in reversed(locks):
+            try:
+                self.bridge.free_lock(l)
+            except Exception as e:
+                self._log_op(op, path, f"free_lock exception: {type(e).__name__}: {e}")
+
     def _resolve_pending_dir_deletes(self, deleted_child_path: str):
         """After a child is deleted, check if its parent directory can now be removed.
 
@@ -4652,6 +4661,7 @@ class AmigaFuseFS(_FuseOperations):
                 # but keep in _pending_deletes until delete confirmed
                 del self._pending_dir_deletes[parent_dir]
             # Attempt the actual directory deletion outside the lock
+            locks = []
             try:
                 # pfs3aio stops answering after an inhibit cycle with a file
                 # open deeper in the tree, and SmartFilesystem drops every
@@ -4670,8 +4680,6 @@ class AmigaFuseFS(_FuseOperations):
                     res1, res2 = self.bridge.delete_object(lock_bptr, name)
                     self._log_op("release", parent_dir, f"deferred rmdir res1={res1} res2={res2}")
                     if res1 == 0:
-                        for l in reversed(locks):
-                            self.bridge.free_lock(l)
                         with self._fh_lock:
                             self._drop_failed_dir_delete(parent_dir)
                         break
@@ -4679,8 +4687,6 @@ class AmigaFuseFS(_FuseOperations):
                     with self._fh_lock:
                         self._drop_failed_dir_delete(parent_dir)
                     break
-                for l in reversed(locks):
-                    self.bridge.free_lock(l)
                 # Delete succeeded - now remove from _pending_deletes
                 with self._fh_lock:
                     self._pending_deletes.discard(parent_dir)
@@ -4692,6 +4698,8 @@ class AmigaFuseFS(_FuseOperations):
                 with self._fh_lock:
                     self._drop_failed_dir_delete(parent_dir)
                 break
+            finally:
+                self._free_locks("release", parent_dir, locks)
             # Successfully deleted this directory - walk up to check its parent
             deleted_child_path = parent_dir
             parent_dir = parent_dir.rsplit("/", 1)[0] or "/"
@@ -4783,13 +4791,7 @@ class AmigaFuseFS(_FuseOperations):
                     with self._fh_lock:
                         self._pending_deletes.add(resolved_path)
             finally:
-                # Each lock apart from the delete and from the others: a
-                # lock left held keeps the directory in use until unmount.
-                for l in reversed(locks):
-                    try:
-                        self.bridge.free_lock(l)
-                    except Exception as e:
-                        self._log_op("release", resolved_path, f"free_lock exception: {type(e).__name__}: {e}")
+                self._free_locks("release", resolved_path, locks)
             if dropped:
                 # The file stays, and takes the date utimens() held for it.
                 self._set_held_date(resolved_path)
