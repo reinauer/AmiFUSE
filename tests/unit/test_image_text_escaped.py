@@ -328,7 +328,7 @@ class TestDiskRDBMessages:
             fuse_fs.main(["ls", str(image)])
         message = str(caught.value)
         assert message.endswith(
-            f"still open, read-only: {SHOWN}. Open one with --partition {SHOWN}.")
+            f"still open, read-only: {SHOWN}. Open one with --partition '{SHOWN}'.")
         assert "\x1b" not in message
 
         with pytest.raises(SystemExit):
