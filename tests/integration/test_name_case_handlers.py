@@ -345,3 +345,23 @@ def test_bffs_is_left_exact(fixture_root):
         assert bridge.name_fold() is None
     finally:
         bridge.close()
+
+
+@pytest.mark.integration
+def test_nfc_same_name_and_case_only_rename_keep_open_state(request, tmp_path, mount):
+    image, driver = _fixture_copy(request, tmp_path, "pfs.hdf", "pfs3aio")
+    ops = mount(image, driver)
+    composed = "/caf\xe9"
+    decomposed = "/cafe\u0301"
+    fh = ops("create", composed, 0o644)
+    ops("write", composed, b"kept", 0, fh)
+    try:
+        assert ops("rename", decomposed, composed) == 0
+        assert ops("getattr", decomposed)["st_size"] == 4
+        assert ops("rename", decomposed, "/CAF\xc9") == 0
+        assert "CAF\xc9" in ops("readdir", "/", None)
+        assert ops("read", decomposed, 4, 0, fh) == b"kept"
+        assert ops._fh_cache[fh]["path"] == "/CAF\xc9"
+    finally:
+        ops("release", decomposed, fh)
+    assert ops.bridge.read_file("/CAF\xc9", 4, 0) == b"kept"
