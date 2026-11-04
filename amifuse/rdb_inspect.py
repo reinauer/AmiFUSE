@@ -659,6 +659,11 @@ def _lenient_rdisk_open(rdisk) -> List[str]:
             )
             rdisk.damaged_part_list = warnings[-1]
             break
+        if (not rdisk.parts and not isinstance(rdisk.rawblk, OffsetBlockDevice)
+                and part_blk >= rdisk.rawblk.num_blocks):
+            raise RDBContentError(
+                f"Invalid image file block num: got {part_blk} "
+                f"but max is {rdisk.rawblk.num_blocks}")
         seen.add(part_blk)
         p = Partition(rdisk.rawblk, part_blk, num, rdb.log_drv.cyl_blks, rdisk)
         num += 1
