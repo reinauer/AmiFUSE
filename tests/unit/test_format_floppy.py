@@ -208,7 +208,7 @@ def test_a_floppy_formats_with_its_geometry_and_no_partition(
     assert kwargs["read_only"] is False
     assert (kwargs["adf_info"].dos_type, kwargs["adf_info"].is_hd) == (DOS3, True)
     launcher = stub_bridge.bridge.launcher
-    assert launcher.send_inhibit.call_args.args[1] is True
+    assert [c.args[1] for c in launcher.send_inhibit.call_args_list] == [True, False]
     assert launcher.alloc_bstr.call_args.args[0] == "Fresh"
     assert launcher.send_format.call_args.args[2] == DOS3
     stub_bridge.bridge.backend.fsync.assert_called_once_with()

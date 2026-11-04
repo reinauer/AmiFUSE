@@ -651,13 +651,14 @@ class TestFormatVolume:
             volname="SFSFmt",
         )
 
-        assert mock_bridge.launcher.send_inhibit.call_count == 1
-        mock_bridge.launcher.send_inhibit.assert_called_once_with(mock_bridge.state, True)
+        assert mock_bridge.launcher.send_inhibit.call_args_list == [
+            call(mock_bridge.state, True), call(mock_bridge.state, False)]
         mock_bridge.launcher.send_flush.assert_called_once_with(mock_bridge.state)
         # Each packet waits for its own reply, not for any reply.
         assert mock_bridge._run_until_reply.call_args_list == [
             call(0x100, "format inhibit"),
             call(0x200, "format", max_iters=2000, cycles=2_000_000),
+            call(0x100, "format uninhibit", max_iters=500, cycles=2_000_000),
             call(0x300, "format flush", max_iters=500, cycles=2_000_000),
         ]
         mock_bridge._run_until_replies.assert_not_called()
