@@ -402,8 +402,8 @@ scripts. Tests are organized into two layers:
 | Layer | Location | Marker | Requires |
 |-------|----------|--------|----------|
 | Unit | `tests/unit/` | _(none)_ | Python + amifuse installed |
-| Integration | `tests/integration/` | `integration` | machine68k + external fixtures |
-| Mount | `tests/integration/` | `fuse` | FUSE backend (WinFSP/FUSE-T/fuse3) + external fixtures |
+| Integration | `tests/integration/` | `integration` | machine68k; external fixtures unless marked `no_fixtures` |
+| Mount | `tests/integration/` | `fuse` | FUSE backend (WinFSP/FUSE-T/fuse3); external fixtures unless marked `no_fixtures` |
 
 ### Bundled FastFileSystem
 
@@ -430,7 +430,10 @@ scripts. Tests are organized into two layers:
 # Unit tests (all platforms, no external dependencies)
 pytest tests/unit/ -v --timeout=30
 
-# Integration tests (needs fixtures + machine68k)
+# Integration tests using generated images (needs machine68k, no fixture repo)
+pytest tests/integration/ -m no_fixtures -v --timeout=60
+
+# Full integration suite (needs fixtures + machine68k)
 pytest tests/integration/ -v --timeout=60
 
 # Mount tests only (needs FUSE backend + fixtures)
@@ -442,14 +445,16 @@ pytest tests/ -v --timeout=60
 
 ### Fixture Resolution
 
-Integration tests need handler binaries and disk images. They resolve
-the fixture directory through a cascade:
+Integration tests marked `no_fixtures` use the bundled handler and generated
+disk images. The other integration tests resolve external handler binaries
+and disk images through a cascade:
 
 1. `AMIFUSE_FIXTURE_ROOT` env var — point this at any directory containing
    `drivers/` (handler binaries) and `fixtures/readonly/` (disk images)
 2. `../AmiFUSE-testing` sibling directory (relative to repo root)
 3. `~/AmigaOS/AmiFuse` (default local path)
-4. `None` → tests skip gracefully with a clear message
+4. `None` → tests needing external fixtures skip with a clear message;
+   tests marked `no_fixtures` still run
 
 The fixture directory must contain at minimum:
 
