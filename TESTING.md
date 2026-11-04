@@ -502,6 +502,12 @@ On Windows, `tools-smoke` also installs WinFSP before `image_format_smoke.py`:
 the tool fakes the mount, but the mount path still checks that WinFSP is
 installed.
 
+Outside CI, tests skip when machine68k or a FUSE backend doesn't work. So that
+a green job means its tests ran, `integration-tests` and `mount-tests` set
+`AMIFUSE_REQUIRE_M68K=1`, and `mount-tests` also sets `AMIFUSE_REQUIRE_FUSE=1`.
+With a variable set, `tests/integration/conftest.py` ends the run with exit
+status 1 instead of skipping. Set them locally to make the same check.
+
 The Windows integration, tools-smoke and mount-tests jobs use the
 `machine68k-amifuse` fork, which includes pre-built wheels with fixes for
 opcode table over-read
