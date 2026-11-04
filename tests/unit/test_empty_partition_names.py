@@ -66,7 +66,7 @@ def test_hint_preserves_a_real_hash_prefixed_name(tmp_path, user_driver_dir):
     image = _failed_disk(tmp_path, ('#0',))
     with pytest.raises(SystemExit) as caught:
         main(['ls', str(image)])
-    assert str(caught.value).endswith('Open one with --partition #0.')
+    assert str(caught.value).endswith("Open one with --partition '#0'.")
 
 
 def test_hint_omits_numeric_name_collision(tmp_path, user_driver_dir):

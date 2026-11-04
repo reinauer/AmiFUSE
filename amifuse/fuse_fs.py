@@ -5216,7 +5216,7 @@ def _entry_partitions_hint(choices: List[Tuple[str, str]]) -> str:
     if not choices:
         return ""
     shown = [escape_text(label) for label, _ in choices]
-    selector = escape_text(choices[0][1])
+    selector = shlex.quote(escape_text(choices[0][1]))
     return (f"\nThe partitions in the MBR's 0x76 entries still open, read-only: "
             f"{', '.join(shown)}. Open one with --partition {selector}.")
 
