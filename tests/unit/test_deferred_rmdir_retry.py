@@ -511,13 +511,16 @@ def test_deferred_delete_drops_the_date_utimens_held(make_fs, answer):
 class _Freed:
     """Records each free_lock(); the first `raising` of them raise."""
 
-    def __init__(self, volume, raising=0):
+    def __init__(self, volume, raising=0, raise_on=()):
         self.locks = []
         self.raising = raising
+        self.raise_on = set(raise_on)
         volume.free_lock = self
 
     def __call__(self, lock):
         self.locks.append(lock)
+        if lock in self.raise_on:
+            raise OSError("free_lock failed")
         if self.raising:
             self.raising -= 1
             raise OSError("free_lock failed")
@@ -691,7 +694,7 @@ def _answer_rmdir(volume, answer):
 def test_deferred_rmdir_frees_each_lock_when_one_free_raises(make_fs, answer):
     fs, volume, hx = _deferred_rmdir(make_fs)
     _answer_rmdir(volume, answer)
-    freed = _Freed(volume, raising=1)
+    freed = _Freed(volume, raise_on={0x201})
 
     assert fs.release("/d/x", hx) == 0
 
@@ -702,8 +705,10 @@ def test_deferred_rmdir_frees_each_lock_when_one_free_raises(make_fs, answer):
 def test_deferred_rmdir_deleted_stays_settled_when_a_free_raises(make_fs):
     fs, volume, hx = _deferred_rmdir(make_fs)
     _answer_rmdir(volume, lambda lock, name: (-1, 0))
-    _Freed(volume, raising=1)
+    _Freed(volume, raise_on={0x201})
+    fs._dir_cache["/"] = (0.0, ["d"])
 
     assert fs.release("/d/x", hx) == 0
 
     assert "/d" not in fs._pending_deletes
+    assert "/" not in fs._dir_cache
