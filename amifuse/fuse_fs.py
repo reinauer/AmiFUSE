@@ -6130,10 +6130,11 @@ def _listing_of(raw):
     A damaged directory block can lead back to a directory that holds it,
     and nothing in the entry says so. fib_DiskKey alone can't tell, as
     pfs3aio and ODFileSystem give one key to many directories. With the rest
-    of the listing it can: a directory lists the same entries each time, and
-    one inside it does not. Two directories side by side can list the same,
-    on ODFileSystem, so this tells only of those above. No key says nothing,
-    and an empty directory leads nowhere.
+    of the listing it can detect repeated visits. A directory inside another
+    can also list the same entries, so the walk allows one repeat before
+    stopping. This is a heuristic: three identical listings along a sound
+    chain are indistinguishable from a loop. Siblings are checked separately.
+    No key says nothing, and an empty directory leads nowhere.
     """
     if not raw or not all(ent.get("disk_key") for ent in raw):
         return None
@@ -6148,7 +6149,7 @@ def _ls_recursive(bridge, root_path: str) -> list:
     """Recursively list all entries under root_path.
 
     A directory it can't go into is listed, without its contents, and named
-    on stderr. So is one that lists what a directory above it lists.
+    on stderr. So is one whose listing repeats twice above it.
     """
     entries = []
     stack = [(root_path, ())]
@@ -6156,8 +6157,8 @@ def _ls_recursive(bridge, root_path: str) -> list:
         current, above = stack.pop()
         raw = bridge.list_dir_path(current)
         listing = _listing_of(raw)
-        if listing in above:
-            print(f"Warning: contents of {current} not listed (it leads back "
+        if above.count(listing) >= 2:
+            print(f"Warning: contents of {escape_text(current)} not listed (it leads back "
                   "to a directory above it, so the volume may be damaged)",
                   file=sys.stderr)
             continue
@@ -6182,7 +6183,7 @@ def _ls_recursive(bridge, root_path: str) -> list:
                 if reason is None:
                     dir_children.append(child)
                 else:
-                    print(f"Warning: contents of {child} not listed ({reason})",
+                    print(f"Warning: contents of {escape_text(child)} not listed ({reason})",
                           file=sys.stderr)
         # Traverse in sorted order for deterministic output
         stack.extend((child, above) for child in reversed(sorted(dir_children)))

@@ -62,7 +62,7 @@ def _path_table(fmt, entries):
     return table
 
 
-def _iso(path, b_lba):
+def _iso(path, b_lba, chain=False):
     """/A/B and /A/C, with B's record in A naming sector b_lba."""
     sectors = {
         ROOT: _dir(ROOT, ROOT, _record(b"A", A)),
@@ -73,6 +73,12 @@ def _iso(path, b_lba):
         25: b"hello",
     }
     entries = [(b"\0", ROOT, 1), (b"A", A, 1), (b"B", B, 2), (b"C", C, 2)]
+    if chain:
+        # Both ancestors list A with the same key and timestamp on
+        # ODFileSystem; the third listing ends in a file instead of a loop.
+        sectors[A] = _dir(A, ROOT, _record(b"A", B))
+        sectors[B] = _dir(B, A, _record(b"F.TXT;1", 25, is_dir=False, size=5))
+        entries = [(b"\0", ROOT, 1), (b"A", A, 1), (b"A", B, 2)]
     little, big = _path_table("<", entries), _path_table(">", entries)
     pvd = bytearray(b" " * SECTOR)
     pvd[:7] = b"\x01CD001\x01"
@@ -118,5 +124,13 @@ def test_a_sound_image_is_walked_whole(tmp_path, driver, capfd):
 def test_a_record_leading_back_up_ends_the_walk(tmp_path, driver, capfd):
     paths, err = _ls(_iso(tmp_path / "loop.iso", A), driver, capfd)
 
-    assert sorted(paths) == ["/A", "/A/B", "/A/C", "/A/F.TXT"]
-    assert "contents of /A/B not listed (it leads back" in err
+    assert sorted(paths) == ["/A", "/A/B", "/A/B/B", "/A/B/C", "/A/B/F.TXT",
+                             "/A/C", "/A/F.TXT"]
+    assert "contents of /A/B/B not listed (it leads back" in err
+
+
+def test_same_name_chain_with_shared_keys_is_walked_whole(tmp_path, driver, capfd):
+    paths, err = _ls(_iso(tmp_path / "chain.iso", B, chain=True), driver, capfd)
+
+    assert paths == ["/A", "/A/A", "/A/A/F.TXT"]
+    assert "leads back" not in err

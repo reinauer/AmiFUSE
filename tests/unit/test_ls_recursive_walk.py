@@ -35,10 +35,13 @@ class _FakeHandler:
     def list_dir_path(self, path):
         self.calls.append(path)
         assert len(self.calls) < 50, f"the walk does not end: {self.calls[-3:]}"
-        for prefix, target in self.aliases:
-            if path == prefix or path.startswith(prefix + "/"):
-                path = target + path[len(prefix):]
-                path = path.replace("//", "/")
+        while True:
+            previous = path
+            for prefix, target in self.aliases:
+                if path == prefix or path.startswith(prefix + "/"):
+                    path = (target + path[len(prefix):]).replace("//", "/")
+            if path == previous:
+                break
         return self.tree.get(path, [])
 
 
@@ -151,9 +154,9 @@ def test_a_directory_leading_back_above_it_is_left_alone(capsys):
 
     entries = fs._ls_recursive(handler, "/")
 
-    assert _names(entries) == ["/a", "/a/b", "/a/f"]
-    assert handler.calls == ["/", "/a", "/a/b"]
-    assert "contents of /a/b not listed (it leads back" in capsys.readouterr().err
+    assert _names(entries) == ["/a", "/a/b", "/a/f", "/a/b/b", "/a/b/f"]
+    assert handler.calls == ["/", "/a", "/a/b", "/a/b/b"]
+    assert "contents of /a/b/b not listed (it leads back" in capsys.readouterr().err
 
 
 def test_a_walk_with_many_ways_back_stays_short(capsys):
@@ -166,8 +169,11 @@ def test_a_walk_with_many_ways_back_stays_short(capsys):
 
     entries = fs._ls_recursive(handler, "/")
 
-    assert _names(entries) == ["/a", "/a/b", "/a/c", "/a/d"]
-    assert capsys.readouterr().err.count("it leads back") == 3
+    assert len(entries) == 13
+    assert set(_names(entries)) == {"/a", "/a/b", "/a/c", "/a/d"} | {
+        f"/a/{parent}/{child}" for parent in "bcd" for child in "bcd"
+    }
+    assert capsys.readouterr().err.count("it leads back") == 9
 
 
 def test_a_way_back_to_the_root_ends(capsys):
@@ -178,8 +184,8 @@ def test_a_way_back_to_the_root_ends(capsys):
 
     entries = fs._ls_recursive(handler, "/")
 
-    assert _names(entries) == ["/a", "/a/b"]
-    assert "contents of /a/b not listed" in capsys.readouterr().err
+    assert _names(entries) == ["/a", "/a/b", "/a/b/a", "/a/b/a/b"]
+    assert "contents of /a/b/a/b not listed" in capsys.readouterr().err
 
 
 def test_directories_side_by_side_that_list_the_same_are_both_walked(capsys):
@@ -215,13 +221,13 @@ def test_one_key_for_many_directories_hides_none(capsys):
 def test_a_real_chain_of_one_name_is_walked_to_its_end(capsys):
     handler = _FakeHandler({
         "/": [_dir("a", 10)],
-        "/a": [_dir("a", 11)],
-        "/a/a": [_dir("a", 12)],
+        "/a": [_dir("a", 10)],
+        "/a/a": [_entry("f", ST_FILE, 5, key=10)],
     })
 
     entries = fs._ls_recursive(handler, "/")
 
-    assert _names(entries) == ["/a", "/a/a", "/a/a/a"]
+    assert _names(entries) == ["/a", "/a/a", "/a/a/f"]
     assert capsys.readouterr().err == ""
 
 
@@ -237,3 +243,19 @@ def test_a_handler_with_no_keys_says_nothing_of_a_way_back(capsys):
 
     assert _names(entries) == ["/a", "/a/a", "/a/a/a"]
     assert capsys.readouterr().err == ""
+
+
+@pytest.mark.parametrize("cycle", [False, True], ids=["link", "cycle"])
+def test_warning_escapes_names_from_the_disk(capsys, cycle):
+    name = "x\x1b[2J"
+    if cycle:
+        handler = _FakeHandler({"/": [_dir(name, 10)]},
+                               aliases=[("/" + name, "/")])
+    else:
+        handler = _FakeHandler({"/": [_entry(name, ST_LINKDIR)]})
+
+    fs._ls_recursive(handler, "/")
+
+    err = capsys.readouterr().err
+    assert "\x1b" not in err
+    assert "x\\x1b[2J" in err
