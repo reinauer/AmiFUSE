@@ -6,13 +6,17 @@ required flags) are also exercised.
 """
 
 import json
-import shutil
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 
 import pytest
+
+from amitools.fs import DosType
+
+from tests.fixtures.images import make_adf
+from tests.fixtures.paths import BUNDLED_FFS
 
 pytestmark = pytest.mark.integration
 
@@ -54,18 +58,16 @@ def _parse_json_stdout(proc: subprocess.CompletedProcess) -> dict:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.no_fixtures
 @pytest.mark.parametrize("command,path", [
     ("hash", "S/Startup-Sequence"), ("hash", "/"),
     ("read", "S/Startup-Sequence"), ("read", "/"),
     ("write", "new/file"),
 ])
-def test_file_commands_reject_unmounted_adf(ofs_adf_image, fixture_root, tmp_path, command, path):
+def test_file_commands_reject_unmounted_adf(tmp_path, command, path):
     """A real handler must report the damaged volume, not a missing file."""
-    driver = fixture_root / "drivers" / "FastFileSystem"
-    if not driver.exists():
-        pytest.skip("FastFileSystem handler not found")
-    image = tmp_path / "unmounted.adf"
-    shutil.copy2(ofs_adf_image, image)
+    driver = BUNDLED_FFS
+    image = make_adf(tmp_path / "unmounted.adf", DosType.DOS0)
     # Standard OFS ADFs place the root block halfway through the disk.
     with image.open("r+b") as stream:
         stream.seek((image.stat().st_size // 512 // 2) * 512)
@@ -108,9 +110,11 @@ class TestInspectJson:
         assert isinstance(data["partitions"], list)
         assert len(data["partitions"]) >= 1
 
-    def test_inspect_adf_image(self, ofs_adf_image):
+    @pytest.mark.no_fixtures
+    def test_inspect_adf_image(self, tmp_path):
         """inspect --json on an ADF image returns floppy metadata."""
-        proc = _run_amifuse("inspect", "--json", str(ofs_adf_image))
+        image = make_adf(tmp_path / "ofs.adf", DosType.DOS0)
+        proc = _run_amifuse("inspect", "--json", str(image))
         assert proc.returncode == 0
         data = _parse_json_stdout(proc)
         assert data["status"] == "ok"

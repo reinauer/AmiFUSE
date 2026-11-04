@@ -15,12 +15,11 @@ import shutil
 import pytest
 
 from amitools.fs import DosType
-from amitools.fs.ADFSVolume import ADFSVolume
-from amitools.fs.FSString import FSString
-from amitools.fs.blkdev.ADFBlockDevice import ADFBlockDevice
 
 from amifuse.fuse_fs import IO_CHUNK, AmigaFuseFS, FuseOSError, HandlerBridge
 from amifuse.rdb_inspect import detect_adf
+from tests.fixtures.images import make_adf, make_ffs_partition
+from tests.fixtures.paths import BUNDLED_FFS
 
 pytestmark = pytest.mark.integration
 
@@ -33,59 +32,60 @@ def _pattern(size):
     return b"".join(k.to_bytes(4, "big") for k in range(words))[:size]
 
 
-def _make_hd_adf(path, dos_type):
-    """Create an empty HD floppy image of the given DOS type."""
-    blkdev = ADFBlockDevice(str(path), hd=True)
-    blkdev.create()
-    volume = ADFSVolume(blkdev)
-    volume.create(FSString("Large"), dos_type=dos_type)
-    volume.close()
-    blkdev.close()
-
-
-# name: (handler, image, partition, file size). The image is a file under
-# fixtures/readonly, or the DOS type of an empty HD floppy to create. On
-# OFS, one packet takes the handler about 9.8 million cycles per MiB read
-# and 16.3 million per MiB written, so a read reaches 10 million cycles
-# only above 1 MiB, which only an HD floppy has room for. Only the FFS
-# partition has room for a file larger than the emulated memory.
+# name: (handler, image, partition, file size). None as the handler is the
+# bundled FastFileSystem. The image is a file under fixtures/readonly, the
+# DOS type of an empty HD floppy to create, or PARTITION for an FFS partition
+# to create. On OFS with FastFileSystem 47.4, one packet takes the handler
+# about 9.8 million cycles per MiB read and 16.3 million per MiB written, so a
+# read reaches 10 million cycles only above 1 MiB, which only an HD floppy has
+# room for. Only the FFS partition has room for a file larger than the
+# emulated memory.
+PARTITION = "partition"
 _VOLUMES = {
-    "ofs": ("FastFileSystem", DosType.DOS0, None, 1536 * 1024),
-    "ffs": ("FastFileSystem", DosType.DOS1, None, 1536 * 1024),
+    "ofs": (None, DosType.DOS0, None, 1536 * 1024),
+    "ffs": (None, DosType.DOS1, None, 1536 * 1024),
     "pfs3": ("pfs3aio", "pfs.hdf", None, 1536 * 1024),
     "sfs": ("SmartFilesystem", "sfs.hdf", None, 1536 * 1024),
-    "ffs-partition": ("FastFileSystem", "emu68k.hdf", "UDH0", (9 << 20) + 5),
+    "ffs-partition": (None, PARTITION, "DH0", (9 << 20) + 5),
 }
 
 
-@pytest.fixture(params=list(_VOLUMES))
-def large_volume(request, fixture_root, tmp_path):
+def _params(names):
+    return [pytest.param(name, marks=[pytest.mark.no_fixtures] if _VOLUMES[name][0] is None else [])
+            for name in names]
+
+
+@pytest.fixture(params=_params(_VOLUMES))
+def large_volume(request, tmp_path):
     """A copy of a volume per handler, as (image, driver, partition, size)."""
-    return _copy_volume(request.param, fixture_root, tmp_path)
+    return _copy_volume(request.param, request, tmp_path)
 
 
-# The FFS partition is left out: filling its 40 MiB of free space would
-# take a write of over 40 MiB to check what the FFS floppy checks.
-@pytest.fixture(params=["ofs", "ffs", "pfs3", "sfs"])
-def small_volume(request, fixture_root, tmp_path):
+# The FFS partition is left out: filling its free space would take a write
+# of over 15 MiB to check what the FFS floppy checks.
+@pytest.fixture(params=_params(["ofs", "ffs", "pfs3", "sfs"]))
+def small_volume(request, tmp_path):
     """A copy of a volume with at most 6 MiB free, as large_volume returns it."""
-    return _copy_volume(request.param, fixture_root, tmp_path)
+    return _copy_volume(request.param, request, tmp_path)
 
 
-def _copy_volume(name, fixture_root, tmp_path):
+def _copy_volume(name, request, tmp_path):
     driver_name, image_name, partition, size = _VOLUMES[name]
+    if driver_name is None:
+        if image_name == PARTITION:
+            image = make_ffs_partition(tmp_path / "large.hdf")
+        else:
+            image = make_adf(tmp_path / "large.adf", image_name, hd=True)
+        return image, BUNDLED_FFS, partition, size
+    fixture_root = request.getfixturevalue("fixture_root")
     driver = fixture_root / "drivers" / driver_name
     if not driver.exists():
         pytest.skip(f"{driver_name} handler not found")
-    if isinstance(image_name, int):
-        image = tmp_path / "large.adf"
-        _make_hd_adf(image, image_name)
-    else:
-        source = fixture_root / "fixtures" / "readonly" / image_name
-        if not source.exists():
-            pytest.skip(f"{image_name} not found")
-        image = tmp_path / image_name
-        shutil.copy2(source, image)
+    source = fixture_root / "fixtures" / "readonly" / image_name
+    if not source.exists():
+        pytest.skip(f"{image_name} not found")
+    image = tmp_path / image_name
+    shutil.copy2(source, image)
     return image, driver, partition, size
 
 

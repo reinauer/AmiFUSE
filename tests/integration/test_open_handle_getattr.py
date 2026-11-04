@@ -1,7 +1,8 @@
 """getattr() while a file handle is open, on real handlers in write mode.
 
 The tests call the AmigaFuseFS callbacks directly, as a mount would, on
-copies of the fixture images. No host FUSE driver is needed.
+copies of the fixture images and on images built here for the bundled
+FastFileSystem. No host FUSE driver is needed.
 """
 
 import errno
@@ -12,31 +13,48 @@ import pytest
 
 from amifuse.fuse_fs import AmigaFuseFS, FuseOSError, HandlerBridge
 from amifuse.rdb_inspect import detect_adf
+from tests.fixtures.images import make_adf, make_ffs_partition
+from tests.fixtures.paths import BUNDLED_FFS
 
 pytestmark = pytest.mark.integration
 
 HANDLERS = [
     ("pfs.hdf", "pfs3aio"),
     ("sfs.hdf", "SmartFilesystem"),
+    # FastFileSystem 47.4 stays for the tests that rename an open file.
     ("ofs.adf", "FastFileSystem"),
-    ("emu68k.hdf", "FastFileSystem"),
+    pytest.param(("floppy", None), id="bundled-floppy", marks=pytest.mark.no_fixtures),
+    pytest.param(("partition", None), id="bundled-partition", marks=pytest.mark.no_fixtures),
 ]
 
 
-@pytest.fixture(params=HANDLERS, ids=[f"{d}-{i}" for i, d in HANDLERS])
-def ops(request, fixture_root, tmp_path):
+@pytest.fixture(params=HANDLERS, ids=lambda handler: f"{handler[1]}-{handler[0]}")
+def ops(request, tmp_path):
     image_name, driver_name = request.param
-    source = fixture_root / "fixtures" / "readonly" / image_name
-    driver = fixture_root / "drivers" / driver_name
-    if not source.exists() or not driver.exists():
-        pytest.skip(f"Missing {image_name} or {driver_name}")
-    image = tmp_path / image_name
-    shutil.copy2(source, image)
+    if driver_name is None:
+        make = make_adf if image_name == "floppy" else make_ffs_partition
+        image = make(tmp_path / "ffs.img")
+        driver = BUNDLED_FFS
+    else:
+        fixture_root = request.getfixturevalue("fixture_root")
+        source = fixture_root / "fixtures" / "readonly" / image_name
+        driver = fixture_root / "drivers" / driver_name
+        if not source.exists() or not driver.exists():
+            pytest.skip(f"Missing {image_name} or {driver_name}")
+        image = tmp_path / image_name
+        shutil.copy2(source, image)
     bridge = HandlerBridge(image, driver, read_only=False, adf_info=detect_adf(image))
+    fs = AmigaFuseFS(bridge)
+    fs.bundled = driver == BUNDLED_FFS
     try:
-        yield AmigaFuseFS(bridge)
+        yield fs
     finally:
         bridge.close()
+
+
+def _skip_on_the_bundled_handler(ops):
+    if ops.bundled:
+        pytest.skip("the bundled FastFileSystem refuses to rename an open file")
 
 
 def _write_file(ops, path, size):
@@ -112,6 +130,7 @@ def test_exclusive_handle_reports_the_closed_mode(ops):
 @pytest.mark.parametrize("flags", [os.O_RDONLY, os.O_RDWR], ids=["O_RDONLY", "O_RDWR"])
 def test_renamed_file_leaves_no_entry_under_its_old_name(ops, flags):
     """A shared handle does not keep the name it was opened under alive."""
+    _skip_on_the_bundled_handler(ops)
     _write_file(ops, "/a.bin", 3000)
     fh = ops.open("/a.bin", flags)
     try:
@@ -128,6 +147,7 @@ def test_renamed_file_leaves_no_entry_under_its_old_name(ops, flags):
 
 def test_shared_handle_answers_under_the_name_it_was_opened_with(ops):
     """WinFsp goes on passing the old name for a handle after a rename."""
+    _skip_on_the_bundled_handler(ops)
     _write_file(ops, "/w.bin", 3000)
     fh = ops.open("/w.bin", os.O_RDWR)
     try:
@@ -170,6 +190,7 @@ def test_exclusive_handle_follows_a_file_rename(ops):
 
 
 def test_exclusive_handle_follows_a_directory_rename(ops):
+    _skip_on_the_bundled_handler(ops)
     ops.mkdir("/dir", 0o755)
     fh = ops.create("/dir/f.bin", 0o644)
     try:
@@ -190,6 +211,7 @@ def test_exclusive_handle_follows_a_directory_rename(ops):
 
 def test_delete_deferred_after_a_rename_runs_at_the_last_release(ops):
     """WinFsp passes release() the name a file was opened under."""
+    _skip_on_the_bundled_handler(ops)
     _write_file(ops, "/w.bin", 3000)
     h1 = ops.open("/w.bin", os.O_RDWR)
     ops.rename("/w.bin", "/v.bin")
@@ -206,6 +228,7 @@ def test_delete_deferred_before_a_directory_rename_follows_it(ops):
     """The delete runs under the new path, and a file created later under
     the old one survives its release().
     """
+    _skip_on_the_bundled_handler(ops)
     ops.mkdir("/d", 0o755)
     _write_file(ops, "/d/x", 3000)
     fh = ops.open("/d/x", os.O_RDWR)

@@ -10,7 +10,7 @@ import time
 
 import pytest
 
-from tests.fixtures.paths import FIXTURE_ROOT, PFS3AIO, PFS3_HDF, OFS_ADF
+from tests.fixtures.paths import FIXTURE_ROOT, PFS3AIO, PFS3_HDF
 
 
 _MOUNT_POLL_INTERVAL = 0.5   # seconds between ismount checks
@@ -86,9 +86,10 @@ _m68k_available = False
 def pytest_collection_modifyitems(config, items):
     """Skip integration tests when machine68k or fixtures are unavailable.
 
-    Skip hierarchy: no fixtures -> skip all integration, then
-    no machine68k -> skip all integration. Tests that don't need
-    either (help, doctor) should use tests/unit/ instead.
+    Skip hierarchy: no fixtures -> skip integration tests that aren't
+    marked no_fixtures, then no machine68k -> skip all integration.
+    Tests that don't need either (help, doctor) should use tests/unit/
+    instead.
     """
     global _m68k_checked, _m68k_available
 
@@ -105,9 +106,9 @@ def pytest_collection_modifyitems(config, items):
             reason="No fixture root found (set AMIFUSE_FIXTURE_ROOT or place fixtures in ~/AmigaOS/AmiFuse)"
         )
         for item in items:
-            if item.get_closest_marker("integration") is not None:
+            if (item.get_closest_marker("integration") is not None
+                    and item.get_closest_marker("no_fixtures") is None):
                 item.add_marker(skip)
-        return
 
     if not _m68k_checked:
         _m68k_available = _machine68k_works()
@@ -139,13 +140,6 @@ def pfs3_image():
     if PFS3_HDF is None or not PFS3_HDF.exists():
         pytest.skip("PFS3 test image not found")
     return PFS3_HDF
-
-
-@pytest.fixture(scope="session")
-def ofs_adf_image():
-    if OFS_ADF is None or not OFS_ADF.exists():
-        pytest.skip("OFS ADF image not found")
-    return OFS_ADF
 
 
 @pytest.fixture(scope="session")

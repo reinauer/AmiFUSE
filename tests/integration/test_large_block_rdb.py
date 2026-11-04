@@ -12,6 +12,7 @@ from amitools.fs.blkdev.DiskGeometry import DiskGeometry
 from amitools.fs.blkdev.RawBlockDevice import RawBlockDevice
 from amitools.fs.rdb.RDisk import RDisk
 
+from tests.fixtures.paths import BUNDLED_FFS
 from tests.unit.test_mbr_rdb_block_size import _make_mbr
 
 pytestmark = pytest.mark.integration
@@ -38,15 +39,19 @@ def make_rdb(image, block_bytes, dos_type):
 
 
 @pytest.mark.parametrize("name,dos_type,block_bytes,start_lba", [
-    ("pfs3aio", 0x50465303, 1024, None),
-    ("pfs3aio", 0x50465303, 1024, 2048),
-    ("FastFileSystem", 0x444F5303, 4096, 2048),
-], ids=["pfs3-1024", "pfs3-1024-mbr", "ffs-4096-mbr"])
-def test_format_write_list_and_read(fixture_root, tmp_path, name, dos_type,
+    pytest.param("pfs3aio", 0x50465303, 1024, None, id="pfs3-1024"),
+    pytest.param("pfs3aio", 0x50465303, 1024, 2048, id="pfs3-1024-mbr"),
+    pytest.param(None, 0x444F5303, 4096, 2048, id="ffs-4096-mbr",
+                 marks=pytest.mark.no_fixtures),
+])
+def test_format_write_list_and_read(request, tmp_path, name, dos_type,
                                     block_bytes, start_lba):
-    driver = fixture_root / "drivers" / name
-    if not driver.exists():
-        pytest.skip(f"Missing handler {name}")
+    if name is None:
+        driver = BUNDLED_FFS
+    else:
+        driver = request.getfixturevalue("fixture_root") / "drivers" / name
+        if not driver.exists():
+            pytest.skip(f"Missing handler {name}")
     image = tmp_path / "rdb.hdf"
     make_rdb(image, block_bytes, dos_type)
     if start_lba is not None:

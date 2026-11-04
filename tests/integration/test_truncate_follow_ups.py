@@ -1,8 +1,8 @@
 """truncate() follow-ups on the real handlers.
 
 Each test runs the FUSE callbacks a mounted volume receives on a writable
-HandlerBridge over a copy of a fixture image, then reads the result back
-in a fresh session.
+HandlerBridge over a copy of a fixture image or a floppy built here, then
+reads the result back in a fresh session.
 """
 
 import errno
@@ -12,7 +12,9 @@ import shutil
 import pytest
 
 from amifuse.fuse_fs import AmigaFuseFS, FuseOSError, SeekResult
-from tests.integration.test_handler_bridge_write import _bridge, _make_ffs_adf
+from tests.fixtures.images import make_adf
+from tests.fixtures.paths import BUNDLED_FFS
+from tests.integration.test_handler_bridge_write import _bridge
 
 pytestmark = pytest.mark.integration
 
@@ -21,15 +23,15 @@ _FH_ARGS = 36
 _PFS3_FE_OFFSET = 74
 
 
-def _volume(fixture_root, tmp_path, driver_name, image_name):
-    """A copy of a volume, as (image, driver); image_name None makes FFS."""
+def _volume(request, tmp_path, driver_name, image_name):
+    """A copy of a volume, as (image, driver); driver_name None makes an FFS
+    floppy for the bundled FastFileSystem."""
+    if driver_name is None:
+        return make_adf(tmp_path / "ffs.adf"), BUNDLED_FFS
+    fixture_root = request.getfixturevalue("fixture_root")
     driver = fixture_root / "drivers" / driver_name
     if not driver.exists():
         pytest.skip(f"{driver_name} handler not found")
-    if image_name is None:
-        image = tmp_path / "ffs.adf"
-        _make_ffs_adf(image)
-        return image, driver
     source = fixture_root / "fixtures" / "readonly" / image_name
     if not source.exists():
         pytest.skip(f"{image_name} not found")
@@ -52,11 +54,11 @@ def _read_back(image, driver, path):
         bridge.close()
 
 
-def test_sfs_write_at_new_end_on_nearly_full_volume(fixture_root, tmp_path):
+def test_sfs_write_at_new_end_on_nearly_full_volume(request, tmp_path):
     """SmartFilesystem failed the write after the shrink with EIO, and
     again on retry, when another file filled the volume to 96 KiB free
     while this one was open."""
-    image, driver = _volume(fixture_root, tmp_path, "SmartFilesystem",
+    image, driver = _volume(request, tmp_path, "SmartFilesystem",
                             "sfs.hdf")
     bridge = _bridge(image, driver, read_only=False)
 
@@ -118,14 +120,15 @@ def _answer_first_shrink_late(bridge):
 
 
 @pytest.mark.parametrize("driver_name, image_name", [
-    ("FastFileSystem", None), ("pfs3aio", "pfs.hdf"),
-], ids=["ffs", "pfs3"])
-def test_shrink_answered_after_the_wait(fixture_root, tmp_path, driver_name,
+    pytest.param(None, None, id="ffs", marks=pytest.mark.no_fixtures),
+    pytest.param("pfs3aio", "pfs.hdf", id="pfs3"),
+])
+def test_shrink_answered_after_the_wait(request, tmp_path, driver_name,
                                         image_name):
     """The handler answered the shrink just after the wait ran out, and
     truncate() failed with EIO for a shrink it made. FastFileSystem stops
     it at the reader and needs the retry as well."""
-    image, driver = _volume(fixture_root, tmp_path, driver_name, image_name)
+    image, driver = _volume(request, tmp_path, driver_name, image_name)
     data = bytes((i * 7) & 0xFF for i in range(60000))
     other = bytes((i * 3) & 0xFF for i in range(5000))
     bridge = _bridge(image, driver, read_only=False)
@@ -153,7 +156,7 @@ def test_shrink_answered_after_the_wait(fixture_root, tmp_path, driver_name,
     assert _read_back(image, driver, "/o.bin") == other
 
 
-def test_pfs3_reader_past_2_gib_after_shrink(fixture_root, tmp_path):
+def test_pfs3_reader_past_2_gib_after_shrink(request, tmp_path):
     """pfs3aio moves a reader past 2 GiB on the file to the new end. Its
     next read at its old offset returned the bytes written there since.
 
@@ -164,7 +167,7 @@ def test_pfs3_reader_past_2_gib_after_shrink(fixture_root, tmp_path):
     end-of-file check; any answer other than a position in a LONG keeps
     the cached position.
     """
-    image, driver = _volume(fixture_root, tmp_path, "pfs3aio", "pfs.hdf")
+    image, driver = _volume(request, tmp_path, "pfs3aio", "pfs.hdf")
     content = bytes(range(256)) * 12  # 3072 bytes
     bridge = _bridge(image, driver, read_only=False)
     try:

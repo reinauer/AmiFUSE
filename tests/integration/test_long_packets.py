@@ -1,18 +1,16 @@
 """A packet that keeps a real handler busy for many bursts gets its reply."""
 
-from contextlib import ExitStack
 import os
 
 import pytest
 
-from amitools.fs.FSString import FSString
-from amitools.fs.blkdev.DiskGeometry import DiskGeometry
-from amitools.fs.blkdev.RawBlockDevice import RawBlockDevice
-from amitools.fs.rdb.RDisk import RDisk
+from amitools.fs import DosType
 
-from amifuse.fuse_fs import HandlerBridge, format_volume
+from amifuse.fuse_fs import HandlerBridge
+from tests.fixtures.images import make_ffs_partition
+from tests.fixtures.paths import BUNDLED_FFS
 
-pytestmark = pytest.mark.integration
+pytestmark = [pytest.mark.integration, pytest.mark.no_fixtures]
 
 # FastFileSystem moves OFS data 488 bytes per block. One ACTION_WRITE of
 # 1.5 MiB keeps it working for about 100 bursts of 200,000 cycles, and one
@@ -22,23 +20,10 @@ DATA = b"".join(k.to_bytes(4, "big") for k in range(SIZE // 4))
 
 
 @pytest.fixture
-def ofs_image(fixture_root, tmp_path):
+def ofs_image(tmp_path):
     """A new image holding one formatted 16 MiB OFS partition, DH0."""
-    driver = fixture_root / "drivers" / "FastFileSystem"
-    if not driver.exists():
-        pytest.skip("FastFileSystem handler not found")
-    image = tmp_path / "ofs.hdf"
-    raw = RawBlockDevice(str(image), read_only=False)
-    with ExitStack() as cleanup:
-        raw.create(64 * 16 * 32)
-        cleanup.callback(raw.close)
-        disk = RDisk(raw)
-        cleanup.callback(disk.close)
-        disk.create(DiskGeometry(64, 16, 32), rdb_cyls=1)
-        disk.add_partition(FSString("DH0"), (1, 63), dos_type=0x444F5300)
-        raw.flush()
-    format_volume(image, driver, None, "DH0", "Long")
-    return image, driver
+    image = make_ffs_partition(tmp_path / "ofs.hdf", DosType.DOS0, "Long")
+    return image, BUNDLED_FFS
 
 
 def _wait_for_reply(bridge, pkt_addr, label):

@@ -1,7 +1,8 @@
 """HandlerBridge write-path integration tests.
 
-Uses temporary copies of fixture images to test write operations
-without modifying source fixture images.
+Uses temporary copies of fixture images, and floppies built here for the
+bundled FastFileSystem, to test write operations without modifying source
+fixture images.
 
 HandlerBridge write API (verified against fuse_fs.py):
   open_file(path, flags) -> Optional[Tuple[fh_addr, dir_lock]]
@@ -21,12 +22,11 @@ import pytest
 from pathlib import Path
 
 from amitools.fs import DosType
-from amitools.fs.ADFSVolume import ADFSVolume
-from amitools.fs.FSString import FSString
-from amitools.fs.blkdev.ADFBlockDevice import ADFBlockDevice
 
 from amifuse.fuse_fs import AmigaFuseFS, FuseOSError, HandlerBridge
 from amifuse.rdb_inspect import detect_adf
+from tests.fixtures.images import make_adf
+from tests.fixtures.paths import BUNDLED_FFS
 
 pytestmark = pytest.mark.integration
 
@@ -107,42 +107,36 @@ class TestHandlerBridgeWriteOps:
 # B. Writes past end of file -- 4 tests
 
 
-def _make_ffs_adf(path):
-    """Create an FFS floppy image holding one small file."""
-    blkdev = ADFBlockDevice(str(path))
-    blkdev.create()
-    volume = ADFSVolume(blkdev)
-    volume.create(FSString("Probe"), dos_type=DosType.DOS1)
-    volume.write_file(b"FFS probe file\n", FSString("probe.txt"))
-    volume.close()
-    blkdev.close()
-
-
-# (handler, image under fixtures/readonly or None to create one, file in it)
+# (handler or None for the bundled FastFileSystem, image under
+# fixtures/readonly or the DOS type of a floppy to create, file in it)
 _VOLUMES = {
     "pfs3": ("pfs3aio", "pfs.hdf", "/Identify.info"),
     "sfs": ("SmartFilesystem", "sfs.hdf", "/Prefs.info"),
-    "ofs": ("FastFileSystem", "ofs.adf", "/OFS_README.txt"),
-    "ffs": ("FastFileSystem", None, "/probe.txt"),
+    "ofs": (None, DosType.DOS0, "/probe.txt"),
+    "ffs": (None, DosType.DOS1, "/probe.txt"),
 }
 
 
-@pytest.fixture(params=list(_VOLUMES))
-def writable_volume(request, fixture_root, tmp_path):
+@pytest.fixture(params=[
+    pytest.param(name, marks=[pytest.mark.no_fixtures] if driver is None else [])
+    for name, (driver, _, _) in _VOLUMES.items()
+])
+def writable_volume(request, tmp_path):
     """A copy of a volume per handler, as (image, driver, existing file)."""
     driver_name, image_name, path = _VOLUMES[request.param]
+    if driver_name is None:
+        image = make_adf(tmp_path / "ffs.adf", image_name,
+                         {"probe.txt": b"FFS probe file\n"})
+        return image, BUNDLED_FFS, path
+    fixture_root = request.getfixturevalue("fixture_root")
     driver = fixture_root / "drivers" / driver_name
     if not driver.exists():
         pytest.skip(f"{driver_name} handler not found")
-    if image_name is None:
-        image = tmp_path / "ffs.adf"
-        _make_ffs_adf(image)
-    else:
-        source = fixture_root / "fixtures" / "readonly" / image_name
-        if not source.exists():
-            pytest.skip(f"{image_name} not found")
-        image = tmp_path / image_name
-        shutil.copy2(source, image)
+    source = fixture_root / "fixtures" / "readonly" / image_name
+    if not source.exists():
+        pytest.skip(f"{image_name} not found")
+    image = tmp_path / image_name
+    shutil.copy2(source, image)
     return image, driver, path
 
 
