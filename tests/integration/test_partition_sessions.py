@@ -166,10 +166,20 @@ def reject_once(block, count):
         check(0, 1)  # Real partition guard: RDB metadata is outside DH0.
     check(block, count)
 try:
+    # A correctly formatted FFS volume can create a file from cached
+    # metadata. Force data I/O instead of relying on a bitmap read at open.
+    source = bridge.open_file('/source', os.O_WRONLY | os.O_CREAT)
+    assert source is not None
+    assert bridge.write_handle(source[0], b'x' * 65536) == 65536
+    bridge.close_file(source[0])
+    bridge.flush_volume()
+    source = bridge.open_file('/source', os.O_RDONLY)
+    assert source is not None
     bridge.backend._check_range = reject_once
-    failed = bridge.open_file('/rejected', os.O_WRONLY | os.O_CREAT)
+    failed = bridge.read_handle_at(source[0], 32768, 32768)
     assert faults and failed is None
     bridge.backend._check_range = check
+    bridge.close_file(source[0])
     handle = bridge.open_file('/recovered', os.O_WRONLY | os.O_CREAT)
     assert handle is not None
     fh, _ = handle
