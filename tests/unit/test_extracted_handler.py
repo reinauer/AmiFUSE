@@ -277,6 +277,23 @@ def test_mount_prints_dos_type_escaped(
     assert "\x1b" not in out
 
 
+def test_mount_prints_iso_volume_id_escaped(
+        monkeypatch, capsys, tmp_path, bridge):
+    """The mount banner shows an ISO's volume ID escaped (#361)."""
+    iso = rdb_inspect.ISOInfo(2048, 20, 1, 1, 20, "CD\x1b[2J")
+    monkeypatch.setattr(rdb_inspect, "detect_iso", lambda image: iso)
+    _bridge_refused(monkeypatch, bridge)
+
+    with pytest.raises(SystemExit):
+        fuse_fs.mount_fuse(
+            Path("disc.iso"), tmp_path / "CDFileSystem", tmp_path / "mnt", None,
+            foreground=True)
+
+    out = capsys.readouterr().out
+    assert "Mounting ISO 9660 image (CD\\x1b[2J) from disc.iso" in out
+    assert "\x1b" not in out
+
+
 def test_mount_prints_drive_name_escaped(
         monkeypatch, capsys, tmp_path, extracted, bridge):
     """The mount banner shows the drive name escaped."""

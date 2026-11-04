@@ -450,7 +450,7 @@ def detect_iso(image: Path) -> Optional[ISOInfo]:
         return None
 
     # Extract volume identifier (bytes 40-71, 32 chars, space-padded)
-    volume_id = pvd[40:72].decode('ascii', errors='replace').rstrip()
+    volume_id = pvd[40:72].decode('latin-1').rstrip(' ')
 
     total_blocks = size // ISO_BLOCK_SIZE
 

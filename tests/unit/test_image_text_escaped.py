@@ -335,3 +335,63 @@ class TestDiskRDBMessages:
             fuse_fs.main(["ls", str(image), "--json"])
         error = json.loads(capsys.readouterr().out)["error"]
         assert error["details"] == {"partitions": [NAME]}
+
+
+ISO_ESC = "CD\x1b[2J\x9b2J\xe9X"
+ISO_SHOWN = "CD\\x1b[2J\\x9b2J\\xe9X"
+
+
+def _iso(tmp_path):
+    """An ISO 9660 image whose volume ID holds ESC [ 2 J."""
+    pvd = bytearray(b" " * 2048)
+    pvd[:6] = b"\x01CD001"
+    pvd[40:40 + len(ISO_ESC)] = ISO_ESC.encode("latin-1")
+    image = tmp_path / "esc.iso"
+    image.write_bytes(bytes(16 * 2048) + bytes(pvd) + bytes(2 * 2048))
+    return image
+
+
+class TestIsoVolumeId:
+    """The volume ID of an ISO 9660 image (#361)."""
+
+    def _inspect(self, image, use_json=False):
+        fuse_fs.cmd_inspect(argparse.Namespace(
+            image=image, json=use_json, block_size=None, full=False,
+            debug=False, partition=None))
+
+    def test_inspect(self, tmp_path, capsys):
+        self._inspect(_iso(tmp_path))
+
+        out = capsys.readouterr().out
+        assert f"Volume ID: {ISO_SHOWN}" in out
+        assert "\x1b" not in out
+
+    def test_inspect_json_keeps_the_raw_bytes(self, tmp_path, capsys):
+        self._inspect(_iso(tmp_path), use_json=True)
+
+        assert json.loads(capsys.readouterr().out)["volume_id"] == ISO_ESC
+
+    def test_driver_message(self, tmp_path):
+        image = _iso(tmp_path)
+
+        with pytest.raises(DriverNotFound) as excinfo:
+            fuse_fs.resolve_driver(image, None, None, None,
+                                   iso_info=rdb_inspect.detect_iso(image))
+
+        assert f"(volume: {ISO_SHOWN})" in str(excinfo.value)
+        assert "\x1b" not in str(excinfo.value)
+
+    def test_backend_description(self, tmp_path):
+        image = _iso(tmp_path)
+        backend = BlockDeviceBackend(
+            image, read_only=True, iso_info=rdb_inspect.detect_iso(image))
+        with ExitStack() as stack:
+            stack.callback(backend.close)
+            backend.open()
+            text = backend.describe()
+
+        assert f"ISO 9660 ({ISO_SHOWN})" in text
+        assert "\x1b" not in text
+
+    def test_detection_keeps_the_raw_bytes(self, tmp_path):
+        assert rdb_inspect.detect_iso(_iso(tmp_path)).volume_id == ISO_ESC
