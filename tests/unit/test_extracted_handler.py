@@ -329,7 +329,7 @@ def bridge_start(monkeypatch, tmp_path):
     handler.write_bytes(HANDLER)
     seen = {}
 
-    def load_handler(driver):
+    def load_handler(driver, *args, **kwargs):
         seen["load"] = Path(driver).exists()
         return 1
 
