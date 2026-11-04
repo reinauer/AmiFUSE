@@ -178,3 +178,32 @@ def test_own_rdb_loop_does_not_hang_the_overlap_check(tmp_path):
         assert backend.mbr_context.mbr_partition.index == 1
     finally:
         backend.close()
+
+
+@pytest.mark.parametrize("target", [0, 100, "bad-checksum"])
+def test_corrupt_later_part_block_keeps_readable_prefix(tmp_path, target):
+    if target == "bad-checksum":
+        image = _image(tmp_path, [("DH0", DOS3), ("DH1", DOS3), ("DH2", DOS3)])
+        from tests.unit.test_rdb_chain_loops import _corrupt
+        _corrupt(image, 3)
+        target = 3
+    else:
+        image = _two_parts(tmp_path, target)
+    names, warnings, damaged = _parsed(image)
+    assert names == ["DH0", "DH1"]
+    assert f"Corrupt partition block at block {target}" in damaged
+    assert warnings == [damaged]
+    assert [p.name for p in list_partitions(image).partitions] == names
+    for selector in ("DH0", "DH1", "0", "1"):
+        assert find_partition(image, None, selector) is not None
+        with pytest.raises(OSError, match="not opened for writing"):
+            find_partition(image, None, selector, write=True)
+    assert _refused(image, None) == _default_refused(_cut("RDB"))
+
+
+def test_corrupt_first_part_block_still_fails(tmp_path):
+    image = _two_parts(tmp_path, 0xffffffff)
+    from tests.unit.test_rdb_chain_loops import _corrupt
+    _corrupt(image, 1)
+    with pytest.raises(OSError, match="Corrupt partition block at block 1"):
+        open_rdisk(image)
