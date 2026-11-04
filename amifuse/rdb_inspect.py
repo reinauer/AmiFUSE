@@ -663,7 +663,12 @@ def _lenient_rdisk_open(rdisk) -> List[str]:
         p = Partition(rdisk.rawblk, part_blk, num, rdb.log_drv.cyl_blks, rdisk)
         num += 1
         if not p.read():
-            raise RDBContentError(f"Corrupt partition block at block {part_blk}")
+            reason = f"Corrupt partition block at block {part_blk}"
+            if not rdisk.parts:
+                raise RDBContentError(reason)
+            warnings.append(f"{reason} (remaining partitions skipped)")
+            rdisk.damaged_part_list = warnings[-1]
+            break
         rdisk.parts.append(p)
         rdisk.used_blks.append(p.get_blk_num())
         part_blk = p.get_next_partition_blk()
