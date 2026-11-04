@@ -369,7 +369,12 @@ def test_daemon_mount_record_from_another_working_directory(
         result = run("mount", "disk.hdf", "--driver", str(pfs3_driver),
                      "--mountpoint", name, cwd=launch)
         assert result.returncode == 0, result.stdout + result.stderr
-        assert os.path.ismount(mountpoint)
+        # FUSE-T calls init before its mount appears in the host table.
+        # The daemon readiness handshake therefore precedes ismount().
+        deadline = time.monotonic() + 15
+        while not os.path.ismount(mountpoint) and time.monotonic() < deadline:
+            time.sleep(0.1)
+        assert os.path.ismount(mountpoint), result.stdout + result.stderr
         result = run("status", "--json")
         assert result.returncode == 0, result.stdout + result.stderr
         matching = [m for m in json.loads(result.stdout)["mounts"]
