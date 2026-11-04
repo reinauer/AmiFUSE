@@ -1091,7 +1091,7 @@ def mount_names(rdb_parts: list) -> List[List[Optional[str]]]:
         for rdb_names, parts in zip(names, rdb_parts):
             for i, p in enumerate(parts):
                 no_automount = p.get_flags() & PartitionBlock.FLAG_NO_AUTOMOUNT
-                drive_name = p.get_drive_name()
+                drive_name = _drive_name(p)
                 if bool(no_automount) == automount or drive_name is None:
                     continue
                 rdb_names[i] = _unique_name(str(drive_name), taken)
@@ -1383,13 +1383,19 @@ def find_partition_mbr_index(
     return None if found is None else found.mbr_partition_index
 
 
+def _drive_name(part) -> Optional[str]:
+    """Normalize missing and empty BSTRs to an unnamed partition."""
+    value = part.get_drive_name()
+    return None if value is None else str(value) or None
+
+
 def partition_label(part) -> str:
     """How a message names an amitools ``Partition`` it has opened.
 
     The drive name; a damaged one, which amitools reads as None, by the
     partition's number: #0.
     """
-    drive_name = part.get_drive_name()
+    drive_name = _drive_name(part)
     return f"#{part.num}" if drive_name is None else str(drive_name)
 
 
@@ -1402,7 +1408,7 @@ def _part_info(p) -> PartInfo:
     ``name`` of None: no ``--partition`` name selects that partition.
     """
     dos_type = p.part_blk.dos_env.dos_type
-    drive_name = p.get_drive_name()
+    drive_name = _drive_name(p)
     return PartInfo(
         index=p.num,
         name=None if drive_name is None else str(drive_name),
@@ -1623,7 +1629,7 @@ def build_rdisk_desc(rdisk: RDisk, mbr_ctx: Optional[MBRContext]) -> dict:
     """
     desc = rdisk.get_desc()
     for part_desc, part in zip(desc["partitions"], rdisk.parts):
-        if part.get_drive_name() is None:
+        if _drive_name(part) is None:
             part_desc["name"] = None
     if mbr_ctx is not None:
         mbr_desc = {
@@ -1654,9 +1660,9 @@ def format_rdisk_report(rdisk: RDisk, full: bool = False) -> List[str]:
     """Format RDB info, filesystem drivers, and warnings as printable lines."""
     lines = list(rdisk.get_info(full=full))
     for part in rdisk.parts:
-        if part.get_drive_name() is None:
+        if _drive_name(part) is None:
             # amitools' line reads as if the partition were named None.
-            prefix = f"Partition: #{part.num} 'None'"
+            prefix = f"Partition: #{part.num} '{part.get_drive_name()}'"
             lines = [
                 f"Partition: #{part.num} (damaged drive name)"
                 + line[len(prefix):] if line.startswith(prefix) else line
