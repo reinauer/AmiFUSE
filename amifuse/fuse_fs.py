@@ -5208,15 +5208,12 @@ def get_partition_name(image: Path, block_size: Optional[int], partition: Option
 
 
 def _entry_partitions(error: Exception, image: Path,
-                      block_size: Optional[int]) -> List[str]:
-    """Name the partitions that still open after an open fails with error.
+                      block_size: Optional[int]) -> List[Tuple[str, str]]:
+    """Return (label, selector) choices after the disk's own RDB fails.
 
-    Where the disk's own RDB fails (DiskRDBError), the partitions in its
-    0x76 entries still open by name. Returns those names, as list_partitions
-    gives them, and [] after any other error. A partition with a damaged
-    drive name has none to give, and a name that --partition does not take
-    to its partition, as after a device or media error in an entry, is left
-    out.
+    Names and numeric fallbacks must resolve to the exact partition being
+    offered. Display labels such as #0 remain separate from selector 0,
+    including when a real drive name happens to start with #.
     """
     from .rdb_inspect import DiskRDBError, find_partition, list_partitions
 
@@ -5226,28 +5223,28 @@ def _entry_partitions(error: Exception, image: Path,
         parts = list_partitions(image, block_size).partitions
     except OSError:
         return []
-    names = []
+    choices = []
     for part in parts:
-        if part.name is None:
-            continue
+        selector = part.name if part.name is not None else str(part.index)
         try:
-            ref = find_partition(image, block_size, part.name)
+            ref = find_partition(image, block_size, selector)
         except OSError:
             continue
         if ref is not None and (ref.mbr_partition_index, ref.number) == (
                 part.mbr_partition_index, part.index):
-            names.append(part.name)
-    return names
+            label = part.name if part.name is not None else f"#{part.index}"
+            choices.append((label, selector))
+    return choices
 
 
-def _entry_partitions_hint(names: List[str]) -> str:
-    """Return the line that follows an open error, from _entry_partitions."""
-    if not names:
+def _entry_partitions_hint(choices: List[Tuple[str, str]]) -> str:
+    """Return the recovery hint with a usable selector, not its label."""
+    if not choices:
         return ""
-    # The image chooses the names; error.details.partitions keeps them raw.
-    shown = [escape_text(name) for name in names]
+    shown = [escape_text(label) for label, _ in choices]
+    selector = escape_text(choices[0][1])
     return (f"\nThe partitions in the MBR's 0x76 entries still open, read-only: "
-            f"{', '.join(shown)}. Open one with --partition {shown[0]}.")
+            f"{', '.join(shown)}. Open one with --partition {selector}.")
 
 
 # The PID that extracted the driver, then mkstemp's random part, whose
@@ -6277,7 +6274,7 @@ def _create_bridge_from_args(args, command: str, read_only: bool = True):
         if use_json:
             print(_json.dumps(_json_error(
                 command, "IMAGE_INVALID", str(e),
-                details={"partitions": names} if names else None)))
+                details={"partitions": [label for label, _ in names]} if names else None)))
             sys.exit(1)
         raise SystemExit(f"Error: {e}{_entry_partitions_hint(names)}")
     except DriverNotFound as e:
@@ -6336,7 +6333,7 @@ def _create_bridge_from_args(args, command: str, read_only: bool = True):
             else:
                 error = _json_error(command, "HANDLER_ERROR",
                     f"Failed to initialize filesystem handler: {e}",
-                    details={"partitions": names} if names else None)
+                    details={"partitions": [label for label, _ in names]} if names else None)
             print(_json.dumps(error))
             sys.exit(1)
         if in_use:

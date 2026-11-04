@@ -47,15 +47,11 @@ def test_damaged_name_is_listed_without_a_name(tmp_path):
     assert find_partition(image, None, "None") is None
 
 
-def test_launcher_skips_the_damaged_partition(tmp_path):
+def test_launcher_mounts_the_damaged_partition_by_number(tmp_path):
     image = _damaged(tmp_path, [("DH0", DOS3), ("DH1", DOS7)])
     units, fallback_reason = _enumerate_mount_units(str(image))
-    # DH1 is mounted by name: without --partition the mount opens the
-    # damaged partition 0.
-    assert [(u.name, u.label) for u in units] == [("DH1", "DH1")]
-    # The summary dialog tells of the skipped partition.
-    assert fallback_reason == (
-        "A partition was not mounted, as its drive name is damaged.")
+    assert [(u.name, u.label) for u in units] == [("0", "#0"), ("DH1", "DH1")]
+    assert fallback_reason is None
 
 
 def test_launcher_mounts_a_lone_damaged_partition_without_a_name(tmp_path):
