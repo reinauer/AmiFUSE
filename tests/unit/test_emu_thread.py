@@ -56,10 +56,20 @@ def test_idle_hook_runs_while_no_call_is_pending(emu):
         return 0.02
 
     emu.set_idle(idle)
-    time.sleep(0.3)
+    # Wait for the ticks rather than count what a fixed sleep gave: a CI
+    # runner can stall the process for most of a short sleep (#369).
+    deadline = time.monotonic() + 10
+    while len(ticks) < 3 and time.monotonic() < deadline:
+        time.sleep(0.01)
     emu.set_idle(None)
+    # A call is served only after a hook run in progress returns.
+    emu.call(lambda: None)
     count = len(ticks)
-    assert 3 <= count <= 20
+    assert count >= 3
+    # the thread waits the 0.02 s the hook asked for between runs; a
+    # stall can only make a gap longer
+    gaps = [b - a for a, b in zip(ticks, ticks[1:])]
+    assert min(gaps) >= 0.015
     time.sleep(0.1)
     # none after the hook is taken away
     assert len(ticks) == count
