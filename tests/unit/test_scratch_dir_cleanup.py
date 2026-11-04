@@ -171,3 +171,26 @@ def test_setup_sweeps_and_names_its_directory(temp_dir, monkeypatch):
         assert match is not None and int(match[1]) == os.getpid()
     finally:
         runtime._temp_dir.cleanup()
+
+
+@pytest.mark.parametrize("handle,error,gone", [
+    (123, 0, False), (0, 87, True), (0, 5, False), (0, 6, False),
+])
+def test_windows_cleanup_requires_a_definitely_gone_owner(
+        monkeypatch, handle, error, gone):
+    import ctypes
+    from amifuse import platform as plat
+
+    kernel = MagicMock()
+    kernel.OpenProcess.return_value = handle
+    dll = MagicMock(return_value=kernel)
+    monkeypatch.setattr(ctypes, "WinDLL", dll, raising=False)
+    monkeypatch.setattr(ctypes, "get_last_error", lambda: error, raising=False)
+    monkeypatch.setattr(plat.sys, "platform", "win32")
+
+    assert plat._temp_owner_gone(12345) is gone
+    dll.assert_called_once_with("kernel32", use_last_error=True)
+    if handle:
+        kernel.CloseHandle.assert_called_once_with(handle)
+    else:
+        kernel.CloseHandle.assert_not_called()

@@ -979,7 +979,30 @@ def _left_by_ended_run(pid: int, mtime: float) -> bool:
     named, is killed before the child it forked has loaded the driver. A PID
     in use again only keeps a file for longer.
     """
-    return time.time() - mtime > _STALE_TEMP_AGE and not _pid_exists(pid)
+    return time.time() - mtime > _STALE_TEMP_AGE and _temp_owner_gone(pid)
+
+
+def _temp_owner_gone(pid: int) -> bool:
+    """Require evidence that an owner exited before deleting its files."""
+    if not sys.platform.startswith("win"):
+        return not _pid_exists(pid)
+    try:
+        import ctypes
+        from ctypes import wintypes
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL,
+                                      wintypes.DWORD]
+        kernel.OpenProcess.restype = wintypes.HANDLE
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel.CloseHandle.restype = wintypes.BOOL
+        handle = kernel.OpenProcess(0x1000, False, pid)
+        if handle:
+            kernel.CloseHandle(handle)
+            return False
+        # Access denied and other failures do not prove the process exited.
+        return ctypes.get_last_error() == 87  # ERROR_INVALID_PARAMETER
+    except Exception:
+        return False
 
 
 def _pid_exists(pid: int) -> bool:
