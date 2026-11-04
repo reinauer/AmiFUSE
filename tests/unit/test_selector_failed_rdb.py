@@ -436,3 +436,28 @@ def test_launcher_mounts_a_lone_partition_before_a_read_error(tmp_path,
     assert [u.name for u in units] == [None]
     assert fallback_reason.startswith("MBR partition [1]: ")
     assert _open(image, read_only=False) == (0, "DH0")
+
+
+@pytest.mark.parametrize("entries", [("DH0", None), ("DH0", "WORK")])
+@pytest.mark.parametrize("selector", ["DH0", "0"])
+@pytest.mark.parametrize("write", [False, True])
+def test_disk_rdb_read_error_never_selects_an_entry(
+        tmp_path, monkeypatch, entries, selector, write):
+    image = _disk_rdb(tmp_path, entries, 2)
+    original = RawBlockDevice.read_block
+
+    def failing(self, block, num_blks=1, **kwargs):
+        start = block * self.block_bytes
+        if start < 4 * 512 and 3 * 512 < start + num_blks * self.block_bytes:
+            raise OSError(errno.EIO, "disk RDB read failed")
+        return original(self, block, num_blks, **kwargs)
+
+    monkeypatch.setattr(RawBlockDevice, "read_block", failing)
+    for operation in (
+        lambda: open_rdisk(image),
+        lambda: find_partition(image, None, selector, write=write),
+        lambda: rdb_inspect.check_default_write(image, None),
+    ):
+        with pytest.raises(OSError) as caught:
+            operation()
+        assert caught.value.errno == errno.EIO
