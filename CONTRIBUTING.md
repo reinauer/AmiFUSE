@@ -5,8 +5,7 @@ needed to clone, build, test, and submit changes.
 
 ## Prerequisites
 
-- **Python 3.11+** for development (`pyproject.toml` declares `>=3.9`
-  for runtime compatibility, but CI tests 3.11 through 3.13)
+- **Python 3.11+** (CI tests 3.11 through 3.13)
 - **Git** with submodule support
 - Optional: [macFUSE](https://osxfuse.github.io/) /
   [FUSE for Linux](https://github.com/libfuse/libfuse) /
@@ -85,10 +84,10 @@ Linux, macOS, and Windows:
   integration tests.
 
 Integration tests, tools smoke, and mount tests start once the unit
-tests pass. On Windows they install the `machine68k-amifuse` fork,
-which carries Windows fixes that upstream machine68k lacks
-([cnvogelg/machine68k#8](https://github.com/cnvogelg/machine68k/issues/8),
-[cnvogelg/machine68k#9](https://github.com/cnvogelg/machine68k/issues/9)).
+tests pass. They use upstream `machine68k>=0.5.0`, which includes the
+Windows fixes previously supplied by the `machine68k-amifuse` fork.
+Windows jobs install the tested upstream-source wheels attached to the
+amitools release; upstream PyPI currently supplies only a source archive.
 
 ## Pull Requests
 

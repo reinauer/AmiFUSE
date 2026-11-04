@@ -31,10 +31,10 @@ def run_checks() -> List[CheckResult]:
 
     # 1. Python version
     py_ver = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
-    if sys.version_info >= (3, 9):
+    if sys.version_info >= (3, 11):
         results.append(CheckResult("python", "ok", f"Python {py_ver}"))
     else:
-        results.append(CheckResult("python", "error", f"Python {py_ver} (requires 3.9+)"))
+        results.append(CheckResult("python", "error", f"Python {py_ver} (requires 3.11+)"))
 
     # 2. amitools
     try:
@@ -62,14 +62,22 @@ def run_checks() -> List[CheckResult]:
             # Segfault on Windows (-1073741819 = 0xC0000005) or Unix (-11 = SIGSEGV)
             results.append(CheckResult(
                 "machine68k", "warning",
-                "machine68k segfaults -- install machine68k-amifuse fork",
-                fixable=True, fix_description="pip install machine68k-amifuse",
+                "machine68k segfaults -- reinstall machine68k 0.5.0 or newer",
+                fixable=True, fix_description=(
+                    "Re-run tools/install-windows.ps1 to reinstall the upstream wheel"
+                    if sys.platform == "win32"
+                    else "pip install --upgrade 'machine68k>=0.5.0'"
+                ),
             ))
         else:
             # rc == 1 or other non-zero: likely ImportError
             results.append(CheckResult(
                 "machine68k", "error", "machine68k is not installed",
-                fixable=True, fix_description="pip install machine68k",
+                fixable=True, fix_description=(
+                    "Re-run tools/install-windows.ps1 to install the upstream wheel"
+                    if sys.platform == "win32"
+                    else "pip install 'machine68k>=0.5.0'"
+                ),
             ))
     except subprocess.TimeoutExpired:
         results.append(CheckResult("machine68k", "warning", "machine68k check timed out"))

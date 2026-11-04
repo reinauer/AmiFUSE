@@ -4,7 +4,7 @@
     One-command Windows bootstrap for AmiFUSE.
 .DESCRIPTION
     Runs UNELEVATED as the current (standard) user. Obtains a compatible Python
-    (3.9-3.13, provisioning per-user if needed), ensures WinFSP is present
+    (3.11-3.15, provisioning per-user if needed), ensures WinFSP is present
     (elevating ONLY that one machine-wide step), creates a per-user venv,
     installs AmiFUSE and its dependencies, then runs amifuse doctor --fix and
     registers the Explorer shell integration in the user's own HKCU hive.
@@ -35,6 +35,7 @@ $TargetPyVersion = "3.13.14"
 $PyInstallerUrl  = "https://www.python.org/ftp/python/3.13.14/python-3.13.14-amd64.exe"
 $PyInstallerSha  = "c54d9b9bbb8a36e6489363ddd01139707fd781d72f1f9e90c7ec65d0061368e0"
 $PerUserPy313    = Join-Path $env:LOCALAPPDATA "Programs\Python\Python313\python.exe"
+$Machine68kWheelBase = "https://github.com/reinauer/amitools/releases/download/v0.8.0.post12"
 
 # WinFSP: pinned MSI (account-agnostic install via msiexec; see G2). Verified.
 $WinFspVersion   = "2.1"
@@ -111,12 +112,12 @@ function Get-PythonVersionInfo {
     return $null
 }
 
-# The ceiling: accept ONLY 3.9 <= minor <= 13 (machine68k-amifuse ships
-# cp39..cp313 win_amd64 wheels; 3.14 has no wheel and would fail late).
+# Match the upstream-source Windows wheels attached to the amitools release.
+# They cover CPython 3.11 through 3.15 on Windows x64.
 function Test-InRange {
     param($Info)
     if ($null -eq $Info) { return $false }
-    return ($Info.Major -eq 3 -and $Info.Minor -ge 9 -and $Info.Minor -le 13)
+    return ($Info.Major -eq 3 -and $Info.Minor -ge 11 -and $Info.Minor -le 15)
 }
 
 # Enumerate candidate interpreters WITHOUT relying on a stale in-session PATH.
@@ -151,7 +152,7 @@ function Get-InstalledPythons {
     return ($paths | Select-Object -Unique)
 }
 
-# From a set of interpreter paths, pick the highest one in 3.9-3.13.
+# From a set of interpreter paths, pick the highest one in 3.11-3.15.
 function Select-BestPython {
     param([string[]]$Paths)
     $best = $null
@@ -339,18 +340,18 @@ if ($Uninstall) {
 Write-Banner
 
 # ---------------------------------------------------------------------------
-# G1 -- Compatible Python (3.9-3.13): reuse, else provision per-user unelevated
+# G1 -- Compatible Python (3.11-3.15): reuse, else provision per-user unelevated
 # ---------------------------------------------------------------------------
-Write-Step "Detecting a compatible Python (3.9-3.13)..."
+Write-Step "Detecting a compatible Python (3.11-3.15)..."
 
 $pythonInfo = Select-BestPython (Get-InstalledPythons)
 if (Test-InRange $pythonInfo) {
     Write-Ok "Found compatible Python $($pythonInfo.Version) at $($pythonInfo.Path)"
 } else {
-    Write-Step "No compatible Python (3.9-3.13) present; provisioning Python $TargetPyVersion..."
+    Write-Step "No compatible Python (3.11-3.15) present; provisioning Python $TargetPyVersion..."
     $pythonInfo = Invoke-PythonProvision
     if (-not (Test-InRange $pythonInfo)) {
-        Write-Err "Could not obtain a compatible Python (3.9-3.13)."
+        Write-Err "Could not obtain a compatible Python (3.11-3.15)."
         Write-Host "  Install Python 3.13 from python.org and re-run." -ForegroundColor White
         exit 1
     }
@@ -489,6 +490,12 @@ if (-not $env:VIRTUAL_ENV) {
     exit 1
 }
 Write-Ok "Venv activated at $venvPath"
+$venvInfo = Get-PythonVersionInfo (Join-Path $venvPath "Scripts\python.exe")
+if (-not (Test-InRange $venvInfo)) {
+    Write-Err "The existing virtual environment requires Python 3.11-3.15."
+    Write-Err "Create a new environment with a supported Python and re-run this installer."
+    exit 1
+}
 
 # Persist the venv Scripts dir to the standard user's PATH ourselves (HKCU),
 # independent of doctor. After dot-sourcing Activate.ps1 above, `amifuse` is on
@@ -523,6 +530,41 @@ Write-Ok "pip ready: $pipVer"
 # ---------------------------------------------------------------------------
 # G5 -- Install AmiFUSE + dependencies
 # ---------------------------------------------------------------------------
+# Upstream 0.5.0 is source-only on PyPI. Download its tested release wheel
+# before changing the environment, so a network error leaves the old install.
+$pyTag = "cp3$($venvInfo.Minor)"
+$wheelFile = "machine68k-0.5.0-$pyTag-$pyTag-win_amd64.whl"
+$wheelUrl = "$Machine68kWheelBase/$wheelFile"
+$wheelDir = Join-Path ([System.IO.Path]::GetTempPath()) ("amifuse-machine68k-" + [guid]::NewGuid().ToString("N"))
+$wheelPath = Join-Path $wheelDir $wheelFile
+New-Item -ItemType Directory -Path $wheelDir -Force | Out-Null
+try {
+    Write-Step "Downloading upstream machine68k 0.5.0 (wheel only)..."
+    if ((Invoke-Native python @('-m', 'pip', 'download', '--no-deps', '--only-binary=:all:', '--dest', $wheelDir, $wheelUrl)) -ne 0) {
+        Write-Err "Could not download the upstream machine68k wheel for Python $($venvInfo.Version)."
+        Write-Err "Expected release asset: $wheelUrl"
+        exit 1
+    }
+
+    # Both distributions own the same import module. Remove the fork first;
+    # removing it after installing upstream could remove the new module.
+    Write-Step "Removing the obsolete machine68k-amifuse distribution..."
+    if ((Invoke-Native python @('-m', 'pip', 'uninstall', '-y', 'machine68k-amifuse')) -ne 0) {
+        Write-Err "Could not remove the old machine68k distribution."
+        exit 1
+    }
+
+    # Reinstall even if upstream's metadata is already present: the fork's
+    # uninstall may have removed files that both distributions owned.
+    Write-Step "Installing upstream machine68k 0.5.0..."
+    if ((Invoke-Native python @('-m', 'pip', 'install', '--no-index', '--no-deps', '--force-reinstall', $wheelPath)) -ne 0) {
+        Write-Err "Could not install the downloaded upstream machine68k wheel."
+        exit 1
+    }
+} finally {
+    Remove-Item -LiteralPath $wheelDir -Recurse -Force -ErrorAction SilentlyContinue
+}
+
 Write-Step "Installing AmiFUSE..."
 
 $devMode = $false
@@ -539,9 +581,8 @@ if ($pyprojectPath -and (Test-Path $pyprojectPath)) {
 
 if ($devMode) {
     Write-Step "Dev checkout detected -- installing in editable mode with [windows] extras..."
-    # G1 guarantees the venv python is 3.9-3.13, so the machine68k-amifuse wheel
-    # pulled transitively (via amitools-amifuse[vamos]) resolves without an sdist
-    # build. The import check below is the fast/clear guard.
+    # The upstream machine68k wheel is installed before either install path,
+    # so resolving amitools' vamos extra does not require a native compiler.
     #
     # setuptools_scm (upstream pyproject build config) lists tracked files at
     # their real path (symlinks and mapped drives resolved, so a network share
@@ -621,18 +662,6 @@ if ($devMode) {
     }
     Write-Ok "Editable install complete."
 } else {
-    # Install machine68k-amifuse FIRST, --only-binary=:all:, so an out-of-range
-    # Python fails FAST and CLEAR here (B8). If we installed `amifuse` first it
-    # would pull machine68k-amifuse transitively (via amitools-amifuse[vamos])
-    # WITHOUT --only-binary, hitting a cryptic sdist C-build failure before this
-    # guard is ever reached. G1 should keep us in 3.9-3.13, so this normally just
-    # installs a wheel.
-    Write-Step "Installing machine68k-amifuse (wheel only)..."
-    if ((Invoke-Native python @('-m', 'pip', 'install', '--only-binary=:all:', 'machine68k-amifuse')) -ne 0) {
-        $pv = (python --version 2>&1)
-        Write-Err "No compatible machine68k-amifuse wheel for this Python -- need Python 3.9-3.13 (have $pv)."
-        exit 1
-    }
     Write-Step "Installing AmiFUSE from PyPI..."
     if ((Invoke-Native python @('-m', 'pip', 'install', 'amifuse', 'pystray', 'Pillow')) -ne 0) {
         Write-Err "Failed to install amifuse/pystray/Pillow from PyPI."
@@ -644,7 +673,7 @@ if ($devMode) {
 Write-Step "Verifying machine68k import..."
 if ((Invoke-Native python @('-c', 'import machine68k')) -ne 0) {
     $pv = (python --version 2>&1)
-    Write-Err "No compatible machine68k-amifuse wheel for this Python -- need Python 3.9-3.13 (have $pv)."
+    Write-Err "The installed upstream machine68k could not be imported (Python $pv)."
     exit 1
 }
 $machine68kOk = $true

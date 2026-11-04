@@ -7,7 +7,7 @@ name = "amifuse"
 dynamic = ["version"]
 description = "Mount Amiga filesystem images via FUSE using native AmigaOS handlers"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.11"
 license = "BSD-2-Clause"
 license-files = ["LICENSE"]
 authors = [
@@ -22,8 +22,6 @@ classifiers = [
     "Operating System :: Microsoft :: Windows",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.9",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
@@ -32,7 +30,7 @@ classifiers = [
 
 dependencies = [
     "fusepy>=3.0",
-    "amitools-amifuse[vamos]>=0.8.0.post11",
+    "amitools-amifuse[vamos]>=0.8.0.post12",
     # the handler's tasks are greenlets (emu_thread.py, startup_runner.py)
     "greenlet>=3.0",
 ]

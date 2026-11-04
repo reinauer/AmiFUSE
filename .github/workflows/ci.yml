@@ -7,6 +7,7 @@ on:
     branches: [main]
 
 env:
+  MACHINE68K_WHEEL_BASE: https://github.com/reinauer/amitools/releases/download/v0.8.0.post12
   # The AmiFUSE-testing commit the fixture clone steps check out, so a push
   # to that repo can't change this repo's CI results. `git clone --depth 1`
   # takes a branch or tag, not a SHA, so those steps fetch this commit into
@@ -29,9 +30,16 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
+      - name: Install the upstream-source machine68k wheel (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $abi = python -c "import sys; print(f'cp{sys.version_info.major}{sys.version_info.minor}')"
+          python -m pip install --only-binary=:all: "$env:MACHINE68K_WHEEL_BASE/machine68k-0.5.0-$abi-$abi-win_amd64.whl"
+
       - name: Build and install with the declared minimum amitools release
         run: |
-          python -m pip install build "amitools-amifuse[vamos]==0.8.0.post11" fusepy
+          python -m pip install build "amitools-amifuse[vamos]==0.8.0.post12" fusepy
           # As the release does: the sdist, then the wheel built from it.
           python -m build
           python -c "import glob, subprocess, sys; subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--no-deps', glob.glob('dist/*.whl')[0]])"
@@ -101,12 +109,40 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: 'pip'
 
+      - name: Install the upstream-source machine68k wheel (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $abi = python -c "import sys; print(f'cp{sys.version_info.major}{sys.version_info.minor}')"
+          python -m pip install --only-binary=:all: "$env:MACHINE68K_WHEEL_BASE/machine68k-0.5.0-$abi-$abi-win_amd64.whl"
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -e "./amitools[vamos]"
           pip install "pytest>=7.0" "pytest-cov>=4.0" "pytest-timeout>=2.0"
           pip install -e "." --no-deps
+
+      - name: Check the Windows installer syntax and Python bounds
+        if: runner.os == 'Windows' && matrix.python-version == '3.13'
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $parseErrors = $null
+          $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path tools/install-windows.ps1), [ref]$tokens, [ref]$parseErrors)
+          if ($parseErrors.Count) { throw ($parseErrors | Out-String) }
+          $bounds = $ast.Find({ param($n)
+            $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Test-InRange'
+          }, $true)
+          if (-not $bounds) { throw 'Installer Python check is missing' }
+          . ([scriptblock]::Create($bounds.Extent.Text))
+          foreach ($minor in 9..16) {
+            $actual = Test-InRange ([pscustomobject]@{Major=3; Minor=$minor})
+            $expected = $minor -ge 11 -and $minor -le 15
+            if ($actual -ne $expected) { throw "Wrong installer decision for Python 3.$minor" }
+          }
+          if (Test-InRange $null) { throw 'A missing interpreter was accepted' }
 
       - name: Run unit tests
         run: pytest tests/unit/ -v --timeout=30
@@ -141,13 +177,12 @@ jobs:
           git -C ../AmiFUSE-testing.tmp checkout --quiet FETCH_HEAD
           mv ../AmiFUSE-testing.tmp ../AmiFUSE-testing
 
-      - name: Install machine68k-amifuse (Windows)
-        # Upstream machine68k lacks Windows fixes (cnvogelg/machine68k#8,
-        # #9). The machine68k-amifuse fork includes all fixes with
-        # pre-built Windows wheels.
-        # Remove this step once upstream machine68k merges the fixes.
+      - name: Install the upstream-source machine68k wheel (Windows)
         if: runner.os == 'Windows'
-        run: pip install "machine68k-amifuse>=0.4.1.post1"
+        shell: pwsh
+        run: |
+          $abi = python -c "import sys; print(f'cp{sys.version_info.major}{sys.version_info.minor}')"
+          python -m pip install --only-binary=:all: "$env:MACHINE68K_WHEEL_BASE/machine68k-0.5.0-$abi-$abi-win_amd64.whl"
 
       - name: Install dependencies
         run: |
@@ -195,13 +230,12 @@ jobs:
           git -C ../AmiFUSE-testing.tmp checkout --quiet FETCH_HEAD
           mv ../AmiFUSE-testing.tmp ../AmiFUSE-testing
 
-      - name: Install machine68k-amifuse (Windows)
-        # Upstream machine68k lacks Windows fixes (cnvogelg/machine68k#8,
-        # #9). The machine68k-amifuse fork includes all fixes with
-        # pre-built Windows wheels.
-        # Remove this step once upstream machine68k merges the fixes.
+      - name: Install the upstream-source machine68k wheel (Windows)
         if: runner.os == 'Windows'
-        run: pip install "machine68k-amifuse>=0.4.1.post1"
+        shell: pwsh
+        run: |
+          $abi = python -c "import sys; print(f'cp{sys.version_info.major}{sys.version_info.minor}')"
+          python -m pip install --only-binary=:all: "$env:MACHINE68K_WHEEL_BASE/machine68k-0.5.0-$abi-$abi-win_amd64.whl"
 
       - name: Install dependencies
         run: |
@@ -275,9 +309,12 @@ jobs:
           git -C ../AmiFUSE-testing.tmp checkout --quiet FETCH_HEAD
           mv ../AmiFUSE-testing.tmp ../AmiFUSE-testing
 
-      - name: Install machine68k-amifuse (Windows)
+      - name: Install the upstream-source machine68k wheel (Windows)
         if: runner.os == 'Windows'
-        run: pip install "machine68k-amifuse>=0.4.1.post1"
+        shell: pwsh
+        run: |
+          $abi = python -c "import sys; print(f'cp{sys.version_info.major}{sys.version_info.minor}')"
+          python -m pip install --only-binary=:all: "$env:MACHINE68K_WHEEL_BASE/machine68k-0.5.0-$abi-$abi-win_amd64.whl"
 
       - name: Install dependencies
         run: |

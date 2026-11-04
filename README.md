@@ -11,7 +11,7 @@ AmiFUSE runs actual Amiga filesystem drivers (like PFS3) through m68k CPU emulat
 - **macOS**: [macFUSE](https://osxfuse.github.io/) 5.3.3 or newer
 - **Linux**: FUSE for Linux
 - **Windows**: [WinFSP](https://winfsp.dev/)
-- **Python 3.9+**
+- **Python 3.11+**
 - **7z**: Required for `make unpack` (install via `brew install p7zip` on macOS)
 - A **filesystem handler**: e.g. [pfs3aio](https://aminet.net/package/disk/misc/pfs3aio) (or use `make download`)
 
@@ -58,6 +58,11 @@ pip install -e './amitools[vamos]'   # Install amitools from submodule (includes
 pip install -e .                     # Install AmiFUSE
 pip install -e '.[windows]'         # Windows only: adds pystray + Pillow for tray/shell integration
 ```
+
+The Windows installer downloads tested wheels built from upstream
+machine68k 0.5.0 for Python 3.11--3.15. Upstream PyPI currently provides
+only a source archive, so a direct pip installation on Windows needs a
+native compiler unless the matching wheel is installed first.
 
 ### macOS-specific
 
@@ -280,8 +285,9 @@ python -m pip install -e './amitools[vamos]'
 python -m pip install -e '.[windows]'
 ```
 
-The published `amitools-amifuse 0.8.0.post11` dependency includes
-physical-disk support and partition range locks; the source installation
+The published `amitools-amifuse 0.8.0.post12` dependency includes
+physical-disk support, partition range locks, and the scheduler runtime,
+and uses upstream machine68k 0.5.0 or newer. The source installation
 above is only needed to test unreleased amitools changes.
 
 ### Formatting

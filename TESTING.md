@@ -7,7 +7,7 @@ amitools, which has the physical-disk support and partition range locks,
 plus the scheduler changes AmiFUSE needs and the fork's packaging.
 
 The installed-wheel CI job checks ordinary-image commands with the
-declared minimum `amitools-amifuse 0.8.0.post11`, the release built from
+declared minimum `amitools-amifuse 0.8.0.post12`, the release built from
 that branch.
 
 Windows CI exercises named locks and unmount events across real processes
@@ -514,13 +514,11 @@ a green job means its tests ran, `integration-tests` and `mount-tests` set
 With a variable set, `tests/integration/conftest.py` ends the run with exit
 status 1 instead of skipping. Set them locally to make the same check.
 
-The Windows integration, tools-smoke and mount-tests jobs use the
-`machine68k-amifuse` fork, which includes pre-built wheels with fixes for
-opcode table over-read
-([cnvogelg/machine68k#8](https://github.com/cnvogelg/machine68k/issues/8))
-and JMP/CAS collision
-([cnvogelg/machine68k#9](https://github.com/cnvogelg/machine68k/issues/9)).
-This workaround can be removed once upstream machine68k merges the fixes.
+The integration, tools-smoke and mount-tests jobs use upstream
+`machine68k>=0.5.0`. That release includes the opcode table over-read and
+JMP/CAS fixes previously supplied by the `machine68k-amifuse` fork.
+Windows jobs install wheels built from the unmodified upstream archive,
+tested by the amitools release workflow, and attached to its GitHub release.
 
 ## Current Gaps
 
@@ -534,4 +532,4 @@ entry points yet:
 - ~~fixture-layout cleanup for `~/AmigaOS/AmiFuse/`~~ (resolved:
   `AMIFUSE_FIXTURE_ROOT` env var + fixture cascade in `tests/fixtures/paths.py`)
 - ~~Windows integration tests pending machine68k upstream fixes~~ (resolved:
-  `machine68k-amifuse` fork with pre-built wheels)
+  fixes included in upstream machine68k 0.5.0)

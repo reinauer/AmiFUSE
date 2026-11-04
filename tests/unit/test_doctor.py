@@ -213,19 +213,21 @@ class TestRunChecks:
         assert "fuse_backend" in names
         assert "path" in names
 
-    def test_python_version_ok(self):
-        patches = _patch_all_checks(version_info=_make_version_info(3, 12, 0))
+    @pytest.mark.parametrize("minor", [11, 12])
+    def test_python_version_ok(self, minor):
+        patches = _patch_all_checks(version_info=_make_version_info(3, minor, 0))
         results = _run_with_patches(patches)
         c = _find_check(results, "python")
         assert c.status == "ok"
-        assert "3.12.0" in c.message
+        assert f"3.{minor}.0" in c.message
 
-    def test_python_version_error(self):
-        patches = _patch_all_checks(version_info=_make_version_info(3, 8, 0))
+    @pytest.mark.parametrize("minor", [8, 9, 10])
+    def test_python_version_error(self, minor):
+        patches = _patch_all_checks(version_info=_make_version_info(3, minor, 0))
         results = _run_with_patches(patches)
         c = _find_check(results, "python")
         assert c.status == "error"
-        assert "3.9+" in c.message
+        assert "3.11+" in c.message
 
     def test_amitools_importable(self):
         patches = _patch_all_checks(amitools_import=True)
@@ -633,13 +635,21 @@ class TestPlatformSpecificChecks:
         patches = _patch_all_checks(subprocess_rc=-11)
         results = _run_with_patches(patches)
         c = _find_check(results, "machine68k")
-        assert c.fix_description == "pip install machine68k-amifuse"
+        assert c.fix_description == "pip install --upgrade 'machine68k>=0.5.0'"
+
+    @pytest.mark.parametrize("rc", [-11, 1])
+    def test_machine68k_fix_uses_windows_installer(self, rc):
+        patches = _patch_all_checks(platform="win32", subprocess_rc=rc)
+        results = _run_with_patches(patches)
+        c = _find_check(results, "machine68k")
+        assert "tools/install-windows.ps1" in c.fix_description
+        assert "upstream wheel" in c.fix_description
 
     def test_machine68k_fix_description_missing(self):
         patches = _patch_all_checks(subprocess_rc=1)
         results = _run_with_patches(patches)
         c = _find_check(results, "machine68k")
-        assert c.fix_description == "pip install machine68k"
+        assert c.fix_description == "pip install 'machine68k>=0.5.0'"
 
 
 # ---------------------------------------------------------------------------

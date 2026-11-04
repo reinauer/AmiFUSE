@@ -43,7 +43,7 @@ case "$OS" in
 esac
 
 # ---------------------------------------------------------------------------
-# 3. Detect Python 3.9+
+# 3. Detect Python 3.11+
 # ---------------------------------------------------------------------------
 step "Detecting Python..."
 
@@ -54,7 +54,7 @@ for candidate in python3 python; do
         if [[ "$ver" =~ Python\ ([0-9]+)\.([0-9]+) ]]; then
             major="${BASH_REMATCH[1]}"
             minor="${BASH_REMATCH[2]}"
-            if (( major >= 3 && minor >= 9 )); then
+            if (( major == 3 && minor >= 11 )); then
                 PYTHON="$candidate"
                 ok "Found $ver ($candidate)"
                 break
@@ -64,7 +64,7 @@ for candidate in python3 python; do
 done
 
 if [[ -z "$PYTHON" ]]; then
-    err "Python 3.9+ not found."
+    err "Python 3.11+ not found."
     echo ""
     if [[ "$OS" == "Darwin" ]]; then
         echo "Install with:  brew install python@3.12"
@@ -75,7 +75,7 @@ if [[ -z "$PYTHON" ]]; then
     elif has pacman; then
         echo "Install with:  sudo pacman -S python"
     else
-        echo "Install Python 3.9+ from https://python.org"
+        echo "Install Python 3.11+ from https://python.org"
     fi
     echo ""
     echo "Then re-run this script."
