@@ -1794,6 +1794,7 @@ class HandlerBridge:
             # directory. The old limit of 256 silently truncated large directories.
             # 65536 is generous; ExamineNext will return ERROR_NO_MORE_ENTRIES
             # (res1=0) when the directory is exhausted, which breaks the loop.
+            unnamed = 0
             for iter_num in range(65536):
                 pkt_addr, _ = self.launcher.send_examine_next(
                     self.state, lock_bptr, fib_mem.addr)
@@ -1807,8 +1808,12 @@ class HandlerBridge:
                 if self._debug:
                     print(f"[amifuse] list_dir: ExamineNext #{iter_num} name='{entry['name']}' type={entry['dir_type']}")
                 if not entry["name"]:
-                    break
+                    unnamed += 1
+                    continue
                 entries.append(entry)
+            if unnamed:
+                print(f"Warning: skipped {unnamed} directory entries with empty names",
+                      file=sys.stderr)
             if root_lock:
                 self.free_lock(root_lock)
             return entries
