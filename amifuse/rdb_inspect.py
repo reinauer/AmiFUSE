@@ -267,6 +267,11 @@ class OffsetBlockDevice:
         self.block_bytes = base_blkdev.block_bytes
         self.block_longs = self.block_bytes // 4
 
+    @property
+    def readable_blocks(self):
+        """Blocks present in the image, without changing declared geometry."""
+        return max(0, min(self.num_blocks, self.base.num_blocks - self.offset))
+
     def read_block(self, blk_num: int, num_blks: int = 1) -> bytes:
         """Read blocks with offset applied."""
         if blk_num + num_blks > self.num_blocks:
@@ -565,7 +570,7 @@ def _read_fs_parceiro(blkdev, fs_blk_num, fs_num):
     while lseg_blk != 0xFFFFFFFF:
         if lseg_blk in seen:
             return fs, 0, f"LSEG chain loops back to block {lseg_blk}"
-        if lseg_blk >= blkdev.num_blocks:
+        if lseg_blk >= getattr(blkdev, "readable_blocks", blkdev.num_blocks):
             # Reading it would raise the IOError of a failing read.
             return fs, 0, (f"LSEG chain links to block {lseg_blk}, "
                            f"past the end of the device")
@@ -651,7 +656,8 @@ def _lenient_rdisk_open(rdisk) -> List[str]:
             )
             rdisk.damaged_part_list = warnings[-1]
             break
-        if rdisk.parts and part_blk >= rdisk.rawblk.num_blocks:
+        if rdisk.parts and part_blk >= getattr(
+                rdisk.rawblk, "readable_blocks", rdisk.rawblk.num_blocks):
             # Not read: it would raise the IOError of a failing read.
             warnings.append(
                 f"Partition list links to block {part_blk}, past the end of "
@@ -683,7 +689,7 @@ def _lenient_rdisk_open(rdisk) -> List[str]:
             )
             rdisk.damaged_fs.append((None, warnings[-1], num))
             break
-        if fs_blk >= rdisk.rawblk.num_blocks:
+        if fs_blk >= getattr(rdisk.rawblk, "readable_blocks", rdisk.rawblk.num_blocks):
             # Not read: it would raise the IOError of a failing read.
             warnings.append(
                 f"Filesystem list links to block {fs_blk}, past the end of "
