@@ -2919,6 +2919,9 @@ class AmigaFuseFS(_FuseOperations):
         # path -> the date utimens() set on an open file, sent at its last
         # release(). Guarded by _fh_lock.
         self._held_dates: Dict[str, float] = {}
+        # Logical grows awaiting data or a zero-filled tail. Pins continue
+        # to describe bytes actually written, including BFFS output handles.
+        self._deferred_grows: Dict[str, Dict[str, int]] = {}
         # How the handler folds names (_state_path). Only a write mount keeps
         # the state above, so the others send no packet to find out.
         self._name_fold = None
@@ -3257,7 +3260,7 @@ class AmigaFuseFS(_FuseOperations):
         cached = self._get_cached_stat(path)
         if cached is not None:
             self._track_op("getattr", path, cached=True)
-            return cached
+            return self._logical_stat(path, cached)
         # A file held on an exclusive lock, from create() or an O_TRUNC
         # open(), was answered from its pinned entry above: the handler
         # cannot examine it until release(). Any other open file is shared,
@@ -3273,7 +3276,59 @@ class AmigaFuseFS(_FuseOperations):
             raise FuseOSError(errno.ENOENT)
         result = self._stat_from_fib(info, path, int(time.time()))
         self._set_cached_stat(path, result)
+        return self._logical_stat(path, result)
+
+    def _logical_stat(self, path, result):
+        pending = self._deferred_grows.get(path)
+        if pending is not None:
+            return dict(result, st_size=pending["length"])
         return result
+
+    def _materialize_grow(self, path):
+        """Write a pending tail using any live handle on this file.
+
+        Keep the record and handle on failure so flush or unmount can retry.
+        No cached handle position survives the bridge's seeks and fill.
+        """
+        pending = self._deferred_grows.get(path)
+        if pending is None:
+            return
+        with self._fh_lock:
+            entries = [e for e in self._fh_cache.values()
+                       if e.get("path") == path and e.get("fh_addr")
+                       and not e.get("closed")]
+            writers = [e for e in entries if e.get("writable")]
+        if not writers:
+            raise FuseOSError(errno.EIO)
+        entry = writers[0]
+        with entry["lock"]:
+            try:
+                size, res2 = self.bridge.truncate_handle(
+                    entry["fh_addr"], pending["length"], end=pending["end"],
+                    past_end=any(e.get("past_pin") for e in entries))
+            finally:
+                for other in entries:
+                    other["pos"] = None
+            if size != pending["length"]:
+                entry["past_pin"] = True
+                raise FuseOSError(_WRITE_ERRNOS.get(res2, errno.EIO))
+            entry["dirty"] = True
+            for other in entries:
+                other.pop("past_pin", None)
+        if path in self._pinned_stats:
+            self._pin_stat(path, size)
+        self._deferred_grows.pop(path, None)
+        with self._cache_lock:
+            if path not in self._pinned_stats:
+                self._stat_cache.pop(path, None)
+
+    def _materialize_grows(self, except_path=None):
+        # Commit other files before an operation can consume their space.
+        # This preserves the existing ENOSPC check without overcommitting
+        # several logical grows against the same free blocks.
+        for path in list(self._deferred_grows):
+            if path != except_path:
+                self._materialize_grow(path)
 
     def _stat_from_fib(self, ent: Dict, name: str, now: int) -> Dict:
         """Build a FUSE stat dict from a parsed FileInfoBlock entry.
@@ -3533,6 +3588,8 @@ class AmigaFuseFS(_FuseOperations):
                         }
                     return handle
             raise FuseOSError(errno.ENOENT)
+        if flags & (os.O_CREAT | os.O_TRUNC):
+            self._materialize_grows(except_path=path)
         opened, res2 = self.bridge.open_file_reply(path, flags)
         if opened is None:
             # The file exists, but the handler will not open it while
@@ -3554,11 +3611,13 @@ class AmigaFuseFS(_FuseOperations):
                 "lock": threading.Lock(),
                 "closed": False,
                 "dirty": False,  # Track if file was written to
+                "writable": (flags & getattr(os, "O_ACCMODE", 3)) != os.O_RDONLY,
                 "path": path,
             }
         # open_file() takes an exclusive ACTION_FINDOUTPUT lock for O_TRUNC
         # without O_RDONLY, as create() does, and the file is empty now.
         if flags & os.O_TRUNC and (flags & getattr(os, "O_ACCMODE", 3)) != os.O_RDONLY:
+            self._deferred_grows.pop(path, None)
             self._pin_stat(path, 0)
         return handle
 
@@ -3566,6 +3625,10 @@ class AmigaFuseFS(_FuseOperations):
         self._check_handler_alive()
         with self._fh_lock:
             entry = self._fh_cache.get(fh)
+        read_path = self._state_path(_handle_path(entry, path))
+        pending = self._deferred_grows.get(read_path)
+        if pending is not None and size and offset + size > pending["end"]:
+            self._materialize_grow(read_path)
         if entry is None:
             data = self.bridge.read_file(path, size, offset)
             if data is None:
@@ -3634,7 +3697,11 @@ class AmigaFuseFS(_FuseOperations):
         if entry is None:
             raise FuseOSError(errno.EIO)
         fh_addr = entry["fh_addr"]
-        end = self._pinned_end(entry, path)
+        path = _handle_path(entry, path)
+        if data:
+            self._materialize_grows(except_path=path)
+        pending = self._deferred_grows.get(path)
+        end = pending["end"] if pending else self._pinned_end(entry, path)
         with entry["lock"]:
             if entry.get("closed"):
                 raise FuseOSError(errno.EIO)
@@ -3667,6 +3734,10 @@ class AmigaFuseFS(_FuseOperations):
                 cached = self._stat_cache.get(path)
                 if cached is not None and offset + written > cached[1]["st_size"]:
                     self._pin_stat(path, offset + written)
+        if pending is not None:
+            pending["end"] = max(pending["end"], offset + written)
+            if pending["end"] >= pending["length"]:
+                self._deferred_grows.pop(path, None)
         return written
 
     def _settle_handles(self, entry, far, seek: bool):
@@ -3746,10 +3817,51 @@ class AmigaFuseFS(_FuseOperations):
                            if h != fh and "fh_addr" in e and not e.get("closed")]
                 others = [e for e in handles if (e["pos"] or 0) <= _LONG_MAX]
                 far = [e for e in handles if (e["pos"] or 0) > _LONG_MAX]
-            if entry is None:
+            if entry is None or entry.get("closed"):
                 raise FuseOSError(errno.EIO)
             fh_addr = entry["fh_addr"]
-            end = self._pinned_end(entry, path)
+            path = _handle_path(entry, path)
+            self._materialize_grows(except_path=path)
+            pending = self._deferred_grows.get(path)
+            end = pending["end"] if pending else self._pinned_end(entry, path)
+            # A path-only truncate closes its temporary handle immediately,
+            # so deferral would save no writes. Unknown/failed ends retain
+            # the bridge's existing recovery behavior.
+            measured = end
+            dos_type = getattr(self.bridge, "_dos_type", None)
+            family = dos_type & 0xFFFFFF00 if isinstance(dos_type, int) else None
+            supported = family in (0x444F5300, *_PFS_FAMILIES, _SFS_FAMILY)
+            if (supported and not temp_handle and length
+                    and entry.get("writable") and not entry.get("past_pin")):
+                if measured is None:
+                    measured = self.bridge._handle_end(fh_addr)
+                    entry["pos"] = None
+                if isinstance(measured, int) and length > measured:
+                    # Zero-length writes alone do not test file protection
+                    # on every handler. Shared handles can still be examined;
+                    # exclusive output handles passed the open's check.
+                    file_info = (self.bridge.stat_path(path)
+                                 if path not in self._pinned_stats else None)
+                    if (file_info and file_info.get("protection", 0)
+                            & DosProtection.FIBF_WRITE):
+                        raise FuseOSError(errno.EACCES)
+                    info = (self.bridge.get_disk_info() if file_info is not None
+                            or path in self._pinned_stats else None)
+                    if info and info["bytes_per_block"]:
+                        bpb = info["bytes_per_block"]
+                        free = max(0, info["num_blocks"] - info["num_blocks_used"])
+                        if length - measured > free * bpb + (-measured % bpb):
+                            raise FuseOSError(errno.ENOSPC)
+                        # Check the handle and volume's write permission
+                        # now, before reporting a successful logical grow.
+                        result, res2 = self.bridge.write_empty_reply(fh_addr)
+                        if result < 0:
+                            entry["pos"] = None
+                            raise FuseOSError(_WRITE_ERRNOS.get(res2, errno.EIO))
+                        self._deferred_grows[path] = {
+                            "length": length, "end": measured}
+                        entry["dirty"] = True
+                        return 0
             with entry["lock"]:
                 if entry.get("closed"):
                     raise FuseOSError(errno.EIO)
@@ -3809,6 +3921,7 @@ class AmigaFuseFS(_FuseOperations):
                     raise FuseOSError(_WRITE_ERRNOS.get(res2, errno.EIO))
                 entry["dirty"] = True  # Truncate modifies the file
                 if size == length:
+                    self._deferred_grows.pop(path, None)
                     # The handler's end is now length, as the pin is.
                     entry.pop("past_pin", None)
                     self._settle_handles(entry, far,
@@ -3912,12 +4025,14 @@ class AmigaFuseFS(_FuseOperations):
             if self._is_platform_special(path):
                 raise FuseOSError(errno.ENOENT)
             path = self._state_path(path)
+            self._materialize_grows(except_path=path)
             opened = self.bridge.open_file(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
             if opened is None:
                 self._log_op("create", path, "FAILED: open_file returned None")
                 raise FuseOSError(errno.EIO)
             fh_addr, parent_lock = opened
             self._forget_pending_delete(path)
+            self._deferred_grows.pop(path, None)
             with self._fh_lock:
                 handle = self._next_fh
                 self._next_fh += 1
@@ -3928,6 +4043,7 @@ class AmigaFuseFS(_FuseOperations):
                     "lock": threading.Lock(),
                     "closed": False,
                     "dirty": True,  # New files are always dirty
+                    "writable": True,
                     "path": path,
                 }
             # Prime stat/dir cache so immediate getattr after create doesn't fail.
@@ -4162,6 +4278,7 @@ class AmigaFuseFS(_FuseOperations):
         dir_path, name = self._split_path(path)
         if not name:
             raise FuseOSError(errno.EINVAL)
+        self._materialize_grows()
         parent_lock, _, locks = self.bridge.locate_path(dir_path)
         try:
             if parent_lock == 0 and dir_path != "/":
@@ -4390,6 +4507,10 @@ class AmigaFuseFS(_FuseOperations):
                     }
                     for d, children in self._pending_dir_deletes.items()
                 }
+                self._deferred_grows = {
+                    _renamed_path(p, old, new) or p: growth
+                    for p, growth in self._deferred_grows.items()
+                }
                 self._held_dates = {
                     _renamed_path(p, old, new) or p: when
                     for p, when in self._held_dates.items()
@@ -4421,6 +4542,9 @@ class AmigaFuseFS(_FuseOperations):
 
     def flush(self, path, fh):
         self._log_op("flush", path, f"fh={fh}")
+        with self._fh_lock:
+            entry = self._fh_cache.get(fh)
+        self._materialize_grow(self._state_path(_handle_path(entry, path)))
         return 0
 
     def fsync(self, path, fdatasync, fh):
@@ -4431,7 +4555,10 @@ class AmigaFuseFS(_FuseOperations):
         # Handlers keep data and metadata in their buffers. ACTION_FLUSH has
         # no per-file form, so write out the whole volume.
         try:
+            self._materialize_grows()
             self.bridge.flush_volume()
+        except FuseOSError:
+            raise
         except OSError as exc:
             raise FuseOSError(errno.EIO) from exc
         return 0
@@ -4444,7 +4571,10 @@ class AmigaFuseFS(_FuseOperations):
         # A create, rename, delete or mkdir in the directory can still be in
         # the handler's buffers, and ACTION_FLUSH writes out the whole volume.
         try:
+            self._materialize_grows()
             self.bridge.flush_volume()
+        except FuseOSError:
+            raise
         except OSError as exc:
             raise FuseOSError(errno.EIO) from exc
         return 0
@@ -4858,6 +4988,15 @@ class AmigaFuseFS(_FuseOperations):
     def release(self, path, fh):
         self._log_op("release", path, f"fh={fh}")
         with self._fh_lock:
+            closing = self._fh_cache.get(fh)
+            resolved = _handle_path(closing, path)
+            last_writer = closing and closing.get("writable") and not any(
+                e.get("path") == resolved and h != fh and e.get("writable")
+                and e.get("fh_addr") and not e.get("closed")
+                for h, e in self._fh_cache.items())
+        if last_writer:
+            self._materialize_grow(resolved)
+        with self._fh_lock:
             entry = self._fh_cache.get(fh)
             if not entry:
                 return 0
@@ -5036,6 +5175,7 @@ class AmigaFuseFS(_FuseOperations):
             if self.bridge._write_enabled:
                 if _handler_has_crashed(self.bridge):
                     raise RuntimeError("handler crashed before volume flush")
+                self._materialize_grows()
                 unanswered = self.bridge.wait_for_pending()
                 flush_error = None
                 try:
