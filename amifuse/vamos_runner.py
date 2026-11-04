@@ -7,6 +7,9 @@ the handler into memory so we can later jump into it.
 
 import logging
 import os
+import re
+import shutil
+import stat
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -58,6 +61,42 @@ def end_task(scheduler, task):
         scheduler.terminate_task(task)
 
 
+# The PID that made the directory, then tempfile's random part, whose alphabet
+# has no "-". Earlier versions wrote no PID.
+_SCRATCH_DIR_NAME = re.compile(r"amifuse_(\d{1,9})-\w+")
+
+
+def _remove_stale_scratch_dirs() -> None:
+    """Remove the scratch directories that killed runs left.
+
+    A process keeps its directory for as long as it runs, and a kill skips
+    the cleanup. The process named is the one using the directory, as a
+    daemon mount forks before it starts the runtime, and no later. So one
+    that _left_by_ended_run calls stale is removed, with what vamos put in
+    it. A directory of another name is left alone, as nothing says whether a
+    run still needs it. One that can't be removed is left for a later run.
+    """
+    from .platform import _left_by_ended_run
+
+    temp_dir = tempfile.gettempdir()
+    try:
+        names = os.listdir(temp_dir)
+    except OSError:
+        return
+    for name in names:
+        match = _SCRATCH_DIR_NAME.fullmatch(name)
+        if match is None:
+            continue
+        path = os.path.join(temp_dir, name)
+        try:
+            info = os.lstat(path)
+        except OSError:
+            continue
+        if stat.S_ISDIR(info.st_mode) and _left_by_ended_run(
+                int(match[1]), info.st_mtime):
+            shutil.rmtree(path, ignore_errors=True)
+
+
 class VamosHandlerRuntime:
     # Emulated cycles a task runs before the scheduler looks for another
     # ready task.
@@ -104,7 +143,9 @@ class VamosHandlerRuntime:
         # Create a temp directory for vamos path manager to avoid permission
         # issues when amitools tries to create volume directories in vols_base_dir.
         # Using "/" would try to create /system etc. which requires root.
-        self._temp_dir = tempfile.TemporaryDirectory(prefix="amifuse_")
+        _remove_stale_scratch_dirs()
+        self._temp_dir = tempfile.TemporaryDirectory(
+            prefix=f"amifuse_{os.getpid()}-")
         temp_path = self._temp_dir.name
         # Avoid touching ~/.vamos/volumes; keep auto volumes/assigns disabled here.
         path_cfg["path"]["auto_volumes"] = []
