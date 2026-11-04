@@ -19,8 +19,9 @@ ST_LINKDIR = 4
 ST_FILE = -3
 
 
-def _entry(name, dir_type, size=0):
-    return {"name": name, "dir_type": dir_type, "size": size, "protection": 0}
+def _entry(name, dir_type, size=0, key=0):
+    return {"name": name, "dir_type": dir_type, "size": size, "protection": 0,
+            "disk_key": key}
 
 
 class _FakeHandler:
@@ -34,10 +35,13 @@ class _FakeHandler:
     def list_dir_path(self, path):
         self.calls.append(path)
         assert len(self.calls) < 50, f"the walk does not end: {self.calls[-3:]}"
-        for prefix, target in self.aliases:
-            if path == prefix or path.startswith(prefix + "/"):
-                path = target + path[len(prefix):]
-                path = path.replace("//", "/")
+        while True:
+            previous = path
+            for prefix, target in self.aliases:
+                if path == prefix or path.startswith(prefix + "/"):
+                    path = (target + path[len(prefix):]).replace("//", "/")
+            if path == previous:
+                break
         return self.tree.get(path, [])
 
 
@@ -130,3 +134,128 @@ def test_verify_counts_the_volume_with_a_colon_directory(monkeypatch, capsys):
     assert "Directories: 1" in captured.out
     assert "Files: 1" in captured.out
     assert "contents of /q: not listed" in captured.err
+
+
+# A damaged directory block that leads back to a directory above it (#364).
+# The entry looks like any other, and only ODFileSystem of the handlers tried
+# follows one: FastFileSystem checks that an entry's parent is the directory.
+
+
+def _dir(name, key):
+    return _entry(name, ST_USERDIR, key=key)
+
+
+def test_a_directory_leading_back_above_it_is_left_alone(capsys):
+    handler = _FakeHandler(
+        {"/": [_dir("a", 10)],
+         "/a": [_dir("b", 11), _entry("f", ST_FILE, 5, key=12)]},
+        aliases=[("/a/b", "/a")],
+    )
+
+    entries = fs._ls_recursive(handler, "/")
+
+    assert _names(entries) == ["/a", "/a/b", "/a/f", "/a/b/b", "/a/b/f"]
+    assert handler.calls == ["/", "/a", "/a/b", "/a/b/b"]
+    assert "contents of /a/b/b not listed (it leads back" in capsys.readouterr().err
+
+
+def test_a_walk_with_many_ways_back_stays_short(capsys):
+    # Each way back doubles the walk: a limit on depth alone would not end it.
+    handler = _FakeHandler(
+        {"/": [_dir("a", 10)],
+         "/a": [_dir("b", 11), _dir("c", 12), _dir("d", 13)]},
+        aliases=[("/a/b", "/a"), ("/a/c", "/a"), ("/a/d", "/a")],
+    )
+
+    entries = fs._ls_recursive(handler, "/")
+
+    assert len(entries) == 13
+    assert set(_names(entries)) == {"/a", "/a/b", "/a/c", "/a/d"} | {
+        f"/a/{parent}/{child}" for parent in "bcd" for child in "bcd"
+    }
+    assert capsys.readouterr().err.count("it leads back") == 9
+
+
+def test_a_way_back_to_the_root_ends(capsys):
+    handler = _FakeHandler(
+        {"/": [_dir("a", 10)], "/a": [_dir("b", 11)]},
+        aliases=[("/a/b", "/")],
+    )
+
+    entries = fs._ls_recursive(handler, "/")
+
+    assert _names(entries) == ["/a", "/a/b", "/a/b/a", "/a/b/a/b"]
+    assert "contents of /a/b/a/b not listed" in capsys.readouterr().err
+
+
+def test_directories_side_by_side_that_list_the_same_are_both_walked(capsys):
+    # On ODFileSystem such directories list the same keys.
+    same = [_entry("f", ST_FILE, 5, key=20)]
+    deep = [_dir("x", 21)]
+    handler = _FakeHandler({
+        "/": [_dir("a", 10), _dir("b", 11)],
+        "/a": deep, "/b": deep, "/a/x": same, "/b/x": same,
+    })
+
+    entries = fs._ls_recursive(handler, "/")
+
+    assert _names(entries) == ["/a", "/b", "/a/x", "/a/x/f", "/b/x", "/b/x/f"]
+    assert capsys.readouterr().err == ""
+
+
+def test_one_key_for_many_directories_hides_none(capsys):
+    # pfs3aio gives its directories one key.
+    handler = _FakeHandler({
+        "/": [_dir("a", 10)],
+        "/a": [_dir("b", 10), _entry("f", ST_FILE, 1, key=10)],
+        "/a/b": [_dir("c", 10)],
+        "/a/b/c": [_entry("g", ST_FILE, 1, key=10)],
+    })
+
+    entries = fs._ls_recursive(handler, "/")
+
+    assert _names(entries) == ["/a", "/a/b", "/a/f", "/a/b/c", "/a/b/c/g"]
+    assert capsys.readouterr().err == ""
+
+
+def test_a_real_chain_of_one_name_is_walked_to_its_end(capsys):
+    handler = _FakeHandler({
+        "/": [_dir("a", 10)],
+        "/a": [_dir("a", 10)],
+        "/a/a": [_entry("f", ST_FILE, 5, key=10)],
+    })
+
+    entries = fs._ls_recursive(handler, "/")
+
+    assert _names(entries) == ["/a", "/a/a", "/a/a/f"]
+    assert capsys.readouterr().err == ""
+
+
+def test_a_handler_with_no_keys_says_nothing_of_a_way_back(capsys):
+    # With no key, two directories of one name and date look alike.
+    handler = _FakeHandler({
+        "/": [_dir("a", 0)],
+        "/a": [_dir("a", 0)],
+        "/a/a": [_dir("a", 0)],
+    })
+
+    entries = fs._ls_recursive(handler, "/")
+
+    assert _names(entries) == ["/a", "/a/a", "/a/a/a"]
+    assert capsys.readouterr().err == ""
+
+
+@pytest.mark.parametrize("cycle", [False, True], ids=["link", "cycle"])
+def test_warning_escapes_names_from_the_disk(capsys, cycle):
+    name = "x\x1b[2J"
+    if cycle:
+        handler = _FakeHandler({"/": [_dir(name, 10)]},
+                               aliases=[("/" + name, "/")])
+    else:
+        handler = _FakeHandler({"/": [_entry(name, ST_LINKDIR)]})
+
+    fs._ls_recursive(handler, "/")
+
+    err = capsys.readouterr().err
+    assert "\x1b" not in err
+    assert "x\\x1b[2J" in err

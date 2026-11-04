@@ -406,12 +406,14 @@ def _parse_fib(mem, fib_addr: int) -> Dict:
       fib_NumBlocks: LONG at 128
       fib_Date: DateStamp (ds_Days, ds_Minute, ds_Tick: 3 LONGs) at 132
 
-    "mtime" is fib_Date as host time.
+    "mtime" is fib_Date as host time. "disk_key" is only a handler's own
+    number: pfs3aio and ODFileSystem give it to many entries.
 
     A name is read no further than fib_FileName, so a longer one gives its
     first 107 characters: the handler fills in the fields after it too, and
     SmartFilesystem's empty fib_Comment puts a NUL into a name that reaches it.
     """
+    disk_key = mem.r32(fib_addr)        # fib_DiskKey (ULONG)
     dir_type = mem.r32s(fib_addr + 4)   # fib_DirEntryType (signed LONG)
     protection = mem.r32(fib_addr + 116)  # fib_Protection (LONG)
     size = mem.r32(fib_addr + 124)      # fib_Size (ULONG)
@@ -422,6 +424,7 @@ def _parse_fib(mem, fib_addr: int) -> Dict:
     mtime = host_time(mem.r32s(fib_addr + 132), mem.r32s(fib_addr + 136),
                       mem.r32s(fib_addr + 140))
     return {
+        "disk_key": disk_key,
         "dir_type": dir_type,
         "size": size,
         "name": name,
@@ -6325,17 +6328,46 @@ def _not_walked_reason(ent):
     return _unsendable_path_reason(ent["name"])
 
 
+def _listing_of(raw):
+    """What tells directory listing `raw` from those above it, or None.
+
+    A damaged directory block can lead back to a directory that holds it,
+    and nothing in the entry says so. fib_DiskKey alone can't tell, as
+    pfs3aio and ODFileSystem give one key to many directories. With the rest
+    of the listing it can detect repeated visits. A directory inside another
+    can also list the same entries, so the walk allows one repeat before
+    stopping. This is a heuristic: three identical listings along a sound
+    chain are indistinguishable from a loop. Siblings are checked separately.
+    No key says nothing, and an empty directory leads nowhere.
+    """
+    if not raw or not all(ent.get("disk_key") for ent in raw):
+        return None
+    return tuple(
+        (ent["disk_key"], ent["name"], ent.get("dir_type"), ent.get("size"),
+         ent.get("protection"), ent.get("mtime"))
+        for ent in raw
+    )
+
+
 def _ls_recursive(bridge, root_path: str) -> list:
     """Recursively list all entries under root_path.
 
     A directory it can't go into is listed, without its contents, and named
-    on stderr.
+    on stderr. So is one whose listing repeats twice above it.
     """
     entries = []
-    stack = [root_path]
+    stack = [(root_path, ())]
     while stack:
-        current = stack.pop()
+        current, above = stack.pop()
         raw = bridge.list_dir_path(current)
+        listing = _listing_of(raw)
+        if above.count(listing) >= 2:
+            print(f"Warning: contents of {escape_text(current)} not listed (it leads back "
+                  "to a directory above it, so the volume may be damaged)",
+                  file=sys.stderr)
+            continue
+        if listing is not None:
+            above = above + (listing,)
         dir_children = []
         for ent in raw:
             is_dir = ent.get("dir_type", 0) > 0
@@ -6355,10 +6387,10 @@ def _ls_recursive(bridge, root_path: str) -> list:
                 if reason is None:
                     dir_children.append(child)
                 else:
-                    print(f"Warning: contents of {child} not listed ({reason})",
+                    print(f"Warning: contents of {escape_text(child)} not listed ({reason})",
                           file=sys.stderr)
         # Traverse in sorted order for deterministic output
-        stack.extend(reversed(sorted(dir_children)))
+        stack.extend((child, above) for child in reversed(sorted(dir_children)))
     return entries
 
 
