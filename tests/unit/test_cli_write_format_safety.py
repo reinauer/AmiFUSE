@@ -304,6 +304,9 @@ def format_context(monkeypatch, tmp_path):
 
         def run_until_reply(pkt_addr, label, **wait):
             ctx.waits[pkt_addr] = wait
+            if label == "format uninhibit":
+                events.append("uninhibit reply")
+                return getattr(ctx, "uninhibit_reply", ACK)
             if pkt_addr == FLUSH_PKT:
                 events.append("flush reply")
                 return ctx.flush_reply
@@ -322,13 +325,10 @@ def _complete_printed(events):
                for e in events if isinstance(e, tuple))
 
 
-@pytest.mark.parametrize("reply", [
-    ACK, NOT_KNOWN,
-    (0, fs.ERROR_DEVICE_NOT_MOUNTED), (0, fs.ERROR_NOT_A_DOS_DISK), (0, fs.ERROR_NO_DISK),
-], ids=["DOSTRUE", "ACTION_NOT_KNOWN", "DEVICE_NOT_MOUNTED", "NOT_A_DOS_DISK", "NO_DISK"])
+@pytest.mark.parametrize("reply", [ACK, NOT_KNOWN],
+                         ids=["DOSTRUE", "ACTION_NOT_KNOWN"])
 def test_format_fsyncs_after_the_flush_reply_before_complete(format_context, reply):
-    """The flush is sent while the volume is still inhibited: a refusal that
-    says there is no volume passes, as SmartFilesystem's does."""
+    """An acknowledged flush, or an unsupported flush, precedes fsync."""
     ctx = format_context
     ctx.flush_reply = reply
     ctx.run()
@@ -345,7 +345,9 @@ def test_format_fsyncs_after_the_flush_reply_before_complete(format_context, rep
     (NAK, "Format failed: handler refused ACTION_FLUSH (error code 0)"),
     ((0, 214), "Format failed: handler refused ACTION_FLUSH (error code 214)"),
     (None, "Format failed: no reply to ACTION_FLUSH from handler."),
-], ids=["DOSFALSE", "write-protected", "no-reply"])
+    *[((0, code), f"Format failed: handler refused ACTION_FLUSH (error code {code})")
+      for code in (218, 225, 226)],
+])
 def test_format_fails_when_the_flush_is_not_acknowledged(format_context, reply,
                                                          message):
     ctx = format_context
@@ -432,3 +434,16 @@ def test_format_checks_the_volume_name_before_the_image(tmp_path, length, messag
     with pytest.raises(SystemExit) as caught:
         fs.cmd_format(args)
     assert str(caught.value) == message.format(image=image)
+
+
+@pytest.mark.parametrize("reply", [None, (0, 218), (0, 0)])
+def test_format_requires_its_uninhibit_reply(format_context, reply):
+    ctx = format_context
+    ctx.uninhibit_reply = reply
+    with pytest.raises(SystemExit, match="ACTION_INHIBIT"):
+        ctx.run()
+    assert "uninhibit reply" in ctx.events
+    assert "flush reply" not in ctx.events
+    assert "fsync" not in ctx.events
+    assert not _complete_printed(ctx.events)
+    assert "close" in ctx.events

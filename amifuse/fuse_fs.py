@@ -5970,26 +5970,31 @@ def format_volume(
         if debug:
             print(f"[amifuse] FORMAT reply: res1={res1} res2={res2}")
 
-        # Flush the newly formatted volume, then close this formatter runtime.
-        # Reopening on the same bridge is redundant and has proven unstable for
-        # SFS. Callers that want to verify the new volume should do so in a
-        # fresh HandlerBridge.
+        # FastFileSystem finishes the new bitmap when inhibition ends.
+        # Wait for this packet before flushing, without restarting the bridge.
+        pkt_addr, _ = bridge.launcher.send_inhibit(bridge.state, False)
+        reply = bridge._run_until_reply(
+            pkt_addr, "format uninhibit", max_iters=500, cycles=2_000_000
+        )
+        _raise_if_handler_crashed(bridge, "format uninhibit")
+        if reply is None:
+            raise SystemExit("Format failed: no reply to ending ACTION_INHIBIT.")
+        if reply[0] == 0:
+            raise SystemExit(
+                f"Format failed: handler refused to end ACTION_INHIBIT "
+                f"(error code {reply[1]})")
+
+        # Flush metadata written while the handler mounts the new volume.
         pkt_addr, _ = bridge.launcher.send_flush(bridge.state)
         reply = bridge._run_until_reply(
             pkt_addr, "format flush", max_iters=500, cycles=2_000_000
         )
         _raise_if_handler_crashed(bridge, "format flush")
-        # The volume is still inhibited, and a handler may refuse the flush
-        # as it refuses other packets then, saying there is no volume:
-        # SmartFilesystem answers ERROR_ACTION_NOT_KNOWN. In the handlers
-        # tested the flush writes nothing here, since ACTION_FORMAT's own
-        # writes are already on the image; the fsync below makes them
-        # durable. No reply, or a refusal for another reason, fails.
+        # Some handlers do not implement ACTION_FLUSH. A missing volume
+        # after successful format/uninhibit is now a failure, not success.
         if reply is None:
             raise SystemExit("Format failed: no reply to ACTION_FLUSH from handler.")
-        if reply[0] == 0 and reply[1] not in (
-                ERROR_ACTION_NOT_KNOWN, ERROR_DEVICE_NOT_MOUNTED,
-                ERROR_NOT_A_DOS_DISK, ERROR_NO_DISK):
+        if reply[0] == 0 and reply[1] != ERROR_ACTION_NOT_KNOWN:
             raise SystemExit(
                 f"Format failed: handler refused ACTION_FLUSH (error code {reply[1]})")
         # "Format complete" promises the new volume is on stable storage.
