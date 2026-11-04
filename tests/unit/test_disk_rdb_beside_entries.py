@@ -33,10 +33,10 @@ def _corrupt(image, block):
 
 
 def _broken_disk_rdb(tmp_path, entries=("PI0", "PI1")):
-    """The disk's own RDB at block 2 with DH1's PART block (block 4) corrupt,
+    """The disk's own RDB at block 2 with DH0's first PART block (block 3) corrupt,
     beside two 0x76 entries at LBA 200 and 400 holding the RDBs named."""
     image = _disk_rdb(tmp_path, entries, 2)
-    _corrupt(image, 4)
+    _corrupt(image, 3)
     return image
 
 
@@ -51,7 +51,7 @@ def _names(image, **kwargs):
 
 
 def _disk_error(image):
-    return f"Failed to parse RDB at {image}: Corrupt partition block at block 4"
+    return f"Failed to parse RDB at {image}: Corrupt partition block at block 3"
 
 
 def test_entries_open_beside_a_disk_rdb_that_fails(tmp_path):
@@ -78,7 +78,7 @@ def test_inspect_reports_the_disk_rdb_once(user_driver_dir, tmp_path, capsys):
     main(["inspect", str(image)])
     out = capsys.readouterr().out
     assert out.startswith("MBR + RDB coexistence detected (Parceiro-style)\n")
-    assert out.count("Corrupt partition block at block 4") == 1
+    assert out.count("Corrupt partition block at block 3") == 1
     assert f"\nRDB beside the MBR: Error: {_disk_error(image)}\n" in out
     assert "=== Amiga RDB in MBR partition [0] (offset: 200 sectors) ===" in out
     assert "=== Amiga RDB in MBR partition [1] (offset: 400 sectors) ===" in out
@@ -237,7 +237,7 @@ def test_launcher_names_an_entry_rdb_that_fails(tmp_path):
     assert fallback_reason == _entry_error(image)
 
     # With the disk's own RDB failing too, each RDB has its own line.
-    _corrupt(image, 4)
+    _corrupt(image, 3)
     listed = list_partitions(image)
     assert [p.name for p in listed.partitions] == ["PI0"]
     assert listed.fallback_reason == (
@@ -322,7 +322,7 @@ def test_launcher_mounts_a_damaged_name_by_its_number(tmp_path):
     # Without --partition the mount ends with the disk RDB's error, and no
     # name selects the entry's partition.
     image = _disk_rdb(tmp_path, ("PI0", None), 2)
-    _corrupt(image, 4)
+    _corrupt(image, 3)
     _damage_entry(image, tmp_path, 200)
 
     units, fallback_reason = _enumerate_mount_units(str(image))
@@ -340,7 +340,7 @@ def test_launcher_mounts_a_damaged_name_by_its_number(tmp_path):
 
 def test_launcher_mounts_a_damaged_name_beside_a_named_partition(tmp_path):
     image = _disk_rdb(tmp_path, ("PI0", None), 2)
-    _corrupt(image, 4)
+    _corrupt(image, 3)
     _damage_entry(image, tmp_path, 200, _make_rdb_parts(
         tmp_path, 512, [("PI0", DOS3), ("PI1", DOS3)]))
 
@@ -354,7 +354,7 @@ def test_launcher_skips_a_damaged_name_whose_number_selects_another(tmp_path):
     # Number 0 selects the first RDB with a partition 0, so entry 1's
     # partition has no selector.
     image = _disk_rdb(tmp_path, ("PI0", "PI1"), 2)
-    _corrupt(image, 4)
+    _corrupt(image, 3)
     _damage_entry(image, tmp_path, 200)
     _damage_entry(image, tmp_path, 400)
 
@@ -371,7 +371,7 @@ def test_launcher_counts_a_damaged_name_it_cannot_select(tmp_path, monkeypatch):
     # without --partition, whose own error reaches the summary, so every
     # partition is counted as not mounted.
     image = _disk_rdb(tmp_path, ("PI0", None), 2)
-    _corrupt(image, 4)
+    _corrupt(image, 3)
     _damage_entry(image, tmp_path, 200)
 
     def find_partition(*args, **kwargs):
