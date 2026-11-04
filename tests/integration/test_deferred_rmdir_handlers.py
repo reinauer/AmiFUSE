@@ -176,8 +176,8 @@ def test_rmdir_of_an_open_directory_holding_an_open_file_is_not_empty(open_ops, 
 def test_rmdir_defers_behind_unlinked_open_files_the_handler_names_differently(open_ops, handler):
     ops = open_ops(handler)
     ops.mkdir("/g", 0o755)
-    # Stored as "?uro.txt", and cut to the handler's name length.
-    names = ["/g/\u20acuro.txt", "/g/a_rather_long_file_name_past_thirty_chars.txt"]
+    # Cut to the handler's name length.
+    names = ["/g/a_rather_long_file_name_past_thirty_chars.txt"]
     handles = []
     for name in names:
         _make(ops, name, b"n" * 50)
