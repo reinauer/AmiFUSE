@@ -80,7 +80,7 @@ def test_keeps_a_recent_directory_of_an_ended_process(temp_dir):
     "other_123-k3x9",
 ])
 def test_leaves_other_names_alone(temp_dir, monkeypatch, name):
-    monkeypatch.setattr("amifuse.platform._pid_exists", lambda pid: False)
+    monkeypatch.setattr("amifuse.platform._temp_owner_gone", lambda pid: True)
     path = temp_dir / name
     path.mkdir()
     when = time.time() - 7200
@@ -92,7 +92,7 @@ def test_leaves_other_names_alone(temp_dir, monkeypatch, name):
 
 
 def test_leaves_a_file_of_a_directory_name_alone(temp_dir, monkeypatch):
-    monkeypatch.setattr("amifuse.platform._pid_exists", lambda pid: False)
+    monkeypatch.setattr("amifuse.platform._temp_owner_gone", lambda pid: True)
     path = temp_dir / "amifuse_123-k3x9"
     path.write_bytes(b"x")
     when = time.time() - 7200
@@ -107,7 +107,7 @@ def test_leaves_a_file_of_a_directory_name_alone(temp_dir, monkeypatch):
                     reason="a directory symlink needs a privilege on Windows")
 def test_leaves_what_a_link_of_a_directory_name_points_at(temp_dir, tmp_path,
                                                           monkeypatch):
-    monkeypatch.setattr("amifuse.platform._pid_exists", lambda pid: False)
+    monkeypatch.setattr("amifuse.platform._temp_owner_gone", lambda pid: True)
     target = tmp_path / "kept"
     target.mkdir()
     (target / "f").write_bytes(b"x")

@@ -434,7 +434,7 @@ def test_name_of_an_extraction_is_one_the_sweep_knows(monkeypatch, temp_dir,
         Path("work.hdf"), None, "DH0")
     assert path.name.startswith(f"amifuse_{os.getpid()}-")
     os.utime(path, (0, 0))
-    monkeypatch.setattr(platform, "_pid_exists", lambda pid: pid != os.getpid())
+    monkeypatch.setattr(platform, "_temp_owner_gone", lambda pid: pid == os.getpid())
 
     fuse_fs._remove_stale_drivers()
 
@@ -476,7 +476,7 @@ def test_sweep_keeps_a_recent_file_of_an_ended_process(temp_dir):
     "amifuse_1000000000-abc_50465303.handler",  # Beyond any PID in use.
 ])
 def test_sweep_leaves_other_names_alone(temp_dir, monkeypatch, name):
-    monkeypatch.setattr(platform, "_pid_exists", lambda pid: False)
+    monkeypatch.setattr(platform, "_temp_owner_gone", lambda pid: True)
     path = temp_dir / name
     path.write_bytes(HANDLER)
     os.utime(path, (0, 0))
