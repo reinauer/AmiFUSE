@@ -337,15 +337,15 @@ class TestDiskRDBMessages:
         assert error["details"] == {"partitions": [NAME]}
 
 
-ISO_ESC = "CD\x1b[2J"
-ISO_SHOWN = "CD\\x1b[2J"
+ISO_ESC = "CD\x1b[2J\x9b2J\xe9X"
+ISO_SHOWN = "CD\\x1b[2J\\x9b2J\\xe9X"
 
 
 def _iso(tmp_path):
     """An ISO 9660 image whose volume ID holds ESC [ 2 J."""
     pvd = bytearray(b" " * 2048)
     pvd[:6] = b"\x01CD001"
-    pvd[40:40 + len(ISO_ESC)] = ISO_ESC.encode("ascii")
+    pvd[40:40 + len(ISO_ESC)] = ISO_ESC.encode("latin-1")
     image = tmp_path / "esc.iso"
     image.write_bytes(bytes(16 * 2048) + bytes(pvd) + bytes(2 * 2048))
     return image
