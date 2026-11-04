@@ -314,6 +314,27 @@ def _prune_cache(cache: Dict, keep: Set = frozenset()) -> None:
             del cache[key]
 
 
+# How handlers compare names, as str.translate() tables. The bridge sends a
+# name in Latin-1 (_alloc_bstr), so a character's code is the byte the handler
+# compares, and any other character can't reach it (_FuseOperations).
+# str.lower() is not the rule: it folds \xc9 where a handler folds only a-z,
+# and the Kelvin sign to k. From looking up every byte in another spelling on
+# each handler: 0xFF does not fold onto 0xDF, nor 0xF7 onto 0xD7.
+_FOLD_ASCII = {c: c - 0x20 for c in range(0x61, 0x7B)}
+_FOLD_LATIN1 = {**_FOLD_ASCII,
+                **{c: c - 0x20 for c in range(0xE0, 0xFF) if c != 0xF7}}
+_NAME_FOLDS = {"ascii": _FOLD_ASCII, "latin1": _FOLD_LATIN1}
+
+# DOS types with the low byte masked off, for HandlerBridge.name_fold().
+_DOS_FAMILY = 0x444F5300  # "DOS\x"
+_PFS_FAMILIES = (0x50465300, 0x50445300)  # "PFS\x", "PDS\x"
+_SFS_FAMILY = 0x53465300  # "SFS\x"
+# struct fsRootBlock in SmartFilesystem: the block's id, and its bits field.
+_SFS_ROOT_ID = b"SFS\0"
+_SFS_ROOT_BITS_OFFSET = 20
+_SFS_ROOTBITS_CASESENSITIVE = 0x80
+
+
 def _renamed_path(path: str, old: str, new: str) -> Optional[str]:
     """Return what path becomes when old is renamed to new.
 
@@ -487,6 +508,13 @@ class HandlerBridge:
             handler_name = "DH0:"
         boot = ba.alloc_all(handler_seglist_baddr=seg_baddr, handler_seglist_bptr=seg_baddr, handler_name=handler_name)
         self._partition_index = boot["part"].num if boot.get("part") else 0
+        # What name_fold() goes by.
+        self._dos_type = adf_info.dos_type if adf_info else None
+        self._first_block = None
+        if boot.get("part") and not adf_info and not iso_info:
+            dos_env = boot["part"].part_blk.dos_env
+            self._dos_type = dos_env.dos_type
+            self._first_block = dos_env.low_cyl * dos_env.surfaces * dos_env.blk_per_trk
 
         # Log partition geometry for debugging.
         if boot.get("part") and debug:
@@ -1802,6 +1830,43 @@ class HandlerBridge:
         """
         return self._query_disk_info()[0]
 
+    def name_fold(self) -> Optional[str]:
+        """Return how the volume's handler folds a name's case.
+
+        A key of _NAME_FOLDS, or None for a volume whose names must match
+        exactly or whose rule is not known. A wrong fold would make two
+        files one, so a volume is folded only by a rule seen on its handler.
+
+        FastFileSystem folds by the disk's own type, which it reports in
+        id_DiskType and which an RDB partition's DOS type need not match:
+        a-z on DOS0 and DOS1, Latin-1 on DOS2 to DOS7. pfs3aio folds Latin-1,
+        and reports DOS3. SmartFilesystem folds Latin-1 unless the volume was
+        formatted case-sensitive, which its root block says. BFFS reports
+        DOS1 too, but its partition's own type keeps it exact: a UFS volume
+        from NetBSD can hold names that differ only in case.
+        """
+        dos_type = getattr(self, "_dos_type", None)
+        if dos_type is None:
+            return None
+        family = dos_type & 0xFFFFFF00
+        if family == _DOS_FAMILY:
+            disk_type = (self.get_disk_info() or {}).get("disk_type", 0)
+            if disk_type & 0xFFFFFF00 == _DOS_FAMILY:
+                dos_type = disk_type
+            variant = dos_type & 0xFF
+            return "ascii" if variant < 2 else "latin1" if variant < 8 else None
+        if family in _PFS_FAMILIES:
+            return "latin1"
+        if family == _SFS_FAMILY and self._first_block is not None:
+            try:
+                root = self.backend.read_blocks(self._first_block, 1)
+            except OSError:
+                return None
+            if (root[:len(_SFS_ROOT_ID)] == _SFS_ROOT_ID
+                    and not root[_SFS_ROOT_BITS_OFFSET] & _SFS_ROOTBITS_CASESENSITIVE):
+                return "latin1"
+        return None
+
     def _query_disk_info(self) -> Tuple[Optional[Dict], Optional[int]]:
         """Send ACTION_DISK_INFO and return (info, res2).
 
@@ -2837,6 +2902,12 @@ class AmigaFuseFS(_FuseOperations):
         # path -> the date utimens() set on an open file, sent at its last
         # release(). Guarded by _fh_lock.
         self._held_dates: Dict[str, float] = {}
+        # How the handler folds names (_state_path). Only a write mount keeps
+        # the state above, so the others send no packet to find out.
+        self._name_fold = None
+        if self.bridge._write_enabled:
+            name_fold = getattr(self.bridge, "name_fold", None)
+            self._name_fold = _NAME_FOLDS.get(name_fold() if name_fold else None)
         self._last_op_time = time.time()
         self._op_count = 0
         # Whether the bridge replies to timer.device requests while the
@@ -2918,6 +2989,46 @@ class AmigaFuseFS(_FuseOperations):
         if path == "/" or "/" not in path.lstrip("/"):
             return "/"
         return "/" + path.lstrip("/").rsplit("/", 1)[0]
+
+    def _folded(self, path: str) -> str:
+        """Return path with its case folded as the handler compares names."""
+        return path if self._name_fold is None else path.translate(self._name_fold)
+
+    def _state_path(self, path: str) -> str:
+        """Return path as the per-path state spells it.
+
+        Handlers find a name in any letter case, so a host program can reach
+        one object under several spellings, while pinned entries, open
+        handles, pending deletes and held dates are all kept under the path
+        they were first given. Each callback that takes a path, and has no
+        handle to name its object, starts here, so that an object or a
+        directory with state has one spelling and the rest of the code can
+        compare exact strings. The longest leading part of path that the
+        state knows takes the state's spelling; what follows stays as given.
+
+        The caller must not hold _fh_lock.
+        """
+        if self._name_fold is None:
+            return path
+        with self._cache_lock, self._fh_lock:
+            known = set(self._pinned_stats)
+            known.update(self._pending_deletes, self._pending_dir_deletes,
+                         self._held_dates)
+            known.update(v.get("path") for v in self._fh_cache.values())
+        known.discard(None)
+        if not known or path in known:
+            return path
+        spellings = {}
+        for spelled in known:
+            while len(spelled) > 1:
+                spellings[self._folded(spelled)] = spelled
+                spelled = spelled.rsplit("/", 1)[0]
+        lead = self._folded(path)
+        while len(lead) > 1:
+            if lead in spellings:
+                return spellings[lead] + path[len(lead):]
+            lead = lead.rsplit("/", 1)[0]
+        return path
 
     def _get_cached_stat(self, path: str) -> Optional[Dict]:
         """Return cached stat result if still valid, else None.
@@ -3088,6 +3199,7 @@ class AmigaFuseFS(_FuseOperations):
                 entry = self._fh_cache.get(fh)
                 open_file = bool(entry and entry.get("path") and "fh_addr" in entry)
                 path = _handle_path(entry, path)
+        path = self._state_path(path)
         # Reject OS special files immediately without calling handler
         if self._is_platform_special(path):
             self._track_op("getattr", path, cached=True)
@@ -3234,19 +3346,24 @@ class AmigaFuseFS(_FuseOperations):
         return None if cached is None else cached["st_size"]
 
     def _filter_pending_deletes(self, path: str, entries: List[str]) -> List[str]:
-        """Drop directory entries whose full path has a pending (deferred) delete."""
+        """Drop directory entries whose full path has a pending (deferred) delete.
+
+        The entries are spelled as the handler stores them, so they are
+        compared as it compares names.
+        """
         with self._fh_lock:
             if not self._pending_deletes:
                 return entries
+            pending = {self._folded(p) for p in self._pending_deletes}
             return [
                 e for e in entries
-                if e in (".", "..") or (
-                    (path.rstrip("/") + "/" + e if path != "/" else "/" + e)
-                    not in self._pending_deletes
-                )
+                if e in (".", "..") or self._folded(
+                    path.rstrip("/") + "/" + e if path != "/" else "/" + e
+                ) not in pending
             ]
 
     def opendir(self, path):
+        path = self._state_path(path)
         with self._fh_lock:
             handle = self._next_fh
             self._next_fh += 1
@@ -3309,6 +3426,7 @@ class AmigaFuseFS(_FuseOperations):
 
     def readdir(self, path, fh):
         self._check_handler_alive()
+        path = self._state_path(path)
         # Check directory cache first
         with self._cache_lock:
             if path in self._dir_cache:
@@ -3364,6 +3482,7 @@ class AmigaFuseFS(_FuseOperations):
         self._check_handler_alive()
         if not self.bridge._write_enabled and (flags & (os.O_WRONLY | os.O_RDWR)):
             raise FuseOSError(errno.EROFS)
+        path = self._state_path(path)
         # Handle virtual Icon\r file - return a special handle
         if self._icons_enabled and self._is_icon_file(path):
             parent_dir = self._get_parent_dir(path)
@@ -3775,6 +3894,7 @@ class AmigaFuseFS(_FuseOperations):
                 raise FuseOSError(errno.EROFS)
             if self._is_platform_special(path):
                 raise FuseOSError(errno.ENOENT)
+            path = self._state_path(path)
             opened = self.bridge.open_file(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
             if opened is None:
                 self._log_op("create", path, "FAILED: open_file returned None")
@@ -3814,6 +3934,7 @@ class AmigaFuseFS(_FuseOperations):
         self._check_handler_alive()
         if not self.bridge._write_enabled:
             raise FuseOSError(errno.EROFS)
+        path = self._state_path(path)
         if self._winfsp:
             # WinFsp passes the name the deleting file handle was opened
             # under, also after a rename through that handle (#290), so the
@@ -3825,7 +3946,8 @@ class AmigaFuseFS(_FuseOperations):
             with self._fh_lock:
                 targets = {
                     v.get("path") for v in self._fh_cache.values()
-                    if "fh_addr" in v and v.get("opened_as", v.get("path")) == path
+                    if "fh_addr" in v and self._folded(
+                        v.get("opened_as", v.get("path")) or "") == self._folded(path)
                 }
             if len(targets) == 1 and path not in targets:
                 target = targets.pop()
@@ -3879,6 +4001,7 @@ class AmigaFuseFS(_FuseOperations):
         self._check_handler_alive()
         if not self.bridge._write_enabled:
             raise FuseOSError(errno.EROFS)
+        path = self._state_path(path)
         dir_path, name = self._split_path(path)
         if not name:
             raise FuseOSError(errno.EINVAL)
@@ -4018,6 +4141,7 @@ class AmigaFuseFS(_FuseOperations):
         self._check_handler_alive()
         if not self.bridge._write_enabled:
             raise FuseOSError(errno.EROFS)
+        path = self._state_path(path)
         dir_path, name = self._split_path(path)
         if not name:
             raise FuseOSError(errno.EINVAL)
@@ -4044,7 +4168,7 @@ class AmigaFuseFS(_FuseOperations):
         if not self.bridge._write_enabled:
             raise FuseOSError(errno.EROFS)
         _, src_name = self._split_path(old)
-        _, dst_name = self._split_path(new)
+        dst_dir, dst_name = self._split_path(new)
         if not src_name or not dst_name:
             raise FuseOSError(errno.EINVAL)
         # Two spellings of one name reach here equal: to rename(2) that is
@@ -4052,6 +4176,9 @@ class AmigaFuseFS(_FuseOperations):
         if old == new:
             self.getattr(old)
             return 0
+        old = self._state_path(old)
+        # The new name keeps its own spelling: a rename can change the case.
+        new = self._state_path(dst_dir).rstrip("/") + "/" + dst_name
         res1, res2 = self._rename_object(old, new)
         # AmigaDOS renames onto no existing name, while rename(2) replaces
         # one, and editors save by renaming a new file over the old one.
@@ -4081,8 +4208,10 @@ class AmigaFuseFS(_FuseOperations):
         # The mount hides these names, so the host can't mean to replace one.
         if self._is_platform_special(new):
             raise FuseOSError(errno.EEXIST)
+        # new as the state spells the object there, which step 1 moves.
+        replaced = self._state_path(new)
         src = self._examine(old)
-        dst = self._examine(new)
+        dst = self._examine(replaced)
         if src is None or dst is None:
             # Neither examined nor pinned: gone, or held on an exclusive lock.
             raise FuseOSError(errno.ENOENT if src is None else errno.EBUSY)
@@ -4093,15 +4222,15 @@ class AmigaFuseFS(_FuseOperations):
             raise FuseOSError(errno.EISDIR)
         if src_is_dir and not dst_is_dir:
             raise FuseOSError(errno.ENOTDIR)
-        if dst_is_dir and self.bridge.list_dir_path(new):
+        if dst_is_dir and self.bridge.list_dir_path(replaced):
             raise FuseOSError(errno.ENOTEMPTY)
         # Put back under the name it had, which may differ from new in case,
         # or be new cut to the volume's name limit.
         on_disk = dst["name"]
-        orig = new if on_disk is None else dst_dir.rstrip("/") + "/" + on_disk
+        orig = replaced if on_disk is None else dst_dir.rstrip("/") + "/" + on_disk
         for _ in range(8):
             temp = dst_dir.rstrip("/") + f"/.amifuse-{os.urandom(4).hex()}"
-            res1, res2 = self._rename_object(new, temp)
+            res1, res2 = self._rename_object(replaced, temp)
             if res1 or res2 != ERROR_OBJECT_EXISTS:
                 break
         if res1 == 0:
@@ -4199,6 +4328,9 @@ class AmigaFuseFS(_FuseOperations):
                 self.bridge.free_lock(l)
             for l in reversed(dst_locks):
                 self.bridge.free_lock(l)
+        # Another spelling of what the state already has: nothing moves.
+        if old == new:
+            return res1, res2
         # Handles of the renamed file itself, now in another directory.
         moved_out = []
         with self._cache_lock:
@@ -4338,6 +4470,7 @@ class AmigaFuseFS(_FuseOperations):
         if path == "/" or (self._icon_handler and (
                 self._is_icon_file(path) or self._is_volume_icon_file(path))):
             return 0
+        path = self._state_path(path)
         mtime = time.time() if times is None else times[1]
         with self._fh_lock:
             target = self._renamed_open_file(path)
@@ -4377,7 +4510,8 @@ class AmigaFuseFS(_FuseOperations):
         """
         moved = {
             v.get("path") for v in self._fh_cache.values()
-            if not v.get("closed") and v.get("opened_as") == path != v.get("path")
+            if not v.get("closed") and v.get("path") != path
+            and self._folded(v.get("opened_as") or "") == self._folded(path)
         }
         if not moved:
             return path

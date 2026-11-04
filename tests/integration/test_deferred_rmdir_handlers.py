@@ -228,11 +228,12 @@ def test_deferred_delete_refused_at_release_leaves_the_file_visible(open_ops, ha
     ops.mkdir("/d", 0o755)
     _make(ops, "/d/x", b"x" * 100)
     h1 = ops.open("/d/x", os.O_RDONLY)
-    h2 = ops.open("/d/X", os.O_RDONLY)  # the same file, in another letter case
+    # A lock on the file that the mount does not know of.
+    lock, _, _ = ops.bridge.locate_path("/d/x")
     assert ops.unlink("/d/x") == 0
 
-    ops.release("/d/x", h1)  # the handle on /d/X keeps the file in use
-    ops.release("/d/X", h2)
+    ops.release("/d/x", h1)  # the lock keeps the file in use
+    ops.bridge.free_lock(lock)
 
     assert ops._pending_deletes == set()
     assert _listed(ops, "/d") == ["x"]

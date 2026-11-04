@@ -15,7 +15,7 @@ def test_truncated_partition_warning_uses_stderr(tmp_path, monkeypatch, capsys):
     # contaminating JSON or extracted file bytes on stdout.
     backend = Mock(block_size=512)
     backend.blkdev = SimpleNamespace(img_file=SimpleNamespace(size=1024))
-    env = SimpleNamespace(low_cyl=1, high_cyl=3, surfaces=1, blk_per_trk=1)
+    env = SimpleNamespace(low_cyl=1, high_cyl=3, surfaces=1, blk_per_trk=1, dos_type=0)
     part = SimpleNamespace(num=0, part_blk=SimpleNamespace(dos_env=env))
     bootstrap = Mock()
     bootstrap.alloc_all.return_value = {"part": part}
