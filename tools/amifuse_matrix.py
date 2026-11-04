@@ -17,10 +17,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
-from fixture_paths import DEFAULT_HDF_URL, DOWNLOADED_DIR, DRIVERS_DIR, FIXTURE_ROOT
+from fixture_paths import DOWNLOADED_DIR, DRIVERS_DIR, FIXTURE_ROOT
 from fixture_paths import GENERATED_DIR, NETBSD_AMIGA_92_URL, ODFS_DRIVER
 from fixture_paths import READONLY_DIR
 from fixture_paths import ensure_downloaded_fixture
+from generated_ffs import BUNDLED_FFS, make_adf, make_rdb
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 AMITOOLS_ROOT = REPO_ROOT / "amitools"
@@ -282,39 +283,36 @@ FIXTURES: Dict[str, Fixture] = {
     "ffs": Fixture(
         key="ffs",
         fs_name="FFS",
-        image=READONLY_DIR / "Default.hdf",
-        driver=DRIVERS_DIR / "FastFileSystem",
+        image=GENERATED_DIR / "bundled_ffs_seed.hdf",
+        driver=BUNDLED_FFS,
         partition="QDH0",
         mode="ro",
         image_kind="rdb-hdf",
-        image_size_mb=512,
-        download_url=DEFAULT_HDF_URL,
+        image_size_mb=16,
     ),
     "ffs-rw": Fixture(
         key="ffs-rw",
         fs_name="FFS rw",
         image=GENERATED_DIR / "ffs_rw.hdf",
-        driver=DRIVERS_DIR / "FastFileSystem",
+        driver=BUNDLED_FFS,
         partition="QDH0",
         mode="rw",
         image_kind="rdb-hdf",
-        image_size_mb=512,
-        seed_image=READONLY_DIR / "Default.hdf",
+        image_size_mb=16,
+        seed_image=GENERATED_DIR / "bundled_ffs_seed.hdf",
         default_run=False,
-        seed_download_url=DEFAULT_HDF_URL,
     ),
     "ffs-load": Fixture(
         key="ffs-load",
         fs_name="FFS load",
         image=GENERATED_DIR / "ffs_load.hdf",
-        driver=DRIVERS_DIR / "FastFileSystem",
+        driver=BUNDLED_FFS,
         partition="QDH0",
         mode="load",
         image_kind="rdb-hdf",
-        image_size_mb=512,
-        seed_image=READONLY_DIR / "Default.hdf",
+        image_size_mb=16,
+        seed_image=GENERATED_DIR / "bundled_ffs_seed.hdf",
         default_run=False,
-        seed_download_url=DEFAULT_HDF_URL,
         load_file_count=LOAD_FILE_COUNT,
         load_file_size_bytes=LOAD_FILE_SIZE_BYTES,
         load_read_count=LOAD_READ_COUNT,
@@ -324,14 +322,13 @@ FIXTURES: Dict[str, Fixture] = {
         key="ffs-meta",
         fs_name="FFS meta",
         image=GENERATED_DIR / "ffs_meta.hdf",
-        driver=DRIVERS_DIR / "FastFileSystem",
+        driver=BUNDLED_FFS,
         partition="QDH0",
         mode="meta",
         image_kind="rdb-hdf",
-        image_size_mb=512,
-        seed_image=READONLY_DIR / "Default.hdf",
+        image_size_mb=16,
+        seed_image=GENERATED_DIR / "bundled_ffs_seed.hdf",
         default_run=False,
-        seed_download_url=DEFAULT_HDF_URL,
         meta_dir_count=META_DIR_COUNT,
         meta_files_per_dir=META_FILES_PER_DIR,
         meta_file_size_bytes=META_FILE_SIZE_BYTES,
@@ -340,7 +337,7 @@ FIXTURES: Dict[str, Fixture] = {
         key="ffs-fmt",
         fs_name="FFS fmt",
         image=GENERATED_DIR / "ffs_fmt.hdf",
-        driver=DRIVERS_DIR / "FastFileSystem",
+        driver=BUNDLED_FFS,
         partition="FDH0",
         mode="fmt",
         image_kind="rdb-hdf",
@@ -363,8 +360,8 @@ FIXTURES: Dict[str, Fixture] = {
     "ofs": Fixture(
         key="ofs",
         fs_name="OFS",
-        image=READONLY_DIR / "ofs.adf",
-        driver=DRIVERS_DIR / "FastFileSystem",
+        image=GENERATED_DIR / "bundled_ofs_seed.adf",
+        driver=BUNDLED_FFS,
         partition=None,
         mode="ro",
         image_kind="adf",
@@ -393,24 +390,24 @@ FIXTURES: Dict[str, Fixture] = {
         key="ofs-rw",
         fs_name="OFS rw",
         image=GENERATED_DIR / "ofs_rw.adf",
-        driver=DRIVERS_DIR / "FastFileSystem",
+        driver=BUNDLED_FFS,
         partition=None,
         mode="rw",
         image_kind="adf",
         image_size_mb=1,
-        seed_image=READONLY_DIR / "ofs.adf",
+        seed_image=GENERATED_DIR / "bundled_ofs_seed.adf",
         default_run=False,
     ),
     "ofs-meta": Fixture(
         key="ofs-meta",
         fs_name="OFS meta",
         image=GENERATED_DIR / "ofs_meta.adf",
-        driver=DRIVERS_DIR / "FastFileSystem",
+        driver=BUNDLED_FFS,
         partition=None,
         mode="meta",
         image_kind="adf",
         image_size_mb=1,
-        seed_image=READONLY_DIR / "ofs.adf",
+        seed_image=GENERATED_DIR / "bundled_ofs_seed.adf",
         default_run=False,
         meta_dir_count=META_DIR_COUNT,
         meta_files_per_dir=META_FILES_PER_DIR,
@@ -420,7 +417,7 @@ FIXTURES: Dict[str, Fixture] = {
         key="ofs-fmt",
         fs_name="OFS fmt",
         image=GENERATED_DIR / "ofs_fmt.hdf",
-        driver=DRIVERS_DIR / "FastFileSystem",
+        driver=BUNDLED_FFS,
         partition="ODH0",
         mode="fmt",
         image_kind="rdb-hdf",
@@ -1561,6 +1558,10 @@ def _run_fmt_fixture(
 
 def _run_fixture_worker(fixture_key: str):
     fixture = FIXTURES[fixture_key]
+    if fixture_key.startswith(("ffs", "ofs")) and fixture.mode != "fmt":
+        _ensure_import_path()
+        seed = fixture.seed_image or fixture.image
+        (make_adf if fixture_key.startswith("ofs") else make_rdb)(seed)
     if fixture.download_url:
         ensure_downloaded_fixture(
             fixture.image, fixture.download_url, fixture.fs_name

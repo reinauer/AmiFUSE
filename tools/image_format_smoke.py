@@ -15,6 +15,8 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
 from fixture_paths import DOWNLOADED_DIR, DRIVERS_DIR, FIXTURE_ROOT, READONLY_DIR
+from fixture_paths import GENERATED_DIR
+from generated_ffs import BUNDLED_FFS, make_adf, make_emu68
 from fixture_paths import PARCEIRO_FULL_URL, ensure_downloaded_fixture
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -61,8 +63,8 @@ CASES: List[FormatCase] = [
     FormatCase(
         key="adf-ofs",
         label="ADF OFS",
-        image=READONLY_DIR / "ofs.adf",
-        driver=DRIVERS_DIR / "FastFileSystem",
+        image=GENERATED_DIR / "format_ofs.adf",
+        driver=BUNDLED_FFS,
         partition=None,
         expected_kind="adf",
         expected_scheme=None,
@@ -94,13 +96,13 @@ CASES: List[FormatCase] = [
     FormatCase(
         key="emu68-ffs",
         label="Emu68 MBR+RDB FFS",
-        image=READONLY_DIR / "emu68k.hdf",
-        driver=None,
-        partition="UDH0",
+        image=GENERATED_DIR / "format_emu68_ffs.hdf",
+        driver=BUNDLED_FFS,
+        partition="QDH0",
         expected_kind="rdb",
         expected_scheme="emu68",
-        expected_root=("AWeb_APL",),
-        read_path="/AWeb_APL/README",
+        expected_root=("Prefs", "README.txt"),
+        read_path="/README.txt",
     ),
     FormatCase(
         key="parceiro-pfs3",
@@ -230,6 +232,10 @@ def _run_case(case: FormatCase) -> FormatResult:
         if case.download_url:
             ensure_downloaded_fixture(case.image, case.download_url, case.label)
         fuse_fs, detect_adf, detect_iso, open_rdisk = _load_runtime()
+        if case.key == "adf-ofs":
+            make_adf(case.image)
+        elif case.key == "emu68-ffs":
+            make_emu68(case.image)
         inspect_info = _inspect_case(case, detect_adf, detect_iso, open_rdisk)
         mount_info = _mount_case(case, fuse_fs)
         detail = (
