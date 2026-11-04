@@ -236,6 +236,14 @@ _RENAME_ERRNOS = {
     ERROR_DELETE_PROTECTED: errno.EACCES,
 }
 
+# Deletion keeps busy/non-empty handling in the callbacks, including their
+# deferred-delete retries. Other refusals use the same file/disk errors.
+_DELETE_ERRNOS = {
+    **_WRITE_ERRNOS,
+    ERROR_OBJECT_NOT_FOUND: errno.ENOENT,
+    ERROR_DELETE_PROTECTED: errno.EACCES,
+}
+
 # AmigaDOS error codes from a failed ACTION_SET_DATE, and the errno
 # utimens() reports for each.
 _SET_DATE_ERRNOS = {
@@ -4003,7 +4011,7 @@ class AmigaFuseFS(_FuseOperations):
                                 self._stat_cache.pop(path, None)
                             self._dir_cache.pop(dir_path, None)
                         return 0
-                raise FuseOSError(errno.EIO)
+                raise FuseOSError(_DELETE_ERRNOS.get(res2, errno.EIO))
             with self._cache_lock:
                 self._stat_cache.pop(path, None)
                 self._dir_cache.pop(dir_path, None)
@@ -4034,8 +4042,7 @@ class AmigaFuseFS(_FuseOperations):
         self._log_op("rmdir", path, f"delete_dir_atomic res1={res1} res2={res2}")
         if res1 == 0:
             if res2 not in (202, 216):
-                # Unrecognized error
-                raise FuseOSError(errno.EIO)
+                raise FuseOSError(_DELETE_ERRNOS.get(res2, errno.EIO))
             # OBJECT_IN_USE: pfs3aio refuses while a file inside is open,
             # even an unlinked one, and answers 202 before 216.
             # DIRECTORY_NOT_EMPTY: the directory holds entries, an unlinked
