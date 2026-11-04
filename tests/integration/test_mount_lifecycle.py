@@ -10,6 +10,8 @@ Marker: @pytest.mark.fuse (NOT @pytest.mark.integration -- avoids machine68k gat
 import hashlib
 import json
 import os
+import shutil
+from pathlib import Path
 import subprocess
 import sys
 import time
@@ -339,3 +341,47 @@ def test_windows_teardown_no_file_locks(mount_image, pfs3_image, pfs3_driver):
             f"Image file {image_path} is still locked after unmount -- "
             f"stale file handles detected (BW7 regression)"
         )
+
+
+@pytest.mark.skipif(sys.platform.startswith("win"), reason="Unix daemon mounts")
+@pytest.mark.parametrize("name", ["relative-mount", "Games --write"])
+def test_daemon_mount_record_from_another_working_directory(
+        fuse_available, pfs3_image, pfs3_driver, tmp_path, name):
+    """A real daemon keeps its absolute mount identity after changing cwd."""
+    launch = tmp_path / "launch"
+    query = tmp_path / "query"
+    launch.mkdir()
+    query.mkdir()
+    image = launch / "disk.hdf"
+    shutil.copy2(pfs3_image, image)
+    mountpoint = launch / name
+    mountpoint.mkdir()
+    env = os.environ.copy()
+    root = str(Path(__file__).resolve().parents[2])
+    env["PYTHONPATH"] = root + os.pathsep + env.get("PYTHONPATH", "")
+
+    def run(*args, cwd=query):
+        return subprocess.run(
+            [sys.executable, "-m", "amifuse", *args], cwd=cwd, env=env,
+            capture_output=True, text=True, timeout=45, check=False)
+
+    try:
+        result = run("mount", "disk.hdf", "--driver", str(pfs3_driver),
+                     "--mountpoint", name, cwd=launch)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert os.path.ismount(mountpoint)
+        result = run("status", "--json")
+        assert result.returncode == 0, result.stdout + result.stderr
+        matching = [m for m in json.loads(result.stdout)["mounts"]
+                    if m.get("mountpoint") == str(mountpoint)]
+        assert len(matching) == 1, result.stdout
+        assert matching[0]["image"] == str(image)
+        result = run("unmount", str(mountpoint))
+        assert result.returncode == 0, result.stdout + result.stderr
+        deadline = time.monotonic() + 10
+        while os.path.ismount(mountpoint) and time.monotonic() < deadline:
+            time.sleep(0.1)
+        assert not os.path.ismount(mountpoint)
+    finally:
+        if os.path.ismount(mountpoint):
+            run("unmount", str(mountpoint))

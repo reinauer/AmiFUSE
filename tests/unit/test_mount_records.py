@@ -60,7 +60,7 @@ def mount_process():
 
 def _record(directory, pid, mountpoint, image="/Users/a/disk.hdf"):
     (directory / f"{pid}.json").write_text(json.dumps(
-        {"pid": pid, "mountpoint": mountpoint, "image": image, "partition": None}))
+        {"pid": pid, "mountpoint": mountpoint, "image": image, "partition": None, "created_at": time.time()}))
 
 
 def _discovered(pid):
@@ -158,7 +158,9 @@ def test_a_record_written_can_be_read_and_removed(record_dir):
 
     plat.write_mount_record(record)
 
-    assert plat._read_mount_records() == {os.getpid(): dict(record, pid=os.getpid())}
+    saved = plat._read_mount_records()[os.getpid()]
+    assert abs(saved.pop("created_at") - time.time()) < 5
+    assert saved == dict(record, pid=os.getpid())
     plat.remove_mount_record()
     assert plat._read_mount_records() == {}
     plat.remove_mount_record()  # nothing left to remove
@@ -242,6 +244,7 @@ def test_a_mount_records_itself_while_up_with_absolute_paths(mount, record_dir, 
     mount(Path("disk.adf"), Path("mnt"),
           lambda operations: seen.update(plat._read_mount_records()))
 
+    assert abs(seen[os.getpid()].pop("created_at") - time.time()) < 5
     assert seen == {os.getpid(): {
         "pid": os.getpid(),
         "mountpoint": os.path.join(cwd, "mnt"),
@@ -260,3 +263,18 @@ def test_a_mount_that_ends_with_an_error_leaves_no_record(mount, record_dir):
         mount(Path("/a/disk.adf"), Path("/a/mnt"), during)
 
     assert plat._read_mount_records() == {}
+
+
+@pytest.mark.parametrize("created,expected", [
+    (900, "/new"), (989, "/old"), (990, "/old"),
+    (None, "/new"), ("invalid", "/new"), (float("nan"), "/new"),
+])
+def test_record_from_previous_pid_owner_is_ignored(monkeypatch, created, expected):
+    monkeypatch.setattr(plat.time, "time", lambda: 1000)
+    monkeypatch.setattr(plat, "_read_mount_records", lambda: {
+        123: {"mountpoint": "/old", "created_at": created}})
+    mounts = [{"pid": 123, "mountpoint": "/new", "uptime_seconds": 10}]
+
+    plat._apply_mount_records(mounts)
+
+    assert mounts[0]["mountpoint"] == expected

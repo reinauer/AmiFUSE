@@ -1028,7 +1028,7 @@ def write_mount_record(record: dict) -> None:
                 (directory / f"{other}.json").unlink(missing_ok=True)
         temp = directory / f"{pid}.tmp"
         with open(temp, "w", encoding="utf-8") as stream:
-            json.dump(dict(record, pid=pid), stream)
+            json.dump(dict(record, pid=pid, created_at=time.time()), stream)
         os.replace(temp, directory / f"{pid}.json")
     except OSError as exc:
         logger.debug("Could not write a mount record: %s", exc)
@@ -1051,6 +1051,14 @@ def _apply_mount_records(mounts) -> None:
     for mount in mounts:
         record = records.get(mount["pid"])
         if record is not None:
+            created = record.get("created_at")
+            uptime = mount.get("uptime_seconds")
+            # ps rounds process start times to seconds. Allow two seconds
+            # of rounding, but never apply a previous owner's record.
+            if not isinstance(created, (int, float)):
+                continue
+            if uptime is not None and not created >= time.time() - uptime - 2:
+                continue
             mount["mountpoint"] = record["mountpoint"]
             mount["image"] = record.get("image") or mount.get("image")
 
