@@ -932,7 +932,7 @@ def _locate_rdisk(image, block_size, mbr_partition_index, mbr_info, open_at):
     if rdb_block is not None and parse_direct:
         try:
             rdisk = _parse_rdb(blkdev, rdb_block)
-        except IOError as e:
+        except RDBContentError as e:
             error = DiskRDBError if _amiga_partitions(mbr_info) else IOError
             raise error(f"Failed to parse RDB at {image}: {e}")
 
@@ -1589,10 +1589,14 @@ def open_each_rdb(
                                 mbr_partition_index=index)
         except IOError as e:
             if index is None:
-                # Any other failure of the default open is an entry's, or
-                # comes again in each entry's turn.
+                # Content failures in entries recur in their own turns.
+                # A device error may instead belong to the disk's RDB,
+                # which selected entry opens deliberately do not parse.
                 if isinstance(e, DiskRDBError):
                     disk_rdb = True
+                    yield index, e
+                elif not isinstance(e, (RDBContentError, EntryRDBError,
+                                        NoEntryRDBError)) and e.errno is not None:
                     yield index, e
             elif not (disk_rdb and isinstance(e, NoEntryRDBError)):
                 # With no RDB beside the MBR every entry gives its error;
