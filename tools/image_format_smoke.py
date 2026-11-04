@@ -13,6 +13,7 @@ import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
+from unittest.mock import patch
 
 from fixture_paths import DOWNLOADED_DIR, DRIVERS_DIR, FIXTURE_ROOT, READONLY_DIR
 from fixture_paths import GENERATED_DIR
@@ -208,11 +209,15 @@ def _mount_case(case: FormatCase, fuse_fs):
         )
         fs.bridge.close()
 
-    fuse_fs.FUSE = _fake_mount
+    from amifuse import platform
     mountpoint = REPO_ROOT / "run" / "image-format-smoke" / case.key
     mountpoint.parent.mkdir(parents=True, exist_ok=True)
 
-    with open(os.devnull, "w") as null_out, open(os.devnull, "w") as null_err:
+    # This tool exercises mount setup and handler callbacks without a
+    # kernel mount; the host FUSE driver need not be installed.
+    with (patch.object(fuse_fs, "FUSE", _fake_mount),
+          patch.object(platform, "check_fuse_available", return_value=None),
+          open(os.devnull, "w") as null_out, open(os.devnull, "w") as null_err):
         with contextlib.redirect_stdout(null_out), contextlib.redirect_stderr(null_err):
             fuse_fs.mount_fuse(
                 image=case.image,

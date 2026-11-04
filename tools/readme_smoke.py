@@ -16,6 +16,7 @@ import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional
+from unittest.mock import patch
 
 from fixture_paths import DRIVERS_DIR, FIXTURE_ROOT, GENERATED_DIR
 from fixture_paths import READONLY_DIR
@@ -91,12 +92,15 @@ def _mount_example_runner() -> Callable:
         fs.bridge.close()
         return invocation
 
-    module.FUSE = _fake_fuse
+    from amifuse import platform
 
     def run(name: str, command: str, check: Callable[[Dict[str, object], object], str],
             context=None, **kwargs) -> ExampleResult:
         try:
-            with context or contextlib.nullcontext():
+            # The callback runner never mounts through the host driver.
+            with (context or contextlib.nullcontext(),
+                  patch.object(module, "FUSE", _fake_fuse),
+                  patch.object(platform, "check_fuse_available", return_value=None)):
                 with open(os.devnull, "w") as null_out, open(os.devnull, "w") as null_err:
                     with contextlib.redirect_stdout(null_out), contextlib.redirect_stderr(null_err):
                         module.mount_fuse(**kwargs)
