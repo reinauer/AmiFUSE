@@ -19,7 +19,7 @@ What it relies on in amitools:
 - WaitPkt() takes the packet from the pr_MsgPort of ExecBase->ThisTask,
   a port the port manager knows, and fails when it is empty.
 - CreateNewProc() makes the child's process through
-  create_child_process(ctx, name, **kw_args) (branch amifuse-0.6.0).
+  create_child_process(ctx, name, **kw_args) (amitools 0.9.0 or later).
 - exec_lib.signal_func.wait() suspends the current task until one of the
   signals is set, and takes the signals it returns.
 """

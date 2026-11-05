@@ -1,4 +1,4 @@
 [submodule "amitools"]
 	path = amitools
-	url = ../amitools.git
-	branch = amifuse-0.6.0
+	url = https://github.com/cnvogelg/amitools.git
+	branch = main

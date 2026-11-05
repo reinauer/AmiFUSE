@@ -3,9 +3,9 @@
 Status: implemented by
 [amitools PR #2](https://github.com/reinauer/amitools/pull/2) (merged
 2026-09-06, first published as `amitools-amifuse 0.8.0.post7`) and AmiFUSE
-PR #55 (merged 2026-09-16). AmiFUSE needs `amitools-amifuse 0.8.0.post8`
-or later for the shared Windows image-buffering fix; `pyproject.toml`
-declares the current minimum. This records the implemented boundary and
+PR #55 (merged 2026-09-16). These changes, including the shared Windows
+image-buffering fix, are included in upstream `amitools[vamos]>=0.9.0`,
+the current minimum declared in `pyproject.toml`. This records the implemented boundary and
 policies, replacing the staged migration plan formerly in `API_CLEANUP.md`.
 
 ## Ownership and integration

@@ -12,7 +12,7 @@ inside the wait, with the signals Wait() returns. Child processes it
 creates with CreateNewProc() are scheduler tasks too and run in the same
 run().
 
-What it relies on in amitools (branch amifuse-0.6.0):
+What it relies on in amitools 0.9.0 or later:
 - Scheduler.run_until_idle(max_cycles) runs the ready tasks and returns
   RunResult.IDLE once all wait, BUSY when the budget is spent, DONE when
   none is left; a task woken with set_signal() from outside runs on at the
