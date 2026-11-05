@@ -604,7 +604,7 @@ if ($devMode) {
     # package-scoped form (suffix canonicalized to "amifuse") targets ONLY our
     # package -- the unscoped var would force this version onto any other
     # setuptools_scm-based package built from sdist in the same isolated build
-    # env (e.g. transitive amitools-amifuse). Derive the version the way
+    # env (e.g. transitive amitools). Derive the version the way
     # setuptools_scm would (guess-next-dev, no local part): the tag itself on a
     # clean tagged commit, else the next patch release as .devN, N commits past
     # the tag (v0.6.0-30-g1234abc -> 0.6.1.dev30; a dirty tree on the tag ->

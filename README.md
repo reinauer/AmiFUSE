@@ -285,10 +285,11 @@ python -m pip install -e './amitools[vamos]'
 python -m pip install -e '.[windows]'
 ```
 
-The published `amitools-amifuse 0.8.0.post12` dependency includes
+The upstream `amitools[vamos]>=0.9.0` dependency includes
 physical-disk support, partition range locks, and the scheduler runtime,
-and uses upstream machine68k 0.5.0 or newer. The source installation
-above is only needed to test unreleased amitools changes.
+and installs machine68k 0.5.0 or newer and greenlet. Plain
+`pip install amitools` omits these optional vamos dependencies. The source
+installation above is only needed to test unreleased amitools changes.
 
 ### Formatting
 

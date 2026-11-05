@@ -2,13 +2,14 @@
 
 ## Windows physical-disk release checks
 
-The amitools submodule tracks the `amifuse-0.6.0` branch: upstream
-amitools, which has the physical-disk support and partition range locks,
-plus the scheduler changes AmiFUSE needs and the fork's packaging.
+The amitools submodule is pinned to upstream v0.9.0, which includes the
+physical-disk support, partition range locks, and scheduler changes
+AmiFUSE needs.
 
 The installed-wheel CI job checks ordinary-image commands with the
-declared minimum `amitools-amifuse 0.8.0.post12`, the release built from
-that branch.
+declared minimum `amitools[vamos]==0.9.0`. It installs the AmiFUSE wheel
+with dependency resolution enabled, checks the resulting dependencies,
+and exercises the installed package outside the checkout.
 
 Windows CI exercises named locks and unmount events across real processes
 without opening a physical disk. The mount persistence test requires a

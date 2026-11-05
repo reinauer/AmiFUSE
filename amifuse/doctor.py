@@ -45,7 +45,7 @@ def run_checks() -> List[CheckResult]:
     except ImportError:
         results.append(CheckResult(
             "amitools", "error", "amitools is not installed",
-            fixable=True, fix_description="pip install amitools-amifuse[vamos]",
+            fixable=True, fix_description='pip install "amitools[vamos]>=0.9.0"',
         ))
 
     # 3. machine68k (subprocess isolation -- segfaults can kill the process)
