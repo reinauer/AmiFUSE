@@ -13,7 +13,7 @@ pytestmark = [pytest.mark.fuse,
               pytest.mark.skipif(sys.platform != "win32", reason="WinFsp")]
 
 
-def test_directory_mount_and_unmount_from_another_directory(tmp_path):
+def test_directory_mount_and_unmount_from_another_directory(tmp_path, fuse_available):
     image = _seed_adf(tmp_path, "DOS3")
     mountpoint = tmp_path / "mount"
     elsewhere = tmp_path / "elsewhere"
