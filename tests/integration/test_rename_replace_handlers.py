@@ -424,3 +424,38 @@ def test_delete_on_close_while_a_directory_renamed_from_the_name_is_open(winfsp_
     assert "r" not in _on_disk(ops)
     assert "q" in _on_disk(ops)
     assert ops._pending_deletes == set()
+
+
+def test_windows_reader_uses_independent_offsets(ops):
+    ops._winfsp = True
+    writer = ops.create("/busy", 0o644)
+    reader = None
+    try:
+        ops.write("/busy", b"first", 0, writer)
+        reader = ops.open("/busy", os.O_RDONLY)
+        assert ops.getattr("/busy", reader)["st_size"] == 5
+        assert ops.read("/busy", 2, 1, reader) == b"ir"
+        ops.write("/busy", b"tail", 5, writer)
+        assert ops.read("/busy", 100, 0, reader) == b"firsttail"
+        ops.release("/busy", reader)
+        reader = None
+        assert ops.getattr("/busy")["st_size"] == 9
+    finally:
+        if reader is not None:
+            ops.release("/busy", reader)
+        ops.release("/busy", writer)
+    assert _read(ops, "/busy") == b"firsttail"
+
+
+def test_windows_metadata_open_allows_rename(ops):
+    ops._winfsp = True
+    _write(ops, "/before", b"keep")
+    handle = ops.open("/before", os.O_RDONLY)
+    try:
+        ops.rename("/before", "/after")
+        assert ops.getattr("/before", handle)["st_size"] == 4
+        assert ops.read("/before", 100, 0, handle) == b"keep"
+    finally:
+        ops.release("/before", handle)
+    assert "before" not in ops.readdir("/", None)
+    assert _read(ops, "/after") == b"keep"
