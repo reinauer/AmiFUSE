@@ -2960,6 +2960,28 @@ class AmigaFuseFS(_FuseOperations):
             self._icon_existence_cache = IconExistenceCache()
             self._icon_handler = platform.get_icon_handler(icons_enabled=True, debug=debug)
 
+    def __call__(self, op, *args):
+        # WinFsp acknowledges directory/volume FlushFileBuffers without a
+        # FUSE callback. Commit metadata before acknowledging its mutation
+        # instead, so that those successful flushes cannot lose it later.
+        flush_metadata = self._winfsp and self.bridge._write_enabled and op in {
+            "create", "mkdir", "unlink", "rmdir", "rename", "utimens",
+        }
+        if self._winfsp and self.bridge._write_enabled and op in {"release", "releasedir"}:
+            with self._fh_lock:
+                entry = self._fh_cache.get(args[-1], {})
+                path = _handle_path(entry, args[0])
+                flush_metadata = bool(entry.get("dirty") or path in self._held_dates
+                                      or path in self._pending_deletes
+                                      or self._pending_dir_deletes)
+        result = super().__call__(op, *args)
+        if flush_metadata:
+            try:
+                self.bridge.flush_volume()
+            except OSError as exc:
+                raise FuseOSError(errno.EIO) from exc
+        return result
+
     def _is_platform_special(self, path: str) -> bool:
         """Return True if path is an OS special file we should reject.
 
