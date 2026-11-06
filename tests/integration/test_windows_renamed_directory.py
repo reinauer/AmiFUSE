@@ -3,6 +3,7 @@
 import ctypes
 from ctypes import wintypes
 import os
+import shutil
 from pathlib import Path
 import sys
 
@@ -13,8 +14,10 @@ pytestmark = [pytest.mark.fuse,
 
 
 def test_delete_renamed_directory_keeps_replacement(
-        mount_image, pfs3_image, pfs3_driver):
-    _proc, root = mount_image(pfs3_image, driver=pfs3_driver,
+        mount_image, pfs3_image, pfs3_driver, tmp_path):
+    image = tmp_path / "disk.hdf"
+    shutil.copy2(pfs3_image, image)
+    _proc, root = mount_image(image, driver=pfs3_driver,
                               extra_args=["--write"])
     old, new = Path(root) / "OldDir", Path(root) / "NewDir"
     old.mkdir()
