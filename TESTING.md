@@ -81,8 +81,8 @@ Current canonical fixture set used by the matrix:
 
 - `fixtures/readonly/pfs.hdf` with `drivers/pfs3aio`
 - `fixtures/readonly/sfs.hdf` with `drivers/SmartFilesystem`
-- `fixtures/readonly/Default.hdf` with `drivers/FastFileSystem`
-- `fixtures/readonly/ofs.adf` with `drivers/FastFileSystem`
+- `generated/bundled_ffs_seed.hdf` with the bundled FastFileSystem
+- generated OFS floppy images with the bundled FastFileSystem
 - `fixtures/downloaded/netbsdamiga92.hdf` with `drivers/BFFSFilesystem`
 - `fixtures/readonly/AmigaOS3.2CD.iso` with `drivers/CDFileSystem`
 
@@ -96,8 +96,11 @@ The `BFFS` NetBSD fixture is fetched on demand from the compressed
 aminet payload if
 `fixtures/downloaded/netbsdamiga92.hdf` is missing.
 
-`fixtures/readonly/Default.hdf` is also fetched on demand from the
-compressed Google Drive upload if it is missing.
+The FFS and OFS smoke images are generated locally under `generated/`;
+no external image or FastFileSystem download is needed. The image-format
+smoke test also generates an Emu68 MBR+RDB image with the bundled handler
+embedded in its RDB, then mounts it without `--driver` to exercise
+filesystem extraction from the partitioned image.
 
 Additional explicit smoke coverage:
 

@@ -30,3 +30,18 @@ def test_generated_ffs_tool(tmp_path, tool, args):
     assert result['status'] == 'ok', result
     assert not (tmp_path / 'drivers').exists()
     assert not (tmp_path / 'fixtures').exists()
+
+
+def test_generated_emu68_loads_the_embedded_handler(tmp_path, monkeypatch):
+    from tools.generated_ffs import make_emu68, BUNDLED_FFS
+    from amifuse.fuse_fs import resolve_driver
+    from amifuse import driver_resolver
+    monkeypatch.setattr(driver_resolver, 'user_driver_dir', lambda: tmp_path / 'drivers')
+    image = make_emu68(tmp_path / 'emu68.hdf')
+    resolved = resolve_driver(image, None, None, 'QDH0')
+    try:
+        assert resolved.to_json()['source'] == 'rdb'
+        assert resolved.path.read_bytes() == BUNDLED_FFS.read_bytes()
+    finally:
+        if resolved.temporary:
+            resolved.path.unlink()
