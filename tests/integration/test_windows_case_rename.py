@@ -25,8 +25,9 @@ def test_case_only_rename(mount_image, pfs3_image, pfs3_driver, directory, tmp_p
     else:
         old.write_bytes(b"keep content")
     os.rename(old, new)
-    assert "CASEPROBE" in os.listdir(root)
-    assert "CaseProbe" not in os.listdir(root)
+    listing = os.listdir(root)
+    assert "CASEPROBE" in listing
+    assert "CaseProbe" not in listing
     if directory:
         assert (root / "caseprobe" / "child").read_bytes() == b"keep child"
         os.replace(new, old)
