@@ -459,3 +459,19 @@ def test_windows_metadata_open_allows_rename(ops):
         ops.release("/before", handle)
     assert "before" not in ops.readdir("/", None)
     assert _read(ops, "/after") == b"keep"
+
+
+def test_windows_logical_reader_keeps_replaced_content(ops):
+    # The callback also supports replacement requested with POSIX rename
+    # semantics; ordinary WinFsp MoveFileEx refuses an open destination.
+    ops._winfsp = True
+    _write(ops, "/new", NEW)
+    _write(ops, "/old", OLD)
+    handle = ops.open("/old", os.O_RDONLY)
+    try:
+        ops.rename("/new", "/old")
+        assert _read(ops, "/old") == NEW
+        assert ops.read("/old", 100, 0, handle) == OLD
+    finally:
+        ops.release("/old", handle)
+    _no_temp_names(ops)
