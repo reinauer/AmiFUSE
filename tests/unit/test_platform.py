@@ -180,7 +180,7 @@ class TestShouldAutoCreateMountpoint:
         monkeypatch.setattr("sys.platform", "win32")
         from amifuse.platform import should_auto_create_mountpoint
 
-        assert should_auto_create_mountpoint(Path(r"C:\mnt\amiga")) is False
+        assert should_auto_create_mountpoint(Path(r"C:\mnt\amiga")) is True
 
 
 # ---------------------------------------------------------------------------
@@ -760,34 +760,28 @@ class TestValidateMountpoint:
         monkeypatch.setattr("sys.platform", "linux")
         assert validate_mountpoint(link) is None
 
-    def test_validate_windows_dir_mountpoint_mounted(self, monkeypatch):
-        r"""On Windows, non-drive-letter path (C:\mnt\amiga) that is mounted returns error."""
+    @pytest.mark.parametrize("exists,parent,expected", [
+        (True, True, "does not exist yet"),
+        (False, False, "parent directory does not exist"),
+        (False, True, None),
+    ])
+    def test_validate_windows_directory(self, monkeypatch, exists,
+                                         parent, expected):
         monkeypatch.setattr("sys.platform", "win32")
-        monkeypatch.setattr(
-            "amifuse.platform.os.path.exists",
-            lambda path: True,
-        )
-        monkeypatch.setattr(
-            "amifuse.platform.os.path.ismount",
-            lambda path: True,
-        )
+        monkeypatch.setattr("amifuse.platform.os.path.lexists", lambda p: exists)
+        monkeypatch.setattr("amifuse.platform.os.path.isdir", lambda p: parent)
         from amifuse.platform import validate_mountpoint
-
         result = validate_mountpoint(Path(r"C:\mnt\amiga"))
-        assert result is not None
-        assert "already a mount" in result
+        if expected is None:
+            assert result is None
+        else:
+            assert expected in result
 
-    def test_validate_windows_dir_mountpoint_available(self, monkeypatch):
-        r"""On Windows, non-drive-letter path (C:\mnt\amiga) that doesn't exist returns None."""
+    @pytest.mark.parametrize("path", ["relative", r"C:relative", r"\rooted"])
+    def test_windows_directory_requires_absolute_path(self, monkeypatch, path):
         monkeypatch.setattr("sys.platform", "win32")
-        monkeypatch.setattr(
-            "amifuse.platform.os.path.exists",
-            lambda path: False,
-        )
         from amifuse.platform import validate_mountpoint
-
-        result = validate_mountpoint(Path(r"C:\mnt\amiga"))
-        assert result is None
+        assert "absolute path" in validate_mountpoint(Path(path))
 
     def test_validate_unix_mountpoint_stale_inaccessible(self, monkeypatch):
         """On Unix, EIO from lstat returns a stale-mount error."""

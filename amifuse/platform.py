@@ -193,9 +193,8 @@ def should_auto_create_mountpoint(mountpoint: Path) -> bool:
         path = posixpath.normpath(str(mountpoint))
         return posixpath.dirname(path) == "/Volumes"
     if sys.platform.startswith("win"):
-        # WinFSP handles drive letter mountpoints; don't mkdir them.
-        # Directory mountpoints (e.g. C:\mnt\amiga) still need mkdir.
-        return windows_drive_mountpoint(mountpoint) is not None
+        # WinFsp creates both drive-letter and directory mountpoints.
+        return True
     return False
 
 
@@ -315,6 +314,19 @@ def validate_mountpoint(mountpoint: Path) -> Optional[str]:
                 f"Drive {drive} is already allocated; choose a different drive "
                 f"letter or free it first."
             )
+    elif sys.platform.startswith("win"):
+        import ntpath
+
+        # Process discovery sees the original command line, so a relative
+        # directory cannot be found reliably from another working directory.
+        drive_name, tail = ntpath.splitdrive(mp_str)
+        if not drive_name or not tail.startswith(("/", "\\")):
+            return "Windows directory mountpoints require an absolute path."
+        if os.path.lexists(mp_str):
+            return (f"WinFsp needs a mountpoint path that does not exist yet: "
+                    f"{mountpoint}. Choose another path.")
+        if not os.path.isdir(ntpath.dirname(mp_str)):
+            return f"Mountpoint parent directory does not exist: {mountpoint}."
     else:
         # A drive name can match a symlink in /Volumes: /Volumes/Macintosh HD
         # points to /. Checked first, as os.path.exists follows the link, and
