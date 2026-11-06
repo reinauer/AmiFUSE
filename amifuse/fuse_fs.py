@@ -7903,6 +7903,7 @@ def cmd_unmount(args):
     except OSError:
         is_mounted = False
     if (not is_mounted and sys.platform.startswith("win")
+            and not plat.is_stale_mountpoint(mountpoint)
             and plat.windows_drive_mountpoint(mountpoint) is None):
         # WinFsp directory mounts are reparse points, which ismount() does
         # not recognize. Match the serving process before requesting its
