@@ -3001,6 +3001,14 @@ class AmigaFuseFS(_FuseOperations):
             try:
                 self.bridge.flush_volume()
             except OSError as exc:
+                if op == "create":
+                    # FUSE never receives the new handle when create fails,
+                    # so it cannot send the release that would close it.
+                    try:
+                        self.release(args[0], result)
+                    except Exception as cleanup:
+                        self._log_op("create", args[0],
+                                     f"cleanup after flush failure: {cleanup}")
                 raise FuseOSError(errno.EIO) from exc
         return result
 
