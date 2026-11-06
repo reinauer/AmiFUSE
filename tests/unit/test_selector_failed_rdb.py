@@ -461,3 +461,46 @@ def test_disk_rdb_read_error_never_selects_an_entry(
         with pytest.raises(OSError) as caught:
             operation()
         assert caught.value.errno == errno.EIO
+
+
+def test_entry_read_error_is_not_reported_as_a_disk_rdb(tmp_path, monkeypatch):
+    image = _two_dh0_entries(tmp_path)
+    read = RawBlockDevice.read_block
+    def failing(self, block, num_blks=1, **kwargs):
+        if block < 216 and block + num_blks > 200:
+            raise OSError(errno.EIO, "entry read failed")
+        return read(self, block, num_blks, **kwargs)
+    monkeypatch.setattr(RawBlockDevice, "read_block", failing)
+    entries = []
+    for index, opened in rdb_inspect.open_each_rdb(image, None, 2):
+        entries.append((index, isinstance(opened, OSError)))
+        if not isinstance(opened, OSError):
+            opened[1].close()
+            opened[0].close()
+    assert entries == [(0, True), (1, False)]
+    listed = list_partitions(image)
+    assert "RDB beside the MBR" not in listed.fallback_reason
+
+
+@pytest.mark.parametrize("names", [("ENTRY",), ("ENTRY", None)])
+def test_disk_read_error_keeps_readable_entry_and_skips_empty_one(tmp_path, monkeypatch, names):
+    image = _disk_rdb(tmp_path, names, 2)
+    read = RawBlockDevice.read_block
+    def failing(self, block, num_blks=1, **kwargs):
+        if block <= 3 < block + num_blks:
+            raise OSError(errno.EIO, "disk read failed")
+        return read(self, block, num_blks, **kwargs)
+    monkeypatch.setattr(RawBlockDevice, "read_block", failing)
+    entries = []
+    for index, opened in rdb_inspect.open_each_rdb(image, None, len(names)):
+        entries.append((index, isinstance(opened, OSError)))
+        if isinstance(opened, OSError):
+            assert isinstance(opened, DiskRDBError)
+            assert opened.errno == errno.EIO
+        else:
+            opened[1].close()
+            opened[0].close()
+    assert entries == [(None, True), (0, False)]
+    listed = list_partitions(image)
+    assert [part.name for part in listed.partitions] == ["ENTRY"]
+    assert "MBR partition [1]" not in listed.fallback_reason

@@ -951,6 +951,12 @@ def _locate_rdisk(image, block_size, mbr_partition_index, mbr_info, open_at):
         except RDBContentError as e:
             error = DiskRDBError if _amiga_partitions(mbr_info) else IOError
             raise error(f"Failed to parse RDB at {image}: {e}")
+        except OSError as e:
+            if e.errno is None or not _amiga_partitions(mbr_info):
+                raise
+            # Preserve both the device errno and which RDB failed. The
+            # default open can otherwise fail while scanning an entry.
+            raise DiskRDBError(e.errno, e.strerror) from e
 
         # Check for Parceiro-style MBR+RDB coexistence. An RDB at block 0
         # beside an MBR that lists 0x76 entries is the disk's own as well.
@@ -1128,7 +1134,7 @@ def _failed_rdb(amiga_parts: List[MBRPartition], rdb_idx: Optional[int],
     that open stands for a single entry, and its own RDB failures are plain
     IOErrors without one. Those leave no RDB open whose names could shift.
     """
-    if isinstance(error, (DiskRDBError, EntryRDBError)):
+    if isinstance(error, (DiskRDBError, EntryRDBError)) and error.errno is None:
         return ("the RDB beside the MBR" if rdb_idx is None else
                 f"the RDB in {rdb_label(amiga_parts, rdb_idx)}")
     if rdb_idx is None:
@@ -1605,14 +1611,10 @@ def open_each_rdb(
                                 mbr_partition_index=index)
         except IOError as e:
             if index is None:
-                # Content failures in entries recur in their own turns.
-                # A device error may instead belong to the disk's RDB,
-                # which selected entry opens deliberately do not parse.
+                # Entry failures recur in their own turns. Only an error
+                # marked while parsing the disk's own RDB belongs here.
                 if isinstance(e, DiskRDBError):
                     disk_rdb = True
-                    yield index, e
-                elif not isinstance(e, (RDBContentError, EntryRDBError,
-                                        NoEntryRDBError)) and e.errno is not None:
                     yield index, e
             elif not (disk_rdb and isinstance(e, NoEntryRDBError)):
                 # With no RDB beside the MBR every entry gives its error;
