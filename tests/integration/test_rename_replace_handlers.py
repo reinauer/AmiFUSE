@@ -424,3 +424,15 @@ def test_delete_on_close_while_a_directory_renamed_from_the_name_is_open(winfsp_
     assert "r" not in _on_disk(ops)
     assert "q" in _on_disk(ops)
     assert ops._pending_deletes == set()
+
+
+def test_getpath_returns_stored_parent_and_child_spelling(ops):
+    if ops._name_fold is None:
+        pytest.skip("handler does not advertise case folding")
+    ops.mkdir("/Canonical", 0o755)
+    _write(ops, "/Canonical/MixedName", b"data")
+    assert ops.getpath("/") == "/"
+    assert ops.getpath("/canonical/mixedname") == "/Canonical/MixedName"
+    ops.rename("/Canonical/MixedName", "/Canonical/MIXEDNAME")
+    assert ops.getpath("/canonical/mixedname") == "/Canonical/MIXEDNAME"
+    assert _errno(ops.getpath, "/canonical/missing") == errno.ENOENT

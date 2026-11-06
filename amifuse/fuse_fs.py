@@ -381,6 +381,9 @@ def _require_fuse():
             "Install fusepy (pip install fusepy) and a supported FUSE backend."
         ) from None
 
+    if sys.platform.startswith("win"):
+        from .winfsp_fuse import with_capabilities
+        fuse_class = with_capabilities(fuse_class)
     FUSE = fuse_class
     return FUSE
 
@@ -3450,6 +3453,26 @@ class AmigaFuseFS(_FuseOperations):
         self._resolve_pending_dir_deletes(resolved_path)
         return 0
 
+    def getpath(self, path):
+        """Return stored spelling for WinFsp's case-insensitive lookups.
+
+        WinFsp needs the canonical name when opening an existing object;
+        otherwise a case-only rename can look like an exact-name no-op.
+        Enumerate parents because a writer can prevent stat_path from
+        locking the object, and its open-handle spelling may be an alias.
+        """
+        self._check_handler_alive()
+        canonical = "/"
+        for component in path.strip("/").split("/"):
+            if not component:
+                continue
+            name = next((name for name in self.readdir(canonical, None)
+                         if self._folded(name) == self._folded(component)), None)
+            if name is None:
+                raise FuseOSError(errno.ENOENT)
+            canonical = canonical.rstrip("/") + "/" + name
+        return canonical
+
     def readdir(self, path, fh):
         self._check_handler_alive()
         path = self._state_path(path)
@@ -4591,8 +4614,24 @@ class AmigaFuseFS(_FuseOperations):
         self._log_op("access", path, f"mode={mode}")
         if self._is_platform_special(path):
             raise FuseOSError(errno.ENOENT)
-        if not self.bridge._write_enabled and (mode & os.W_OK):
+        from .winfsp_fuse import DELETE_OK
+        deleting = self._winfsp and mode & DELETE_OK
+        if not self.bridge._write_enabled and (mode & os.W_OK or deleting):
             raise FuseOSError(errno.EROFS)
+        if deleting:
+            self._check_handler_alive()
+            path = self._state_path(path)
+            info = self.bridge.stat_path(path)
+            if info is None:
+                # An exclusive writer can prevent Examine by path. A
+                # parent listing still carries the object's protection.
+                parent, name = self._split_path(path)
+                info = next((entry for entry in self.bridge.list_dir_path(parent)
+                             if self._folded(entry["name"]) == self._folded(name)), None)
+            if info is None:
+                raise FuseOSError(errno.ENOENT)
+            if info.get("protection", 0) & 1:  # FIBF_DELETE: set forbids delete
+                raise FuseOSError(errno.EACCES)
         return 0
 
     def listxattr(self, path):
