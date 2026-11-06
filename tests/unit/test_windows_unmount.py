@@ -188,6 +188,7 @@ def test_exit_callback_captures_mount_thread_context(monkeypatch):
 @pytest.mark.parametrize("requested", ["E:", "E:\\", "e:/", "e:\\."])
 @pytest.mark.parametrize("mounted", ["E:", "E:\\", "e:/"])
 def test_drive_mount_owner_matches_root_aliases(monkeypatch, requested, mounted):
+    monkeypatch.setattr(unmount, "is_mount_ready", lambda pid: True)
     from amifuse import platform
 
     monkeypatch.setattr(platform, "sys", SimpleNamespace(platform="win32"))
@@ -202,6 +203,7 @@ def test_drive_mount_owner_matches_root_aliases(monkeypatch, requested, mounted)
 def test_mount_owner_is_process_behind_venv_launcher(monkeypatch):
     # A venv's python.exe re-runs the same command line under the base
     # interpreter; only that child creates the PID-named unmount events.
+    monkeypatch.setattr(unmount, "is_mount_ready", lambda pid: True)
     from amifuse import platform
 
     cmd = {"mountpoint": "J:", "image": "pfs.hdf", "uptime_seconds": 1,
@@ -271,3 +273,29 @@ finally:
         if proc.poll() is None:
             proc.kill()
         proc.communicate(timeout=10)
+
+
+def test_mount_owner_ignores_starting_process(monkeypatch):
+    from amifuse import platform
+    monkeypatch.setattr(platform, "sys", SimpleNamespace(platform="win32"))
+    monkeypatch.setattr(platform, "find_amifuse_mounts", lambda: [
+        {"mountpoint": "R:", "pid": 10}, {"mountpoint": "R:", "pid": 11}])
+    monkeypatch.setattr(unmount, "is_mount_ready", lambda pid: pid == 10)
+    assert platform._find_mount_owner_pids(Path("R:")) == [10]
+
+
+def test_mounted_marker_lifetime(monkeypatch):
+    events = Events()
+    monkeypatch.setattr(unmount, "_Events", lambda: events)
+    monkeypatch.setattr(unmount, "_fuse_exit_callback", lambda: lambda: None)
+    control = unmount.UnmountControl()
+    try:
+        assert "mounted" not in events.events
+        control.start()
+        assert events.events["mounted"].is_set()
+        assert unmount.is_mount_ready(os.getpid())
+        control.stop()
+        assert "mounted" in events.closed
+        assert "mounted" not in control.handles
+    finally:
+        control.close()
