@@ -137,7 +137,7 @@ def test_oversized_grow_fails_before_changing_the_file(volume):
     ops.release('/full', h)
 
 
-@pytest.mark.parametrize('finish', ['flush', 'fsync', 'release'])
+@pytest.mark.parametrize('finish', ['flush', 'fsync'])
 def test_failed_tail_fill_keeps_the_length_for_retry(volume, monkeypatch, finish):
     ops, bridge, image, driver = volume
     h = ops.create('/retry', 0o644)
@@ -235,3 +235,102 @@ def test_two_large_grows_cannot_claim_the_same_free_blocks(volume):
     assert ops.getattr('/reserve-b', second)['st_size'] == 0
     ops.release('/reserve-a', first)
     ops.release('/reserve-b', second)
+
+
+def test_failed_release_closes_handle_and_applies_held_date(volume, monkeypatch, capsys):
+    ops, bridge, image, driver = volume
+    h = ops.create('/failed', 0o644)
+    ops.write('/failed', b'head', 0, h)
+    ops.truncate('/failed', 4096, h)
+    ops.utimens('/failed', (1700000000, 1700000000))
+    with monkeypatch.context() as patch:
+        patch.setattr(bridge, 'truncate_handle', lambda *a, **kw: (-1, 221))
+        ops.release('/failed', h)
+    assert h not in ops._fh_cache
+    assert '/failed' not in ops._deferred_grows
+    assert '/failed' not in ops._held_dates
+    assert 'failed' in capsys.readouterr().err
+    reopened = ops.open('/failed', os.O_RDWR)
+    assert ops.getattr('/failed', reopened)['st_size'] == 4
+    assert ops.getattr('/failed', reopened)['st_mtime'] == 1700000000
+    ops.release('/failed', reopened)
+    other = ops.create('/other', 0o644)
+    assert ops.write('/other', b'ok', 0, other) == 2
+    ops.release('/other', other)
+
+
+def test_deleted_grow_is_not_filled_and_does_not_reappear(volume, monkeypatch):
+    ops, bridge, image, driver = volume
+    h = ops.create('/deleted', 0o644)
+    ops.write('/deleted', b'head', 0, h)
+    ops.truncate('/deleted', 65536, h)
+    ops.unlink('/deleted')
+    assert '/deleted' in ops._pending_deletes
+    def forbidden(*a, **kw):
+        pytest.fail('a deleted file must not have its tail filled')
+    monkeypatch.setattr(bridge, 'truncate_handle', forbidden)
+    ops.flush('/deleted', h)
+    ops.release('/deleted', h)
+    assert h not in ops._fh_cache
+    assert '/deleted' not in ops._pending_deletes
+    ops.destroy('/')
+    reopened = _bridge(image, driver)
+    try:
+        assert reopened.stat_path('/deleted') is None
+    finally:
+        reopened.close()
+
+
+def test_destroy_flushes_other_files_after_failed_fill(volume, monkeypatch, capsys):
+    ops, bridge, image, driver = volume
+    h = ops.create('/saved', 0o644)
+    data = b'saved' * 40000
+    ops.write('/saved', data, 0, h)
+    ops.release('/saved', h)
+    h = ops.create('/failed', 0o644)
+    ops.write('/failed', b'head', 0, h)
+    ops.truncate('/failed', 65536, h)
+    monkeypatch.setattr(bridge, 'truncate_handle', lambda *a, **kw: (-1, 221))
+    flush = bridge.flush_volume
+    calls = []
+    def record(*a, **kw):
+        calls.append(True)
+        return flush(*a, **kw)
+    monkeypatch.setattr(bridge, 'flush_volume', record)
+    ops.destroy('/')
+    assert calls
+    assert 'failed' in capsys.readouterr().out
+    reopened = _bridge(image, driver)
+    try:
+        assert reopened.read_file('/saved', len(data), 0) == data
+        assert reopened.read_file('/failed', 4, 0) == b'head'
+    finally:
+        reopened.close()
+
+
+@pytest.mark.no_fixtures
+@pytest.mark.parametrize('dos_type', [0x444f5300, 0x444f5301])
+def test_near_full_grow_fails_at_truncate_and_does_not_block_writes(tmp_path, dos_type):
+    image = make_adf(tmp_path / 'full.adf', dos_type=dos_type)
+    bridge = _bridge(image, BUNDLED_FFS, read_only=False)
+    ops = AmigaFuseFS(bridge, icons=False)
+    try:
+        h = ops.create('/full', 0o644)
+        info = bridge.get_disk_info()
+        free = (info['num_blocks'] - info['num_blocks_used']) * info['bytes_per_block']
+        with pytest.raises(FuseOSError) as exc:
+            ops.truncate('/full', free * 995 // 1000, h)
+        assert exc.value.errno == errno.ENOSPC
+        assert '/full' not in ops._deferred_grows
+        ops.release('/full', h)
+        other = ops.create('/other', 0o644)
+        assert ops.write('/other', b'ok', 0, other) == 2
+        ops.release('/other', other)
+        ops.destroy('/')
+        reopened = _bridge(image, BUNDLED_FFS)
+        try:
+            assert reopened.read_file('/other', 2, 0) == b'ok'
+        finally:
+            reopened.close()
+    finally:
+        bridge.close()

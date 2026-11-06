@@ -3314,11 +3314,16 @@ class AmigaFuseFS(_FuseOperations):
     def _materialize_grow(self, path):
         """Write a pending tail using any live handle on this file.
 
-        Keep the record and handle on failure so flush or unmount can retry.
+        Keep the record on failure while a writer can still retry it.
         No cached handle position survives the bridge's seeks and fill.
         """
         pending = self._deferred_grows.get(path)
         if pending is None:
+            return
+        if path in self._pending_deletes:
+            # Cleanup may delete a cancelled copy before flush/release.
+            # Its unwritten tail will never be visible or need allocation.
+            self._deferred_grows.pop(path, None)
             return
         with self._fh_lock:
             entries = [e for e in self._fh_cache.values()
@@ -3885,10 +3890,15 @@ class AmigaFuseFS(_FuseOperations):
                         if result < 0:
                             entry["pos"] = None
                             raise FuseOSError(_WRITE_ERRNOS.get(res2, errno.EIO))
-                        self._deferred_grows[path] = {
-                            "length": length, "end": measured}
-                        entry["dirty"] = True
-                        return 0
+                        # Free blocks include filesystem metadata and OFS
+                        # block headers. Near capacity, fill synchronously
+                        # so ENOSPC reaches truncate rather than close,
+                        # whose result the host filesystem can discard.
+                        if (length - measured) * 10 <= free * bpb * 9:
+                            self._deferred_grows[path] = {
+                                "length": length, "end": measured}
+                            entry["dirty"] = True
+                            return 0
             with entry["lock"]:
                 if entry.get("closed"):
                     raise FuseOSError(errno.EIO)
@@ -5021,7 +5031,18 @@ class AmigaFuseFS(_FuseOperations):
                 and e.get("fh_addr") and not e.get("closed")
                 for h, e in self._fh_cache.items())
         if last_writer:
-            self._materialize_grow(resolved)
+            try:
+                self._materialize_grow(resolved)
+            except Exception as e:
+                # release is called only once, even when it fails. Close
+                # the handle and complete held dates/deletes below. Losing
+                # the logical tail leaves only bytes the handler wrote.
+                print(f"[amifuse] WARNING: could not fill "
+                      f"{escape_text(resolved)} before close: {e}",
+                      file=sys.stderr, flush=True)
+                self._deferred_grows.pop(resolved, None)
+                with self._cache_lock:
+                    self._stat_cache.pop(resolved, None)
         with self._fh_lock:
             entry = self._fh_cache.get(fh)
             if not entry:
@@ -5201,7 +5222,16 @@ class AmigaFuseFS(_FuseOperations):
             if self.bridge._write_enabled:
                 if _handler_has_crashed(self.bridge):
                     raise RuntimeError("handler crashed before volume flush")
-                self._materialize_grows()
+                for pending_path in list(self._deferred_grows):
+                    try:
+                        self._materialize_grow(pending_path)
+                    except Exception as e:
+                        success = False
+                        print(f"[amifuse] WARNING: could not fill "
+                              f"{escape_text(pending_path)} before unmount: "
+                              f"{e}", flush=True)
+                # A failed fill must not prevent unrelated buffered data
+                # from reaching the image, or another tail being filled.
                 unanswered = self.bridge.wait_for_pending()
                 flush_error = None
                 try:
