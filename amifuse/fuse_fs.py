@@ -381,6 +381,9 @@ def _require_fuse():
             "Install fusepy (pip install fusepy) and a supported FUSE backend."
         ) from None
 
+    if sys.platform.startswith("win"):
+        from .winfsp_fuse import with_capabilities
+        fuse_class = with_capabilities(fuse_class)
     FUSE = fuse_class
     return FUSE
 
