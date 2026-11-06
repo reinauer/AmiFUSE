@@ -381,6 +381,9 @@ def _require_fuse():
             "Install fusepy (pip install fusepy) and a supported FUSE backend."
         ) from None
 
+    if sys.platform.startswith("win"):
+        from .winfsp_fuse import with_capabilities
+        fuse_class = with_capabilities(fuse_class)
     FUSE = fuse_class
     return FUSE
 
@@ -3449,6 +3452,26 @@ class AmigaFuseFS(_FuseOperations):
             return 0
         self._resolve_pending_dir_deletes(resolved_path)
         return 0
+
+    def getpath(self, path):
+        """Return stored spelling for WinFsp's case-insensitive lookups.
+
+        WinFsp needs the canonical name when opening an existing object;
+        otherwise a case-only rename can look like an exact-name no-op.
+        Enumerate parents because a writer can prevent stat_path from
+        locking the object, and its open-handle spelling may be an alias.
+        """
+        self._check_handler_alive()
+        canonical = "/"
+        for component in path.strip("/").split("/"):
+            if not component:
+                continue
+            name = next((name for name in self.readdir(canonical, None)
+                         if self._folded(name) == self._folded(component)), None)
+            if name is None:
+                raise FuseOSError(errno.ENOENT)
+            canonical = canonical.rstrip("/") + "/" + name
+        return canonical
 
     def readdir(self, path, fh):
         self._check_handler_alive()
