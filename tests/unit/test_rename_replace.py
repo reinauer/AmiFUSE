@@ -48,6 +48,9 @@ class _FakeVolume:
         self.freed = []
         self._next_lock = 0x100
 
+    def flush_volume(self):
+        pass
+
     def _cut(self, path):
         if self.max_name is None:
             return path
