@@ -424,3 +424,15 @@ def test_delete_on_close_while_a_directory_renamed_from_the_name_is_open(winfsp_
     assert "r" not in _on_disk(ops)
     assert "q" in _on_disk(ops)
     assert ops._pending_deletes == set()
+
+
+def test_delete_renamed_directory_preserves_old_name(ops):
+    ops._winfsp = True
+    ops.mkdir("/before", 0o755)
+    handle = ops.opendir("/before")
+    ops.rename("/before", "/after")
+    ops.mkdir("/before", 0o755)
+    ops.rmdir("/before")
+    ops.releasedir("/before", handle)
+    assert "before" in ops.readdir("/", None)
+    assert "after" not in ops.readdir("/", None)
