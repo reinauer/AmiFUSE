@@ -5242,7 +5242,14 @@ def _entry_partitions_hint(choices: List[Tuple[str, str]]) -> str:
     if not choices:
         return ""
     shown = [escape_text(label) for label, _ in choices]
-    selector = shlex.quote(escape_text(choices[0][1]))
+    raw_selector = escape_text(choices[0][1])
+    selector = shlex.quote(raw_selector)
+    if sys.platform == "win32" and selector != raw_selector:
+        # POSIX single quotes reach cmd.exe as literal name characters.
+        # Keep # prefixed names quoted for PowerShell as well.
+        selector = subprocess.list2cmdline([raw_selector])
+        if not selector.startswith('"'):
+            selector = f'"{selector}"'
     return (f"\nThe partitions in the MBR's 0x76 entries still open, read-only: "
             f"{', '.join(shown)}. Open one with --partition {selector}.")
 
@@ -7548,6 +7555,7 @@ def cmd_inspect(args):
         amiga_parts = amiga_rdb_partitions(args.image)
         all_rdbs = []
         rdb_parts = []
+        rdb_indices = []
         notes = []
         first_error = None
         beside_mbr = False  # The disk has its own RDB beside the MBR.
@@ -7570,6 +7578,7 @@ def cmd_inspect(args):
             try:
                 all_rdbs.append(build_rdisk_desc(rdisk, mbr_ctx))
                 rdb_parts.append(list(rdisk.parts))
+                rdb_indices.append(rdb_idx)
             finally:
                 rdisk.close()
                 blkdev.close()
@@ -7580,14 +7589,25 @@ def cmd_inspect(args):
             sys.exit(1)
 
         # Resolved with the image closed: a Windows disk admits one reader.
-        for desc, names in zip(all_rdbs, mount_names(rdb_parts)):
+        for desc, names, rdb_idx in zip(
+                all_rdbs, mount_names(rdb_parts), rdb_indices):
             for part, name in zip(desc["partitions"], names):
                 if name not in (None, part["name"]):
                     # A repeated drive name, which mount --partition takes
                     # as AmigaOS names it. A damaged one has no such name.
                     part["mount_name"] = name
+                selector = name
+                if selector is None:
+                    try:
+                        ref = find_partition(args.image, args.block_size,
+                                             str(part["num"]))
+                    except OSError:
+                        ref = None
+                    if ref is not None and (ref.mbr_partition_index, ref.number) == (
+                            rdb_idx, part["num"]):
+                        selector = str(part["num"])
                 part["driver"], text = _partition_driver(
-                    args.image, args.block_size, name)
+                    args.image, args.block_size, selector)
                 if part["driver"] is None:
                     part["driver_note"] = text
 
@@ -7635,6 +7655,8 @@ def cmd_inspect(args):
         else:
             if ref is not None and (ref.mbr_partition_index, ref.number) == (
                     part.mbr_partition_index, part.index):
+                text = _partition_driver(args.image, args.block_size,
+                                         str(part.index))[1]
                 print(f"  #{part.index}: {text}")
                 continue
             if ref is None:

@@ -363,9 +363,10 @@ def _enumerate_mount_units(image: str) -> tuple[list[_MountUnit], Optional[str]]
         # The mount opens partition 0, whatever its drive name.
         label = parts[0].name if parts and parts[0].name else "disk image"
         units = [_MountUnit(name=None, label=label)]
-        units.extend(_MountUnit(name=str(p.index), label=f"#{p.index}")
-                     for p in parts[1:] if _number_selects(img, p))
-        skipped = len(parts) - len(units)
+        numbered = [_MountUnit(name=str(p.index), label=f"#{p.index}")
+                    for p in parts[1:] if _number_selects(img, p)]
+        units.extend(numbered)
+        skipped = len(parts[1:]) - len(numbered)
     else:
         units = []
         for p in parts:
