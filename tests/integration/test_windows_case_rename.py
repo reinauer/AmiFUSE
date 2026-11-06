@@ -1,6 +1,7 @@
 """Case-only renames must reach the case-insensitive Amiga handler."""
 
 import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -11,8 +12,10 @@ pytestmark = [pytest.mark.fuse,
 
 
 @pytest.mark.parametrize("directory", [False, True])
-def test_case_only_rename(mount_image, pfs3_image, pfs3_driver, directory):
-    _proc, root = mount_image(pfs3_image, driver=pfs3_driver,
+def test_case_only_rename(mount_image, pfs3_image, pfs3_driver, directory, tmp_path):
+    image = tmp_path / "disk.hdf"
+    shutil.copy2(pfs3_image, image)
+    _proc, root = mount_image(image, driver=pfs3_driver,
                               extra_args=["--write"])
     root = Path(root)
     old, new = root / "CaseProbe", root / "CASEPROBE"
