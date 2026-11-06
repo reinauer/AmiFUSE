@@ -7,6 +7,8 @@ Keep this adapter Windows-only; other FUSE implementations differ.
 import ctypes
 
 CASE_INSENSITIVE = 1 << 29
+DELETE_ACCESS = 1 << 24
+DELETE_OK = 0x40000000
 
 
 class _Connection(ctypes.Structure):
@@ -19,9 +21,12 @@ class _Connection(ctypes.Structure):
 def with_capabilities(fuse_class):
     class WinFspFUSE(fuse_class):
         def init(self, conn):
-            if conn and self.operations._name_fold is not None:
+            if conn:
                 info = ctypes.cast(conn, ctypes.POINTER(_Connection)).contents
-                info.want |= info.capable & CASE_INSENSITIVE
+                wanted = DELETE_ACCESS
+                if self.operations._name_fold is not None:
+                    wanted |= CASE_INSENSITIVE
+                info.want |= info.capable & wanted
             return super().init(conn)
 
     return WinFspFUSE
