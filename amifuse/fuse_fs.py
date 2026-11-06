@@ -7902,6 +7902,12 @@ def cmd_unmount(args):
         is_mounted = os.path.ismount(mountpoint)
     except OSError:
         is_mounted = False
+    if (not is_mounted and sys.platform.startswith("win")
+            and plat.windows_drive_mountpoint(mountpoint) is None):
+        # WinFsp directory mounts are reparse points, which ismount() does
+        # not recognize. Match the serving process before requesting its
+        # cooperative shutdown; never remove the directory ourselves.
+        is_mounted = bool(plat._find_mount_owner_pids(mountpoint))
     if not is_mounted and not plat.is_stale_mountpoint(mountpoint):
         raise SystemExit(f"Mountpoint {mountpoint} is not currently mounted.")
     # On macOS, `umount -f` unmounts any volume, and the fallback below kills
