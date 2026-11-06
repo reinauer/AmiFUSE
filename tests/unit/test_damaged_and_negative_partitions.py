@@ -94,9 +94,8 @@ def test_inspect_json_gives_the_damaged_partition_no_name(
     # not a missing driver.
     assert damaged["name"] is None
     assert "mount_name" not in damaged
-    assert damaged["driver"] is None
-    assert damaged["driver_note"] == (
-        "damaged drive name: no --partition name selects it")
+    assert damaged["driver"]["source"] == "bundled"
+    assert "driver_note" not in damaged
     assert named["name"] == "DH1"
     assert named["driver"] is not None
     assert "driver_note" not in named
@@ -109,8 +108,7 @@ def test_inspect_labels_the_damaged_partition_by_number(
     out = capsys.readouterr().out
     lines = out.split("Filesystem driver per partition (without --driver):\n",
                       1)[1].splitlines()
-    assert lines[0] == (
-        "  #0: damaged drive name: no --partition name selects it")
+    assert lines[0].startswith("  #0: FastFileSystem")
     assert lines[1].startswith("  DH1: ")
     assert len(lines) == 2
 
@@ -162,8 +160,8 @@ def test_inspect_names_the_damaged_partition_a_number_selects_instead(
         tmp_path, _make_rdb_parts(tmp_path, 512, [("DH1", DOS7)]))
     image = _make_mbr(tmp_path, [(64, first), (448, second)])
     lines = _driver_lines(capsys, image)
-    assert lines == [
-        "  #0: damaged drive name: no --partition name selects it",
+    assert lines[0].startswith("  #0: FastFileSystem")
+    assert lines[1:] == [
         "  #0 in MBR partition [1]: damaged drive name: --partition 0 selects "
         "#0 in MBR partition [0] instead"]
 
@@ -178,7 +176,8 @@ def test_inspect_keeps_the_number_when_it_selects_a_later_rdbs_partition(
     assert [(p.mbr_partition_index, p.index, p.name)
             for p in list_partitions(image).partitions] == [(1, 0, None)]
     lines = _driver_lines(capsys, image)
-    assert lines == ["  #0: damaged drive name: no --partition name selects it"]
+    assert len(lines) == 1
+    assert lines[0].startswith("  #0: FastFileSystem")
 
 
 def test_inspect_labels_a_damaged_partition_whose_number_is_a_name(
