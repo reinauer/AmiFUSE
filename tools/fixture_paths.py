@@ -26,9 +26,6 @@ TMP_DIR = FIXTURE_ROOT / "tmp"
 SRC_DIR = FIXTURE_ROOT / "src"
 ODFS_DRIVER = DRIVERS_DIR / "ODFileSystem"
 NETBSD_AMIGA_92_URL = "https://aminet.net/misc/os/netbsdamiga92.hdf.gz"
-DEFAULT_HDF_URL = (
-    "https://drive.google.com/file/d/1B72e2zHbeSKuWgNUfEPcy5IYYJj_TCr0/view"
-)
 PARCEIRO_FULL_URL = (
     "https://drive.google.com/file/d/1GXV3vGWOkuK_uMsQyo9TbGRsTfPllo5x/view"
 )

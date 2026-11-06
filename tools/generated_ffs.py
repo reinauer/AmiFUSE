@@ -68,7 +68,7 @@ def make_rdb(path, embedded=False):
 
 def make_emu68(path):
     """Wrap the generated RDB in an MBR entry without changing its geometry."""
-    make_rdb(path)
+    make_rdb(path, embedded=True)
     rdb = path.read_bytes()
     mbr = bytearray(2048 * 512)
     mbr[446 + 4] = 0x76
