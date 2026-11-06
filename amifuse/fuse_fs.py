@@ -236,10 +236,11 @@ _RENAME_ERRNOS = {
     ERROR_DELETE_PROTECTED: errno.EACCES,
 }
 
-# Deletion keeps busy/non-empty handling in the callbacks, including their
-# deferred-delete retries. Other refusals use the same file/disk errors.
+# Busy-delete deferral and non-empty handling stay in the callbacks.
+# Other refusals use the same file/disk errors.
 _DELETE_ERRNOS = {
     **_WRITE_ERRNOS,
+    ERROR_OBJECT_IN_USE: errno.EBUSY,
     ERROR_OBJECT_NOT_FOUND: errno.ENOENT,
     ERROR_DELETE_PROTECTED: errno.EACCES,
 }

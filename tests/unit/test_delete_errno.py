@@ -29,3 +29,13 @@ def test_delete_errno(operation, path, code, expected):
     assert caught.value.errno == expected
     assert not fs._pending_deletes
     assert not fs._pending_dir_deletes
+
+
+def test_unlink_busy_without_a_fuse_handle():
+    volume = _InUseVolume({"/", "/d"}, {"/d/x"})
+    volume.delete_object = lambda lock, name: (0, 202)
+    fs = AmigaFuseFS(volume, icons=False)
+    with pytest.raises(FuseOSError) as caught:
+        fs.unlink("/d/x")
+    assert caught.value.errno == errno.EBUSY
+    assert not fs._pending_deletes
