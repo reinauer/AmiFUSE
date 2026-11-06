@@ -146,10 +146,12 @@ def test_concurrent_handler_writes_persist(partition_image, tmp_path):
             proc.communicate(timeout=5)
 
 
-# FastFileSystem 47.4: its create fails on the rejected read. The bundled
-# handler's goes on and returns a handle, so nothing here would recover.
-@pytest.mark.parametrize("partition_image", [("FastFileSystem", 0x444f5301)],
-                         indirect=True)
+# Both handlers report a rejected data read and remain usable afterward.
+@pytest.mark.parametrize("partition_image", [
+    ("FastFileSystem", 0x444f5301),
+    pytest.param((None, 0x444f5301), id="bundled-FastFileSystem",
+                 marks=pytest.mark.no_fixtures),
+], indirect=True)
 def test_handler_recovers_after_range_error(partition_image):
     image, driver = partition_image
     script = """

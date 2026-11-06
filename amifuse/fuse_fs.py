@@ -5998,8 +5998,9 @@ def format_volume(
             pkt_addr, "format flush", max_iters=500, cycles=2_000_000
         )
         _raise_if_handler_crashed(bridge, "format flush")
-        # Some handlers do not implement ACTION_FLUSH. A missing volume
-        # after successful format/uninhibit is now a failure, not success.
+        # Uninhibit has mounted the new volume, so a refusal saying there
+        # is no volume fails the format. Only ERROR_ACTION_NOT_KNOWN, from
+        # a handler without ACTION_FLUSH, passes.
         if reply is None:
             raise SystemExit("Format failed: no reply to ACTION_FLUSH from handler.")
         if reply[0] == 0 and reply[1] != ERROR_ACTION_NOT_KNOWN:
