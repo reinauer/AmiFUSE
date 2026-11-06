@@ -16,7 +16,7 @@ def test_case_only_rename(mount_image, pfs3_image, pfs3_driver, directory, tmp_p
     image = tmp_path / "disk.hdf"
     shutil.copy2(pfs3_image, image)
     _proc, root = mount_image(image, driver=pfs3_driver,
-                              extra_args=["--write"])
+                              extra_args=["--write", "--debug"])
     root = Path(root)
     old, new = root / "CaseProbe", root / "CASEPROBE"
     if directory:
@@ -25,8 +25,13 @@ def test_case_only_rename(mount_image, pfs3_image, pfs3_driver, directory, tmp_p
     else:
         old.write_bytes(b"keep content")
     os.rename(old, new)
-    assert "CASEPROBE" in os.listdir(root)
-    assert "CaseProbe" not in os.listdir(root)
+    listing = os.listdir(root)
+    if "CASEPROBE" not in listing:
+        from tests.integration.test_bundled_ffs import _unmount
+        print(_unmount(root, _proc))
+        print(_proc.stderr.read().decode(errors="replace"))
+    assert "CASEPROBE" in listing
+    assert "CaseProbe" not in listing
     if directory:
         assert (root / "caseprobe" / "child").read_bytes() == b"keep child"
         os.replace(new, old)
