@@ -35,7 +35,8 @@ def _make_rdb_parts(tmp_path, block_bytes, parts):
     names = "-".join(name for name, _ in parts)
     rdb_image = tmp_path / f"rdb-{block_bytes}-{names}.hdf"
     raw = RawBlockDevice(str(rdb_image), read_only=False, block_bytes=block_bytes)
-    cyl_ranges = {1: [(1, 9)], 2: [(1, 4), (5, 9)]}[len(parts)]
+    cyl_ranges = {0: [], 1: [(1, 9)], 2: [(1, 4), (5, 9)],
+                  3: [(1, 3), (4, 6), (7, 9)]}[len(parts)]
     with ExitStack() as cleanup:
         raw.create(160)
         cleanup.callback(raw.close)

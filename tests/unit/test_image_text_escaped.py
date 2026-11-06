@@ -327,8 +327,10 @@ class TestDiskRDBMessages:
         with pytest.raises(SystemExit) as caught:
             fuse_fs.main(["ls", str(image)])
         message = str(caught.value)
+        quote = '"' if fuse_fs.sys.platform == "win32" else "'"
         assert message.endswith(
-            f"still open, read-only: {SHOWN}. Open one with --partition '{SHOWN}'.")
+            f"still open, read-only: {SHOWN}. Open one with --partition "
+            f"{quote}{SHOWN}{quote}.")
         assert "\x1b" not in message
 
         with pytest.raises(SystemExit):
