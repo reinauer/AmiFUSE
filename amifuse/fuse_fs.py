@@ -4028,6 +4028,28 @@ class AmigaFuseFS(_FuseOperations):
             self._log_op("create", path, f"EXCEPTION: {type(e).__name__}: {e}")
             raise FuseOSError(errno.EIO) from e
 
+    def _retain_deferred_readers(self, path):
+        """Keep an unlinked/replaced file alive until its readers close.
+
+        Logical Windows readers normally hold no Amiga lock. Before a
+        delete, give them shared object locks so the handler defers it in
+        the same way as for native handles. A lock needs no read permission
+        and is only acquired after a replacement target has been renamed.
+        """
+        with self._fh_lock:
+            readers = [entry for entry in self._fh_cache.values()
+                       if entry.get("path") == path and entry.get("deferred_read")]
+        for entry in readers:
+            with entry["lock"]:
+                if entry.get("closed") or entry.get("delete_lock"):
+                    continue
+                lock, error, _ = self.bridge.locate_path(path)
+                if lock:
+                    entry["delete_lock"] = lock
+                elif error != ERROR_OBJECT_IN_USE:
+                    raise FuseOSError(_DELETE_ERRNOS.get(error, errno.EIO))
+                # An exclusive writer already holds the object in use.
+
     def unlink(self, path):
         self._log_op("unlink", path, "")
         self._check_handler_alive()
@@ -4065,6 +4087,7 @@ class AmigaFuseFS(_FuseOperations):
             if lock_bptr == 0:
                 self._log_op("unlink", path, f"parent dir not found: {dir_path}")
                 raise FuseOSError(errno.ENOENT)
+            self._retain_deferred_readers(path)
             res1, res2 = self.bridge.delete_object(lock_bptr, name)
             self._log_op("unlink", path, f"delete_object res1={res1} res2={res2}")
             if res1 == 0:
@@ -4369,6 +4392,7 @@ class AmigaFuseFS(_FuseOperations):
         the replace stands. Raises FuseOSError when the handler refuses.
         """
         # delete_dir_atomic() sends ACTION_DELETE_OBJECT, for a file too.
+        self._retain_deferred_readers(temp)
         res1, res2 = self.bridge.delete_dir_atomic(temp)
         deferred = False
         if res1 == 0 and res2 == ERROR_OBJECT_IN_USE:
@@ -4959,6 +4983,8 @@ class AmigaFuseFS(_FuseOperations):
             parent_lock = entry.get("parent_lock", 0)
             if parent_lock:
                 self.bridge.free_lock(parent_lock)
+            if entry.get("delete_lock"):
+                self.bridge.free_lock(entry["delete_lock"])
         # The pin is under the handle's path, and so is a delete unlink()
         # deferred, which it records only under a path a handle has.
         resolved_path = _handle_path(entry, path)

@@ -47,3 +47,43 @@ def test_bundled_file_rename(mount_image, tmp_path):
     assert (root / "Target.txt").read_bytes() == payload
     _unmount(root, proc)
     assert _xdf_read(image, "Target.txt", tmp_path) == payload
+
+
+@pytest.mark.parametrize("replace", [False, True])
+def test_open_reader_keeps_content_after_delete_or_replace(mount_image, tmp_path, replace):
+    import ctypes
+    from ctypes import wintypes
+
+    image = _seed_adf(tmp_path, "DOS3")
+    _proc, root = mount_image(image, extra_args=["--write"])
+    root = Path(root)
+    old = root / "Root.txt"
+    payload = old.read_bytes()
+    api = ctypes.WinDLL("kernel32", use_last_error=True)
+    api.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD,
+        wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD,
+        wintypes.HANDLE]
+    api.CreateFileW.restype = wintypes.HANDLE
+    api.ReadFile.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD,
+                            ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
+    api.ReadFile.restype = wintypes.BOOL
+    api.CloseHandle.argtypes = [wintypes.HANDLE]
+    api.CloseHandle.restype = wintypes.BOOL
+    # Share deletion explicitly; Python's open() does not request this.
+    handle = api.CreateFileW(str(old), 0x80000000, 7, None, 3, 0, None)
+    assert handle != ctypes.c_void_p(-1).value, ctypes.WinError()
+    try:
+        if replace:
+            source = root / "New.txt"
+            source.write_bytes(b"replacement")
+            os.replace(source, old)
+            assert old.read_bytes() == b"replacement"
+        else:
+            os.remove(old)
+        buffer = ctypes.create_string_buffer(len(payload) + 1)
+        count = wintypes.DWORD()
+        assert api.ReadFile(handle, buffer, len(buffer), ctypes.byref(count), None), ctypes.WinError()
+        assert buffer.raw[:count.value] == payload
+    finally:
+        assert api.CloseHandle(handle), ctypes.WinError()
+    assert old.exists() == replace
