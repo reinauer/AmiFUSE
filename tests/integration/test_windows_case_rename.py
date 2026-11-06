@@ -2,6 +2,7 @@
 
 import os
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -12,9 +13,19 @@ pytestmark = [pytest.mark.fuse,
 
 
 @pytest.mark.parametrize("directory", [False, True])
-def test_case_only_rename(mount_image, pfs3_image, pfs3_driver, directory, tmp_path):
+def test_case_only_rename(mount_image, pfs3_image, pfs3_driver, directory, tmp_path, monkeypatch):
     image = tmp_path / "disk.hdf"
     shutil.copy2(pfs3_image, image)
+    log_path = tmp_path / "mount.log"
+    log_file = log_path.open("wb")
+    original_popen = subprocess.Popen
+
+    def capture_mount(command, *args, **kwargs):
+        if "mount" in command and "amifuse" in command:
+            kwargs.update(stdout=log_file, stderr=log_file)
+        return original_popen(command, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", capture_mount)
     _proc, root = mount_image(image, driver=pfs3_driver,
                               extra_args=["--write", "--debug"])
     root = Path(root)
@@ -29,7 +40,7 @@ def test_case_only_rename(mount_image, pfs3_image, pfs3_driver, directory, tmp_p
     if "CASEPROBE" not in listing:
         from tests.integration.test_bundled_ffs import _unmount
         print(_unmount(root, _proc))
-        print(_proc.stderr.read().decode(errors="replace"))
+        print(log_path.read_text(errors="replace"))
     assert "CASEPROBE" in listing
     assert "CaseProbe" not in listing
     if directory:
