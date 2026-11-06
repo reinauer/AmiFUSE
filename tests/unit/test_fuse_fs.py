@@ -73,14 +73,19 @@ class TestFuseLazyLoad:
     def test_imports_and_caches_fuse_on_demand(self, monkeypatch):
         import amifuse.fuse_fs as fuse_fs_mod
 
-        sentinel = object()
+        sentinel = type("FUSE", (), {})
         fake_fuse = types.ModuleType("fuse")
         fake_fuse.FUSE = sentinel
         monkeypatch.setitem(sys.modules, "fuse", fake_fuse)
         monkeypatch.setattr(fuse_fs_mod, "FUSE", None)
 
-        assert fuse_fs_mod._require_fuse() is sentinel
-        assert fuse_fs_mod.FUSE is sentinel
+        loaded = fuse_fs_mod._require_fuse()
+        if sys.platform.startswith("win"):
+            assert issubclass(loaded, sentinel)
+        else:
+            assert loaded is sentinel
+        assert fuse_fs_mod.FUSE is loaded
+        assert fuse_fs_mod._require_fuse() is loaded
 
     @pytest.mark.parametrize("failure", [ImportError, OSError])
     def test_reports_unavailable_fuse(self, monkeypatch, failure):
