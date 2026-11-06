@@ -8035,6 +8035,14 @@ def _validate_driver_path(driver: Optional[Path]) -> None:
 
 
 def main(argv=None):
+    # Redirected Windows streams use the active code page. Keep that
+    # encoding, but escape names it cannot represent: reporting a completed
+    # write must not turn it into a failed command. Binary output still
+    # goes directly to stdout.buffer.
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(errors="backslashreplace")
     parser = argparse.ArgumentParser(
         prog="amifuse",
         description=f"{__banner__}\n\n"
