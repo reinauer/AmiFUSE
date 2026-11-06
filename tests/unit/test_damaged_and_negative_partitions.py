@@ -14,7 +14,8 @@ from amitools.fs.DosType import DOS3, DOS7
 
 from amifuse import rdb_inspect
 from amifuse.driver_runtime import BlockDeviceBackend
-from amifuse.fuse_fs import _partition_driver, get_partition_info, main
+from amifuse.fuse_fs import (PartitionNotFound, _partition_driver,
+                             get_partition_info, main)
 from amifuse.launcher import _enumerate_mount_units
 from amifuse.rdb_inspect import (PartInfo, PartitionList, find_partition,
                                  list_partitions)
@@ -217,9 +218,8 @@ def test_negative_number_selects_no_partition(tmp_path, selector):
     image.write_bytes(_make_rdb_parts(tmp_path, 512,
                                       [("DH0", DOS3), ("DH1", DOS7)]))
     assert find_partition(image, None, selector) is None
-    assert get_partition_info(image, None, selector) == {"name": "AmigaFS",
-                                                         "dostype": None,
-                                                         "block_size": None}
+    with pytest.raises(PartitionNotFound, match="Partition not found"):
+        get_partition_info(image, None, selector)
     backend = BlockDeviceBackend(image, partition_scope=True,
                                  partition=selector)
     with pytest.raises(ValueError) as caught:

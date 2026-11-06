@@ -5155,6 +5155,15 @@ class AmigaFuseFS(_FuseOperations):
         return result
 
 
+class PartitionNotFound(ValueError):
+    """An explicit RDB selector matches neither a name nor a number."""
+
+    def __init__(self, partition):
+        super().__init__(
+            f"Partition not found: {escape_text(partition)}. "
+            "Use amifuse inspect to list the image's partitions.")
+
+
 def get_partition_info(image: Path, block_size: Optional[int], partition: Optional[str]) -> dict:
     """Get partition name, dostype and block size in bytes from RDB.
 
@@ -5162,9 +5171,11 @@ def get_partition_info(image: Path, block_size: Optional[int], partition: Option
     DH0.1 (rdb_inspect.find_partition). A damaged drive name, which amitools
     reads as None, is named by the partition's number: #0. The block size
     is the partition's own (de_SizeBlock), which the handler uses.
+    Raises PartitionNotFound if an explicit selector matches no partition.
     """
     from .rdb_inspect import open_rdisk, find_partition, partition_label
-    ref = find_partition(image, block_size, partition) if partition else None
+    ref = (find_partition(image, block_size, partition)
+           if partition is not None else None)
     mbr_idx = ref.mbr_partition_index if ref else None
     blkdev, rdisk, _mbr_ctx = open_rdisk(image, block_size=block_size, mbr_partition_index=mbr_idx)
     try:
@@ -5173,6 +5184,8 @@ def get_partition_info(image: Path, block_size: Optional[int], partition: Option
         else:
             part = rdisk.get_partition(ref.number) if ref else None
         if part is None:
+            if partition is not None:
+                raise PartitionNotFound(partition)
             return {"name": "AmigaFS", "dostype": None, "block_size": None}
         return {
             "name": ref.name if ref and ref.name else partition_label(part),
@@ -5364,9 +5377,15 @@ def resolve_driver(
     drivers folder, the bundled FastFileSystem). An ISO needs --driver.
     part_info is get_partition_info()'s result when the caller has it.
 
-    Raises DriverNotFound. Errors reading the RDB propagate. Only an RDB
-    extraction is temporary, so only that is the caller's to delete.
+    Raises PartitionNotFound or DriverNotFound. RDB read errors propagate.
+    Only an RDB extraction is temporary, so only that is the caller's
+    to delete.
     """
+    # Validate an explicit RDB selector before choosing any driver. Mount
+    # and format have already checked it when reading their partition info.
+    if (partition is not None and adf_info is None and iso_info is None
+            and part_info is None):
+        part_info = get_partition_info(image, block_size, partition)
     if driver is not None:
         return ResolvedDriver(Path(driver), "explicit", str(driver))
     if adf_info is not None:
@@ -5498,7 +5517,7 @@ def mount_fuse(
             # HDF/RDB image - get partition info
             try:
                 part_info = get_partition_info(image, block_size, partition)
-            except IOError as e:
+            except (IOError, PartitionNotFound) as e:
                 names = _entry_partitions(e, image, block_size)
                 raise SystemExit(f"Error: {e}{_entry_partitions_hint(names)}")
             part_name = part_info["name"]
@@ -6256,6 +6275,12 @@ def _create_bridge_from_args(args, command: str, read_only: bool = True):
                 details={"partitions": names} if names else None)))
             sys.exit(1)
         raise SystemExit(f"Error: {e}{_entry_partitions_hint(names)}")
+    except PartitionNotFound as e:
+        if use_json:
+            print(_json.dumps(_json_error(
+                command, "PARTITION_NOT_FOUND", str(e))))
+            sys.exit(1)
+        raise SystemExit(str(e)) from None
     except DriverNotFound as e:
         msg = " ".join(str(e).splitlines())
         if use_json:
@@ -7412,7 +7437,7 @@ def _partition_driver(image: Path, block_size: Optional[int],
         return None, "damaged drive name: no --partition name selects it"
     try:
         resolved = resolve_driver(image, None, block_size, name)
-    except (DriverNotFound, OSError) as exc:
+    except (DriverNotFound, PartitionNotFound, OSError) as exc:
         return None, " ".join(str(exc).splitlines())
     info = resolved.to_json()
     if resolved.temporary:
