@@ -10,14 +10,7 @@ from amifuse.rdb_inspect import detect_adf, detect_iso
 from tests.fixtures.images import make_adf
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("damaged", [f"f{n}" for n in range(1, 9)])
-def test_empty_name_keeps_other_files(tmp_path, damaged, capsys, fixture_root):
-    driver = fixture_root / "drivers" / "FastFileSystem"
-    if not driver.exists():
-        pytest.skip("FastFileSystem 47.4 fixture required")
-    files = {f"f{n}": b"hello" for n in range(1, 9)}
-    image = make_adf(tmp_path / "empty-name.adf", files=files)
+def _damage_name(image, damaged):
     data = bytearray(image.read_bytes())
     changed = 0
     for offset in range(0, len(data), 512):
@@ -33,6 +26,17 @@ def test_empty_name_keeps_other_files(tmp_path, damaged, capsys, fixture_root):
         changed += 1
     assert changed == 1
     image.write_bytes(data)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("damaged", [f"f{n}" for n in range(1, 9)])
+def test_empty_name_keeps_other_files(tmp_path, damaged, capsys, fixture_root):
+    driver = fixture_root / "drivers" / "FastFileSystem"
+    if not driver.exists():
+        pytest.skip("FastFileSystem 47.4 fixture required")
+    files = {f"f{n}": b"hello" for n in range(1, 9)}
+    image = make_adf(tmp_path / "empty-name.adf", files=files)
+    _damage_name(image, damaged)
     bridge = HandlerBridge(image, driver, adf_info=detect_adf(image))
     try:
         assert {e["name"] for e in bridge.list_dir_path("/")} == files.keys() - {damaged}
@@ -89,5 +93,32 @@ def test_handler_ends_listing_with_a_failed_packet(
     try:
         assert bridge.list_dir_path("/")
         assert replies[-1] == (0, 232)  # ERROR_NO_MORE_ENTRIES
+    finally:
+        bridge.close()
+
+
+@pytest.mark.integration
+@pytest.mark.no_fixtures
+@pytest.mark.parametrize("damaged", [f"f{n}" for n in range(1, 9)])
+def test_bundled_handler_warns_about_incomplete_listing(tmp_path, damaged, capsys):
+    files = {f"f{n}": b"hello" for n in range(1, 9)}
+    image = make_adf(tmp_path / "damaged.adf", files=files)
+    bridge = HandlerBridge(image, BUNDLED_DRIVER, adf_info=detect_adf(image))
+    try:
+        order = [e["name"] for e in bridge.list_dir_path("/")]
+    finally:
+        bridge.close()
+    assert capsys.readouterr().err == ""
+    _damage_name(image, damaged)
+    bridge = HandlerBridge(image, BUNDLED_DRIVER, adf_info=detect_adf(image))
+    try:
+        expected = order[:order.index(damaged)]
+        assert [e["name"] for e in bridge.list_dir_path("/")] == expected
+        warning = capsys.readouterr().err
+        assert "listing / stopped early with error 213" in warning
+        assert "incomplete" in warning
+        ops = AmigaFuseFS(bridge, icons=False)
+        assert set(ops.readdir("/", None)) == {".", "..", *expected}
+        assert "incomplete" in capsys.readouterr().err
     finally:
         bridge.close()

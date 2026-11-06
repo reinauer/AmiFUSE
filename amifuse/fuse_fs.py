@@ -172,6 +172,9 @@ _NOT_FOUND_ERRORS = frozenset({ERROR_DIR_NOT_FOUND, ERROR_OBJECT_NOT_FOUND})
 # blocks it cannot read, so it does not prove the offset is past the end.
 ERROR_SEEK_ERROR = 219
 
+# ExamineNext signals normal directory exhaustion with this error.
+ERROR_NO_MORE_ENTRIES = 232
+
 # ACTION_SEEK and ACTION_SET_FILE_SIZE carry the offset in dp_Arg2, a
 # signed LONG.
 _LONG_MIN = -0x80000000
@@ -1764,8 +1767,12 @@ class HandlerBridge:
                 self._unwritten_outputs.add(fh_addr)
             return (fh_addr, dir_lock), 0
 
-    def list_dir(self, lock_bptr: int) -> List[Dict]:
+    def list_dir(self, lock_bptr: int, path: Optional[str] = None) -> List[Dict]:
         with self._lock:
+            # A path is supplied by list_dir_path; direct callers may only
+            # have a lock. Escape names before including them in warnings.
+            shown = escape_text(path) if path is not None else (
+                "/" if lock_bptr == 0 else f"lock 0x{lock_bptr:x}")
             # ensure we have a lock; lock_bptr=0 -> root
             root_lock = 0
             if lock_bptr == 0:
@@ -1803,6 +1810,10 @@ class HandlerBridge:
                     if self._debug:
                         res2 = reply[1] if reply else -1
                         print(f"[amifuse] list_dir: ExamineNext #{iter_num} ended res2={res2}")
+                    if reply is not None and reply[1] != ERROR_NO_MORE_ENTRIES:
+                        print(f"Warning: listing {shown} stopped early "
+                              f"with error {reply[1]}; it may be incomplete",
+                              file=sys.stderr)
                     break
                 entry = _parse_fib(self.mem, fib_mem.addr)
                 if self._debug:
@@ -1812,8 +1823,10 @@ class HandlerBridge:
                     continue
                 entries.append(entry)
             if unnamed:
-                print(f"Warning: skipped {unnamed} directory entries with empty names",
-                      file=sys.stderr)
+                detail = ("entry with an empty name" if unnamed == 1
+                          else "entries with empty names")
+                print(f"Warning: listing {shown}: skipped {unnamed} directory "
+                      f"{detail}", file=sys.stderr)
             if root_lock:
                 self.free_lock(root_lock)
             return entries
@@ -1822,11 +1835,11 @@ class HandlerBridge:
         """List directory contents by path."""
         with self._lock:
             if path == "/":
-                return self.list_dir(0)
+                return self.list_dir(0, path=path)
             lock, _, locks = self.locate_path(path)
             if lock == 0:
                 return []
-            entries = self.list_dir(lock)
+            entries = self.list_dir(lock, path=path)
             for l in reversed(locks):
                 self.free_lock(l)
             return entries
