@@ -57,6 +57,7 @@ def test_other_paths_are_not_drive_mounts(windows, monkeypatch, mountpoint):
 
 @pytest.mark.parametrize("requested", DRIVE_ALIASES)
 def test_mount_owner_matching_accepts_global_and_local_aliases(windows, monkeypatch, requested):
+    monkeypatch.setattr("amifuse.windows_unmount.is_mount_ready", lambda pid: True)
     monkeypatch.setattr(platform, "find_amifuse_mounts", lambda: [
         {"pid": i, "mountpoint": value} for i, value in enumerate(DRIVE_ALIASES)
     ] + [{"pid": 50, "mountpoint": "S:"},

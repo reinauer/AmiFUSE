@@ -1334,6 +1334,10 @@ class TestWindowsProcessDiscovery:
     _find_mount_owner_pids moved to platform.py in Phase 8.
     """
 
+    @pytest.fixture(autouse=True)
+    def mounted_processes(self, monkeypatch):
+        monkeypatch.setattr("amifuse.windows_unmount.is_mount_ready", lambda pid: True)
+
     def test_finds_amifuse_pid_from_wmic_output(self, fuse_mock, monkeypatch):
         import amifuse.platform as plat_mod
 
@@ -4105,6 +4109,10 @@ class TestCommandMatchesMountpoint:
 
     _find_mount_owner_pids moved to platform.py in Phase 8.
     """
+
+    @pytest.fixture(autouse=True)
+    def mounted_processes(self, monkeypatch):
+        monkeypatch.setattr("amifuse.windows_unmount.is_mount_ready", lambda pid: True)
 
     def test_matches_literal_mountpoint(self, fuse_mock, monkeypatch):
         """Matches when mountpoint value equals the raw mountpoint string."""
