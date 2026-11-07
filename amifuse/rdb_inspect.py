@@ -20,6 +20,7 @@ from amitools.fs.rdb.RDisk import RDisk  # type: ignore  # noqa: E402
 from amitools.fs.block.rdb.PartitionBlock import PartitionBlock  # type: ignore  # noqa: E402
 import amitools.fs.DosType as DosType  # type: ignore  # noqa: E402
 from amitools.util.Win32Disk import image_size, open_image  # type: ignore  # noqa: E402
+from amifuse.cli_output import configure_text_output
 
 
 # ADF geometry constants
@@ -1916,6 +1917,7 @@ def dos_type_arg(text: str) -> int:
 
 
 def main(argv=None):
+    configure_text_output()
     parser = argparse.ArgumentParser(
         description="Inspect an RDB image and optionally extract filesystem drivers."
     )
