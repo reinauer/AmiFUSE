@@ -4038,7 +4038,9 @@ class AmigaFuseFS(_FuseOperations):
                         v.get("opened_as", v.get("path")) or "") == self._folded(path)
                 }
             if len(targets) == 1 and path not in targets:
-                path = targets.pop()
+                target = targets.pop()
+                self._log_op("rmdir", path, f"renamed open directory: {target}")
+                path = target
         dir_path, name = self._split_path(path)
         if not name:
             raise FuseOSError(errno.EINVAL)
