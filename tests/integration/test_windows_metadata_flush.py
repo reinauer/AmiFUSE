@@ -1,4 +1,4 @@
-"""Windows volume flush must not leave completed metadata in handler RAM."""
+"""Windows root-directory flush must not leave completed metadata in handler RAM."""
 
 import ctypes
 from ctypes import wintypes
@@ -14,7 +14,7 @@ pytestmark = [pytest.mark.fuse,
               pytest.mark.skipif(sys.platform != "win32", reason="WinFsp")]
 
 
-def test_directory_creation_survives_volume_flush_and_kill(
+def test_directory_creation_survives_root_flush_and_kill(
         mount_image, pfs3_image, pfs3_driver, tmp_path):
     image = tmp_path / "disk.hdf"
     shutil.copy2(pfs3_image, image)
@@ -28,12 +28,12 @@ def test_directory_creation_survives_volume_flush_and_kill(
     api.FlushFileBuffers.restype = wintypes.BOOL
     api.CloseHandle.argtypes = [wintypes.HANDLE]
     api.CloseHandle.restype = wintypes.BOOL
-    handle = api.CreateFileW("\\\\.\\" + str(root)[:2], 0x40000000,
-                             7, None, 3, 0, None)
-    assert handle != ctypes.c_void_p(-1).value, ctypes.WinError()
+    handle = api.CreateFileW(str(root), 0x40000000,
+                             7, None, 3, 0x02000000, None)
+    assert handle != ctypes.c_void_p(-1).value, ctypes.WinError(ctypes.get_last_error())
     try:
         (Path(root) / "PersistedDir").mkdir()
-        assert api.FlushFileBuffers(handle), ctypes.WinError()
+        assert api.FlushFileBuffers(handle), ctypes.WinError(ctypes.get_last_error())
         proc.kill()
         proc.wait(timeout=10)
     finally:
