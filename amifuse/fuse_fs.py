@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Dict, List, NamedTuple, Optional, Sequence, Set, Tuple
 
 from .platform import kill_mount_owner_processes
+from .cli_output import configure_text_output
 
 FUSE = None
 
@@ -7828,14 +7829,7 @@ def _validate_driver_path(driver: Optional[Path]) -> None:
 
 
 def main(argv=None):
-    # Redirected Windows streams use the active code page. Keep that
-    # encoding, but escape names it cannot represent: reporting a completed
-    # write must not turn it into a failed command. Binary output still
-    # goes directly to stdout.buffer.
-    for stream in (sys.stdout, sys.stderr):
-        reconfigure = getattr(stream, "reconfigure", None)
-        if reconfigure is not None:
-            reconfigure(errors="backslashreplace")
+    configure_text_output()
     parser = argparse.ArgumentParser(
         prog="amifuse",
         description=f"{__banner__}\n\n"
