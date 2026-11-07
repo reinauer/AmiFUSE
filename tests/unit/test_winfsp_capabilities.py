@@ -102,3 +102,46 @@ def test_getpath_buffer_is_terminated_and_bounded(size):
         assert result == 0
         assert buffer.raw[:len(expected)] == expected
         assert buffer.raw[len(expected):20] == b"x" * (20 - len(expected))
+
+
+def test_delete_access_on_read_only_mount():
+    import errno
+    import os
+    from amifuse.fuse_fs import AmigaFuseFS, FuseOSError
+    from amifuse.winfsp_fuse import DELETE_OK
+
+    ops = AmigaFuseFS(SimpleNamespace(_write_enabled=False))
+    ops._winfsp = True
+    with pytest.raises(FuseOSError) as caught:
+        ops.access("/file", DELETE_OK)
+    assert caught.value.errno == errno.EROFS
+    assert ops.access("/file", os.R_OK) == 0
+
+
+@pytest.mark.parametrize("directory", [False, True])
+@pytest.mark.parametrize("protected", [False, True])
+@pytest.mark.parametrize("replacement", [None, 0, 1])
+def test_delete_access_uses_renamed_object_protection(directory, protected, replacement):
+    import errno
+    from amifuse.fuse_fs import AmigaFuseFS, FuseOSError
+    from amifuse.winfsp_fuse import DELETE_OK
+
+    paths = []
+    def stat(path):
+        paths.append(path)
+        if path == "/after":
+            return {"name": "after", "protection": int(protected)}
+        return None if replacement is None else {"name": "before", "protection": replacement}
+    bridge = SimpleNamespace(_write_enabled=True,
+        state=SimpleNamespace(crashed=False), stat_path=stat)
+    ops = AmigaFuseFS(bridge)
+    ops._winfsp = True
+    ops._fh_cache[42] = {"path": "/after", "opened_as": "/before",
+        **({"dir_handle": True} if directory else {"fh_addr": 7})}
+    if protected:
+        with pytest.raises(FuseOSError) as caught:
+            ops.access("/before", DELETE_OK)
+        assert caught.value.errno == errno.EACCES
+    else:
+        assert ops.access("/before", DELETE_OK) == 0
+    assert paths == ["/after"]

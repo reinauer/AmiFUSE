@@ -4628,6 +4628,19 @@ class AmigaFuseFS(_FuseOperations):
         if deleting:
             self._check_handler_alive()
             path = self._state_path(path)
+            # Delete-on-close uses the handle's original name after rename.
+            # Match unlink/rmdir, including closed handles awaiting release.
+            with self._fh_lock:
+                targets = {
+                    value.get("path") for value in self._fh_cache.values()
+                    if ("fh_addr" in value or value.get("dir_handle"))
+                    and self._folded(value.get("opened_as", value.get("path")) or "")
+                    == self._folded(path)
+                }
+            if len(targets) == 1 and path not in targets:
+                target = targets.pop()
+                self._log_op("access", path, f"renamed delete target: {target}")
+                path = target
             info = self.bridge.stat_path(path)
             if info is None:
                 # An exclusive writer can prevent Examine by path. A
