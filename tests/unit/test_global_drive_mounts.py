@@ -100,6 +100,7 @@ def test_unmount_without_owner_suggests_administrator_shell(windows, monkeypatch
     monkeypatch.setattr(fuse_fs.os.path, "ismount", Mock(return_value=True))
     monkeypatch.setattr(platform, "is_windows_admin", lambda: elevated)
     monkeypatch.setattr(platform, "_find_mount_owner_pids", lambda mp: [])
+    monkeypatch.setattr(platform, "_find_starting_mount_pids", lambda mp: [])
     stop = Mock(return_value=[])
     monkeypatch.setattr(platform, "stop_mount_processes", stop)
     with pytest.raises(SystemExit) as caught:

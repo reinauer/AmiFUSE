@@ -151,6 +151,7 @@ def test_windows_cli_uses_control_without_taskkill(monkeypatch):
     from amifuse import fuse_fs, platform
 
     monkeypatch.setattr(platform, "is_windows_admin", lambda: False)
+    monkeypatch.setattr(platform, "_find_starting_mount_pids", lambda p: [])
     monkeypatch.setattr(fuse_fs, "sys", SimpleNamespace(platform="win32"))
     monkeypatch.setattr(platform, "sys", SimpleNamespace(platform="win32"))
     monkeypatch.setattr(os.path, "ismount", lambda p: True)
@@ -282,6 +283,26 @@ def test_mount_owner_ignores_starting_process(monkeypatch):
         {"mountpoint": "R:", "pid": 10}, {"mountpoint": "R:", "pid": 11}])
     monkeypatch.setattr(unmount, "is_mount_ready", lambda pid: pid == 10)
     assert platform._find_mount_owner_pids(Path("R:")) == [10]
+    assert platform._find_starting_mount_pids(Path("R:")) == [11]
+    assert platform._find_starting_mount_pids(Path("S:")) == []
+
+
+def test_unmount_reports_starting_mount_without_admin_hint(monkeypatch):
+    from amifuse import fuse_fs, platform
+
+    monkeypatch.setattr(fuse_fs, "sys", SimpleNamespace(platform="win32"))
+    monkeypatch.setattr(platform, "sys", SimpleNamespace(platform="win32"))
+    monkeypatch.setattr(os.path, "ismount", lambda p: True)
+    monkeypatch.setattr(platform, "find_amifuse_mounts", lambda: [
+        {"mountpoint": "R:", "pid": 11}])
+    monkeypatch.setattr(unmount, "is_mount_ready", lambda pid: False)
+    request = Mock(return_value=[])
+    monkeypatch.setattr(unmount, "request_unmount_many", request)
+    with pytest.raises(SystemExit, match="still starting") as caught:
+        fuse_fs.cmd_unmount(SimpleNamespace(mountpoint=Path("R:")))
+    assert "Administrator" not in str(caught.value)
+    assert "once the mount is ready" in str(caught.value)
+    request.assert_called_once_with([], timeout=30.0)
 
 
 def test_mounted_marker_lifetime(monkeypatch):

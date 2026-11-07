@@ -7957,6 +7957,11 @@ def cmd_unmount(args):
         else:
             killed_pids = kill_mount_owner_processes(mountpoint)
         if not killed_pids:
+            if (sys.platform.startswith("win")
+                    and plat._find_starting_mount_pids(mountpoint)):
+                raise SystemExit(
+                    f"AmiFUSE at {mountpoint} is still starting; "
+                    "try unmounting again once the mount is ready.")
             message = f"No amifuse process found for mountpoint {mountpoint}."
             if sys.platform.startswith("win") and not plat.is_windows_admin():
                 message += (
