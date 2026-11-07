@@ -278,3 +278,29 @@ def test_record_from_previous_pid_owner_is_ignored(monkeypatch, created, expecte
     plat._apply_mount_records(mounts)
 
     assert mounts[0]["mountpoint"] == expected
+
+
+@pytest.mark.parametrize("zone", ["UTC0", "CET-1CEST,M3.5.0,M10.5.0/3", "JST-9", "PST8PDT,M3.2.0,M11.1.0"])
+@pytest.mark.parametrize("created_delta", [3, -3600])
+def test_local_start_time_validates_mount_record(monkeypatch, zone, created_delta):
+    previous = os.environ.get("TZ")
+    try:
+        os.environ["TZ"] = zone
+        time.tzset()
+        now = 1794078000
+        start = now - 120
+        stamp = time.strftime("%a %b %d %H:%M:%S %Y", time.localtime(start))
+        monkeypatch.setattr(plat.time, "time", lambda: now)
+        uptime = plat._parse_lstart_uptime(stamp)
+        assert uptime == 120
+        mounts = [{"pid": 42, "mountpoint": "mnt", "uptime_seconds": uptime}]
+        monkeypatch.setattr(plat, "_read_mount_records", lambda: {
+            42: {"created_at": start + created_delta, "mountpoint": "/Users/a/mnt"}})
+        plat._apply_mount_records(mounts)
+        assert mounts[0]["mountpoint"] == ("/Users/a/mnt" if created_delta > 0 else "mnt")
+    finally:
+        if previous is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = previous
+        time.tzset()

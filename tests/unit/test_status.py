@@ -295,107 +295,44 @@ class TestFindAmifuseMountsUnix:
 
 
 # ---------------------------------------------------------------------------
-# C. find_amifuse_mounts -- Windows (mocked wmic)
-# ---------------------------------------------------------------------------
+# C. find_amifuse_mounts -- Windows (mocked CIM)
 
 
 class TestFindAmifuseMountsWindows:
-    """Test _find_amifuse_mounts_windows with mocked subprocess output."""
-
-    @pytest.fixture(autouse=True)
-    def _force_windows(self, monkeypatch):
+    @pytest.mark.parametrize("entries, expected", [
+        ([], []),
+        ([{"ProcessId": 12345, "ParentProcessId": 1,
+           "CommandLine": "python -m amifuse mount C:/José-Ω-ā.hdf --mountpoint D:",
+           "CreationDate": "/Date(1700000000000)/"}], [12345]),
+        ([{"ProcessId": 111, "CommandLine": "python other.py"},
+          {"ProcessId": 222, "CommandLine": "python -m amifuse mount C:/a.hdf"},
+          {"ProcessId": 333, "CommandLine": "python -m amifuse mount C:/b.hdf"}], [222, 333]),
+    ])
+    def test_cim_discovery(self, monkeypatch, entries, expected):
+        from amifuse import platform as plat
         monkeypatch.setattr("sys.platform", "win32")
+        monkeypatch.setattr(plat.os, "getpid", lambda: 99999)
+        run = MagicMock(return_value=MagicMock(returncode=0,
+            stdout=json.dumps(entries, ensure_ascii=False).encode("utf-8-sig")))
+        monkeypatch.setattr(plat.subprocess, "run", run)
+        mounts = plat._find_amifuse_mounts_windows()
+        assert [m["pid"] for m in mounts] == expected
+        command = run.call_args.args[0]
+        assert command[0] == "powershell"
+        assert "OutputEncoding" in command[-1] and "UTF8Encoding" in command[-1]
+        if expected == [12345]:
+            assert mounts[0]["image"] == "C:/José-Ω-ā.hdf"
+            assert mounts[0]["mountpoint"] == "D:"
+            assert mounts[0]["parent_pid"] == 1
+            assert mounts[0]["uptime_seconds"] is not None
 
-    def _mock_wmic(self, monkeypatch, stdout, returncode=0):
-        result = MagicMock()
-        result.stdout = stdout
-        result.returncode = returncode
-        monkeypatch.setattr(
-            "amifuse.platform.subprocess.run",
-            MagicMock(return_value=result),
-        )
-
-    def test_single_mount(self, monkeypatch):
-        from amifuse.platform import _find_amifuse_mounts_windows
-
-        monkeypatch.setattr("amifuse.platform.os.getpid", lambda: 99999)
-        self._mock_wmic(monkeypatch,
-            "CommandLine=python -m amifuse mount C:/images/test.hdf --mountpoint D:\r\n"
-            "CreationDate=20260419103000.123456+000\r\n"
-            "ParentProcessId=1\r\n"
-            "ProcessId=12345\r\n"
-            "\r\n")
-
-        mounts = _find_amifuse_mounts_windows()
-        assert len(mounts) == 1
-        assert mounts[0]["pid"] == 12345
-        assert mounts[0]["image"] == "C:/images/test.hdf"
-        assert mounts[0]["mountpoint"] == "D:"
-        assert mounts[0]["filesystem_type"] is None
-        assert mounts[0]["parent_pid"] == 1
-
-    def test_empty_process_list(self, monkeypatch):
-        from amifuse.platform import _find_amifuse_mounts_windows
-
-        self._mock_wmic(monkeypatch, "")
-        mounts = _find_amifuse_mounts_windows()
-        assert mounts == []
-
-    def test_non_amifuse_filtered(self, monkeypatch):
-        from amifuse.platform import _find_amifuse_mounts_windows
-
-        monkeypatch.setattr("amifuse.platform.os.getpid", lambda: 99999)
-        self._mock_wmic(monkeypatch,
-            "CommandLine=python some_script.py\r\n"
-            "CreationDate=20260419100000.000000+000\r\n"
-            "ParentProcessId=1\r\n"
-            "ProcessId=111\r\n"
-            "\r\n"
-            "CommandLine=python -m amifuse mount C:/img.hdf --mountpoint E:\r\n"
-            "CreationDate=20260419100000.000000+000\r\n"
-            "ParentProcessId=1\r\n"
-            "ProcessId=222\r\n"
-            "\r\n")
-
-        mounts = _find_amifuse_mounts_windows()
-        assert len(mounts) == 1
-        assert mounts[0]["pid"] == 222
-
-    def test_wmic_failure_returns_empty(self, monkeypatch):
-        from amifuse.platform import _find_amifuse_mounts_windows
-
-        self._mock_wmic(monkeypatch, "", returncode=1)
-        mounts = _find_amifuse_mounts_windows()
-        assert mounts == []
-
-    def test_wmic_not_found_returns_empty(self, monkeypatch):
-        from amifuse.platform import _find_amifuse_mounts_windows
-
-        monkeypatch.setattr(
-            "amifuse.platform.subprocess.run",
-            MagicMock(side_effect=OSError("[WinError 2] The system cannot find the file specified")),
-        )
-        mounts = _find_amifuse_mounts_windows()
-        assert mounts == []
-
-    def test_multiple_mounts(self, monkeypatch):
-        from amifuse.platform import _find_amifuse_mounts_windows
-
-        monkeypatch.setattr("amifuse.platform.os.getpid", lambda: 99999)
-        self._mock_wmic(monkeypatch,
-            "CommandLine=python -m amifuse mount C:/a.hdf --mountpoint D:\r\n"
-            "CreationDate=20260419100000.000000+000\r\n"
-            "ParentProcessId=1\r\n"
-            "ProcessId=100\r\n"
-            "\r\n"
-            "CommandLine=python -m amifuse mount C:/b.hdf --mountpoint E:\r\n"
-            "CreationDate=20260419100000.000000+000\r\n"
-            "ParentProcessId=1\r\n"
-            "ProcessId=200\r\n"
-            "\r\n")
-
-        mounts = _find_amifuse_mounts_windows()
-        assert len(mounts) == 2
+    @pytest.mark.parametrize("error", [False, True])
+    def test_query_failure_returns_empty(self, monkeypatch, error):
+        from amifuse import platform as plat
+        run = MagicMock(side_effect=OSError("not found")) if error else MagicMock(
+            return_value=MagicMock(returncode=1, stdout=b""))
+        monkeypatch.setattr(plat.subprocess, "run", run)
+        assert plat._find_amifuse_mounts_windows() == []
 
 
 # ---------------------------------------------------------------------------

@@ -777,6 +777,7 @@ def _find_amifuse_mounts_unix():
     try:
         result = subprocess.run(
             ps_cmd, check=False, capture_output=True, text=True,
+            env={**os.environ, "LC_ALL": "C"},
         )
     except OSError:
         logger.debug("ps not available, cannot discover mounts")
@@ -853,27 +854,25 @@ def _find_amifuse_mounts_unix():
 
 def _parse_lstart_uptime(lstart_str):
     """Parse macOS ps lstart string and return uptime in seconds."""
-    import calendar
-
     try:
         # lstart format: "Sat Apr 19 10:30:00 2026"
-        # Parse with time.strptime (locale-independent for English month/day names)
+        # ps reports local wall time, including the local daylight saving rule.
         t = time.strptime(lstart_str, "%a %b %d %H:%M:%S %Y")
-        start_epoch = calendar.timegm(t)
+        start_epoch = time.mktime(t)
         return max(0, int(time.time() - start_epoch))
     except (ValueError, OverflowError):
         return None
 
 
 # ---------------------------------------------------------------------------
-# CIM/PowerShell fallback for mount discovery (wmic deprecated on Win11)
+# CIM/PowerShell mount discovery
 # ---------------------------------------------------------------------------
 
 
 def _find_amifuse_mounts_cim():
     """Discover amifuse mounts on Windows using PowerShell Get-CimInstance.
 
-    Fallback for when wmic is unavailable (removed on newer Windows 11 builds).
+    Use UTF-8 explicitly; legacy wmic loses characters outside the OEM page.
 
     Note: The CIM filter does not restrict by session, so on multi-user systems
     this may return processes from other logged-in users.  A SessionId filter
@@ -881,6 +880,7 @@ def _find_amifuse_mounts_cim():
     """
     ps_cmd = [
         "powershell", "-NoProfile", "-Command",
+        '[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); '
         'Get-CimInstance Win32_Process -Filter "Name like \'%python%\'" '
         "| Select-Object ProcessId,CommandLine,CreationDate,ParentProcessId "
         "| ConvertTo-Json",
@@ -897,7 +897,7 @@ def _find_amifuse_mounts_cim():
         logger.debug("PowerShell CIM query timed out")
         return []
     except OSError:
-        logger.debug("PowerShell not available for CIM fallback")
+        logger.debug("PowerShell not available for mount discovery")
         return []
     if result.returncode != 0:
         logger.debug("PowerShell CIM query exited with code %d", result.returncode)
@@ -1410,102 +1410,8 @@ def kill_mount_owner_processes(mountpoint: Path) -> List[int]:
 
 
 def _find_amifuse_mounts_windows():
-    """Discover amifuse mounts on Windows using wmic.
-
-    Falls back to PowerShell Get-CimInstance when wmic is missing or fails
-    (wmic is deprecated and removed on newer Windows 11 builds).
-    """
-    try:
-        result = subprocess.run(
-            ["wmic", "process", "where",
-             "name like '%python%'",
-             "get", "ProcessId,CommandLine,CreationDate,ParentProcessId",
-             "/FORMAT:LIST"],
-            check=False,
-            capture_output=True,
-            text=True,
-            creationflags=_CREATE_NO_WINDOW,
-        )
-    except OSError:
-        # wmic not available (e.g., removed on newer Windows 11 builds)
-        logger.debug("wmic not available, cannot discover mounts")
-        return _find_amifuse_mounts_cim()
-    if result.returncode != 0:
-        # wmic may exist as a broken/deprecated stub -- try CIM instead of
-        # silently reporting no mounts.
-        logger.debug("wmic exited with code %d", result.returncode)
-        return _find_amifuse_mounts_cim()
-
-    current_pid = os.getpid()
-    mounts = []
-
-    # wmic /FORMAT:LIST outputs key=value pairs separated by blank lines
-    current_cmdline = None
-    current_pid_val = None
-    current_creation = None
-    current_parent_pid = None
-
-    def _process_record():
-        if current_cmdline is None or current_pid_val is None:
-            return
-        if current_pid_val == current_pid:
-            return
-        if "amifuse" not in current_cmdline:
-            return
-
-        try:
-            tokens = shlex.split(current_cmdline, posix=False)
-        except ValueError:
-            tokens = current_cmdline.split()
-
-        if "mount" not in tokens:
-            return
-
-        image, mountpoint = _parse_mount_tokens(tokens)
-
-        uptime = _parse_wmic_creation_date_uptime(current_creation)
-
-        mounts.append({
-            "mountpoint": mountpoint,
-            "image": image,
-            "pid": current_pid_val,
-            "uptime_seconds": uptime,
-            "filesystem_type": None,
-            "parent_pid": current_parent_pid,
-        })
-
-    for line in result.stdout.splitlines():
-        line = line.strip()
-        if not line:
-            # wmic uses \r\r\n which creates spurious empty lines between
-            # fields within a record.  Only finalise when we have a complete
-            # record (both CommandLine and ProcessId collected).
-            if current_cmdline is not None and current_pid_val is not None:
-                _process_record()
-                current_cmdline = None
-                current_pid_val = None
-                current_creation = None
-                current_parent_pid = None
-            continue
-        if line.startswith("CommandLine="):
-            current_cmdline = line[len("CommandLine="):]
-        elif line.startswith("ProcessId="):
-            try:
-                current_pid_val = int(line[len("ProcessId="):])
-            except ValueError:
-                current_pid_val = None
-        elif line.startswith("CreationDate="):
-            current_creation = line[len("CreationDate="):]
-        elif line.startswith("ParentProcessId="):
-            try:
-                current_parent_pid = int(line[len("ParentProcessId="):])
-            except ValueError:
-                current_parent_pid = None
-
-    # Handle last record if no trailing blank line
-    _process_record()
-
-    return mounts
+    """Discover Windows mounts without lossy OEM-code-page conversion."""
+    return _find_amifuse_mounts_cim()
 
 
 # ---------------------------------------------------------------------------
@@ -1726,29 +1632,6 @@ def _enrich_mountpoints_macos(null_mounts, all_mounts):
     for mount, vol in zip(null_mounts, amifuse_volumes):
         mount["mountpoint"] = vol
 
-
-def _parse_wmic_creation_date_uptime(creation_str):
-    """Parse wmic CreationDate (yyyymmddHHMMSS.ffffff+ZZZ) to uptime seconds."""
-    if not creation_str:
-        return None
-    try:
-        # Format: 20260419103000.123456+060
-        # Take first 14 chars: yyyymmddHHMMSS
-        dt_str = creation_str[:14]
-        t = time.strptime(dt_str, "%Y%m%d%H%M%S")
-        import calendar
-        start_epoch = calendar.timegm(t)
-        # Adjust for timezone offset in wmic output (+/- minutes)
-        if len(creation_str) > 21:
-            tz_str = creation_str[21:]
-            try:
-                tz_minutes = int(tz_str)
-                start_epoch -= tz_minutes * 60
-            except ValueError:
-                pass
-        return max(0, int(time.time() - start_epoch))
-    except (ValueError, OverflowError):
-        return None
 
 
 # ---------------------------------------------------------------------------
