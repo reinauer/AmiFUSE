@@ -1073,7 +1073,7 @@ class TestInspectMultiRdb:
         size skips, leaves no driver and gives the error as the note."""
         from amifuse import rdb_inspect
 
-        def refuse(image, block_size, name):
+        def refuse(image, block_size, name, write=False):
             raise IOError(f"Partition {name} is in an RDB that does not "
                           f"open with 1024-byte blocks")
 

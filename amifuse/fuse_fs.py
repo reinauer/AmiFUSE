@@ -5158,13 +5158,17 @@ class AmigaFuseFS(_FuseOperations):
 class PartitionNotFound(ValueError):
     """An explicit RDB selector matches neither a name nor a number."""
 
-    def __init__(self, partition):
-        super().__init__(
-            f"Partition not found: {escape_text(partition)}. "
-            "Use amifuse inspect to list the image's partitions.")
+    def __init__(self, partition, *, incomplete=False):
+        if incomplete:
+            message = (f"Cannot resolve partition {escape_text(partition)}: "
+                       "the partition list is incomplete. ")
+        else:
+            message = f"Partition not found: {escape_text(partition)}. "
+        super().__init__(message + "Use amifuse inspect to list the image's partitions.")
 
 
-def get_partition_info(image: Path, block_size: Optional[int], partition: Optional[str]) -> dict:
+def get_partition_info(image: Path, block_size: Optional[int],
+                       partition: Optional[str], *, write: bool = False) -> dict:
     """Get partition name, dostype and block size in bytes from RDB.
 
     The name is the one the partition mounts as: a repeated drive name reads
@@ -5173,8 +5177,8 @@ def get_partition_info(image: Path, block_size: Optional[int], partition: Option
     is the partition's own (de_SizeBlock), which the handler uses.
     Raises PartitionNotFound if an explicit selector matches no partition.
     """
-    from .rdb_inspect import open_rdisk, find_partition, partition_label
-    ref = (find_partition(image, block_size, partition)
+    from .rdb_inspect import open_rdisk, find_partition, partition_label, _disk_names
+    ref = (find_partition(image, block_size, partition, write=write)
            if partition is not None else None)
     mbr_idx = ref.mbr_partition_index if ref else None
     blkdev, rdisk, _mbr_ctx = open_rdisk(image, block_size=block_size, mbr_partition_index=mbr_idx)
@@ -5185,7 +5189,8 @@ def get_partition_info(image: Path, block_size: Optional[int], partition: Option
             part = rdisk.get_partition(ref.number) if ref else None
         if part is None:
             if partition is not None:
-                raise PartitionNotFound(partition)
+                _rdbs, failed, _end = _disk_names(image, block_size)
+                raise PartitionNotFound(partition, incomplete=bool(failed))
             return {"name": "AmigaFS", "dostype": None, "block_size": None}
         return {
             "name": ref.name if ref and ref.name else partition_label(part),
@@ -5516,7 +5521,7 @@ def mount_fuse(
         else:
             # HDF/RDB image - get partition info
             try:
-                part_info = get_partition_info(image, block_size, partition)
+                part_info = get_partition_info(image, block_size, partition, write=write)
             except (IOError, PartitionNotFound) as e:
                 names = _entry_partitions(e, image, block_size)
                 raise SystemExit(f"Error: {e}{_entry_partitions_hint(names)}")
@@ -5870,7 +5875,7 @@ def format_volume(
                 "Error: --dos-type is only for a floppy image (901120 or "
                 "1802240 bytes); a partition has its DOS type in the RDB.")
         else:
-            part_info = get_partition_info(image, block_size, partition)
+            part_info = get_partition_info(image, block_size, partition, write=True)
     except (OSError, ValueError) as exc:
         # A missing or unreadable image, or one without a usable RDB.
         if debug:
@@ -6265,8 +6270,13 @@ def _create_bridge_from_args(args, command: str, read_only: bool = True):
         iso_info = detect_iso(image)
 
     try:
+        part_info = None
+        if partition is not None and adf_info is None and iso_info is None:
+            part_info = get_partition_info(
+                image, block_size, partition, write=not read_only)
         resolved = resolve_driver(
-            image, driver, block_size, partition, adf_info=adf_info, iso_info=iso_info)
+            image, driver, block_size, partition, adf_info=adf_info,
+            iso_info=iso_info, part_info=part_info)
     except IOError as e:
         names = _entry_partitions(e, image, block_size)
         if use_json:
