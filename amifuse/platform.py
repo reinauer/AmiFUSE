@@ -292,6 +292,16 @@ def check_fuse_available() -> None:
     )
 
 
+def _windows_drive_type(root: str) -> int:
+    import ctypes
+    from ctypes import wintypes
+
+    get_drive_type = ctypes.windll.kernel32.GetDriveTypeW
+    get_drive_type.argtypes = [wintypes.LPCWSTR]
+    get_drive_type.restype = wintypes.UINT
+    return int(get_drive_type(root))
+
+
 def validate_mountpoint(mountpoint: Path) -> Optional[str]:
     """Validate that a mountpoint is available for use.
 
@@ -322,6 +332,11 @@ def validate_mountpoint(mountpoint: Path) -> Optional[str]:
         drive_name, tail = ntpath.splitdrive(mp_str)
         if not drive_name or not tail.startswith(("/", "\\")):
             return "Windows directory mountpoints require an absolute path."
+        root = drive_name.replace("/", "\\")
+        is_unc = (root.upper().startswith("\\\\?\\UNC\\") or
+                  (root.startswith("\\\\") and not root.startswith("\\\\?\\")))
+        if is_unc or _windows_drive_type(root + "\\") == 4:  # DRIVE_REMOTE
+            return "Windows directory mountpoints must be on a local drive."
         if os.path.lexists(mp_str):
             return (f"WinFsp needs a mountpoint path that does not exist yet: "
                     f"{mountpoint}. Choose another path.")
