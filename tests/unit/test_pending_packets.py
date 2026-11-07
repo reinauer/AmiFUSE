@@ -749,6 +749,7 @@ def _mount(b):
     ops = fs.AmigaFuseFS.__new__(fs.AmigaFuseFS)
     ops.bridge = b
     ops._unmount_control = None
+    ops._deferred_grows = {}
     ops._mountpoint = None
     return ops
 

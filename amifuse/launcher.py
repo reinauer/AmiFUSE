@@ -316,11 +316,10 @@ def _enumerate_mount_units(image: str) -> tuple[list[_MountUnit], Optional[str]]
     single-partition command, unless that command fails
     (``default_open_fails``).
 
-    A partition whose drive name is damaged has no name to pass as
-    ``--partition``: it is skipped, and ``fallback_reason`` says so. With no
-    readable name at all, partition 0 is mounted as a lone partition is.
-    Where a mount without ``--partition`` fails, such a partition is mounted
-    by its number instead, if that number selects it, and is skipped if not.
+    A partition without a usable drive name is mounted by number only
+    when that selector resolves to the same RDB and partition. With no
+    readable name at all, the first partition retains the default mount.
+    Unselectable partitions are skipped and reported in fallback_reason.
 
     Any enumeration failure (non-RDB / unreadable image, IOError from
     ``open_rdisk``) degrades to a single no-``--partition`` unit -- exactly the
@@ -364,12 +363,18 @@ def _enumerate_mount_units(image: str) -> tuple[list[_MountUnit], Optional[str]]
         # The mount opens partition 0, whatever its drive name.
         label = parts[0].name if parts and parts[0].name else "disk image"
         units = [_MountUnit(name=None, label=label)]
-        skipped = len(parts[1:])
+        numbered = [_MountUnit(name=str(p.index), label=f"#{p.index}")
+                    for p in parts[1:] if _number_selects(img, p)]
+        units.extend(numbered)
+        skipped = len(parts[1:]) - len(numbered)
     else:
-        # A damaged drive name (None) selects no partition, and a mount
-        # without --partition opens partition 0: such a partition is skipped.
-        units = [_MountUnit(name=p.name, label=p.name) for p in named]
-        skipped = len(parts) - len(named)
+        units = []
+        for p in parts:
+            if p.name is not None:
+                units.append(_MountUnit(name=p.name, label=p.name))
+            elif _number_selects(img, p):
+                units.append(_MountUnit(name=str(p.index), label=f"#{p.index}"))
+        skipped = len(parts) - len(units)
     reason = result.fallback_reason
     if skipped:
         note = ("A partition was not mounted, as its drive name is damaged."

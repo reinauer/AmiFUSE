@@ -470,3 +470,16 @@ def test_getpath_lists_only_the_parent_of_a_refused_lock(ops, monkeypatch):
     monkeypatch.setattr(ops, "readdir", listing)
     assert ops.getpath("/canonical/mixedname") == "/Canonical/MixedName"
     assert listed == ["/Canonical"]
+
+
+def test_delete_renamed_directory_preserves_old_name(ops):
+    ops._winfsp = True
+    ops.mkdir("/before", 0o755)
+    handle = ops.opendir("/before")
+    assert ops.rename("/before", "/after") == 0
+    ops.mkdir("/before", 0o755)
+    assert ops.rmdir("/before") == 0
+    assert ops.releasedir("/before", handle) == 0
+    assert "before" in _on_disk(ops)
+    assert "after" not in _on_disk(ops)
+    assert ops._pending_deletes == set()

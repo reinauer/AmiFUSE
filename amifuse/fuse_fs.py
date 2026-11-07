@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Dict, List, NamedTuple, Optional, Sequence, Set, Tuple
 
 from .platform import kill_mount_owner_processes
+from .cli_output import configure_text_output
 
 FUSE = None
 
@@ -171,6 +172,9 @@ _NOT_FOUND_ERRORS = frozenset({ERROR_DIR_NOT_FOUND, ERROR_OBJECT_NOT_FOUND})
 # afs also uses it for a negative offset and for a file whose extension
 # blocks it cannot read, so it does not prove the offset is past the end.
 ERROR_SEEK_ERROR = 219
+
+# ExamineNext signals normal directory exhaustion with this error.
+ERROR_NO_MORE_ENTRIES = 232
 
 # ACTION_SEEK and ACTION_SET_FILE_SIZE carry the offset in dp_Arg2, a
 # signed LONG.
@@ -1767,8 +1771,12 @@ class HandlerBridge:
                 self._unwritten_outputs.add(fh_addr)
             return (fh_addr, dir_lock), 0
 
-    def list_dir(self, lock_bptr: int) -> List[Dict]:
+    def list_dir(self, lock_bptr: int, path: Optional[str] = None) -> List[Dict]:
         with self._lock:
+            # A path is supplied by list_dir_path; direct callers may only
+            # have a lock. Escape names before including them in warnings.
+            shown = escape_text(path) if path is not None else (
+                "/" if lock_bptr == 0 else f"lock 0x{lock_bptr:x}")
             # ensure we have a lock; lock_bptr=0 -> root
             root_lock = 0
             if lock_bptr == 0:
@@ -1797,6 +1805,7 @@ class HandlerBridge:
             # directory. The old limit of 256 silently truncated large directories.
             # 65536 is generous; ExamineNext will return ERROR_NO_MORE_ENTRIES
             # (res1=0) when the directory is exhausted, which breaks the loop.
+            unnamed = 0
             for iter_num in range(65536):
                 pkt_addr, _ = self.launcher.send_examine_next(
                     self.state, lock_bptr, fib_mem.addr)
@@ -1805,13 +1814,23 @@ class HandlerBridge:
                     if self._debug:
                         res2 = reply[1] if reply else -1
                         print(f"[amifuse] list_dir: ExamineNext #{iter_num} ended res2={res2}")
+                    if reply is not None and reply[1] != ERROR_NO_MORE_ENTRIES:
+                        print(f"Warning: listing {shown} stopped early "
+                              f"with error {reply[1]}; it may be incomplete",
+                              file=sys.stderr)
                     break
                 entry = _parse_fib(self.mem, fib_mem.addr)
                 if self._debug:
                     print(f"[amifuse] list_dir: ExamineNext #{iter_num} name='{entry['name']}' type={entry['dir_type']}")
                 if not entry["name"]:
-                    break
+                    unnamed += 1
+                    continue
                 entries.append(entry)
+            if unnamed:
+                detail = ("entry with an empty name" if unnamed == 1
+                          else "entries with empty names")
+                print(f"Warning: listing {shown}: skipped {unnamed} directory "
+                      f"{detail}", file=sys.stderr)
             if root_lock:
                 self.free_lock(root_lock)
             return entries
@@ -1820,11 +1839,11 @@ class HandlerBridge:
         """List directory contents by path."""
         with self._lock:
             if path == "/":
-                return self.list_dir(0)
+                return self.list_dir(0, path=path)
             lock, _, locks = self.locate_path(path)
             if lock == 0:
                 return []
-            entries = self.list_dir(lock)
+            entries = self.list_dir(lock, path=path)
             for l in reversed(locks):
                 self.free_lock(l)
             return entries
@@ -2931,6 +2950,9 @@ class AmigaFuseFS(_FuseOperations):
         # path -> the date utimens() set on an open file, sent at its last
         # release(). Guarded by _fh_lock.
         self._held_dates: Dict[str, float] = {}
+        # Logical grows awaiting data or a zero-filled tail. Pins continue
+        # to describe bytes actually written, including BFFS output handles.
+        self._deferred_grows: Dict[str, Dict[str, int]] = {}
         # How the handler folds names (_state_path). Only a write mount keeps
         # the state above, so the others send no packet to find out.
         self._name_fold = None
@@ -3269,7 +3291,7 @@ class AmigaFuseFS(_FuseOperations):
         cached = self._get_cached_stat(path)
         if cached is not None:
             self._track_op("getattr", path, cached=True)
-            return cached
+            return self._logical_stat(path, cached)
         # A file held on an exclusive lock, from create() or an O_TRUNC
         # open(), was answered from its pinned entry above: the handler
         # cannot examine it until release(). Any other open file is shared,
@@ -3285,7 +3307,64 @@ class AmigaFuseFS(_FuseOperations):
             raise FuseOSError(errno.ENOENT)
         result = self._stat_from_fib(info, path, int(time.time()))
         self._set_cached_stat(path, result)
+        return self._logical_stat(path, result)
+
+    def _logical_stat(self, path, result):
+        pending = self._deferred_grows.get(path)
+        if pending is not None:
+            return dict(result, st_size=pending["length"])
         return result
+
+    def _materialize_grow(self, path):
+        """Write a pending tail using any live handle on this file.
+
+        Keep the record on failure while a writer can still retry it.
+        No cached handle position survives the bridge's seeks and fill.
+        """
+        pending = self._deferred_grows.get(path)
+        if pending is None:
+            return
+        if path in self._pending_deletes:
+            # Cleanup may delete a cancelled copy before flush/release.
+            # Its unwritten tail will never be visible or need allocation.
+            self._deferred_grows.pop(path, None)
+            return
+        with self._fh_lock:
+            entries = [e for e in self._fh_cache.values()
+                       if e.get("path") == path and e.get("fh_addr")
+                       and not e.get("closed")]
+            writers = [e for e in entries if e.get("writable")]
+        if not writers:
+            raise FuseOSError(errno.EIO)
+        entry = writers[0]
+        with entry["lock"]:
+            try:
+                size, res2 = self.bridge.truncate_handle(
+                    entry["fh_addr"], pending["length"], end=pending["end"],
+                    past_end=any(e.get("past_pin") for e in entries))
+            finally:
+                for other in entries:
+                    other["pos"] = None
+            if size != pending["length"]:
+                entry["past_pin"] = True
+                raise FuseOSError(_WRITE_ERRNOS.get(res2, errno.EIO))
+            entry["dirty"] = True
+            for other in entries:
+                other.pop("past_pin", None)
+        if path in self._pinned_stats:
+            self._pin_stat(path, size)
+        self._deferred_grows.pop(path, None)
+        with self._cache_lock:
+            if path not in self._pinned_stats:
+                self._stat_cache.pop(path, None)
+
+    def _materialize_grows(self, except_path=None):
+        # Commit other files before an operation can consume their space.
+        # This preserves the existing ENOSPC check without overcommitting
+        # several logical grows against the same free blocks.
+        for path in list(self._deferred_grows):
+            if path != except_path:
+                self._materialize_grow(path)
 
     def _stat_from_fib(self, ent: Dict, name: str, now: int) -> Dict:
         """Build a FUSE stat dict from a parsed FileInfoBlock entry.
@@ -3572,6 +3651,8 @@ class AmigaFuseFS(_FuseOperations):
                         }
                     return handle
             raise FuseOSError(errno.ENOENT)
+        if flags & (os.O_CREAT | os.O_TRUNC):
+            self._materialize_grows(except_path=path)
         opened, res2 = self.bridge.open_file_reply(path, flags)
         if opened is None:
             # The file exists, but the handler will not open it while
@@ -3593,11 +3674,13 @@ class AmigaFuseFS(_FuseOperations):
                 "lock": threading.Lock(),
                 "closed": False,
                 "dirty": False,  # Track if file was written to
+                "writable": (flags & getattr(os, "O_ACCMODE", 3)) != os.O_RDONLY,
                 "path": path,
             }
         # open_file() takes an exclusive ACTION_FINDOUTPUT lock for O_TRUNC
         # without O_RDONLY, as create() does, and the file is empty now.
         if flags & os.O_TRUNC and (flags & getattr(os, "O_ACCMODE", 3)) != os.O_RDONLY:
+            self._deferred_grows.pop(path, None)
             self._pin_stat(path, 0)
         return handle
 
@@ -3605,6 +3688,10 @@ class AmigaFuseFS(_FuseOperations):
         self._check_handler_alive()
         with self._fh_lock:
             entry = self._fh_cache.get(fh)
+        read_path = self._state_path(_handle_path(entry, path))
+        pending = self._deferred_grows.get(read_path)
+        if pending is not None and size and offset + size > pending["end"]:
+            self._materialize_grow(read_path)
         if entry is None:
             data = self.bridge.read_file(path, size, offset)
             if data is None:
@@ -3673,7 +3760,11 @@ class AmigaFuseFS(_FuseOperations):
         if entry is None:
             raise FuseOSError(errno.EIO)
         fh_addr = entry["fh_addr"]
-        end = self._pinned_end(entry, path)
+        path = _handle_path(entry, path)
+        if data:
+            self._materialize_grows(except_path=path)
+        pending = self._deferred_grows.get(path)
+        end = pending["end"] if pending else self._pinned_end(entry, path)
         with entry["lock"]:
             if entry.get("closed"):
                 raise FuseOSError(errno.EIO)
@@ -3706,6 +3797,10 @@ class AmigaFuseFS(_FuseOperations):
                 cached = self._stat_cache.get(path)
                 if cached is not None and offset + written > cached[1]["st_size"]:
                     self._pin_stat(path, offset + written)
+        if pending is not None:
+            pending["end"] = max(pending["end"], offset + written)
+            if pending["end"] >= pending["length"]:
+                self._deferred_grows.pop(path, None)
         return written
 
     def _settle_handles(self, entry, far, seek: bool):
@@ -3785,10 +3880,56 @@ class AmigaFuseFS(_FuseOperations):
                            if h != fh and "fh_addr" in e and not e.get("closed")]
                 others = [e for e in handles if (e["pos"] or 0) <= _LONG_MAX]
                 far = [e for e in handles if (e["pos"] or 0) > _LONG_MAX]
-            if entry is None:
+            if entry is None or entry.get("closed"):
                 raise FuseOSError(errno.EIO)
             fh_addr = entry["fh_addr"]
-            end = self._pinned_end(entry, path)
+            path = _handle_path(entry, path)
+            self._materialize_grows(except_path=path)
+            pending = self._deferred_grows.get(path)
+            end = pending["end"] if pending else self._pinned_end(entry, path)
+            # A path-only truncate closes its temporary handle immediately,
+            # so deferral would save no writes. Unknown/failed ends retain
+            # the bridge's existing recovery behavior.
+            measured = end
+            dos_type = getattr(self.bridge, "_dos_type", None)
+            family = dos_type & 0xFFFFFF00 if isinstance(dos_type, int) else None
+            supported = family in (0x444F5300, *_PFS_FAMILIES, _SFS_FAMILY)
+            if (supported and not temp_handle and length
+                    and entry.get("writable") and not entry.get("past_pin")):
+                if measured is None:
+                    measured = self.bridge._handle_end(fh_addr)
+                    entry["pos"] = None
+                if isinstance(measured, int) and length > measured:
+                    # Zero-length writes alone do not test file protection
+                    # on every handler. Shared handles can still be examined;
+                    # exclusive output handles passed the open's check.
+                    file_info = (self.bridge.stat_path(path)
+                                 if path not in self._pinned_stats else None)
+                    if (file_info and file_info.get("protection", 0)
+                            & DosProtection.FIBF_WRITE):
+                        raise FuseOSError(errno.EACCES)
+                    info = (self.bridge.get_disk_info() if file_info is not None
+                            or path in self._pinned_stats else None)
+                    if info and info["bytes_per_block"]:
+                        bpb = info["bytes_per_block"]
+                        free = max(0, info["num_blocks"] - info["num_blocks_used"])
+                        if length - measured > free * bpb + (-measured % bpb):
+                            raise FuseOSError(errno.ENOSPC)
+                        # Check the handle and volume's write permission
+                        # now, before reporting a successful logical grow.
+                        result, res2 = self.bridge.write_empty_reply(fh_addr)
+                        if result < 0:
+                            entry["pos"] = None
+                            raise FuseOSError(_WRITE_ERRNOS.get(res2, errno.EIO))
+                        # Free blocks include filesystem metadata and OFS
+                        # block headers. Near capacity, fill synchronously
+                        # so ENOSPC reaches truncate rather than close,
+                        # whose result the host filesystem can discard.
+                        if (length - measured) * 10 <= free * bpb * 9:
+                            self._deferred_grows[path] = {
+                                "length": length, "end": measured}
+                            entry["dirty"] = True
+                            return 0
             with entry["lock"]:
                 if entry.get("closed"):
                     raise FuseOSError(errno.EIO)
@@ -3848,6 +3989,7 @@ class AmigaFuseFS(_FuseOperations):
                     raise FuseOSError(_WRITE_ERRNOS.get(res2, errno.EIO))
                 entry["dirty"] = True  # Truncate modifies the file
                 if size == length:
+                    self._deferred_grows.pop(path, None)
                     # The handler's end is now length, as the pin is.
                     entry.pop("past_pin", None)
                     self._settle_handles(entry, far,
@@ -3951,12 +4093,14 @@ class AmigaFuseFS(_FuseOperations):
             if self._is_platform_special(path):
                 raise FuseOSError(errno.ENOENT)
             path = self._state_path(path)
+            self._materialize_grows(except_path=path)
             opened = self.bridge.open_file(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
             if opened is None:
                 self._log_op("create", path, "FAILED: open_file returned None")
                 raise FuseOSError(errno.EIO)
             fh_addr, parent_lock = opened
             self._forget_pending_delete(path)
+            self._deferred_grows.pop(path, None)
             with self._fh_lock:
                 handle = self._next_fh
                 self._next_fh += 1
@@ -3967,6 +4111,7 @@ class AmigaFuseFS(_FuseOperations):
                     "lock": threading.Lock(),
                     "closed": False,
                     "dirty": True,  # New files are always dirty
+                    "writable": True,
                     "path": path,
                 }
             # Prime stat/dir cache so immediate getattr after create doesn't fail.
@@ -4058,6 +4203,19 @@ class AmigaFuseFS(_FuseOperations):
         if not self.bridge._write_enabled:
             raise FuseOSError(errno.EROFS)
         path = self._state_path(path)
+        if self._winfsp:
+            # Delete-on-close keeps the handle's original spelling after
+            # FileRenameInfo, just as it does for file handles in unlink().
+            with self._fh_lock:
+                targets = {
+                    v.get("path") for v in self._fh_cache.values()
+                    if v.get("dir_handle") and self._folded(
+                        v.get("opened_as", v.get("path")) or "") == self._folded(path)
+                }
+            if len(targets) == 1 and path not in targets:
+                target = targets.pop()
+                self._log_op("rmdir", path, f"renamed open directory: {target}")
+                path = target
         dir_path, name = self._split_path(path)
         if not name:
             raise FuseOSError(errno.EINVAL)
@@ -4200,6 +4358,7 @@ class AmigaFuseFS(_FuseOperations):
         dir_path, name = self._split_path(path)
         if not name:
             raise FuseOSError(errno.EINVAL)
+        self._materialize_grows()
         parent_lock, _, locks = self.bridge.locate_path(dir_path)
         try:
             if parent_lock == 0 and dir_path != "/":
@@ -4428,6 +4587,10 @@ class AmigaFuseFS(_FuseOperations):
                     }
                     for d, children in self._pending_dir_deletes.items()
                 }
+                self._deferred_grows = {
+                    _renamed_path(p, old, new) or p: growth
+                    for p, growth in self._deferred_grows.items()
+                }
                 self._held_dates = {
                     _renamed_path(p, old, new) or p: when
                     for p, when in self._held_dates.items()
@@ -4459,6 +4622,9 @@ class AmigaFuseFS(_FuseOperations):
 
     def flush(self, path, fh):
         self._log_op("flush", path, f"fh={fh}")
+        with self._fh_lock:
+            entry = self._fh_cache.get(fh)
+        self._materialize_grow(self._state_path(_handle_path(entry, path)))
         return 0
 
     def fsync(self, path, fdatasync, fh):
@@ -4469,7 +4635,10 @@ class AmigaFuseFS(_FuseOperations):
         # Handlers keep data and metadata in their buffers. ACTION_FLUSH has
         # no per-file form, so write out the whole volume.
         try:
+            self._materialize_grows()
             self.bridge.flush_volume()
+        except FuseOSError:
+            raise
         except OSError as exc:
             raise FuseOSError(errno.EIO) from exc
         return 0
@@ -4482,7 +4651,10 @@ class AmigaFuseFS(_FuseOperations):
         # A create, rename, delete or mkdir in the directory can still be in
         # the handler's buffers, and ACTION_FLUSH writes out the whole volume.
         try:
+            self._materialize_grows()
             self.bridge.flush_volume()
+        except FuseOSError:
+            raise
         except OSError as exc:
             raise FuseOSError(errno.EIO) from exc
         return 0
@@ -4896,6 +5068,26 @@ class AmigaFuseFS(_FuseOperations):
     def release(self, path, fh):
         self._log_op("release", path, f"fh={fh}")
         with self._fh_lock:
+            closing = self._fh_cache.get(fh)
+            resolved = _handle_path(closing, path)
+            last_writer = closing and closing.get("writable") and not any(
+                e.get("path") == resolved and h != fh and e.get("writable")
+                and e.get("fh_addr") and not e.get("closed")
+                for h, e in self._fh_cache.items())
+        if last_writer:
+            try:
+                self._materialize_grow(resolved)
+            except Exception as e:
+                # release is called only once, even when it fails. Close
+                # the handle and complete held dates/deletes below. Losing
+                # the logical tail leaves only bytes the handler wrote.
+                print(f"[amifuse] WARNING: could not fill "
+                      f"{escape_text(resolved)} before close: {e}",
+                      file=sys.stderr, flush=True)
+                self._deferred_grows.pop(resolved, None)
+                with self._cache_lock:
+                    self._stat_cache.pop(resolved, None)
+        with self._fh_lock:
             entry = self._fh_cache.get(fh)
             if not entry:
                 return 0
@@ -5074,6 +5266,16 @@ class AmigaFuseFS(_FuseOperations):
             if self.bridge._write_enabled:
                 if _handler_has_crashed(self.bridge):
                     raise RuntimeError("handler crashed before volume flush")
+                for pending_path in list(self._deferred_grows):
+                    try:
+                        self._materialize_grow(pending_path)
+                    except Exception as e:
+                        success = False
+                        print(f"[amifuse] WARNING: could not fill "
+                              f"{escape_text(pending_path)} before unmount: "
+                              f"{e}", flush=True)
+                # A failed fill must not prevent unrelated buffered data
+                # from reaching the image, or another tail being filled.
                 unanswered = self.bridge.wait_for_pending()
                 flush_error = None
                 try:
@@ -5220,15 +5422,12 @@ def get_partition_name(image: Path, block_size: Optional[int], partition: Option
 
 
 def _entry_partitions(error: Exception, image: Path,
-                      block_size: Optional[int]) -> List[str]:
-    """Name the partitions that still open after an open fails with error.
+                      block_size: Optional[int]) -> List[Tuple[str, str]]:
+    """Return (label, selector) choices after the disk's own RDB fails.
 
-    Where the disk's own RDB fails (DiskRDBError), the partitions in its
-    0x76 entries still open by name. Returns those names, as list_partitions
-    gives them, and [] after any other error. A partition with a damaged
-    drive name has none to give, and a name that --partition does not take
-    to its partition, as after a device or media error in an entry, is left
-    out.
+    Names and numeric fallbacks must resolve to the exact partition being
+    offered. Display labels such as #0 remain separate from selector 0,
+    including when a real drive name happens to start with #.
     """
     from .rdb_inspect import DiskRDBError, find_partition, list_partitions
 
@@ -5238,28 +5437,35 @@ def _entry_partitions(error: Exception, image: Path,
         parts = list_partitions(image, block_size).partitions
     except OSError:
         return []
-    names = []
+    choices = []
     for part in parts:
-        if part.name is None:
-            continue
+        selector = part.name if part.name is not None else str(part.index)
         try:
-            ref = find_partition(image, block_size, part.name)
+            ref = find_partition(image, block_size, selector)
         except OSError:
             continue
         if ref is not None and (ref.mbr_partition_index, ref.number) == (
                 part.mbr_partition_index, part.index):
-            names.append(part.name)
-    return names
+            label = part.name if part.name is not None else f"#{part.index}"
+            choices.append((label, selector))
+    return choices
 
 
-def _entry_partitions_hint(names: List[str]) -> str:
-    """Return the line that follows an open error, from _entry_partitions."""
-    if not names:
+def _entry_partitions_hint(choices: List[Tuple[str, str]]) -> str:
+    """Return the recovery hint with a usable selector, not its label."""
+    if not choices:
         return ""
-    # The image chooses the names; error.details.partitions keeps them raw.
-    shown = [escape_text(name) for name in names]
+    shown = [escape_text(label) for label, _ in choices]
+    raw_selector = escape_text(choices[0][1])
+    selector = shlex.quote(raw_selector)
+    if sys.platform == "win32" and selector != raw_selector:
+        # POSIX single quotes reach cmd.exe as literal name characters.
+        # Keep # prefixed names quoted for PowerShell as well.
+        selector = subprocess.list2cmdline([raw_selector])
+        if not selector.startswith('"'):
+            selector = f'"{selector}"'
     return (f"\nThe partitions in the MBR's 0x76 entries still open, read-only: "
-            f"{', '.join(shown)}. Open one with --partition {shown[0]}.")
+            f"{', '.join(shown)}. Open one with --partition {selector}.")
 
 
 # The PID that extracted the driver, then mkstemp's random part, whose
@@ -6289,7 +6495,7 @@ def _create_bridge_from_args(args, command: str, read_only: bool = True):
         if use_json:
             print(_json.dumps(_json_error(
                 command, "IMAGE_INVALID", str(e),
-                details={"partitions": names} if names else None)))
+                details={"partitions": [label for label, _ in names]} if names else None)))
             sys.exit(1)
         raise SystemExit(f"Error: {e}{_entry_partitions_hint(names)}")
     except DriverNotFound as e:
@@ -6348,7 +6554,7 @@ def _create_bridge_from_args(args, command: str, read_only: bool = True):
             else:
                 error = _json_error(command, "HANDLER_ERROR",
                     f"Failed to initialize filesystem handler: {e}",
-                    details={"partitions": names} if names else None)
+                    details={"partitions": [label for label, _ in names]} if names else None)
             print(_json.dumps(error))
             sys.exit(1)
         if in_use:
@@ -7563,6 +7769,7 @@ def cmd_inspect(args):
         amiga_parts = amiga_rdb_partitions(args.image)
         all_rdbs = []
         rdb_parts = []
+        rdb_indices = []
         notes = []
         first_error = None
         beside_mbr = False  # The disk has its own RDB beside the MBR.
@@ -7585,6 +7792,7 @@ def cmd_inspect(args):
             try:
                 all_rdbs.append(build_rdisk_desc(rdisk, mbr_ctx))
                 rdb_parts.append(list(rdisk.parts))
+                rdb_indices.append(rdb_idx)
             finally:
                 rdisk.close()
                 blkdev.close()
@@ -7595,14 +7803,25 @@ def cmd_inspect(args):
             sys.exit(1)
 
         # Resolved with the image closed: a Windows disk admits one reader.
-        for desc, names in zip(all_rdbs, mount_names(rdb_parts)):
+        for desc, names, rdb_idx in zip(
+                all_rdbs, mount_names(rdb_parts), rdb_indices):
             for part, name in zip(desc["partitions"], names):
                 if name not in (None, part["name"]):
                     # A repeated drive name, which mount --partition takes
                     # as AmigaOS names it. A damaged one has no such name.
                     part["mount_name"] = name
+                selector = name
+                if selector is None:
+                    try:
+                        ref = find_partition(args.image, args.block_size,
+                                             str(part["num"]))
+                    except OSError:
+                        ref = None
+                    if ref is not None and (ref.mbr_partition_index, ref.number) == (
+                            rdb_idx, part["num"]):
+                        selector = str(part["num"])
                 part["driver"], text = _partition_driver(
-                    args.image, args.block_size, name)
+                    args.image, args.block_size, selector)
                 if part["driver"] is None:
                     part["driver_note"] = text
 
@@ -7650,6 +7869,8 @@ def cmd_inspect(args):
         else:
             if ref is not None and (ref.mbr_partition_index, ref.number) == (
                     part.mbr_partition_index, part.index):
+                text = _partition_driver(args.image, args.block_size,
+                                         str(part.index))[1]
                 print(f"  #{part.index}: {text}")
                 continue
             if ref is None:
@@ -7724,6 +7945,13 @@ def cmd_unmount(args):
         is_mounted = os.path.ismount(mountpoint)
     except OSError:
         is_mounted = False
+    if (not is_mounted and sys.platform.startswith("win")
+            and not plat.is_stale_mountpoint(mountpoint)
+            and plat.windows_drive_mountpoint(mountpoint) is None):
+        # WinFsp directory mounts are reparse points, which ismount() does
+        # not recognize. Match the serving process before requesting its
+        # cooperative shutdown; never remove the directory ourselves.
+        is_mounted = bool(plat._find_mount_owner_pids(mountpoint))
     if not is_mounted and not plat.is_stale_mountpoint(mountpoint):
         raise SystemExit(f"Mountpoint {mountpoint} is not currently mounted.")
     # On macOS, `umount -f` unmounts any volume, and the fallback below kills
@@ -7759,6 +7987,11 @@ def cmd_unmount(args):
         else:
             killed_pids = kill_mount_owner_processes(mountpoint)
         if not killed_pids:
+            if (sys.platform.startswith("win")
+                    and plat._find_starting_mount_pids(mountpoint)):
+                raise SystemExit(
+                    f"AmiFUSE at {mountpoint} is still starting; "
+                    "try unmounting again once the mount is ready.")
             message = f"No amifuse process found for mountpoint {mountpoint}."
             if sys.platform.startswith("win") and not plat.is_windows_admin():
                 message += (
@@ -7858,6 +8091,7 @@ def _validate_driver_path(driver: Optional[Path]) -> None:
 
 
 def main(argv=None):
+    configure_text_output()
     parser = argparse.ArgumentParser(
         prog="amifuse",
         description=f"{__banner__}\n\n"
