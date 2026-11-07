@@ -410,3 +410,21 @@ def test_inhibit_cycle_uninhibits_after_the_inhibit_reply(fuse_fs_mod, monkeypat
     assert inhibit_pkt in launcher.answered_at_send[1]
     assert launcher.own_replies_queued() == []
     bridge.backend.sync.assert_called_once_with()
+
+
+@pytest.mark.parametrize("mode", MODES)
+@pytest.mark.parametrize("error", [213, ERROR_NO_MORE_ENTRIES])
+def test_listing_warning_names_and_escapes_the_directory(fuse_fs_mod, monkeypatch, mode, error, capsys):
+    answers = iter([(-1, 0, {"name": ""}), (0, error)])
+    bridge, launcher = _run(fuse_fs_mod, monkeypatch, mode, {
+        ACTION_LOCATE_OBJECT: _locate,
+        ACTION_EXAMINE_OBJECT: lambda args, names: (-1, 0, {"name": "dir"}),
+        ACTION_EXAMINE_NEXT: lambda args, names: next(answers),
+        ACTION_FREE_LOCK: _ok,
+    })
+    monkeypatch.setattr(bridge, "locate_path", lambda path: (DIR_LOCK, 0, []))
+    assert bridge.list_dir_path("/bad\nname") == []
+    warning = capsys.readouterr().err
+    assert "listing /bad\\x0aname" in warning
+    assert "skipped 1 directory entry with an empty name" in warning
+    assert ("incomplete" in warning) == (error != ERROR_NO_MORE_ENTRIES)

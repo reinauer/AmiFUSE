@@ -987,12 +987,40 @@ class TestUnmountCommand:
     def test_unmount_rejects_non_mountpoint(self, monkeypatch, fuse_mock):
         monkeypatch.setattr("os.path.ismount", lambda path: False)
         monkeypatch.setattr("amifuse.platform.is_stale_mountpoint", lambda path: False)
+        monkeypatch.setattr("amifuse.platform._find_mount_owner_pids", lambda path: [])
         import amifuse.fuse_fs as fuse_fs_mod
 
         with pytest.raises(SystemExit) as exc_info:
             fuse_fs_mod.cmd_unmount(argparse.Namespace(mountpoint=Path("/mnt/amiga")))
 
         assert "is not currently mounted" in str(exc_info.value)
+
+    @pytest.mark.parametrize("owners", [[], [42]])
+    def test_unmount_windows_directory_uses_owner(self, monkeypatch,
+                                                 fuse_mock, owners):
+        import amifuse.fuse_fs as fuse_fs_mod
+        from amifuse import platform as plat
+
+        monkeypatch.setattr(fuse_fs_mod, "sys", SimpleNamespace(platform="win32"))
+        monkeypatch.setattr("os.path.ismount", lambda path: False)
+        monkeypatch.setattr(plat, "windows_drive_mountpoint", lambda path: None)
+        monkeypatch.setattr(plat, "is_stale_mountpoint", lambda path: False)
+        monkeypatch.setattr(plat, "_find_mount_owner_pids", lambda path: owners)
+        monkeypatch.setattr(plat, "get_unmount_command", lambda path: [])
+        stopped = []
+
+        def stop(pids):
+            stopped.extend(pids)
+            return pids
+
+        monkeypatch.setattr(plat, "stop_mount_processes", stop)
+        args = argparse.Namespace(mountpoint=Path(r"C:\mnt\amiga"))
+        if owners:
+            fuse_fs_mod.cmd_unmount(args)
+        else:
+            with pytest.raises(SystemExit, match="not currently mounted"):
+                fuse_fs_mod.cmd_unmount(args)
+        assert stopped == owners
 
     def test_unmount_uses_process_kill_without_unix_command(self, monkeypatch, fuse_mock):
         """Unix retains its process fallback; Windows uses cooperative control."""
@@ -1305,6 +1333,10 @@ class TestWindowsProcessDiscovery:
 
     _find_mount_owner_pids moved to platform.py in Phase 8.
     """
+
+    @pytest.fixture(autouse=True)
+    def mounted_processes(self, monkeypatch):
+        monkeypatch.setattr("amifuse.windows_unmount.is_mount_ready", lambda pid: True)
 
     def test_finds_amifuse_pid_from_wmic_output(self, fuse_mock, monkeypatch):
         import amifuse.platform as plat_mod
@@ -4077,6 +4109,10 @@ class TestCommandMatchesMountpoint:
 
     _find_mount_owner_pids moved to platform.py in Phase 8.
     """
+
+    @pytest.fixture(autouse=True)
+    def mounted_processes(self, monkeypatch):
+        monkeypatch.setattr("amifuse.windows_unmount.is_mount_ready", lambda pid: True)
 
     def test_matches_literal_mountpoint(self, fuse_mock, monkeypatch):
         """Matches when mountpoint value equals the raw mountpoint string."""

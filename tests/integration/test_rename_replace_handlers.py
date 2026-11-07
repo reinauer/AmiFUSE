@@ -530,3 +530,16 @@ def test_windows_pinned_reader_avoids_metadata_packets(ops, monkeypatch):
         if reader is not None:
             ops.release("/busy", reader)
         ops.release("/busy", writer)
+
+
+def test_delete_renamed_directory_preserves_old_name(ops):
+    ops._winfsp = True
+    ops.mkdir("/before", 0o755)
+    handle = ops.opendir("/before")
+    assert ops.rename("/before", "/after") == 0
+    ops.mkdir("/before", 0o755)
+    assert ops.rmdir("/before") == 0
+    assert ops.releasedir("/before", handle) == 0
+    assert "before" in _on_disk(ops)
+    assert "after" not in _on_disk(ops)
+    assert ops._pending_deletes == set()
