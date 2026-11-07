@@ -430,9 +430,10 @@ def test_delete_renamed_directory_preserves_old_name(ops):
     ops._winfsp = True
     ops.mkdir("/before", 0o755)
     handle = ops.opendir("/before")
-    ops.rename("/before", "/after")
+    assert ops.rename("/before", "/after") == 0
     ops.mkdir("/before", 0o755)
-    ops.rmdir("/before")
-    ops.releasedir("/before", handle)
-    assert "before" in ops.readdir("/", None)
-    assert "after" not in ops.readdir("/", None)
+    assert ops.rmdir("/before") == 0
+    assert ops.releasedir("/before", handle) == 0
+    assert "before" in _on_disk(ops)
+    assert "after" not in _on_disk(ops)
+    assert ops._pending_deletes == set()
