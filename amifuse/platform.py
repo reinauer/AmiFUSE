@@ -193,9 +193,8 @@ def should_auto_create_mountpoint(mountpoint: Path) -> bool:
         path = posixpath.normpath(str(mountpoint))
         return posixpath.dirname(path) == "/Volumes"
     if sys.platform.startswith("win"):
-        # WinFSP handles drive letter mountpoints; don't mkdir them.
-        # Directory mountpoints (e.g. C:\mnt\amiga) still need mkdir.
-        return windows_drive_mountpoint(mountpoint) is not None
+        # WinFsp creates both drive-letter and directory mountpoints.
+        return True
     return False
 
 
@@ -293,6 +292,16 @@ def check_fuse_available() -> None:
     )
 
 
+def _windows_drive_type(root: str) -> int:
+    import ctypes
+    from ctypes import wintypes
+
+    get_drive_type = ctypes.windll.kernel32.GetDriveTypeW
+    get_drive_type.argtypes = [wintypes.LPCWSTR]
+    get_drive_type.restype = wintypes.UINT
+    return int(get_drive_type(root))
+
+
 def validate_mountpoint(mountpoint: Path) -> Optional[str]:
     """Validate that a mountpoint is available for use.
 
@@ -315,6 +324,24 @@ def validate_mountpoint(mountpoint: Path) -> Optional[str]:
                 f"Drive {drive} is already allocated; choose a different drive "
                 f"letter or free it first."
             )
+    elif sys.platform.startswith("win"):
+        import ntpath
+
+        # Process discovery sees the original command line, so a relative
+        # directory cannot be found reliably from another working directory.
+        drive_name, tail = ntpath.splitdrive(mp_str)
+        if not drive_name or not tail.startswith(("/", "\\")):
+            return "Windows directory mountpoints require an absolute path."
+        root = drive_name.replace("/", "\\")
+        is_unc = (root.upper().startswith("\\\\?\\UNC\\") or
+                  (root.startswith("\\\\") and not root.startswith("\\\\?\\")))
+        if is_unc or _windows_drive_type(root + "\\") == 4:  # DRIVE_REMOTE
+            return "Windows directory mountpoints must be on a local drive."
+        if os.path.lexists(mp_str):
+            return (f"WinFsp needs a mountpoint path that does not exist yet: "
+                    f"{mountpoint}. Choose another path.")
+        if not os.path.isdir(ntpath.dirname(mp_str)):
+            return f"Mountpoint parent directory does not exist: {mountpoint}."
     else:
         # A drive name can match a symlink in /Volumes: /Volumes/Macintosh HD
         # points to /. Checked first, as os.path.exists follows the link, and
@@ -1156,6 +1183,18 @@ def _pid_exists(pid: int) -> bool:
 
 
 def _find_mount_owner_pids(mountpoint: Path) -> List[int]:
+    """Find serving processes, excluding Windows mounts still starting."""
+    return _find_mount_pids(mountpoint, ready=True)
+
+
+def _find_starting_mount_pids(mountpoint: Path) -> List[int]:
+    """Find Windows mount processes that have not reached FUSE init."""
+    if not sys.platform.startswith("win"):
+        return []
+    return _find_mount_pids(mountpoint, ready=False)
+
+
+def _find_mount_pids(mountpoint: Path, *, ready: bool) -> List[int]:
     """Find PIDs of amifuse processes that own the given mountpoint.
 
     Uses find_amifuse_mounts() for process discovery, then filters to those
@@ -1179,10 +1218,13 @@ def _find_mount_owner_pids(mountpoint: Path) -> List[int]:
             # resolving through WinFsp can produce a different device path.
             return ntpath.normcase(ntpath.abspath(path))
 
+        from .windows_unmount import is_mount_ready
+
         target = key(mountpoint)
         return [mount["pid"] for mount in all_mounts
                 if mount.get("mountpoint") is not None
-                and key(mount["mountpoint"]) == target]
+                and key(mount["mountpoint"]) == target
+                and is_mount_ready(mount["pid"]) == ready]
 
     raw_mountpoint = str(mountpoint)
     abs_mountpoint = str(mountpoint.resolve(strict=False))

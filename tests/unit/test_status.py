@@ -543,6 +543,10 @@ class TestFindMountOwnerPidsRefactored:
     _find_mount_owner_pids moved to platform.py in Phase 8.
     """
 
+    @pytest.fixture(autouse=True)
+    def mounted_processes(self, monkeypatch):
+        monkeypatch.setattr("amifuse.windows_unmount.is_mount_ready", lambda pid: True)
+
     def test_filters_by_mountpoint(self, monkeypatch):
         from amifuse.platform import _find_mount_owner_pids
 

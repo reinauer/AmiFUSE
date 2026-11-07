@@ -110,18 +110,20 @@ def test_repeated_name_is_given_as_it_selects(tmp_path, user_driver_dir):
     assert caught.value.code.endswith(_hint(["DH0", "DH0.1"]))
 
 
-def test_damaged_name_is_left_out(tmp_path, user_driver_dir):
+def test_damaged_name_is_offered_by_number(tmp_path, user_driver_dir):
     image = _failed_disk(tmp_path, ("PI0", "PI1"))
     _damage_entry(image, tmp_path, 200)
     with pytest.raises(SystemExit) as caught:
         main(["ls", str(image)])
-    assert caught.value.code.endswith(_hint(["PI1"]))
+    assert caught.value.code.endswith(
+        _hint(['#0', 'PI1']).replace('--partition #0', '--partition 0'))
 
-    # With no name left there is nothing to say.
+    # The later index 0 is ambiguous, but the first one remains usable.
     _damage_entry(image, tmp_path, 400)
     with pytest.raises(SystemExit) as caught:
         main(["ls", str(image)])
-    assert caught.value.code == f"Error: {_error(image)}"
+    assert caught.value.code.endswith(
+        _hint(["#0"]).replace("--partition #0", "--partition 0"))
 
 
 def test_name_that_does_not_select_its_partition_is_left_out(

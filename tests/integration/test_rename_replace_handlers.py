@@ -506,5 +506,22 @@ def test_windows_delete_access_after_directory_rename(ops, recreate):
         if recreate:
             assert ops.mkdir("/before", 0o755) == 0
         assert ops.access("/before", DELETE_OK) == 0
+        assert ops.rmdir("/before") == 0
     finally:
         ops.releasedir("/before", handle)
+    assert "after" not in _on_disk(ops)
+    assert ("before" in _on_disk(ops)) == recreate
+    assert not ops._pending_deletes
+
+
+def test_delete_renamed_directory_preserves_old_name(ops):
+    ops._winfsp = True
+    ops.mkdir("/before", 0o755)
+    handle = ops.opendir("/before")
+    assert ops.rename("/before", "/after") == 0
+    ops.mkdir("/before", 0o755)
+    assert ops.rmdir("/before") == 0
+    assert ops.releasedir("/before", handle) == 0
+    assert "before" in _on_disk(ops)
+    assert "after" not in _on_disk(ops)
+    assert ops._pending_deletes == set()

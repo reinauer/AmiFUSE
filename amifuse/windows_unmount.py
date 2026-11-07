@@ -100,6 +100,10 @@ class UnmountControl:
 
     def start(self):
         callback = _fuse_exit_callback()
+        # Construction precedes FUSE startup; only init establishes that
+        # this process has reached a mount, rather than merely requesting it.
+        self.handles["mounted"] = self.api.open(os.getpid(), "mounted", create=True)
+        self.api.set(self.handles["mounted"])
 
         def watch():
             try:
@@ -129,9 +133,10 @@ class UnmountControl:
         # The mount is going: drop the ready event before destroy's flush,
         # which may take seconds, so that a launch never reads a mount whose
         # mount point WinFsp refused after init as up.
-        ready = self.handles.pop("ready", None)
-        if ready is not None:
-            self.api.close(ready)
+        for kind in ("ready", "mounted"):
+            handle = self.handles.pop(kind, None)
+            if handle is not None:
+                self.api.close(handle)
         self.stopped.set()
         if self.thread is not None:
             self.thread.join()
@@ -151,6 +156,21 @@ class UnmountControl:
         for handle in self.handles.values():
             self.api.close(handle)
         self.handles.clear()
+
+
+def is_mount_ready(pid):
+    """Whether this process reached FUSE init and has not begun teardown."""
+    api = _Events()
+    try:
+        handle = api.open(pid, "mounted")
+    except OSError as exc:
+        if getattr(exc, "winerror", None) == 2:
+            return False
+        raise
+    try:
+        return api.wait(handle, 0)
+    finally:
+        api.close(handle)
 
 
 class UnmountError(OSError):
