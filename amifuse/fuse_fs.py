@@ -2996,11 +2996,23 @@ class AmigaFuseFS(_FuseOperations):
                 flush_metadata = bool(entry.get("dirty") or path in self._held_dates
                                       or path in self._pending_deletes
                                       or self._pending_dir_deletes)
+        pending_before = set(self._pending_deletes) if op in {"unlink", "rmdir"} else set()
         result = super().__call__(op, *args)
+        if flush_metadata and op in {"unlink", "rmdir"}:
+            # A deferred deletion changes only our in-memory bookkeeping.
+            flush_metadata = not (self._state_path(args[0]) in self._pending_deletes
+                                  or self._pending_deletes - pending_before)
+        if flush_metadata and op == "utimens":
+            flush_metadata = self._state_path(args[0]) not in self._held_dates
         if flush_metadata:
             try:
                 self.bridge.flush_volume()
             except OSError as exc:
+                if op in {"release", "releasedir"}:
+                    # WinFsp ignores close callback errors. Keep data-loss
+                    # diagnostics visible even without debug logging.
+                    print(f"[amifuse] WARNING: {op} flush failed for {args[0]}: {exc}",
+                          file=sys.stderr, flush=True)
                 if op == "create":
                     # FUSE never receives the new handle when create fails,
                     # so it cannot send the release that would close it.
