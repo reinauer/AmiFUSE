@@ -475,3 +475,58 @@ def test_windows_logical_reader_keeps_replaced_content(ops):
     finally:
         ops.release("/old", handle)
     _no_temp_names(ops)
+
+
+def test_windows_metadata_open_allows_truncate(ops):
+    ops._winfsp = True
+    _write(ops, "/before", b"keep")
+    handle = ops.open("/before", os.O_RDONLY)
+    try:
+        assert ops.truncate("/before", 0, handle) == 0
+        assert ops.getattr("/before", handle)["st_size"] == 0
+        assert ops.read("/before", 100, 0, handle) == b""
+    finally:
+        ops.release("/before", handle)
+    assert ops.getattr("/before")["st_size"] == 0
+    assert not ops._fh_cache
+    assert _read(ops, "/before") == b""
+
+
+def test_windows_read_only_reuses_data_handle(ops, monkeypatch):
+    from unittest.mock import Mock
+
+    _write(ops, "/data", NEW)
+    ops._winfsp = True
+    monkeypatch.setattr(ops.bridge, "_write_enabled", False)
+    opened = Mock(wraps=ops.bridge.open_file_reply)
+    closed = Mock(wraps=ops.bridge.close_file)
+    monkeypatch.setattr(ops.bridge, "open_file_reply", opened)
+    monkeypatch.setattr(ops.bridge, "close_file", closed)
+    handle = ops.open("/data", os.O_RDONLY)
+    assert opened.call_count == 0
+    for offset in (0, 128, 256, 7):
+        assert ops.read("/data", 128, offset, handle) == NEW[offset:offset + 128]
+    assert opened.call_count == 1
+    assert closed.call_count == 0
+    ops.release("/data", handle)
+    assert closed.call_count == 1
+    assert not ops._fh_cache
+
+
+def test_windows_pinned_reader_avoids_metadata_packets(ops, monkeypatch):
+    ops._winfsp = True
+    writer = ops.create("/busy", 0o644)
+    reader = None
+    try:
+        ops.write("/busy", NEW, 0, writer)
+        reader = ops.open("/busy", os.O_RDONLY)
+        def unexpected(*args):
+            pytest.fail("pinned reader must not examine or enumerate")
+        monkeypatch.setattr(ops.bridge, "stat_path", unexpected)
+        monkeypatch.setattr(ops.bridge, "list_dir_path", unexpected)
+        for offset in (0, 128, 256, 7):
+            assert ops.read("/busy", 128, offset, reader) == NEW[offset:offset + 128]
+    finally:
+        if reader is not None:
+            ops.release("/busy", reader)
+        ops.release("/busy", writer)

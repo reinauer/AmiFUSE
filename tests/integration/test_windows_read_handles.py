@@ -8,6 +8,7 @@ import sys
 import pytest
 
 from tests.integration.test_bundled_ffs import ROOT_DATA, _seed_adf, _unmount, _xdf_read
+from amifuse.driver_resolver import BUNDLED_DRIVER
 
 pytestmark = [pytest.mark.fuse,
               pytest.mark.skipif(sys.platform != "win32", reason="WinFsp")]
@@ -16,7 +17,7 @@ pytestmark = [pytest.mark.fuse,
 @pytest.mark.parametrize("handler", ["bundled", "pfs3aio"])
 def test_stat_and_read_while_writing(mount_image, tmp_path, fixture_root, handler):
     if handler == "bundled":
-        image, driver = _seed_adf(tmp_path, "DOS3"), None
+        image, driver = _seed_adf(tmp_path, "DOS3"), BUNDLED_DRIVER
     else:
         image = tmp_path / "pfs.hdf"
         shutil.copy2(fixture_root / "fixtures/readonly/pfs.hdf", image)
@@ -38,7 +39,7 @@ def test_stat_and_read_while_writing(mount_image, tmp_path, fixture_root, handle
 
 def test_bundled_file_rename(mount_image, tmp_path):
     image = _seed_adf(tmp_path, "DOS3")
-    proc, root = mount_image(image, extra_args=["--write"])
+    proc, root = mount_image(image, driver=BUNDLED_DRIVER, extra_args=["--write"])
     root = Path(root)
     payload = (root / "Root.txt").read_bytes()
     os.rename(root / "Root.txt", root / "Renamed.txt")
@@ -55,7 +56,7 @@ def test_open_reader_survives_delete_or_refused_replace(mount_image, tmp_path, r
     from ctypes import wintypes
 
     image = _seed_adf(tmp_path, "DOS3")
-    _proc, root = mount_image(image, extra_args=["--write"])
+    _proc, root = mount_image(image, driver=BUNDLED_DRIVER, extra_args=["--write"])
     root = Path(root)
     old = root / "Root.txt"
     payload = ROOT_DATA
@@ -95,3 +96,28 @@ def test_open_reader_survives_delete_or_refused_replace(mount_image, tmp_path, r
         assert old.read_bytes() == b"replacement"
     else:
         assert not old.exists()
+
+
+def test_read_only_create_always(mount_image, tmp_path):
+    import ctypes
+    from ctypes import wintypes
+
+    image = _seed_adf(tmp_path, "DOS3")
+    proc, root = mount_image(image, driver=BUNDLED_DRIVER, extra_args=["--write"])
+    path = Path(root) / "Root.txt"
+    api = ctypes.WinDLL("kernel32", use_last_error=True)
+    api.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD,
+        wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD,
+        wintypes.HANDLE]
+    api.CreateFileW.restype = wintypes.HANDLE
+    api.CloseHandle.argtypes = [wintypes.HANDLE]
+    api.CloseHandle.restype = wintypes.BOOL
+    handle = api.CreateFileW(str(path), 0x80000000, 7, None, 2, 0, None)
+    assert handle != ctypes.c_void_p(-1).value, ctypes.WinError(ctypes.get_last_error())
+    try:
+        assert path.stat().st_size == 0
+    finally:
+        assert api.CloseHandle(handle), ctypes.WinError(ctypes.get_last_error())
+    assert path.read_bytes() == b""
+    _unmount(root, proc)
+    assert _xdf_read(image, "Root.txt", tmp_path) == b""

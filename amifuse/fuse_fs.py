@@ -3606,7 +3606,7 @@ class AmigaFuseFS(_FuseOperations):
             if offset >= len(icns_data):
                 return b""
             return icns_data[offset:end]
-        if entry.get("deferred_read"):
+        if entry.get("deferred_read") and not entry.get("fh_addr"):
             return self._read_deferred(entry, size, offset)
         fh_addr = entry["fh_addr"]
         with entry["lock"]:
@@ -3645,23 +3645,33 @@ class AmigaFuseFS(_FuseOperations):
                 raise FuseOSError(errno.EBADF)
             path = entry["path"]
             parent, name = self._split_path(path)
-            info = self.bridge.stat_path(path)
-            if info is None:
-                info = next((item for item in self.bridge.list_dir_path(parent)
-                             if self._folded(item["name"]) == self._folded(name)), None)
-            if info is None:
-                raise FuseOSError(errno.ENOENT)
-            if info.get("protection", 0) & 8:  # FIBF_READ
-                raise FuseOSError(errno.EACCES)
+            # Our exclusive writer already pins this file's metadata.
+            # EXAMINE would fail and force a directory scan on every read.
+            if path not in self._pinned_stats:
+                info = self.bridge.stat_path(path)
+                if info is None:
+                    info = next((item for item in self.bridge.list_dir_path(parent)
+                                 if self._folded(item["name"]) == self._folded(name)), None)
+                if info is None:
+                    raise FuseOSError(errno.ENOENT)
+                if info.get("protection", 0) & 8:  # FIBF_READ
+                    raise FuseOSError(errno.EACCES)
             opened, error = self.bridge.open_file_reply(path, os.O_RDONLY)
             if opened is not None:
                 address, parent_lock = opened
                 try:
                     data = self.bridge.read_handle_at(address, offset, size)
                 finally:
-                    self.bridge.close_file(address)
-                    if parent_lock:
-                        self.bridge.free_lock(parent_lock)
+                    if not self.bridge._write_enabled:
+                        # A read-only mount cannot rename or delete the file.
+                        # Keep its first data handle until release().
+                        entry["fh_addr"] = address
+                        entry["parent_lock"] = parent_lock
+                        entry["pos"] = None
+                    else:
+                        self.bridge.close_file(address)
+                        if parent_lock:
+                            self.bridge.free_lock(parent_lock)
             elif error == ERROR_OBJECT_IN_USE:
                 # An exclusive writer in this mount can serve a read too.
                 # Serialize access and invalidate its cached position so its
@@ -3808,6 +3818,13 @@ class AmigaFuseFS(_FuseOperations):
         if length < 0:
             raise FuseOSError(errno.EINVAL)
         self._fit_file_size_limit(length, 0)
+        if fh is not None:
+            with self._fh_lock:
+                entry = self._fh_cache.get(fh)
+            if entry is not None and entry.get("deferred_read"):
+                # WinFsp can issue CREATE_ALWAYS with GENERIC_READ. Windows
+                # checked access; the logical handle has no Amiga handle.
+                path, fh = _handle_path(entry, path), None
         if fh is None:
             fh = self.open(path, os.O_WRONLY)
             temp_handle = True
