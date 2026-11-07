@@ -768,6 +768,7 @@ class TestValidateMountpoint:
     def test_validate_windows_directory(self, monkeypatch, exists,
                                          parent, expected):
         monkeypatch.setattr("sys.platform", "win32")
+        monkeypatch.setattr("amifuse.platform._windows_drive_type", lambda root: 3)
         monkeypatch.setattr("amifuse.platform.os.path.lexists", lambda p: exists)
         monkeypatch.setattr("amifuse.platform.os.path.isdir", lambda p: parent)
         from amifuse.platform import validate_mountpoint
@@ -782,6 +783,19 @@ class TestValidateMountpoint:
         monkeypatch.setattr("sys.platform", "win32")
         from amifuse.platform import validate_mountpoint
         assert "absolute path" in validate_mountpoint(Path(path))
+
+    @pytest.mark.parametrize("path,drive_type", [
+        (r"U:\mnt\amiga", 4),
+        (r"\\server\share\amiga", 0),
+        (r"\\?\UNC\server\share\amiga", 0),
+    ])
+    def test_windows_directory_rejects_network_drive(self, monkeypatch,
+                                                     path, drive_type):
+        monkeypatch.setattr("sys.platform", "win32")
+        monkeypatch.setattr("amifuse.platform._windows_drive_type",
+                            lambda root: drive_type)
+        from amifuse.platform import validate_mountpoint
+        assert "local drive" in validate_mountpoint(Path(path))
 
     def test_validate_unix_mountpoint_stale_inaccessible(self, monkeypatch):
         """On Unix, EIO from lstat returns a stale-mount error."""
