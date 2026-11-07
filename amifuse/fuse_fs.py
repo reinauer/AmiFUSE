@@ -4172,6 +4172,19 @@ class AmigaFuseFS(_FuseOperations):
         if not self.bridge._write_enabled:
             raise FuseOSError(errno.EROFS)
         path = self._state_path(path)
+        if self._winfsp:
+            # Delete-on-close keeps the handle's original spelling after
+            # FileRenameInfo, just as it does for file handles in unlink().
+            with self._fh_lock:
+                targets = {
+                    v.get("path") for v in self._fh_cache.values()
+                    if v.get("dir_handle") and self._folded(
+                        v.get("opened_as", v.get("path")) or "") == self._folded(path)
+                }
+            if len(targets) == 1 and path not in targets:
+                target = targets.pop()
+                self._log_op("rmdir", path, f"renamed open directory: {target}")
+                path = target
         dir_path, name = self._split_path(path)
         if not name:
             raise FuseOSError(errno.EINVAL)
