@@ -508,7 +508,7 @@ class HandlerBridge:
         mbr_idx = self.backend.mbr_partition_index
         self.vh = VamosHandlerRuntime()
         # Use 68020 CPU for compatibility with SFS and other modern handlers
-        self.vh.setup(cpu="68020")
+        self.vh.setup(cpu="68020", debug=debug)
         if trace:
             self.vh.enable_trace()
         self.mem = self.vh.alloc.get_mem()

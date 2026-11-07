@@ -17,7 +17,7 @@ from types import SimpleNamespace
 from typing import Optional
 
 from amitools.vamos.cfg import VamosMainParser
-from amitools.vamos.log import log_machine, log_setup
+from amitools.vamos.log import log_machine, log_setup, loggers
 from amitools.vamos.machine import Machine, MemoryMap, Runtime
 from amitools.vamos.trace import TraceManager
 
@@ -44,6 +44,12 @@ def _ensure_vamos_logging(levels):
     )
     log_setup(cfg)
     _LOG_SETUP_DONE = True
+
+
+def _configure_vamos_logging(debug=False):
+    """Keep expected emulated teardown warnings behind --debug."""
+    for channel in loggers:
+        channel.setLevel(logging.WARNING if debug else logging.ERROR)
 
 
 def end_task(scheduler, task):
@@ -121,7 +127,9 @@ class VamosHandlerRuntime:
         self.scsi_debug = False
         self.timer_device = None
 
-    def setup(self, cpu: Optional[str] = None):
+    def setup(self, cpu: Optional[str] = None, debug: bool = False):
+        self._debug = debug
+        _configure_vamos_logging(debug)
         self.disk_session = DiskSession(
             acknowledge_read_only_writes=True,
             acknowledge_unsupported_commands=True,
@@ -256,6 +264,7 @@ class VamosHandlerRuntime:
         if not self.machine:
             return
         _ensure_vamos_logging({"machine": "info"})
+        _configure_vamos_logging(getattr(self, "_debug", False))
         log_machine.setLevel(logging.INFO)
         self.trace_mgr.setup_cpu_instr_trace(show_regs)
 
