@@ -1156,6 +1156,18 @@ def _pid_exists(pid: int) -> bool:
 
 
 def _find_mount_owner_pids(mountpoint: Path) -> List[int]:
+    """Find serving processes, excluding Windows mounts still starting."""
+    return _find_mount_pids(mountpoint, ready=True)
+
+
+def _find_starting_mount_pids(mountpoint: Path) -> List[int]:
+    """Find Windows mount processes that have not reached FUSE init."""
+    if not sys.platform.startswith("win"):
+        return []
+    return _find_mount_pids(mountpoint, ready=False)
+
+
+def _find_mount_pids(mountpoint: Path, *, ready: bool) -> List[int]:
     """Find PIDs of amifuse processes that own the given mountpoint.
 
     Uses find_amifuse_mounts() for process discovery, then filters to those
@@ -1179,10 +1191,13 @@ def _find_mount_owner_pids(mountpoint: Path) -> List[int]:
             # resolving through WinFsp can produce a different device path.
             return ntpath.normcase(ntpath.abspath(path))
 
+        from .windows_unmount import is_mount_ready
+
         target = key(mountpoint)
         return [mount["pid"] for mount in all_mounts
                 if mount.get("mountpoint") is not None
-                and key(mount["mountpoint"]) == target]
+                and key(mount["mountpoint"]) == target
+                and is_mount_ready(mount["pid"]) == ready]
 
     raw_mountpoint = str(mountpoint)
     abs_mountpoint = str(mountpoint.resolve(strict=False))
