@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Dict, List, NamedTuple, Optional, Sequence, Set, Tuple
 
 from .platform import kill_mount_owner_processes
+from .cli_output import configure_text_output
 
 FUSE = None
 
@@ -8035,6 +8036,7 @@ def _validate_driver_path(driver: Optional[Path]) -> None:
 
 
 def main(argv=None):
+    configure_text_output()
     parser = argparse.ArgumentParser(
         prog="amifuse",
         description=f"{__banner__}\n\n"

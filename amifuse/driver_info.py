@@ -13,6 +13,7 @@ if str(AMITOOLS_PATH) not in sys.path:
 
 from amitools.binfmt.BinFmt import BinFmt  # type: ignore  # noqa: E402
 from amitools.binfmt.Relocate import Relocate  # type: ignore  # noqa: E402
+from amifuse.cli_output import configure_text_output
 
 def describe_driver(path: Path, base_addr: int = 0x100000, padding: int = 0):
     bin_img = BinFmt().load_image(str(path))
@@ -57,6 +58,7 @@ def describe_driver(path: Path, base_addr: int = 0x100000, padding: int = 0):
 
 
 def main(argv=None):
+    configure_text_output()
     parser = argparse.ArgumentParser(
         description="Inspect an Amiga filesystem binary and verify it relocates."
     )
