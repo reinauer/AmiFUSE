@@ -496,8 +496,8 @@ The CI workflow (`.github/workflows/ci.yml`) runs five jobs:
 
 | Job | Platforms | Python | What |
 |-----|-----------|--------|------|
-| `package-smoke` | Linux, macOS, Windows | 3.13 | Builds the sdist and the wheel, installs the wheel with the declared minimum amitools release and checks it from outside the checkout |
-| `unit-tests` | Linux, macOS, Windows | 3.11, 3.12, 3.13 | `pytest tests/unit/` |
+| `package-smoke` | Linux, macOS, Windows | 3.11–3.15 | Builds the sdist and the wheel, installs the wheel with the declared minimum amitools release and checks it from outside the checkout |
+| `unit-tests` | Linux, macOS, Windows | 3.11–3.15 | `pytest tests/unit/` |
 | `integration-tests` | Linux, macOS, Windows | 3.13 | `pytest tests/integration/` with external fixtures |
 | `tools-smoke` | Linux, macOS, Windows | 3.13 | `amifuse_matrix.py` + `image_format_smoke.py` |
 | `mount-tests` | Linux, macOS, Windows | 3.13 | `pytest tests/integration/ -m fuse` with FUSE backend |
