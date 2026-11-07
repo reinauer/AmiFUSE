@@ -607,17 +607,19 @@ def _lenient_rdisk_open(rdisk) -> List[str]:
     """Open an RDisk leniently, tolerating corrupt filesystem blocks.
 
     Replicates the logic of RDisk.open() but continues past corrupt
-    filesystem (LSEG) blocks instead of failing.  Partition blocks are
-    still required to be valid.
+    filesystem (LSEG) blocks instead of failing. The first partition block
+    must be valid; a corrupt first block or a first link past the image end
+    fails the RDB with RDBContentError.
 
     LSEG blocks with Parceiro-style checksums (off by exactly one) are
     accepted and the filesystem driver data is made available.
 
     A partition list, filesystem list or LSEG chain that links back to a
-    block it has already read, or past the end of the device, ends there,
-    with a warning; the link is not read. Only an RDB's first link to a
-    partition is read even past the end, and fails the RDB: with no
-    partition read, there is nothing to keep.
+    block it has already read, or past the readable end of the device,
+    ends there with a warning; the link is not read. A corrupt later PART
+    block also ends the partition list with a warning. In each case the
+    partitions read before the damaged link or block are kept. With no
+    valid first partition there is nothing to keep, so the RDB fails.
 
     Returns a list of warning strings (empty if everything parsed cleanly).
     A partition list that ends so is also recorded, by its warning, in
@@ -839,11 +841,13 @@ def open_rdisk(
     - Emu68-style: MBR with 0x76 (Amiga RDB) partition, RDSK inside that
       partition.
 
-    Tolerates corrupt filesystem driver (LSEG) blocks in the RDB — partition
-    data is parsed strictly, but corrupt FS entries are skipped with warnings
-    stored in ``rdisk.rdb_warnings``, and recorded in ``rdisk.damaged_fs``.
-    A partition list that loops or links on past the end of the device
-    ends there with a warning, recorded in ``rdisk.damaged_part_list``.
+    Tolerates corrupt filesystem driver (LSEG) blocks in the RDB: corrupt FS
+    entries are skipped with warnings stored in ``rdisk.rdb_warnings`` and
+    recorded in ``rdisk.damaged_fs``. The first PART block must be valid;
+    a corrupt first block or first link past the image end fails the RDB
+    with RDBContentError. A loop, a later link past the readable device end,
+    or a corrupt later PART block ends the list with a warning, retaining
+    the partitions already read and setting ``rdisk.damaged_part_list``.
 
     Args:
         image: Path to the disk image
@@ -911,13 +915,22 @@ def _locate_rdisk(image, block_size, mbr_partition_index, mbr_info, open_at):
     initial_block_size = block_size or 512
     blkdev = open_at(initial_block_size)
 
-    # First try direct RDB scan
-    rdb_block, new_block_size, bad_blk = _scan_for_rdb(blkdev, block_size)
-
-    if new_block_size is not None:
-        # Need to reopen with correct block size and rescan
-        blkdev = open_at(new_block_size)
-        rdb_block, _, bad_blk = _scan_for_rdb(blkdev, block_size)
+    # An explicitly selected entry does not depend on the disk-level RDB.
+    parse_direct = (mbr_partition_index is None
+                    or not _amiga_partitions(mbr_info))
+    rdb_block = bad_blk = None
+    if parse_direct:
+        try:
+            rdb_block, new_block_size, bad_blk = _scan_for_rdb(blkdev, block_size)
+            if new_block_size is not None:
+                blkdev = open_at(new_block_size)
+                rdb_block, _, bad_blk = _scan_for_rdb(blkdev, block_size)
+        except OSError as exc:
+            if exc.errno is None or not _amiga_partitions(mbr_info):
+                raise
+            # Attribute a device error to the disk scan once, not to every
+            # readable 0x76 entry subsequently opened for inspection.
+            raise DiskRDBError(exc.errno, exc.strerror) from exc
 
     def in_amiga_partition(blk_num):
         offset = blk_num * blkdev.block_bytes
@@ -936,10 +949,6 @@ def _locate_rdisk(image, block_size, mbr_partition_index, mbr_info, open_at):
     if bad_blk is not None and in_amiga_partition(bad_blk):
         bad_blk = None
 
-    # A selected 0x76 partition holds its own RDB, if any, beside this one,
-    # so this one is not parsed: its failure must not end that open.
-    parse_direct = (mbr_partition_index is None
-                    or not _amiga_partitions(mbr_info))
     if rdb_block is None and bad_blk is not None and parse_direct:
         # An RDSK block with a bad checksum is a damaged RDB, not none: the
         # 0x76 partitions are not tried in its place.
