@@ -271,8 +271,11 @@ def format_context(monkeypatch, tmp_path):
                           flush_reply=ACK, close_error=None, fsync_error=None,
                           waits={})
 
-    monkeypatch.setattr(fs, "get_partition_info",
-                        lambda image, block_size, partition: {"dostype": DOSTYPE})
+    def partition_info(image, block_size, partition, *, write=False):
+        assert write, "format must validate the partition for writing"
+        return {"dostype": DOSTYPE}
+
+    monkeypatch.setattr(fs, "get_partition_info", partition_info)
     monkeypatch.setattr(fs, "extract_embedded_driver",
                         lambda image, block_size, partition: (handler, "PFS3", DOSTYPE))
 
