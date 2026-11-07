@@ -10,7 +10,13 @@ from amifuse.winfsp_fuse import CASE_INSENSITIVE, _Connection, with_capabilities
 
 @pytest.mark.parametrize("fold", [None, {97: 65}])
 @pytest.mark.parametrize("capable", [0, CASE_INSENSITIVE])
-def test_case_folding_capability(fold, capable):
+@pytest.mark.parametrize("version,supported", [
+    (None, False), ("unknown", False), ("1.10.0.0", False),
+    ("1.11.0.0", True), ("2.1.0.0", True),
+])
+def test_case_folding_capability(monkeypatch, fold, capable, version, supported):
+    monkeypatch.setattr("amifuse.platform.detect_fuse_backend",
+                        lambda: {"version": version})
     conn = _Connection()
     conn.capable = capable
     conn.want = 32
@@ -23,7 +29,7 @@ def test_case_folding_capability(fold, capable):
             return "initialized"
 
     assert object.__new__(with_capabilities(FUSE)).init(ctypes.byref(conn)) == "initialized"
-    assert conn.want == 32 | (capable if fold is not None else 0)
+    assert conn.want == 32 | (capable if supported and fold is not None else 0)
     assert conn.capable == capable
 
 

@@ -39,10 +39,20 @@ def _extend_operations(fuse):
 
 
 def with_capabilities(fuse_class):
+    from .platform import detect_fuse_backend
+
+    version = detect_fuse_backend().get("version")
+    try:
+        parts = tuple(int(part) for part in version.split(".")[:2])
+        getpath_supported = len(parts) == 2 and parts >= (1, 11)
+    except (AttributeError, ValueError):
+        getpath_supported = False
+
     class WinFspFUSE(fuse_class):
         def __init__(self, *args, **kwargs):
             import fuse
-            _extend_operations(fuse)
+            if getpath_supported:
+                _extend_operations(fuse)
             super().__init__(*args, **kwargs)
 
         def getpath(self, path, buffer, size, fi):
@@ -54,7 +64,12 @@ def with_capabilities(fuse_class):
             return 0
 
         def init(self, conn):
-            if conn and self.operations._name_fold is not None:
+            # Pre-1.11 WinFsp drops getpath from the operations table;
+            # declaring case insensitivity there makes case-only renames
+            # silent no-ops. Unknown versions keep the old behavior too.
+            # Windows folds Unicode even on DOS0/DOS1's ASCII-only fold,
+            # so non-ASCII case pairs can still alias on those volumes.
+            if conn and getpath_supported and self.operations._name_fold is not None:
                 info = ctypes.cast(conn, ctypes.POINTER(_Connection)).contents
                 info.want |= info.capable & CASE_INSENSITIVE
             return super().init(conn)

@@ -3458,16 +3458,23 @@ class AmigaFuseFS(_FuseOperations):
 
         WinFsp needs the canonical name when opening an existing object;
         otherwise a case-only rename can look like an exact-name no-op.
-        Enumerate parents because a writer can prevent stat_path from
-        locking the object, and its open-handle spelling may be an alias.
+        Examine each component to avoid enumerating whole directories on
+        every open. A writer can refuse that lock, so retain a directory
+        lookup for that case; the handle's own spelling may be an alias.
         """
         self._check_handler_alive()
         canonical = "/"
         for component in path.strip("/").split("/"):
             if not component:
                 continue
-            name = next((name for name in self.readdir(canonical, None)
-                         if self._folded(name) == self._folded(component)), None)
+            child = canonical.rstrip("/") + "/" + component
+            info = self.bridge.stat_path(child)
+            name = info.get("name") if info is not None else None
+            if name is None:
+                name = next((name for name in self.readdir(canonical, None)
+                             if self._folded(name) == self._folded(component)), None)
+            elif not self._filter_pending_deletes(canonical, [name]):
+                name = None
             if name is None:
                 raise FuseOSError(errno.ENOENT)
             canonical = canonical.rstrip("/") + "/" + name

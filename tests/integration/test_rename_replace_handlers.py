@@ -436,3 +436,37 @@ def test_getpath_returns_stored_parent_and_child_spelling(ops):
     ops.rename("/Canonical/MixedName", "/Canonical/MIXEDNAME")
     assert ops.getpath("/canonical/mixedname") == "/Canonical/MIXEDNAME"
     assert _errno(ops.getpath, "/canonical/missing") == errno.ENOENT
+
+
+def test_getpath_does_not_enumerate_unlocked_directories(ops, monkeypatch):
+    if ops._name_fold is None:
+        pytest.skip("handler does not advertise case folding")
+    ops.mkdir("/Canonical", 0o755)
+    _write(ops, "/Canonical/MixedName", b"data")
+
+    def refuse_listing(*args):
+        raise AssertionError("getpath enumerated an unlocked directory")
+
+    monkeypatch.setattr(ops, "readdir", refuse_listing)
+    assert ops.getpath("/canonical/mixedname") == "/Canonical/MixedName"
+
+
+def test_getpath_lists_only_the_parent_of_a_refused_lock(ops, monkeypatch):
+    if ops._name_fold is None:
+        pytest.skip("handler does not advertise case folding")
+    ops.mkdir("/Canonical", 0o755)
+    _write(ops, "/Canonical/MixedName", b"data")
+    stat_path, readdir = ops.bridge.stat_path, ops.readdir
+    listed = []
+
+    def stat(path):
+        return None if path == "/Canonical/mixedname" else stat_path(path)
+
+    def listing(path, fh):
+        listed.append(path)
+        return readdir(path, fh)
+
+    monkeypatch.setattr(ops.bridge, "stat_path", stat)
+    monkeypatch.setattr(ops, "readdir", listing)
+    assert ops.getpath("/canonical/mixedname") == "/Canonical/MixedName"
+    assert listed == ["/Canonical"]
