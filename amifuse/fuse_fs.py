@@ -3531,6 +3531,13 @@ class AmigaFuseFS(_FuseOperations):
 
     def readdir(self, path, fh):
         self._check_handler_alive()
+        if self._winfsp:
+            # WinFsp's pre-delete emptiness check retains the opened name,
+            # but its directory handle tracks the object after a rename.
+            with self._fh_lock:
+                entry = self._fh_cache.get(fh)
+                if entry and entry.get("dir_handle") and not entry.get("closed"):
+                    path = _handle_path(entry, path)
         path = self._state_path(path)
         # Check directory cache first
         with self._cache_lock:
@@ -4355,6 +4362,21 @@ class AmigaFuseFS(_FuseOperations):
         dst_dir, dst_name = self._split_path(new)
         if not src_name or not dst_name:
             raise FuseOSError(errno.EINVAL)
+        if self._winfsp:
+            # FileRenameInfo keeps sending the handle's original name,
+            # including a second rename back to that name. Resolve before
+            # the equality check, but only for an actually renamed handle.
+            with self._fh_lock:
+                matches = [entry for entry in self._fh_cache.values()
+                           if ("fh_addr" in entry or entry.get("dir_handle"))
+                           and self._folded(entry.get("opened_as", entry.get("path")) or "")
+                           == self._folded(old)]
+                targets = {entry.get("path") for entry in matches}
+                moved = any("opened_as" in entry for entry in matches)
+            if moved and len(targets) == 1 and old not in targets:
+                target = targets.pop()
+                self._log_op("rename", old, f"renamed open object: {target}")
+                old = target
         # Two spellings of one name reach here equal: to rename(2) that is
         # one file, which stays as it is, and a handler may call it taken.
         if old == new:
