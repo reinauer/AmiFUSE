@@ -437,3 +437,52 @@ def test_delete_renamed_directory_preserves_old_name(ops):
     assert "before" in _on_disk(ops)
     assert "after" not in _on_disk(ops)
     assert ops._pending_deletes == set()
+
+
+@pytest.mark.parametrize("replacement", [False, True])
+def test_windows_readdir_follows_renamed_directory(ops, replacement):
+    ops._winfsp = True
+    assert ops.mkdir("/before", 0o755) == 0
+    _write(ops, "/before/child", OLD)
+    handle = ops.opendir("/before")
+    try:
+        assert ops.rename("/before", "/after") == 0
+        if replacement:
+            assert ops.mkdir("/before", 0o755) == 0
+        assert "child" in ops.readdir("/before", handle)
+        assert "child" not in ops.readdir("/before", None)
+    finally:
+        ops.releasedir("/before", handle)
+    assert _read(ops, "/after/child") == OLD
+
+
+@pytest.mark.parametrize("back", [False, True])
+def test_windows_repeated_file_rename_uses_opened_name(open_rename, back):
+    ops = open_rename
+    ops._winfsp = True
+    _write(ops, "/before", OLD)
+    handle = ops.open("/before", os.O_RDONLY)
+    target = "/before" if back else "/last"
+    try:
+        assert ops.rename("/before", "/after") == 0
+        assert ops.rename("/before", target) == 0
+        assert ops._fh_cache[handle]["path"] == target
+    finally:
+        ops.release("/before", handle)
+    assert "after" not in _on_disk(ops)
+    assert _read(ops, target) == OLD
+
+
+@pytest.mark.parametrize("target", ["/before", "/last", "/BEFORE"])
+def test_windows_repeated_directory_rename_uses_opened_name(ops, target):
+    ops._winfsp = True
+    assert ops.mkdir("/before", 0o755) == 0
+    handle = ops.opendir("/before")
+    try:
+        assert ops.rename("/before", "/after") == 0
+        assert ops.rename("/before", target) == 0
+        assert ops._fh_cache[handle]["path"] == target
+    finally:
+        ops.releasedir("/before", handle)
+    assert "after" not in _on_disk(ops)
+    assert target[1:] in _on_disk(ops)
