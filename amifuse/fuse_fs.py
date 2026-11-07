@@ -5690,6 +5690,16 @@ def _fork_daemon_parent() -> int:
     os._exit(code if code >= 0 else 1)
 
 
+def _partitionless_image_error(image, partition, adf_info, iso_info):
+    if partition is None:
+        return None
+    kind = "floppy" if adf_info is not None else "ISO" if iso_info is not None else None
+    if kind is not None:
+        article = "an" if kind == "ISO" else "a"
+        return f"{image} is {article} {kind} image, which has no partitions"
+    return None
+
+
 def mount_fuse(
     image: Path,
     driver: Optional[Path],
@@ -5716,6 +5726,9 @@ def mount_fuse(
     part_info = None
 
     if adf_info is not None:
+        error = _partitionless_image_error(image, partition, adf_info, None)
+        if error:
+            raise SystemExit(f"Error: {error}")
         # ADF floppy detected - use DF0 as the partition name
         part_name = "DF0"  # Will use actual volume name from handler later
     else:
@@ -5723,6 +5736,9 @@ def mount_fuse(
         iso_info = detect_iso(image)
 
         if iso_info is not None:
+            error = _partitionless_image_error(image, partition, None, iso_info)
+            if error:
+                raise SystemExit(f"Error: {error}")
             part_name = "CD0"
         else:
             # HDF/RDB image - get partition info
@@ -6480,6 +6496,13 @@ def _create_bridge_from_args(args, command: str, read_only: bool = True):
 
     if adf_info is None:
         iso_info = detect_iso(image)
+
+    error = _partitionless_image_error(image, partition, adf_info, iso_info)
+    if error:
+        if use_json:
+            print(_json.dumps(_json_error(command, "PARTITION_UNSUPPORTED", error)))
+            sys.exit(1)
+        raise SystemExit(f"Error: {error}")
 
     try:
         part_info = None

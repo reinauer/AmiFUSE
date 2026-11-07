@@ -504,3 +504,42 @@ def test_disk_read_error_keeps_readable_entry_and_skips_empty_one(tmp_path, monk
     listed = list_partitions(image)
     assert [part.name for part in listed.partitions] == ["ENTRY"]
     assert "MBR partition [1]" not in listed.fallback_reason
+
+
+@pytest.mark.parametrize("layout, failed_block", [("emu68", 5), ("parceiro", 1)])
+def test_disk_scan_error_does_not_poison_entry_reads(tmp_path, monkeypatch, capsys,
+                                                   layout, failed_block):
+    image = (_two_dh0_entries(tmp_path) if layout == "emu68" else
+             _disk_rdb(tmp_path, ("DH0", "WORK"), 2))
+    read = RawBlockDevice.read_block
+    def failing(self, block, num_blks=1, **kwargs):
+        start = block * self.block_bytes
+        if start <= failed_block * 512 < start + num_blks * self.block_bytes:
+            raise OSError(errno.EIO, "disk scan failed")
+        return read(self, block, num_blks, **kwargs)
+    monkeypatch.setattr(RawBlockDevice, "read_block", failing)
+    entries = []
+    for index, opened in rdb_inspect.open_each_rdb(image, None, 2):
+        entries.append((index, isinstance(opened, OSError)))
+        if isinstance(opened, OSError):
+            assert isinstance(opened, DiskRDBError)
+            assert opened.errno == errno.EIO
+        else:
+            opened[1].close()
+            opened[0].close()
+    assert entries == [(None, True), (0, False), (1, False)]
+    listed = list_partitions(image)
+    assert len(listed.partitions) == 2
+    assert listed.fallback_reason.count("disk scan failed") == 1
+    rdb_inspect.print_inspect_report(image, None, False)
+    report = capsys.readouterr().out
+    assert report.count("disk scan failed") == 1
+    assert "RDB beside the MBR" in report
+    for selector in ("0", "DH0"):
+        for write in (False, True):
+            with pytest.raises(OSError) as caught:
+                find_partition(image, None, selector, write=write)
+            assert caught.value.errno == errno.EIO
+    with pytest.raises(OSError) as caught:
+        rdb_inspect.check_default_write(image, None)
+    assert caught.value.errno == errno.EIO
