@@ -1423,10 +1423,10 @@ class TestKillPids:
 # ---------------------------------------------------------------------------
 
 
-class TestCimFallback:
-    """Tests for _find_amifuse_mounts_cim fallback."""
+class TestCimDiscovery:
+    """Tests for Unicode-preserving CIM discovery."""
 
-    def test_wmic_oserror_falls_through_to_cim(self, monkeypatch):
+    def test_uses_cim_directly(self, monkeypatch):
         from unittest.mock import MagicMock
         from amifuse.platform import _find_amifuse_mounts_windows
 
@@ -1436,9 +1436,7 @@ class TestCimFallback:
 
         def fake_run(cmd, **kwargs):
             call_count["n"] += 1
-            if cmd[0] == "wmic":
-                raise OSError("wmic not found")
-            # powershell fallback
+            assert cmd[0] == "powershell"
             result = MagicMock()
             result.returncode = 0
             result.stdout = b'[]'
@@ -1448,8 +1446,8 @@ class TestCimFallback:
 
         mounts = _find_amifuse_mounts_windows()
         assert mounts == []
-        # Should have tried wmic then PowerShell
-        assert call_count["n"] >= 2
+        # One lossless query; no OEM conversion.
+        assert call_count["n"] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -1457,10 +1455,10 @@ class TestCimFallback:
 # ---------------------------------------------------------------------------
 
 
-class TestWmicCreationFlags:
-    """Verify wmic subprocess call uses CREATE_NO_WINDOW."""
+class TestCimCreationFlags:
+    """Verify CIM subprocess call uses CREATE_NO_WINDOW."""
 
-    def test_find_mounts_wmic_uses_create_no_window(self, monkeypatch):
+    def test_find_mounts_cim_uses_create_no_window(self, monkeypatch):
         from unittest.mock import MagicMock
         from amifuse.platform import _find_amifuse_mounts_windows, _CREATE_NO_WINDOW
 
