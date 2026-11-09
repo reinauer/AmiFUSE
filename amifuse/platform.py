@@ -632,16 +632,18 @@ def mount_is_starting(pid: int) -> bool:
     """Whether a Windows mount process has not reached FUSE init yet.
 
     Its unmount control events don't exist before that, so an unmount
-    request fails, or ends the mount as soon as it comes up. A process
-    whose state can't be read (such as one an Administrator started)
-    counts as not starting, so that the unmount request reports why.
+    request fails, or ends the mount as soon as it comes up. A mount that
+    has begun to unmount is not starting: an unmount request waits for the
+    one under way. A process whose state can't be read (such as one an
+    Administrator started) counts as not starting, so that the unmount
+    request reports why.
     """
     if not sys.platform.startswith("win"):
         return False
-    from .windows_unmount import is_mount_ready
+    from .windows_unmount import mount_reached_init
 
     try:
-        return not is_mount_ready(pid)
+        return not mount_reached_init(pid)
     except OSError:
         return False
 

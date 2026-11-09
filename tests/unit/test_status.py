@@ -419,7 +419,7 @@ class TestFindAmifuseMountsDispatch:
         from amifuse import platform as plat
 
         monkeypatch.setattr("sys.platform", "win32")
-        monkeypatch.setattr("amifuse.windows_unmount.is_mount_ready",
+        monkeypatch.setattr("amifuse.windows_unmount.mount_reached_init",
                             lambda pid: pid == 2)
         sentinel = [{"mountpoint": "D:", "pid": 2, "image": "b",
                      "uptime_seconds": None, "filesystem_type": None},
@@ -439,7 +439,7 @@ class TestFindAmifuseMountsDispatch:
             raise PermissionError(13, "Access is denied")
 
         monkeypatch.setattr("sys.platform", "win32")
-        monkeypatch.setattr("amifuse.windows_unmount.is_mount_ready", denied)
+        monkeypatch.setattr("amifuse.windows_unmount.mount_reached_init", denied)
         assert plat.mount_is_starting(4) is False
 
 

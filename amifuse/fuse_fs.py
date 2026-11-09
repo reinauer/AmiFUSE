@@ -8088,7 +8088,8 @@ def cmd_status(args):
                 image = _truncate_left(m.get("image") or "N/A", 40)
                 mountpoint = m.get("mountpoint") or "N/A"
                 if m.get("starting"):
-                    # Not mounted yet; `amifuse unmount` waits for it (#428).
+                    # Not mounted yet; amifuse unmount refuses it until it
+                    # is ready (#428).
                     uptime_str += " (starting)"
                 print(f"{m['pid']:<8} {mountpoint:<20} {image:<40} {uptime_str}")
 
