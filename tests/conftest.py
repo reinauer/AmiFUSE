@@ -128,6 +128,11 @@ def fuse_mock(monkeypatch):
     _stub_module("amitools.vamos.lib.dos")
     _stub_module("amitools.vamos.lib.dos.DosProtection", DosProtection=_FakeDosProtection)
 
+    # Mock-backed callback tests model eager POSIX file handles. Windows
+    # cases explicitly select WinFsp semantics; native mounts are exercised
+    # by the integration suite without this fixture.
+    import amifuse.fuse_fs as fuse_fs
+    monkeypatch.setattr(fuse_fs.AmigaFuseFS, "_winfsp", False)
     yield fake_fuse
 
     if not module_was_loaded:

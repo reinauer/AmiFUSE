@@ -3628,6 +3628,22 @@ class AmigaFuseFS(_FuseOperations):
                         }
                     return handle
             raise FuseOSError(errno.ENOENT)
+        if self._winfsp and (flags & getattr(os, "O_ACCMODE", 3)) == os.O_RDONLY:
+            # WinFsp opens even for a stat or rename. Holding FINDINPUT here
+            # blocks a bundled FFS rename and conflicts with an exclusive
+            # writer. Keep a logical handle until data is actually read.
+            info = self.getattr(path)
+            if info["st_mode"] & 0o170000 == 0o040000:
+                raise FuseOSError(errno.EISDIR)
+            with self._fh_lock:
+                handle = self._next_fh
+                self._next_fh += 1
+                self._fh_cache[handle] = {
+                    "fh_addr": 0, "parent_lock": 0, "pos": None,
+                    "lock": threading.Lock(), "closed": False,
+                    "dirty": False, "path": path, "deferred_read": True,
+                }
+            return handle
         if flags & (os.O_CREAT | os.O_TRUNC):
             self._materialize_grows(except_path=path)
         opened, res2 = self.bridge.open_file_reply(path, flags)
@@ -3684,6 +3700,8 @@ class AmigaFuseFS(_FuseOperations):
             if offset >= len(icns_data):
                 return b""
             return icns_data[offset:end]
+        if entry.get("deferred_read") and not entry.get("fh_addr"):
+            return self._read_deferred(entry, size, offset)
         fh_addr = entry["fh_addr"]
         with entry["lock"]:
             if entry.get("closed"):
@@ -3700,18 +3718,95 @@ class AmigaFuseFS(_FuseOperations):
                     size = max(0, min(size, cached[1]["st_size"] - offset))
                     if not size:
                         return b""
-            if entry["pos"] is None or offset != entry["pos"]:
-                data = self.bridge.read_handle_at(fh_addr, offset, size)
+            return self._read_through(entry, fh_addr, size, offset)
+
+    def _read_through(self, entry, fh_addr, size, offset):
+        """Read size bytes at offset through the entry's handle fh_addr.
+
+        The caller holds entry["lock"]. The handler's position is cached in
+        entry["pos"], so a sequential read needs no seek.
+        """
+        if entry["pos"] is None or offset != entry["pos"]:
+            data = self.bridge.read_handle_at(fh_addr, offset, size)
+        else:
+            data = self.bridge.read_handle(fh_addr, size)
+        if data is None:
+            # The handler's position is unknown after a failed read or
+            # seek, so the next read must seek explicitly.
+            entry["pos"] = None
+            raise FuseOSError(errno.EIO)
+        # A refused seek past end of file also reads as empty but leaves
+        # the handler's position where it was, so cache only real data.
+        entry["pos"] = offset + len(data) if data else None
+        return data
+
+    def _read_deferred(self, entry, size, offset):
+        """Read a Windows logical handle without keeping an Amiga lock."""
+        with entry["lock"]:
+            if entry.get("closed"):
+                raise FuseOSError(errno.EBADF)
+            if entry.get("fh_addr"):
+                # A read-only mount keeps the first data handle, and another
+                # read kept it while this one waited for the lock. Opening a
+                # second would leak one, and move the handle that a read on
+                # read()'s path took before the lock, under its cached pos.
+                return self._read_through(entry, entry["fh_addr"], size, offset)
+            path = entry["path"]
+            parent, name = self._split_path(path)
+            # Our exclusive writer already pins this file's metadata.
+            # EXAMINE would fail and force a directory scan on every read.
+            if path not in self._pinned_stats:
+                info = self.bridge.stat_path(path)
+                if info is None:
+                    info = next((item for item in self.bridge.list_dir_path(parent)
+                                 if self._folded(item["name"]) == self._folded(name)), None)
+                if info is None:
+                    raise FuseOSError(errno.ENOENT)
+                if info.get("protection", 0) & 8:  # FIBF_READ
+                    raise FuseOSError(errno.EACCES)
+            opened, error = self.bridge.open_file_reply(path, os.O_RDONLY)
+            if opened is not None:
+                address, parent_lock = opened
+                try:
+                    data = self.bridge.read_handle_at(address, offset, size)
+                finally:
+                    if not self.bridge._write_enabled:
+                        # A read-only mount cannot rename or delete the file.
+                        # Keep its first data handle until release().
+                        entry["fh_addr"] = address
+                        entry["parent_lock"] = parent_lock
+                        entry["pos"] = None
+                    else:
+                        self.bridge.close_file(address)
+                        if parent_lock:
+                            self.bridge.free_lock(parent_lock)
+            elif error == ERROR_OBJECT_IN_USE:
+                # An exclusive writer in this mount can serve a read too.
+                # Serialize access and invalidate its cached position so its
+                # next write seeks to the caller's offset, not ours.
+                with self._fh_lock:
+                    holders = [value for value in self._fh_cache.values()
+                               if value.get("path") == path and value.get("fh_addr")
+                               and not value.get("closed")]
+                if not holders:
+                    raise FuseOSError(errno.EBUSY)
+                holder = holders[0]
+                with holder["lock"]:
+                    if holder.get("closed"):
+                        raise FuseOSError(errno.EBUSY)
+                    with self._cache_lock:
+                        cached = self._stat_cache.get(path)
+                        if path in self._pinned_stats and cached is not None:
+                            size = max(0, min(size, cached[1]["st_size"] - offset))
+                    try:
+                        data = (self.bridge.read_handle_at(holder["fh_addr"], offset, size)
+                                if size else b"")
+                    finally:
+                        holder["pos"] = None
             else:
-                data = self.bridge.read_handle(fh_addr, size)
-            if data is None:
-                # The handler's position is unknown after a failed read or
-                # seek, so the next read must seek explicitly.
-                entry["pos"] = None
                 raise FuseOSError(errno.EIO)
-            # A refused seek past end of file also reads as empty but leaves
-            # the handler's position where it was, so cache only real data.
-            entry["pos"] = offset + len(data) if data else None
+            if data is None:
+                raise FuseOSError(errno.EIO)
             return data
 
     @staticmethod
@@ -3734,7 +3829,7 @@ class AmigaFuseFS(_FuseOperations):
             raise FuseOSError(errno.EROFS)
         with self._fh_lock:
             entry = self._fh_cache.get(fh)
-        if entry is None:
+        if entry is None or entry.get("deferred_read"):
             raise FuseOSError(errno.EIO)
         fh_addr = entry["fh_addr"]
         path = _handle_path(entry, path)
@@ -3839,6 +3934,19 @@ class AmigaFuseFS(_FuseOperations):
         if length < 0:
             raise FuseOSError(errno.EINVAL)
         self._fit_file_size_limit(length, 0)
+        if fh is not None:
+            with self._fh_lock:
+                entry = self._fh_cache.get(fh)
+            if entry is not None and entry.get("deferred_read"):
+                # WinFsp can issue CREATE_ALWAYS with GENERIC_READ. Windows
+                # checked access; the logical handle has no Amiga handle.
+                path, fh = _handle_path(entry, path), None
+                # A writer this mount holds on the file truncates it: pfs3aio
+                # refuses the temporary handle beside it as in use.
+                with self._fh_lock:
+                    fh = next((h for h, e in self._fh_cache.items()
+                               if e.get("path") == path and e.get("writable")
+                               and e.get("fh_addr") and not e.get("closed")), None)
         if fh is None:
             fh = self.open(path, os.O_WRONLY)
             temp_handle = True
@@ -3854,11 +3962,13 @@ class AmigaFuseFS(_FuseOperations):
                 # 0x7FFFFFFF is not moved: no seek can return it there, so
                 # its next read would fail.
                 handles = [e for h, e in self._fh_cache.items()
-                           if h != fh and "fh_addr" in e and not e.get("closed")]
+                           if h != fh and e.get("fh_addr") and not e.get("closed")]
                 others = [e for e in handles if (e["pos"] or 0) <= _LONG_MAX]
                 far = [e for e in handles if (e["pos"] or 0) > _LONG_MAX]
             if entry is None or entry.get("closed"):
                 raise FuseOSError(errno.EIO)
+            if entry.get("deferred_read"):
+                raise FuseOSError(errno.EBADF)
             fh_addr = entry["fh_addr"]
             path = _handle_path(entry, path)
             self._materialize_grows(except_path=path)
@@ -4107,6 +4217,28 @@ class AmigaFuseFS(_FuseOperations):
             self._log_op("create", path, f"EXCEPTION: {type(e).__name__}: {e}")
             raise FuseOSError(errno.EIO) from e
 
+    def _retain_deferred_readers(self, path):
+        """Keep an unlinked/replaced file alive until its readers close.
+
+        Logical Windows readers normally hold no Amiga lock. Before a
+        delete, give them shared object locks so the handler defers it in
+        the same way as for native handles. A lock needs no read permission
+        and is only acquired after a replacement target has been renamed.
+        """
+        with self._fh_lock:
+            readers = [entry for entry in self._fh_cache.values()
+                       if entry.get("path") == path and entry.get("deferred_read")]
+        for entry in readers:
+            with entry["lock"]:
+                if entry.get("closed") or entry.get("delete_lock"):
+                    continue
+                lock, error, _ = self.bridge.locate_path(path)
+                if lock:
+                    entry["delete_lock"] = lock
+                elif error != ERROR_OBJECT_IN_USE:
+                    raise FuseOSError(_DELETE_ERRNOS.get(error, errno.EIO))
+                # An exclusive writer already holds the object in use.
+
     def unlink(self, path):
         self._log_op("unlink", path, "")
         self._check_handler_alive()
@@ -4144,6 +4276,7 @@ class AmigaFuseFS(_FuseOperations):
             if lock_bptr == 0:
                 self._log_op("unlink", path, f"parent dir not found: {dir_path}")
                 raise FuseOSError(errno.ENOENT)
+            self._retain_deferred_readers(path)
             res1, res2 = self.bridge.delete_object(lock_bptr, name)
             self._log_op("unlink", path, f"delete_object res1={res1} res2={res2}")
             if res1 == 0:
@@ -4477,6 +4610,7 @@ class AmigaFuseFS(_FuseOperations):
         the replace stands. Raises FuseOSError when the handler refuses.
         """
         # delete_dir_atomic() sends ACTION_DELETE_OBJECT, for a file too.
+        self._retain_deferred_readers(temp)
         res1, res2 = self.bridge.delete_dir_atomic(temp)
         deferred = False
         if res1 == 0 and res2 == ERROR_OBJECT_IN_USE:
@@ -5100,12 +5234,19 @@ class AmigaFuseFS(_FuseOperations):
             parent_lock = entry.get("parent_lock", 0)
             if parent_lock:
                 self.bridge.free_lock(parent_lock)
+            if entry.get("delete_lock"):
+                self.bridge.free_lock(entry["delete_lock"])
         # The pin is under the handle's path, and so is a delete unlink()
         # deferred, which it records only under a path a handle has.
         resolved_path = _handle_path(entry, path)
         # Unpin stat cache so future getattr re-queries PFS3 for current size.
-        self._pinned_stats.discard(resolved_path)
-        if self._cache_ttl <= 0:
+        with self._fh_lock:
+            still_held = any(value.get("path") == resolved_path
+                             and value.get("fh_addr") and not value.get("closed")
+                             for value in self._fh_cache.values())
+        if not still_held:
+            self._pinned_stats.discard(resolved_path)
+        if self._cache_ttl <= 0 and not still_held:
             with self._cache_lock:
                 self._stat_cache.pop(resolved_path, None)
         if resolved_path:

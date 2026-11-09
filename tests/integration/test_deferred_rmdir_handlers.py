@@ -196,6 +196,9 @@ def test_rmdir_defers_behind_unlinked_open_files_the_handler_names_differently(o
 @pytest.mark.parametrize("handler", [_fixture(PFS), _fixture(SFS), _fixture(OFS)])
 def test_rmdir_refused_by_a_lock_an_open_file_holds_is_busy(open_ops, handler, monkeypatch):
     ops = open_ops(handler)
+    # Exercise a retained native parent lock; Windows metadata opens do
+    # not keep one until a read/delete needs it.
+    ops._winfsp = False
     ops.mkdir("/d", 0o755)
     _make(ops, "/d/x", b"x" * 100)
     hx = ops.open("/d/x", os.O_RDONLY)  # keeps its lock on /d when the new directory can't be locked
