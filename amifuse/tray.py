@@ -18,6 +18,7 @@ _ERROR_ALREADY_EXISTS = 183
 class TrayApp:
     POLL_INTERVAL = 2.5  # seconds
     GRACE_PERIOD = 10.0  # seconds after last mount disappears before auto-exit
+    EXIT_START_WAIT = 5.0  # seconds Exit waits for a mount still starting
 
     def __init__(self):
         self._icon = None
@@ -150,9 +151,29 @@ class TrayApp:
         self._unmount_mounts([mount])
 
     def _unmount_all(self):
+        """Unmount every mount on Exit.
+
+        Exit leaves no tray to unmount from later, so a mount still starting
+        gets EXIT_START_WAIT seconds to become ready (starting takes well
+        under a second). One whose process ended meanwhile is dropped, and
+        one still starting after that is reported: the dialog outlasts the
+        icon.
+        """
+        from .platform import find_amifuse_mounts, mount_is_starting
+
         with self._lock:
             mounts_copy = list(self._mounts)
-        self._unmount_mounts(mounts_copy, report_starting=False)
+        deadline = time.monotonic() + self.EXIT_START_WAIT
+        while any(mount_is_starting(m["pid"]) for m in mounts_copy):
+            if time.monotonic() >= deadline:
+                try:
+                    live = {m["pid"] for m in find_amifuse_mounts()}
+                except OSError:
+                    break
+                mounts_copy = [m for m in mounts_copy if m["pid"] in live]
+                break
+            time.sleep(0.1)
+        self._unmount_mounts(mounts_copy)
 
     def _unmount_mounts(self, mounts, *, report_starting=True):
         from .platform import (mount_is_starting, notify_shell_drive_change,
@@ -167,7 +188,7 @@ class TrayApp:
         if starting:
             logger.info("Not unmounting mounts still starting: %s",
                         [m.get("mountpoint") for m in starting])
-            if report_starting and not mounts:
+            if report_starting:
                 self._report_unmount_error("\n".join(
                     f"AmiFUSE at {m.get('mountpoint') or m['pid']} is still "
                     "starting; try unmounting again once the mount is ready."

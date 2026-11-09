@@ -100,7 +100,7 @@ def no_real_mounts(monkeypatch):
     monkeypatch.setattr("amifuse.platform.find_amifuse_mounts", lambda: [])
     monkeypatch.setattr("amifuse.platform.stop_mount_processes", stop_mount_processes)
     monkeypatch.setattr("amifuse.platform.notify_shell_drive_change", MagicMock())
-    monkeypatch.setattr("amifuse.windows_unmount.is_mount_ready", lambda pid: True)
+    monkeypatch.setattr("amifuse.windows_unmount.mount_reached_init", lambda pid: True)
     if sys.platform == "win32":
         import ctypes
         monkeypatch.setattr(ctypes.windll.user32, "MessageBoxW", MagicMock())
@@ -524,7 +524,7 @@ class TestStartingMounts:
         """PIDs whose mount reached FUSE init; the others are starting."""
         pids = set()
         monkeypatch.setattr("sys.platform", "win32")
-        monkeypatch.setattr("amifuse.windows_unmount.is_mount_ready",
+        monkeypatch.setattr("amifuse.windows_unmount.mount_reached_init",
                             lambda pid: pid in pids)
         return pids
 
@@ -543,11 +543,62 @@ class TestStartingMounts:
         tray_app._mounts = [{"pid": 1, "mountpoint": "D:"},
                             {"pid": 2, "mountpoint": "R:"}]
 
-        tray_app._unmount_all()
+        tray_app._unmount_all_cb(None, None)
+        tray_app._unmount_thread.join(2)
 
         stop.assert_called_once_with([1])
         report.assert_not_called()
         assert tray_app._mounts == [{"pid": 2, "mountpoint": "R:"}]
+
+    def test_exit_waits_for_a_starting_mount(self, tray_app, ready, stop,
+                                             monkeypatch):
+        # Exit leaves no tray to unmount it from later.
+        report = MagicMock()
+        monkeypatch.setattr(tray_app, "_report_unmount_error", report)
+        monkeypatch.setattr("amifuse.tray.time.sleep", lambda _: ready.add(2))
+        ready.add(1)
+        tray_app._mounts = [{"pid": 1, "mountpoint": "D:"},
+                            {"pid": 2, "mountpoint": "R:"}]
+
+        tray_app._unmount_all()
+
+        stop.assert_called_once_with([1, 2])
+        report.assert_not_called()
+
+    def test_exit_reports_a_mount_still_starting(self, tray_app, ready, stop,
+                                                 monkeypatch):
+        report = MagicMock()
+        monkeypatch.setattr(tray_app, "_report_unmount_error", report)
+        monkeypatch.setattr(tray_app, "EXIT_START_WAIT", 0)
+        monkeypatch.setattr("amifuse.platform.find_amifuse_mounts", lambda: [
+            {"pid": 1, "mountpoint": "D:"}, {"pid": 2, "mountpoint": "R:"}])
+        ready.add(1)
+        tray_app._mounts = [{"pid": 1, "mountpoint": "D:"},
+                            {"pid": 2, "mountpoint": "R:"}]
+
+        tray_app._unmount_all()
+
+        stop.assert_called_once_with([1])
+        report.assert_called_once_with(
+            "AmiFUSE at R: is still starting; try unmounting again once the "
+            "mount is ready.")
+
+    def test_exit_drops_a_mount_whose_process_ended(self, tray_app, ready, stop,
+                                                    monkeypatch):
+        # Its events are gone too, so it looks like a mount still starting.
+        report = MagicMock()
+        monkeypatch.setattr(tray_app, "_report_unmount_error", report)
+        monkeypatch.setattr(tray_app, "EXIT_START_WAIT", 0)
+        monkeypatch.setattr("amifuse.platform.find_amifuse_mounts", lambda: [
+            {"pid": 1, "mountpoint": "D:"}])
+        ready.add(1)
+        tray_app._mounts = [{"pid": 1, "mountpoint": "D:"},
+                            {"pid": 2, "mountpoint": "R:"}]
+
+        tray_app._unmount_all()
+
+        stop.assert_called_once_with([1])
+        report.assert_not_called()
 
     def test_unmount_of_a_starting_mount_says_so(self, tray_app, ready, stop,
                                                  monkeypatch):
