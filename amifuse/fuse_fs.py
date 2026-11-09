@@ -8018,7 +8018,7 @@ def cmd_inspect(args):
                     amiga_parts and isinstance(opened, DiskRDBError))
                 first_error = first_error or opened
                 if beside_mbr:
-                    notes.append(f"{rdb_label(amiga_parts, rdb_idx)}: {opened}")
+                    notes.append(f"{rdb_label(amiga_parts, rdb_idx, opened)}: {opened}")
                     continue
                 envelope = _json_error("inspect", "OPEN_FAILED", str(opened))
                 envelope["image"] = str(args.image)
