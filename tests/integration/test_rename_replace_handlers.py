@@ -553,6 +553,49 @@ def _hard_link_image(tmp_path):
     return image
 
 
+def test_exclusive_create_of_an_existing_name_fails_on_winfsp(ops):
+    # WinFsp sends CREATE_NEW to create() without opening the name first,
+    # and the handler matches a name in any case: without the check, this
+    # create emptied CaseX.
+    if ops._name_fold is None:
+        pytest.skip("handler does not advertise case folding")
+    ops._winfsp = True
+    _write(ops, "/CaseX", b"keep me")
+    for name in ("/CaseX", "/CASEX"):
+        assert _errno(ops.create, name, 0o644) == errno.EEXIST
+    assert _read(ops, "/casex") == b"keep me"
+    assert "CaseX" in _on_disk(ops)
+
+
+def test_exclusive_create_of_a_held_file_fails_on_winfsp(ops):
+    # A file still open from its create() can't be examined; its pin
+    # tells that it exists.
+    if ops._name_fold is None:
+        pytest.skip("handler does not advertise case folding")
+    ops._winfsp = True
+    fh = ops.create("/Held", 0o644)
+    try:
+        assert ops.write("/Held", b"data", 0, fh) == 4
+        assert _errno(ops.create, "/HELD", 0o644) == errno.EEXIST
+    finally:
+        ops.release("/Held", fh)
+    assert _read(ops, "/Held") == b"data"
+
+
+def test_a_name_whose_delete_is_pending_is_not_taken_for_existing(ops):
+    # A pending delete hides its file, and create() takes the name over.
+    ops._winfsp = True
+    _write(ops, "/Pending", b"old")
+    fh = ops.open("/Pending", os.O_RDONLY)
+    try:
+        assert ops.unlink("/Pending") == 0
+        if "/Pending" not in ops._pending_deletes:
+            pytest.skip("handler deletes an open file at once")
+        ops._refuse_existing("/PENDING" if ops._name_fold else "/Pending")
+    finally:
+        ops.release("/Pending", fh)
+
+
 def test_getpath_names_a_hard_link_not_its_target(tmp_path):
     # FastFileSystem resolves a hard link when it locks it, so Examine on
     # the lock names the target. getpath must give the link's own name, or

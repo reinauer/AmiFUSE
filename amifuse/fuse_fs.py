@@ -3559,7 +3559,11 @@ class AmigaFuseFS(_FuseOperations):
             info = self.bridge.stat_path(child)
             name = info.get("name") if info is not None else None
             if name is not None and self._folded(name) != self._folded(component):
-                name = None  # a hard link: Examine names its target
+                # A hard link: Examine names its target. A link whose name
+                # folds equal to its target's, differing only in letter
+                # case, isn't told apart and gets the target's spelling;
+                # that would take a listing for each component.
+                name = None
             if (name is None and info is None and at == len(components) - 1
                     and created is not None
                     and self._folded(created) == self._folded(child)):
@@ -4110,6 +4114,8 @@ class AmigaFuseFS(_FuseOperations):
             if self._is_platform_special(path):
                 raise FuseOSError(errno.ENOENT)
             path = self._state_path(path)
+            if self._winfsp:
+                self._refuse_existing(path)
             self._materialize_grows(except_path=path)
             opened = self.bridge.open_file(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
             if opened is None:
@@ -4130,9 +4136,10 @@ class AmigaFuseFS(_FuseOperations):
                     "dirty": True,  # New files are always dirty
                     "writable": True,
                     "path": path,
-                    # getpath takes this as the spelling on disk. On a
-                    # case-insensitive volume WinFsp creates only a name no
-                    # existing one folds to, which the handler stores as sent.
+                    # getpath takes this as the spelling on disk. On
+                    # WinFsp create() refuses a name an existing object
+                    # folds to (_refuse_existing), so the handler stores the
+                    # name as sent.
                     "created": True,
                 }
             # Prime stat/dir cache so immediate getattr after create doesn't fail.
@@ -4150,6 +4157,27 @@ class AmigaFuseFS(_FuseOperations):
         except Exception as e:
             self._log_op("create", path, f"EXCEPTION: {type(e).__name__}: {e}")
             raise FuseOSError(errno.EIO) from e
+
+    def _refuse_existing(self, path):
+        """Fail a WinFsp create() of a name an object already has.
+
+        WinFsp sends CREATE_NEW (an exclusive create) to create() without
+        opening the name first; its other dispositions open it first and
+        call create() only when that reports it missing. create() opens
+        with O_CREAT | O_TRUNC, which the handler matches in any letter
+        case, so an exclusive create of CASEX would empty CaseX, where
+        Windows expects "file exists". A file a writer holds on an
+        exclusive lock can't be examined, but is pinned. A file with a
+        pending delete is hidden, and create() takes its name over.
+        """
+        folded = self._folded(path)
+        with self._fh_lock:
+            if any(self._folded(p) == folded for p in self._pending_deletes):
+                return
+            pinned = any(self._folded(p) == folded for p in self._pinned_stats)
+        if pinned or self.bridge.stat_path(path) is not None:
+            self._log_op("create", path, "exists")
+            raise FuseOSError(errno.EEXIST)
 
     def unlink(self, path):
         self._log_op("unlink", path, "")
