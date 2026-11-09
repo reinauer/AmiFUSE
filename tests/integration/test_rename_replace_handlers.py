@@ -426,6 +426,37 @@ def test_delete_on_close_while_a_directory_renamed_from_the_name_is_open(winfsp_
     assert ops._pending_deletes == set()
 
 
+@pytest.mark.parametrize("readdir_plus", [True, False])
+def test_directory_renamed_through_its_handle_lists_with_attributes(ops, readdir_plus):
+    # WinFsp lists a directory handle under the path it was opened with,
+    # and asks getattr() under that path for any entry given without
+    # attributes. After a rename through the handle that path is stale, so
+    # every entry failed and the listing came back empty (#427). With
+    # READDIR_PLUS granted, readdir() gives each entry's attributes.
+    ops._winfsp = True
+    ops._readdir_plus = readdir_plus
+    ops.mkdir("/L2a", 0o755)
+    _write(ops, "/L2a/f", b"data")
+    handle = ops.opendir("/L2a")
+    try:
+        assert ops.rename("/L2a", "/L2b") == 0
+        listing = ops.readdir("/L2a", handle)
+        assert _errno(ops.getattr, "/L2a/f") == errno.ENOENT
+        if not readdir_plus:
+            assert sorted(listing) == [".", "..", "f"]
+            return
+        attrs = {name: st for name, st, offset in listing}
+        assert sorted(attrs) == [".", "..", "f"]
+        assert attrs["f"]["st_size"] == 4
+        assert attrs["f"]["st_mode"] & 0o170000 == 0o100000
+        assert attrs["."]["st_mode"] & 0o170000 == 0o040000
+        assert attrs[".."] == ops.getattr("/")
+        # and by the new path, as a second handle lists it
+        assert sorted(name for name, _, _ in ops.readdir("/L2b", None)) == [".", "..", "f"]
+    finally:
+        ops.releasedir("/L2a", handle)
+
+
 def test_delete_renamed_directory_preserves_old_name(ops):
     ops._winfsp = True
     ops.mkdir("/before", 0o755)
