@@ -4277,7 +4277,9 @@ class AmigaFuseFS(_FuseOperations):
         send. Caller holds _fh_lock.
 
         A file child counts only while a FUSE handle with an AmigaDOS
-        FileHandle is open on it, whose release() sends the delete (#222).
+        FileHandle is open on it, whose release() sends the delete (#222),
+        or while it waits on handles open through a hard link to it
+        (_link_deletes), the last of whose release() sends it (#425).
         A directory child counts while it waits on children of its own or
         on a directory handle, as _drop_failed_dir_delete keeps it.
 
@@ -4287,7 +4289,8 @@ class AmigaFuseFS(_FuseOperations):
         held = {v.get("path") for v in self._fh_cache.values()
                 if "fh_addr" in v or v.get("dir_handle")}
         children = {p for p in self._pending_deletes
-                    if p.rsplit("/", 1)[0] == path and p in held}
+                    if p.rsplit("/", 1)[0] == path
+                    and (p in held or p in self._link_deletes)}
         children.update(d for d in self._pending_dir_deletes if d.rsplit("/", 1)[0] == path)
         return children
 

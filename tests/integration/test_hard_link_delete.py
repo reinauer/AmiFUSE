@@ -44,20 +44,24 @@ def _file_header(data, name):
     raise AssertionError(f"no file header for {name!r}")
 
 
-@pytest.fixture
-def ops(tmp_path):
-    """An FFS floppy with TargetFile.txt, lf, a hard link to it, and other.txt."""
+def _link_image(tmp_path, link, target, *names):
+    """An FFS floppy with each of names, a file or (ending in /) a directory,
+    and link, a file hard link to target, which is one of them."""
     image = tmp_path / "links.adf"
     content, empty = tmp_path / "content.txt", tmp_path / "empty.txt"
     content.write_bytes(b"target\n")
     empty.write_bytes(b"")
-    _xdftool(image, "create", "+", "format", "Links", "ffs",
-             "+", "write", str(content), "TargetFile.txt",
-             "+", "write", str(empty), "lf",
-             "+", "write", str(content), "other.txt")
+    commands = []
+    for name in names:
+        if name.endswith("/"):
+            commands += ["+", "makedir", name.rstrip("/")]
+        else:
+            commands += ["+", "write", str(content), name]
+    _xdftool(image, "create", "+", "format", "Links", "ffs", *commands,
+             "+", "write", str(empty), link)
     data = bytearray(image.read_bytes())
-    link_key = _file_header(data, b"lf")
-    target_key = _file_header(data, b"TargetFile.txt")
+    link_key = _file_header(data, link.rsplit("/", 1)[-1].encode())
+    target_key = _file_header(data, target.rsplit("/", 1)[-1].encode())
 
     def to_link(block):
         struct.pack_into(">i", block, BLOCK - 4, ST_LINKFILE)
@@ -69,12 +73,29 @@ def ops(tmp_path):
     _edit_block(data, link_key, to_link)
     _edit_block(data, target_key, link_back)
     image.write_bytes(data)
+    return image
+
+
+def _mounted(image):
     bridge = HandlerBridge(image, BUNDLED_DRIVER, read_only=False,
                            adf_info=detect_adf(image))
     try:
         yield AmigaFuseFS(bridge)
     finally:
         bridge.close()
+
+
+@pytest.fixture
+def ops(tmp_path):
+    """TargetFile.txt, lf, a hard link to it, and other.txt."""
+    yield from _mounted(_link_image(tmp_path, "lf", "TargetFile.txt",
+                                    "TargetFile.txt", "other.txt"))
+
+
+@pytest.fixture
+def folder_ops(tmp_path):
+    """D/T.txt, and l, a hard link to it, outside D."""
+    yield from _mounted(_link_image(tmp_path, "l", "D/T.txt", "D/", "D/T.txt"))
 
 
 def _names(ops):
@@ -144,3 +165,28 @@ def test_an_unrelated_open_file_does_not_hold_a_delete(ops):
         assert ops.bridge.stat_path("/TargetFile.txt") is None
     finally:
         ops.release("/other.txt", fh)
+
+
+def test_folder_delete_waits_for_a_file_held_through_a_link(folder_ops):
+    # The file is hidden, so WinFsp finds the folder empty and deletes it;
+    # the handler refuses while the file is there, so the folder's delete
+    # waits for the file's, as for a file open under its own name.
+    ops = folder_ops
+    ops._winfsp = True
+    fh = ops.open("/l", os.O_RDONLY)
+    try:
+        assert ops.unlink("/D/T.txt") == 0
+        assert ops.readdir("/D", None) == [".", ".."]
+        assert ops.rmdir("/D") == 0
+        assert "D" not in _names(ops)
+        assert ops.bridge.stat_path("/D") is not None
+    finally:
+        ops.release("/l", fh)
+    assert ops.bridge.stat_path("/D/T.txt") is None
+    assert ops.bridge.stat_path("/D") is None
+    assert _names(ops) == {"l"}
+    fh = ops.open("/l", os.O_RDONLY)
+    try:
+        assert ops.read("/l", 7, 0, fh) == b"target\n"
+    finally:
+        ops.release("/l", fh)
