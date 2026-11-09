@@ -506,11 +506,25 @@ def test_disk_read_error_keeps_readable_entry_and_skips_empty_one(tmp_path, monk
     assert "MBR partition [1]" not in listed.fallback_reason
 
 
+def _scan_disk(tmp_path, layout, entries):
+    """An Emu68 disk, or a Parceiro one with its own RDB at block 2, with
+    one or two entries holding an RDB."""
+    names = ("DH0", "WORK")[:entries]
+    if layout == "parceiro":
+        return _disk_rdb(tmp_path, names, 2)
+    return _make_mbr(tmp_path, [(lba, _make_rdb(tmp_path, 512, name))
+                                for lba, name in zip((200, 400), names)])
+
+
+@pytest.mark.parametrize("entries", [1, 2])
 @pytest.mark.parametrize("layout, failed_block", [("emu68", 5), ("parceiro", 1)])
 def test_disk_scan_error_does_not_poison_entry_reads(tmp_path, monkeypatch, capsys,
-                                                   layout, failed_block):
-    image = (_two_dh0_entries(tmp_path) if layout == "emu68" else
-             _disk_rdb(tmp_path, ("DH0", "WORK"), 2))
+                                                   user_driver_dir, layout,
+                                                   failed_block, entries):
+    from amifuse import fuse_fs
+    import json
+
+    image = _scan_disk(tmp_path, layout, entries)
     read = RawBlockDevice.read_block
     def failing(self, block, num_blks=1, **kwargs):
         start = block * self.block_bytes
@@ -518,23 +532,38 @@ def test_disk_scan_error_does_not_poison_entry_reads(tmp_path, monkeypatch, caps
             raise OSError(errno.EIO, "disk scan failed")
         return read(self, block, num_blks, **kwargs)
     monkeypatch.setattr(RawBlockDevice, "read_block", failing)
-    entries = []
-    for index, opened in rdb_inspect.open_each_rdb(image, None, 2):
-        entries.append((index, isinstance(opened, OSError)))
+    opened_entries = []
+    for index, opened in rdb_inspect.open_each_rdb(image, None, entries):
+        opened_entries.append((index, isinstance(opened, OSError)))
         if isinstance(opened, OSError):
-            assert isinstance(opened, DiskRDBError)
+            # A DiskRDBError for the selectors, but not that RDB's failure.
+            assert isinstance(opened, rdb_inspect.DiskScanError)
             assert opened.errno == errno.EIO
         else:
             opened[1].close()
             opened[0].close()
-    assert entries == [(None, True), (0, False), (1, False)]
+    assert opened_entries == [(None, True)] + [(i, False) for i in range(entries)]
+
+    # The scan stopped at the bad block, so no layout is known: no RDB
+    # beside the MBR, Parceiro-style or not, and no Emu68-style either.
+    scan = "Blocks 0-15 of the disk: "
     listed = list_partitions(image)
-    assert len(listed.partitions) == 2
+    assert len(listed.partitions) == entries
     assert listed.fallback_reason.count("disk scan failed") == 1
+    assert scan in listed.fallback_reason
     rdb_inspect.print_inspect_report(image, None, False)
     report = capsys.readouterr().out
     assert report.count("disk scan failed") == 1
-    assert "RDB beside the MBR" in report
+    assert f"{scan}Error: " in report
+    assert report.startswith("MBR Partition Table detected\n")
+    for claim in ("RDB beside the MBR", "Parceiro-style", "Emu68-style"):
+        assert claim not in report
+    assert "=== Amiga RDB in MBR partition [0]" in report
+    # The entries open, so JSON inspect succeeds, with the scan as a note.
+    fuse_fs.main(["inspect", str(image), "--json"])
+    notes = json.loads(capsys.readouterr().out)["notes"]
+    assert [note.startswith(scan) for note in notes] == [True]
+
     for selector in ("0", "DH0"):
         for write in (False, True):
             with pytest.raises(OSError) as caught:
