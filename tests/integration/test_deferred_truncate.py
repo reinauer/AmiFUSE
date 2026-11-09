@@ -14,6 +14,10 @@ pytestmark = pytest.mark.integration
 VOLUMES = [
     pytest.param('ffs', id='ffs', marks=pytest.mark.no_fixtures),
     pytest.param('ofs', id='ofs', marks=pytest.mark.no_fixtures),
+    # FastFileSystem 47.4 from the fixtures answers a write of no bytes with
+    # (0, -1), not (0, 0) (#426).
+    pytest.param('ffs47', id='ffs47'),
+    pytest.param('ofs47', id='ofs47'),
     pytest.param('pfs3', id='pfs3'),
     pytest.param('sfs', id='sfs'),
 ]
@@ -25,6 +29,12 @@ def volume(request, tmp_path):
     if kind in ('ffs', 'ofs'):
         image = make_adf(tmp_path / 'disk.adf', dos_type=0x444f5301 if kind == 'ffs' else 0x444f5300)
         driver = BUNDLED_FFS
+    elif kind in ('ffs47', 'ofs47'):
+        driver = request.getfixturevalue('fixture_root') / 'drivers' / 'FastFileSystem'
+        if not driver.exists():
+            pytest.skip('FastFileSystem handler not found')
+        image = make_adf(tmp_path / 'disk.adf',
+                         dos_type=0x444f5301 if kind == 'ffs47' else 0x444f5300)
     else:
         name = 'pfs3aio' if kind == 'pfs3' else 'SmartFilesystem'
         image, driver = _volume(request, tmp_path, name, 'pfs.hdf' if kind == 'pfs3' else 'sfs.hdf')

@@ -2740,6 +2740,11 @@ class HandlerBridge:
         extend the file's last block. Returns (0, 0), or (-1, dp_Res2) when
         the handler fails the write, or (-1, 0) when it gets no reply.
         close_file() sends no second one either way.
+
+        A refusal can come as DOSFALSE, 0 bytes, with an error code in
+        dp_Res2: BFFS's read-only checks reply so. FastFileSystem 47.4
+        writes the 0 bytes asked for with dp_Res2 -1, which is no error
+        code, so only a positive dp_Res2 makes a 0 a refusal (#426).
         """
         with self._lock:
             self._unwritten_outputs.discard(fh_addr)
@@ -2749,8 +2754,8 @@ class HandlerBridge:
             reply = self._run_until_reply(pkt_addr, "write")
         if reply is None:
             return -1, 0
-        # A refusal can come as DOSFALSE: BFFS's read-only checks reply 0.
-        return (0, 0) if reply == (0, 0) else (-1, reply[1])
+        res1, res2 = reply
+        return (0, 0) if res1 == 0 and res2 <= 0 else (-1, res2)
 
     def close_file(self, fh_addr: int):
         """End the handle with ACTION_END and free its FileHandle.
