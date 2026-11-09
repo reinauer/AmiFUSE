@@ -774,10 +774,20 @@ def _find_amifuse_mounts_unix():
     else:
         ps_cmd = ["ps", "-axwwo", "pid=,ppid=,etimes=,command="]
 
+    # macOS prints lstart's day and month names in LC_TIME's language, and
+    # _parse_lstart_uptime reads only English ones. Only LC_TIME changes:
+    # in the C character set ps escapes every byte of a non-ASCII path.
+    # Linux's etimes is a number and needs neither.
+    env = None
+    if is_mac:
+        env = dict(os.environ)
+        if "LC_ALL" in env:
+            env["LC_CTYPE"] = env.pop("LC_ALL")
+        env["LC_TIME"] = "C"
+
     try:
         result = subprocess.run(
-            ps_cmd, check=False, capture_output=True, text=True,
-            env={**os.environ, "LC_ALL": "C"},
+            ps_cmd, check=False, capture_output=True, text=True, env=env,
         )
     except OSError:
         logger.debug("ps not available, cannot discover mounts")
