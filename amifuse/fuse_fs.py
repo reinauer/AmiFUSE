@@ -2944,6 +2944,11 @@ class AmigaFuseFS(_FuseOperations):
         self._next_fh = 1
         self._pending_deletes: set = set()
         self._pending_dir_deletes: Dict[str, set] = {}  # dir_path -> set of pending child paths blocking removal
+        # path -> the file handles (keys of _fh_cache) open on the same
+        # object under another name, a hard link to it, that made the
+        # handler refuse path's pending delete. The last one's release()
+        # sends it again (_link_holders). Guarded by _fh_lock.
+        self._link_deletes: Dict[str, set] = {}
         # path -> the date utimens() set on an open file, sent at its last
         # release(). Guarded by _fh_lock.
         self._held_dates: Dict[str, float] = {}
@@ -4154,6 +4159,18 @@ class AmigaFuseFS(_FuseOperations):
                         has_handle = any(v.get("path") == path for v in self._fh_cache.values())
                         if has_handle:
                             self._pending_deletes.add(path)
+                    if not has_handle:
+                        # The file can be open under another name, a hard
+                        # link to it (#425). WinFsp discards what unlink()
+                        # answers at cleanup, so the delete waits for the
+                        # release() of the last of those handles.
+                        holders = self._link_holders(path)
+                        if holders:
+                            self._log_op("unlink", path, "open through a link, deferred")
+                            with self._fh_lock:
+                                self._pending_deletes.add(path)
+                                self._link_deletes[path] = holders
+                            has_handle = True
                     if has_handle:
                         with self._cache_lock:
                             # A file held on an exclusive lock keeps its pinned
@@ -4279,6 +4296,7 @@ class AmigaFuseFS(_FuseOperations):
         with self._fh_lock:
             self._pending_deletes.discard(path)
             self._pending_dir_deletes.pop(path, None)
+            self._link_deletes.pop(path, None)
 
     def _any_file_open(self) -> bool:
         """True while a FUSE handle holds an AmigaDOS FileHandle and a lock."""
@@ -4572,6 +4590,10 @@ class AmigaFuseFS(_FuseOperations):
                 # delete it at its release().
                 self._pending_deletes = {
                     _renamed_path(p, old, new) or p for p in self._pending_deletes
+                }
+                self._link_deletes = {
+                    _renamed_path(p, old, new) or p: holders
+                    for p, holders in self._link_deletes.items()
                 }
                 self._pending_dir_deletes = {
                     _renamed_path(d, old, new) or d: {
@@ -5112,69 +5134,133 @@ class AmigaFuseFS(_FuseOperations):
             self._set_held_date(resolved_path)
         # Check for deferred deletes (WinFSP unlink-before-release pattern)
         if resolved_path:
-            with self._fh_lock:
-                if resolved_path not in self._pending_deletes:
-                    return 0
-                # Check if another handle for this path is still open
-                still_open = any(
-                    v.get("path") == resolved_path and not v.get("closed")
-                    for v in self._fh_cache.values()
-                )
-                if still_open:
-                    return 0
-                self._pending_deletes.discard(resolved_path)
-            delete_succeeded = False
-            dropped = False
-            locks = []
-            try:
-                dir_path, name = self._split_path(resolved_path)
-                lock_bptr, _, locks = self.bridge.locate_path(dir_path)
-                if dir_path == "/" and lock_bptr == 0:
-                    lock_bptr, _ = self.bridge.locate(0, "")
-                    if lock_bptr:
-                        locks.append(lock_bptr)
-                no_reply = False
-                if lock_bptr != 0:
-                    res1, res2 = self.bridge.delete_object(lock_bptr, name)
-                    self._log_op("release", resolved_path, f"deferred delete res1={res1} res2={res2}")
-                    delete_succeeded = res1 != 0
-                    # No reply: the handler may still delete it.
-                    no_reply = not delete_succeeded and res2 == -1
-                if not delete_succeeded:
-                    with self._fh_lock:
-                        # A handle left on the path, closed by a failed
-                        # truncate() reopen, sends the delete again.
-                        dropped = not no_reply and not any(
-                            v.get("path") == resolved_path and "fh_addr" in v
-                            for v in self._fh_cache.values()
-                        )
-                        if dropped:
-                            self._drop_refused_delete(resolved_path)
-                        else:
-                            self._pending_deletes.add(resolved_path)
-                if delete_succeeded:
-                    with self._cache_lock:
-                        self._stat_cache.pop(resolved_path, None)
-                        self._dir_cache.pop(dir_path, None)
-            except Exception as e:
-                self._log_op("release", resolved_path, f"deferred delete exception: {type(e).__name__}: {e}")
-                # Hidden again only when the delete got no answer: one the
-                # handler answered is settled above.
-                if not delete_succeeded and not dropped:
-                    with self._fh_lock:
-                        self._pending_deletes.add(resolved_path)
-            finally:
-                self._free_locks("release", resolved_path, locks)
-            if dropped:
-                # The file stays, and takes the date utimens() held for it.
-                self._set_held_date(resolved_path)
-            else:
-                with self._fh_lock:
-                    self._held_dates.pop(resolved_path, None)
-            # Resolve any deferred parent directory deletes only on success
-            if delete_succeeded:
-                self._resolve_pending_dir_deletes(resolved_path)
+            self._send_deferred_delete(resolved_path)
+        self._release_link_holder(fh)
         return 0
+
+    def _send_deferred_delete(self, resolved_path: str):
+        """Send the delete unlink() deferred for resolved_path, once no
+        file handle holds the file, under its name or a hard link to it."""
+        with self._fh_lock:
+            if resolved_path not in self._pending_deletes:
+                return
+            # Check if another handle for this path, or through a hard link
+            # to it, is still open
+            still_open = resolved_path in self._link_deletes or any(
+                v.get("path") == resolved_path and not v.get("closed")
+                for v in self._fh_cache.values()
+            )
+            if still_open:
+                return
+            self._pending_deletes.discard(resolved_path)
+        delete_succeeded = False
+        dropped = False
+        locks = []
+        try:
+            dir_path, name = self._split_path(resolved_path)
+            lock_bptr, _, locks = self.bridge.locate_path(dir_path)
+            if dir_path == "/" and lock_bptr == 0:
+                lock_bptr, _ = self.bridge.locate(0, "")
+                if lock_bptr:
+                    locks.append(lock_bptr)
+            no_reply = in_use = False
+            if lock_bptr != 0:
+                res1, res2 = self.bridge.delete_object(lock_bptr, name)
+                self._log_op("release", resolved_path, f"deferred delete res1={res1} res2={res2}")
+                delete_succeeded = res1 != 0
+                # No reply: the handler may still delete it.
+                no_reply = not delete_succeeded and res2 == -1
+                in_use = not delete_succeeded and res2 == ERROR_OBJECT_IN_USE
+            # Still open under another name, a hard link to it: the last
+            # of those handles sends the delete again (#425).
+            holders = self._link_holders(resolved_path) if in_use else set()
+            if not delete_succeeded:
+                with self._fh_lock:
+                    # A handle left on the path, closed by a failed
+                    # truncate() reopen, sends the delete again.
+                    dropped = not no_reply and not holders and not any(
+                        v.get("path") == resolved_path and "fh_addr" in v
+                        for v in self._fh_cache.values()
+                    )
+                    if dropped:
+                        self._drop_refused_delete(resolved_path)
+                    else:
+                        self._pending_deletes.add(resolved_path)
+                        if holders:
+                            self._link_deletes[resolved_path] = holders
+            if delete_succeeded:
+                with self._cache_lock:
+                    self._stat_cache.pop(resolved_path, None)
+                    self._dir_cache.pop(dir_path, None)
+        except Exception as e:
+            self._log_op("release", resolved_path, f"deferred delete exception: {type(e).__name__}: {e}")
+            # Hidden again only when the delete got no answer: one the
+            # handler answered is settled above.
+            if not delete_succeeded and not dropped:
+                with self._fh_lock:
+                    self._pending_deletes.add(resolved_path)
+        finally:
+            self._free_locks("release", resolved_path, locks)
+        if dropped:
+            # The file stays, and takes the date utimens() held for it.
+            self._set_held_date(resolved_path)
+        else:
+            with self._fh_lock:
+                self._held_dates.pop(resolved_path, None)
+        # Resolve any deferred parent directory deletes only on success
+        if delete_succeeded:
+            self._resolve_pending_dir_deletes(resolved_path)
+
+    def _release_link_holder(self, fh):
+        """Send each deferred delete that waited on fh, the last handle
+        open on its file through a hard link (_link_deletes)."""
+        due = []
+        with self._fh_lock:
+            for path, holders in list(self._link_deletes.items()):
+                if fh in holders:
+                    holders.discard(fh)
+                    if not holders:
+                        del self._link_deletes[path]
+                        due.append(path)
+        for path in due:
+            self._send_deferred_delete(path)
+
+    def _link_holders(self, path: str) -> set:
+        """The file handles open on path's file under another name.
+
+        A lock taken through a hard link is a lock on the object it links
+        to, so FastFileSystem refuses to delete any of its names while such
+        a handle is open (ERROR_OBJECT_IN_USE). Examine through either name
+        gives the linked object's fib_DiskKey and name, which must both
+        match, as pfs3aio and ODFileSystem give one disk key to many
+        entries. A file held on an exclusive lock can't be examined, and
+        doesn't count.
+        """
+        try:
+            info = self.bridge.stat_path(path)
+        except Exception:
+            return set()
+        if not info or info.get("dir_type", 0) >= 0 or not info.get("disk_key"):
+            return set()
+        key = (info["disk_key"], info.get("name"), info.get("dir_type"))
+        with self._fh_lock:
+            others = {
+                fh: v.get("path") for fh, v in self._fh_cache.items()
+                if v.get("fh_addr") and not v.get("closed") and v.get("path")
+                and self._folded(v["path"]) != self._folded(path)
+            }
+        holders, seen = set(), {}
+        for fh, other in others.items():
+            if other not in seen:
+                try:
+                    found = self.bridge.stat_path(other)
+                except Exception:
+                    found = None
+                seen[other] = found and (
+                    found.get("disk_key"), found.get("name"), found.get("dir_type"))
+            if seen[other] == key:
+                holders.add(fh)
+        return holders
 
     def init(self, path):
         """Called when filesystem is mounted. Notify shell on Windows."""
