@@ -3711,25 +3711,39 @@ class AmigaFuseFS(_FuseOperations):
                     size = max(0, min(size, cached[1]["st_size"] - offset))
                     if not size:
                         return b""
-            if entry["pos"] is None or offset != entry["pos"]:
-                data = self.bridge.read_handle_at(fh_addr, offset, size)
-            else:
-                data = self.bridge.read_handle(fh_addr, size)
-            if data is None:
-                # The handler's position is unknown after a failed read or
-                # seek, so the next read must seek explicitly.
-                entry["pos"] = None
-                raise FuseOSError(errno.EIO)
-            # A refused seek past end of file also reads as empty but leaves
-            # the handler's position where it was, so cache only real data.
-            entry["pos"] = offset + len(data) if data else None
-            return data
+            return self._read_through(entry, fh_addr, size, offset)
+
+    def _read_through(self, entry, fh_addr, size, offset):
+        """Read size bytes at offset through the entry's handle fh_addr.
+
+        The caller holds entry["lock"]. The handler's position is cached in
+        entry["pos"], so a sequential read needs no seek.
+        """
+        if entry["pos"] is None or offset != entry["pos"]:
+            data = self.bridge.read_handle_at(fh_addr, offset, size)
+        else:
+            data = self.bridge.read_handle(fh_addr, size)
+        if data is None:
+            # The handler's position is unknown after a failed read or
+            # seek, so the next read must seek explicitly.
+            entry["pos"] = None
+            raise FuseOSError(errno.EIO)
+        # A refused seek past end of file also reads as empty but leaves
+        # the handler's position where it was, so cache only real data.
+        entry["pos"] = offset + len(data) if data else None
+        return data
 
     def _read_deferred(self, entry, size, offset):
         """Read a Windows logical handle without keeping an Amiga lock."""
         with entry["lock"]:
             if entry.get("closed"):
                 raise FuseOSError(errno.EBADF)
+            if entry.get("fh_addr"):
+                # A read-only mount keeps the first data handle, and another
+                # read kept it while this one waited for the lock. Opening a
+                # second would leak one, and move the handle that a read on
+                # read()'s path took before the lock, under its cached pos.
+                return self._read_through(entry, entry["fh_addr"], size, offset)
             path = entry["path"]
             parent, name = self._split_path(path)
             # Our exclusive writer already pins this file's metadata.
@@ -3920,6 +3934,12 @@ class AmigaFuseFS(_FuseOperations):
                 # WinFsp can issue CREATE_ALWAYS with GENERIC_READ. Windows
                 # checked access; the logical handle has no Amiga handle.
                 path, fh = _handle_path(entry, path), None
+                # A writer this mount holds on the file truncates it: pfs3aio
+                # refuses the temporary handle beside it as in use.
+                with self._fh_lock:
+                    fh = next((h for h, e in self._fh_cache.items()
+                               if e.get("path") == path and e.get("writable")
+                               and e.get("fh_addr") and not e.get("closed")), None)
         if fh is None:
             fh = self.open(path, os.O_WRONLY)
             temp_handle = True

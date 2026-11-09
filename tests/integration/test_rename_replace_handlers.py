@@ -492,6 +492,94 @@ def test_windows_metadata_open_allows_truncate(ops):
     assert _read(ops, "/before") == b""
 
 
+def test_windows_reader_truncates_through_this_mounts_writer(ops):
+    # CREATE_ALWAYS with GENERIC_READ while this mount holds the file open
+    # for writing: pfs3aio refuses a second writer, so the truncate goes
+    # through the one already open.
+    ops._winfsp = True
+    _write(ops, "/w", NEW)
+    writer = ops.open("/w", os.O_RDWR)
+    reader = None
+    try:
+        reader = ops.open("/w", os.O_RDONLY)
+        assert ops.truncate("/w", 0, reader) == 0
+        assert ops.getattr("/w", reader)["st_size"] == 0
+        assert ops.read("/w", 100, 0, reader) == b""
+    finally:
+        if reader is not None:
+            ops.release("/w", reader)
+        ops.release("/w", writer)
+    assert not ops._fh_cache
+    assert _read(ops, "/w") == b""
+
+
+def test_windows_read_only_concurrent_first_reads_share_one_handle(ops, monkeypatch):
+    # A read-only mount runs multithreaded. A read that arrives while the
+    # first one is still opening the data handle must use that handle, not
+    # open (and leak) another under the first one's cached position.
+    import threading
+    from unittest.mock import Mock
+
+    _write(ops, "/data", NEW)
+    ops._winfsp = True
+    monkeypatch.setattr(ops.bridge, "_write_enabled", False)
+    opened = Mock(wraps=ops.bridge.open_file_reply)
+    closed = Mock(wraps=ops.bridge.close_file)
+    monkeypatch.setattr(ops.bridge, "open_file_reply", opened)
+    monkeypatch.setattr(ops.bridge, "close_file", closed)
+
+    first_in, first_go = threading.Event(), threading.Event()
+    real_read_at = ops.bridge.read_handle_at
+
+    def held_read_at(*args):
+        if not first_in.is_set():
+            first_in.set()
+            assert first_go.wait(10)
+        return real_read_at(*args)
+
+    monkeypatch.setattr(ops.bridge, "read_handle_at", held_read_at)
+    handle = ops.open("/data", os.O_RDONLY)
+
+    class WatchedLock:
+        """The entry's lock; tells when a second read waits for it."""
+        def __init__(self, lock):
+            self.lock, self.waiting = lock, threading.Event()
+
+        def __enter__(self):
+            if not self.lock.acquire(blocking=False):
+                self.waiting.set()
+                self.lock.acquire()
+
+        def __exit__(self, *exc):
+            self.lock.release()
+
+    entry = ops._fh_cache[handle]
+    entry["lock"] = watched = WatchedLock(entry["lock"])
+    results = {}
+
+    def read(name, offset):
+        results[name] = ops.read("/data", 1000, offset, handle)
+
+    first = threading.Thread(target=read, args=("first", 0))
+    second = threading.Thread(target=read, args=("second", 1000))
+    try:
+        first.start()
+        assert first_in.wait(10)
+        second.start()
+        assert watched.waiting.wait(10)
+    finally:
+        first_go.set()
+        first.join(10)
+        second.join(10)
+    assert results == {"first": NEW[:1000], "second": NEW[1000:2000]}
+    # and a sequential read after them reads on from the second
+    assert ops.read("/data", 1000, 2000, handle) == NEW[2000:3000]
+    assert opened.call_count == 1
+    ops.release("/data", handle)
+    assert closed.call_count == 1
+    assert not ops._fh_cache
+
+
 def test_windows_read_only_reuses_data_handle(ops, monkeypatch):
     from unittest.mock import Mock
 
