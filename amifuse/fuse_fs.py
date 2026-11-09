@@ -431,10 +431,37 @@ def _require_fuse():
         ) from None
 
     if sys.platform.startswith("win"):
+        import fuse as fuse_module  # type: ignore
+        _winfsp_operations_order(fuse_module)
         from .winfsp_fuse import with_capabilities
         fuse_class = with_capabilities(fuse_class)
     FUSE = fuse_class
     return FUSE
+
+
+def _winfsp_operations_order(fuse_module):
+    """Lay out fusepy's operations table as WinFsp's (#434).
+
+    WinFsp's struct fuse_operations has getdir before readlink, where
+    libfuse, which fusepy follows, has readlink first. WinFsp then takes
+    readlink from fusepy's getdir slot, which fusepy leaves empty, and
+    serves a soft link as a file. Both slots hold a function pointer, so
+    swapping them changes nothing else. fusepy builds the table from
+    fuse_operations when FUSE() mounts.
+    """
+    import ctypes
+
+    fields = list(fuse_module.fuse_operations._fields_)
+    names = [field[0] for field in fields]
+    readlink, getdir = names.index("readlink"), names.index("getdir")
+    if getdir < readlink:
+        return
+    fields[readlink], fields[getdir] = fields[getdir], fields[readlink]
+
+    class WinFspOperations(ctypes.Structure):
+        _fields_ = fields
+
+    fuse_module.fuse_operations = WinFspOperations
 
 
 def _handler_has_crashed(obj) -> bool:

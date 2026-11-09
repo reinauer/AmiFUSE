@@ -70,22 +70,36 @@ class TestFuseLazyLoad:
 
         assert fuse_fs_mod._require_fuse() is sentinel
 
-    def test_imports_and_caches_fuse_on_demand(self, monkeypatch):
+    @pytest.mark.parametrize("platform", ["win32", "linux"])
+    def test_imports_and_caches_fuse_on_demand(self, monkeypatch, platform):
+        import ctypes
         import amifuse.fuse_fs as fuse_fs_mod
+
+        class Operations(ctypes.Structure):
+            _fields_ = [(name, ctypes.c_void_p)
+                        for name in ("getattr", "readlink", "getdir")]
 
         sentinel = type("FUSE", (), {})
         fake_fuse = types.ModuleType("fuse")
         fake_fuse.FUSE = sentinel
+        fake_fuse.fuse_operations = Operations
         monkeypatch.setitem(sys.modules, "fuse", fake_fuse)
         monkeypatch.setattr(fuse_fs_mod, "FUSE", None)
+        monkeypatch.setattr(sys, "platform", platform)
+        monkeypatch.setattr("amifuse.platform.detect_fuse_backend",
+                            lambda: {"version": None})
 
         loaded = fuse_fs_mod._require_fuse()
-        if sys.platform.startswith("win"):
+        if platform == "win32":
             assert issubclass(loaded, sentinel)
         else:
             assert loaded is sentinel
         assert fuse_fs_mod.FUSE is loaded
         assert fuse_fs_mod._require_fuse() is loaded
+        # WinFsp's table has getdir before readlink (#434).
+        order = [field[0] for field in fake_fuse.fuse_operations._fields_]
+        assert order == (["getattr", "getdir", "readlink"] if platform == "win32"
+                         else ["getattr", "readlink", "getdir"])
 
     @pytest.mark.parametrize("failure", [ImportError, OSError])
     def test_reports_unavailable_fuse(self, monkeypatch, failure):
