@@ -885,7 +885,10 @@ def open_rdisk(
             media error, ends the open. A selected partition with no RDSK
             block raises NoEntryRDBError, and one whose RDB is found but
             does not open EntryRDBError. A block carrying the RDSK id with
-            a bad checksum is an RDB that does not open, not none.
+            a bad checksum is an RDB that does not open, not none. A device
+            error in the scan of blocks 0-15 of a disk with 0x76 entries
+            raises DiskScanError, a DiskRDBError; a selected entry skips
+            that scan.
     """
     # Read the MBR first: a Windows physical disk opened outside a mount
     # session is locked against other readers until blkdev closes.
