@@ -472,6 +472,106 @@ def test_getpath_lists_only_the_parent_of_a_refused_lock(ops, monkeypatch):
     assert listed == ["/Canonical"]
 
 
+def test_getpath_of_a_created_file_does_not_list_its_parent(ops, monkeypatch):
+    # WinFsp calls getpath right after create(), while the new file is open
+    # for writing and the handler may refuse its lock. Listing the parent
+    # there made every copy onto a mount quadratic in the folder's size.
+    if ops._name_fold is None:
+        pytest.skip("handler does not advertise case folding")
+    ops.mkdir("/Canonical", 0o755)
+    readdir = ops.readdir
+
+    def refuse_listing(*args):
+        raise AssertionError("getpath listed the parent of a created file")
+
+    handle = ops.create("/Canonical/NewFile", 0o644)
+    try:
+        monkeypatch.setattr(ops, "readdir", refuse_listing)
+        assert ops.getpath("/canonical/newfile", handle) == "/Canonical/NewFile"
+    finally:
+        monkeypatch.setattr(ops, "readdir", readdir)
+        ops.release("/Canonical/NewFile", handle)
+
+
+def test_getpath_does_not_trust_an_opened_handles_spelling(ops, monkeypatch):
+    # open() may name the file in any case; only the disk has its spelling.
+    if ops._name_fold is None:
+        pytest.skip("handler does not advertise case folding")
+    ops.mkdir("/Canonical", 0o755)
+    _write(ops, "/Canonical/MixedName", b"data")
+    handle = ops.open("/canonical/mixedname", os.O_RDONLY)
+    stat_path = ops.bridge.stat_path
+    try:
+        monkeypatch.setattr(ops.bridge, "stat_path", lambda path: (
+            None if path == "/Canonical/mixedname" else stat_path(path)))
+        assert ops.getpath("/canonical/mixedname", handle) == "/Canonical/MixedName"
+    finally:
+        ops.release("/canonical/mixedname", handle)
+
+
+def _hard_link_image(tmp_path):
+    """An FFS floppy with lf, a hard link to TargetFile.txt, and L, a hard
+    link to the directory TargetDir, which holds inner.txt."""
+    import struct
+    from tests.integration.test_ls_recursive_ffs import BLOCK, _edit_block, _xdftool
+
+    image = tmp_path / "links.adf"
+    content, empty = tmp_path / "content.txt", tmp_path / "empty.txt"
+    content.write_bytes(b"target\n")
+    empty.write_bytes(b"")
+    _xdftool(image, "create", "+", "format", "Links", "ffs",
+             "+", "write", str(content), "TargetFile.txt",
+             "+", "write", str(empty), "lf",
+             "+", "makedir", "TargetDir", "+", "write", str(content), "TargetDir/inner.txt",
+             "+", "makedir", "L")
+    data = bytearray(image.read_bytes())
+
+    def header(name, sec_type):
+        for key in range(len(data) // BLOCK):
+            block = data[key * BLOCK:(key + 1) * BLOCK]
+            if (struct.unpack(">I", block[:4])[0] == 2
+                    and struct.unpack(">i", block[-4:])[0] == sec_type
+                    and block[433:433 + block[432]] == name):
+                return key
+        raise AssertionError(f"no header for {name!r}")
+
+    for link, target, sec_type, link_type in (
+            (b"lf", b"TargetFile.txt", -3, -4),  # ST_FILE -> ST_LINKFILE
+            (b"L", b"TargetDir", 2, 4)):         # ST_USERDIR -> ST_LINKDIR
+        link_key, target_key = header(link, sec_type), header(target, sec_type)
+
+        def to_link(block, target_key=target_key, link_type=link_type):
+            struct.pack_into(">i", block, BLOCK - 4, link_type)
+            struct.pack_into(">I", block, BLOCK - 11 * 4, target_key)  # real_entry
+
+        def link_back(block, link_key=link_key):
+            struct.pack_into(">I", block, BLOCK - 10 * 4, link_key)  # next_link
+
+        _edit_block(data, link_key, to_link)
+        _edit_block(data, target_key, link_back)
+    image.write_bytes(data)
+    return image
+
+
+def test_getpath_names_a_hard_link_not_its_target(tmp_path):
+    # FastFileSystem resolves a hard link when it locks it, so Examine on
+    # the lock names the target. getpath must give the link's own name, or
+    # WinFsp rejects every open through it.
+    image = _hard_link_image(_bundled_image(tmp_path).parent)
+    bridge = HandlerBridge(image, BUNDLED_DRIVER, read_only=False,
+                           adf_info=detect_adf(image))
+    try:
+        ops = AmigaFuseFS(bridge)
+        assert ops._name_fold is not None
+        assert ops.getpath("/lf") == "/lf"
+        assert ops.getpath("/LF") == "/lf"
+        assert ops.getpath("/l") == "/L"
+        assert ops.getpath("/l/INNER.TXT") == "/L/inner.txt"
+        assert ops.getpath("/targetfile.txt") == "/TargetFile.txt"
+    finally:
+        bridge.close()
+
+
 def test_delete_renamed_directory_preserves_old_name(ops):
     ops._winfsp = True
     ops.mkdir("/before", 0o755)
