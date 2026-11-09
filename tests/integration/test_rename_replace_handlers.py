@@ -426,15 +426,15 @@ def test_delete_on_close_while_a_directory_renamed_from_the_name_is_open(winfsp_
     assert ops._pending_deletes == set()
 
 
-@pytest.mark.parametrize("readdir_plus", [True, False])
-def test_directory_renamed_through_its_handle_lists_with_attributes(ops, readdir_plus):
+def test_directory_renamed_through_its_handle_lists_with_attributes(ops):
     # WinFsp lists a directory handle under the path it was opened with,
     # and asks getattr() under that path for any entry given without
     # attributes. After a rename through the handle that path is stale, so
     # every entry failed and the listing came back empty (#427). With
     # READDIR_PLUS granted, readdir() gives each entry's attributes.
+    # test_windows_renamed_directory checks the same through WinFsp.
     ops._winfsp = True
-    ops._readdir_plus = readdir_plus
+    ops._readdir_plus = True
     ops.mkdir("/L2a", 0o755)
     _write(ops, "/L2a/f", b"data")
     handle = ops.opendir("/L2a")
@@ -442,9 +442,6 @@ def test_directory_renamed_through_its_handle_lists_with_attributes(ops, readdir
         assert ops.rename("/L2a", "/L2b") == 0
         listing = ops.readdir("/L2a", handle)
         assert _errno(ops.getattr, "/L2a/f") == errno.ENOENT
-        if not readdir_plus:
-            assert sorted(listing) == [".", "..", "f"]
-            return
         attrs = {name: st for name, st, offset in listing}
         assert sorted(attrs) == [".", "..", "f"]
         assert attrs["f"]["st_size"] == 4
@@ -455,6 +452,61 @@ def test_directory_renamed_through_its_handle_lists_with_attributes(ops, readdir
         assert sorted(name for name, _, _ in ops.readdir("/L2b", None)) == [".", "..", "f"]
     finally:
         ops.releasedir("/L2a", handle)
+
+
+def test_listing_gives_a_pending_grow_its_logical_length(ops, request):
+    # truncate() defers the zeros of a grow; getattr() reports the length
+    # the file will have, and so must the listing WinFsp now takes it from.
+    if request.node.callspec.id == "FastFileSystem":
+        pytest.skip("FastFileSystem 47.4 refuses the grow until #426 is fixed")
+    ops._winfsp = True
+    ops._readdir_plus = True
+    _write(ops, "/grown", b"abc")
+    fh = ops.open("/grown", os.O_RDWR)
+    try:
+        assert ops.truncate("/grown", 8192, fh) == 0
+        ops._dir_cache.clear()
+        attrs = {name: st for name, st, _ in ops.readdir("/", None)}
+        assert attrs["grown"]["st_size"] == ops.getattr("/grown")["st_size"] == 8192
+    finally:
+        ops.release("/grown", fh)
+
+
+def test_listing_leaves_a_soft_link_to_getattr(tmp_path):
+    # The handler refuses a lock on a soft link, so getattr() fails on it,
+    # and WinFsp drops an entry whose getattr() fails. Its listed
+    # attributes, a directory's, would list it as one nothing can open.
+    import struct
+    from tests.integration.test_ls_recursive_ffs import BLOCK, _edit_block, _xdftool
+
+    image = _bundled_image(tmp_path)
+    empty = tmp_path / "empty"
+    empty.write_bytes(b"")
+    _xdftool(image, "write", str(empty), "sl", "+", "makedir", "Target")
+    data = bytearray(image.read_bytes())
+    key = next(k for k in range(len(data) // BLOCK)
+               if struct.unpack(">I", data[k * BLOCK:k * BLOCK + 4])[0] == 2
+               and data[k * BLOCK + 433:k * BLOCK + 433 + data[k * BLOCK + 432]] == b"sl")
+
+    def to_soft_link(block):
+        struct.pack_into(">i", block, BLOCK - 4, 3)  # ST_SOFTLINK
+        block[24:24 + 7] = b"Target\0"  # the link's path, in the hash table
+
+    _edit_block(data, key, to_soft_link)
+    image.write_bytes(data)
+    bridge = HandlerBridge(image, BUNDLED_DRIVER, read_only=False,
+                           adf_info=detect_adf(image))
+    try:
+        ops = AmigaFuseFS(bridge)
+        ops._winfsp = True
+        ops._readdir_plus = True
+        assert any(e["name"] == "sl" and e["dir_type"] == 3
+                   for e in bridge.list_dir_path("/"))
+        attrs = {name: st for name, st, _ in ops.readdir("/", None)}
+        assert "sl" in attrs and attrs["sl"] is None
+        assert attrs["Target"]["st_mode"] & 0o170000 == 0o040000
+    finally:
+        bridge.close()
 
 
 def test_delete_renamed_directory_preserves_old_name(ops):

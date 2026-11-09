@@ -3557,7 +3557,8 @@ class AmigaFuseFS(_FuseOperations):
         WinFsp asks getattr() for any entry given without attributes, by
         the path the directory was opened with, which is stale after a
         rename through that handle (#427). listed holds the attributes the
-        listing just read; "." and ".." and the rest come from getattr()
+        listing just read, with a pending grow's logical length, as
+        getattr() reports it; "." and ".." and the rest come from getattr()
         under the current path. An entry whose getattr() fails goes without
         attributes, and WinFsp leaves it out as before.
         """
@@ -3577,6 +3578,8 @@ class AmigaFuseFS(_FuseOperations):
                     attrs = self.getattr(child)
                 except FuseOSError:
                     attrs = None
+            else:
+                attrs = self._logical_stat(child, attrs)
             result.append((name, attrs, 0))
         return result
 
@@ -3602,7 +3605,11 @@ class AmigaFuseFS(_FuseOperations):
             # Pre-populate stat cache from directory listing
             child_path = path.rstrip("/") + "/" + name if path != "/" else "/" + name
             stat_result = self._stat_from_fib(ent, name, int(now))
-            listed[name] = stat_result
+            if ent.get("dir_type") != 3:  # ST_SOFTLINK
+                # A soft link lists as a directory (dir_type >= 0), but the
+                # handler refuses a lock on it, so getattr() fails. It goes
+                # without attributes, so WinFsp asks getattr(), as before.
+                listed[name] = stat_result
             with self._cache_lock:
                 _prune_cache(self._stat_cache, self._pinned_stats)
                 # A pinned entry stands until release (_pin_stat), and
