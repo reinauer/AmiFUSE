@@ -70,8 +70,10 @@ class TrayApp:
                 self._wake_event.wait(self.POLL_INTERVAL)
                 self._wake_event.clear()
                 continue
-            # Compare (pid, mountpoint) tuples to detect mountpoint changes
-            current_set = {(m["pid"], m.get("mountpoint", "")) for m in mounts}
+            # Compare (pid, mountpoint, starting) to detect mountpoint changes
+            # and a starting mount becoming ready.
+            current_set = {(m["pid"], m.get("mountpoint", ""), bool(m.get("starting")))
+                           for m in mounts}
 
             if current_set != prev_set:
                 prev_set = current_set
@@ -109,13 +111,18 @@ class TrayApp:
             image_name = Path(image).name if image else "unknown"
 
             label = f"{mountpoint} - {image_name}"
+            starting = bool(mount.get("starting"))
+            if starting:
+                # It can't take an unmount request before FUSE init (#428).
+                label += " (starting)"
             logger.info("Building submenu for %s (image=%s)", label, image)
             # Factory functions, not lambdas (pystray rejects lambdas with default args)
             items.append(pystray.MenuItem(
                 label,
                 pystray.Menu(
                     pystray.MenuItem("Inspect", self._make_inspect_cb(mount)),
-                    pystray.MenuItem("Unmount", self._make_unmount_cb(mount)),
+                    pystray.MenuItem("Unmount", self._make_unmount_cb(mount),
+                                     enabled=not starting),
                 ),
             ))
 
@@ -145,12 +152,26 @@ class TrayApp:
     def _unmount_all(self):
         with self._lock:
             mounts_copy = list(self._mounts)
-        self._unmount_mounts(mounts_copy)
+        self._unmount_mounts(mounts_copy, report_starting=False)
 
-    def _unmount_mounts(self, mounts):
-        from .platform import stop_mount_processes, notify_shell_drive_change
+    def _unmount_mounts(self, mounts, *, report_starting=True):
+        from .platform import (mount_is_starting, notify_shell_drive_change,
+                               stop_mount_processes)
         from .windows_unmount import UnmountError
 
+        # A mount still starting has no unmount control events yet: the
+        # request would fail, or end the mount as soon as it came up
+        # (#428). Its state is read now, not when the menu was built.
+        starting = [m for m in mounts if mount_is_starting(m["pid"])]
+        mounts = [m for m in mounts if m not in starting]
+        if starting:
+            logger.info("Not unmounting mounts still starting: %s",
+                        [m.get("mountpoint") for m in starting])
+            if report_starting and not mounts:
+                self._report_unmount_error("\n".join(
+                    f"AmiFUSE at {m.get('mountpoint') or m['pid']} is still "
+                    "starting; try unmounting again once the mount is ready."
+                    for m in starting))
         pids = [m["pid"] for m in mounts]
         if not pids:
             return
@@ -181,18 +202,19 @@ class TrayApp:
         except Exception:
             logger.exception("Could not display the unmount error")
 
-    def _start_unmount(self, mounts):
+    def _start_unmount(self, mounts, report_starting=True):
         # Menu callbacks must return immediately to the Win32 message pump.
         if self._unmount_thread is not None and self._unmount_thread.is_alive():
             return
         self._unmount_thread = threading.Thread(
-            target=self._unmount_mounts, args=(mounts,))
+            target=self._unmount_mounts, args=(mounts,),
+            kwargs={"report_starting": report_starting})
         self._unmount_thread.start()
 
     def _unmount_all_cb(self, icon, item):
         with self._lock:
             mounts = list(self._mounts)
-        self._start_unmount(mounts)
+        self._start_unmount(mounts, report_starting=False)
 
     def _inspect(self, mount):
         logger.info("_inspect called with mount=%s", mount)

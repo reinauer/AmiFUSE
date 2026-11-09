@@ -608,6 +608,8 @@ def find_amifuse_mounts():
         - pid (int)
         - uptime_seconds (int or None)
         - filesystem_type (None -- reserved for future use)
+        - starting (bool, Windows only): the process has not reached FUSE
+          init, so it can't take an unmount request yet
 
     Raises OSError if the process discovery command fails unexpectedly.
     Returns an empty list if the discovery tool is unavailable.
@@ -620,7 +622,28 @@ def find_amifuse_mounts():
     mounts = _deduplicate_fusepy_children(mounts)
     _apply_mount_records(mounts)
     _enrich_null_mountpoints(mounts)
+    if sys.platform.startswith("win"):
+        for mount in mounts:
+            mount["starting"] = mount_is_starting(mount["pid"])
     return mounts
+
+
+def mount_is_starting(pid: int) -> bool:
+    """Whether a Windows mount process has not reached FUSE init yet.
+
+    Its unmount control events don't exist before that, so an unmount
+    request fails, or ends the mount as soon as it comes up. A process
+    whose state can't be read (such as one an Administrator started)
+    counts as not starting, so that the unmount request reports why.
+    """
+    if not sys.platform.startswith("win"):
+        return False
+    from .windows_unmount import is_mount_ready
+
+    try:
+        return not is_mount_ready(pid)
+    except OSError:
+        return False
 
 
 def _strip_matched_quotes(value):

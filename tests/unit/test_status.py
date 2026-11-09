@@ -419,10 +419,28 @@ class TestFindAmifuseMountsDispatch:
         from amifuse import platform as plat
 
         monkeypatch.setattr("sys.platform", "win32")
+        monkeypatch.setattr("amifuse.windows_unmount.is_mount_ready",
+                            lambda pid: pid == 2)
         sentinel = [{"mountpoint": "D:", "pid": 2, "image": "b",
-                     "uptime_seconds": None, "filesystem_type": None}]
+                     "uptime_seconds": None, "filesystem_type": None},
+                    {"mountpoint": "E:", "pid": 3, "image": "c",
+                     "uptime_seconds": 0, "filesystem_type": None}]
         monkeypatch.setattr(plat, "_find_amifuse_mounts_windows", lambda: sentinel)
-        assert plat.find_amifuse_mounts() == sentinel
+        mounts = plat.find_amifuse_mounts()
+        # Windows marks a process that has not reached FUSE init (#428).
+        assert [(m["pid"], m["starting"]) for m in mounts] == [(2, False), (3, True)]
+
+    def test_unreadable_mount_state_is_not_taken_for_starting(self, monkeypatch):
+        # A process an Administrator started may not let this one open its
+        # events: the unmount request then reports why, as before.
+        from amifuse import platform as plat
+
+        def denied(pid):
+            raise PermissionError(13, "Access is denied")
+
+        monkeypatch.setattr("sys.platform", "win32")
+        monkeypatch.setattr("amifuse.windows_unmount.is_mount_ready", denied)
+        assert plat.mount_is_starting(4) is False
 
 
 # ---------------------------------------------------------------------------
@@ -515,6 +533,16 @@ class TestCmdStatus:
         assert "999" in out
         assert "/mnt/amiga" in out
         assert "/images/test.hdf" in out
+
+    def test_text_marks_a_starting_mount(self, monkeypatch, capsys):
+        from amifuse.fuse_fs import cmd_status
+
+        mounts = [{"mountpoint": "R:", "image": "C:/a.hdf", "pid": 7156,
+                   "uptime_seconds": 0, "filesystem_type": None, "starting": True}]
+        monkeypatch.setattr("amifuse.platform.find_amifuse_mounts", lambda: mounts)
+        cmd_status(self._make_args(json_flag=False))
+        row = capsys.readouterr().out.splitlines()[-1]
+        assert row.startswith("7156") and row.endswith("0h 0m 0s (starting)")
 
     def test_json_multiple_mounts(self, monkeypatch, capsys):
         from amifuse.fuse_fs import cmd_status
