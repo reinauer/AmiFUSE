@@ -8095,7 +8095,7 @@ class TestOpenHandleGetattr:
         fs.rename("/s.bin", "/t.bin")
 
         assert fs.getattr("/s.bin", fh)["st_size"] == 3000
-        bridge.stat_path.assert_called_with("/t.bin")
+        bridge.stat_path.assert_called_with("/t.bin", links=True)
 
     def test_rename_moves_only_paths_below_the_renamed_one(self, fs):
         fs, bridge = fs

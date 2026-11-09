@@ -187,7 +187,7 @@ class _DateVolume:
         self.reply = reply
         self.sent = []
 
-    def stat_path(self, path):
+    def stat_path(self, path, links=False):
         return {"dir_type": -3, "size": 0, "name": "f", "protection": 0,
                 "num_blocks": 0, "mtime": 1e9}
 

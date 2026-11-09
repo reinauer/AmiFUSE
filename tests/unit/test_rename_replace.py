@@ -84,7 +84,7 @@ class _FakeVolume:
     def _dir(self, lock):
         return self.locks[lock] if lock else "/"
 
-    def stat_path(self, path):
+    def stat_path(self, path, links=False):
         found = self._find(path)
         if found is None:
             return None

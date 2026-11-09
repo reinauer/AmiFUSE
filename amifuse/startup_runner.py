@@ -78,6 +78,7 @@ ACTION_SET_DATE = 34
 ACTION_FLUSH = 27
 ACTION_FORMAT = 1020
 ACTION_INHIBIT = 31
+ACTION_READ_LINK = 1024
 # The names of the opcodes above, for messages.
 _PACKET_TYPE_NAMES = {
     ACTION_STARTUP: "ACTION_STARTUP",
@@ -101,6 +102,7 @@ _PACKET_TYPE_NAMES = {
     ACTION_FLUSH: "ACTION_FLUSH",
     ACTION_FORMAT: "ACTION_FORMAT",
     ACTION_INHIBIT: "ACTION_INHIBIT",
+    ACTION_READ_LINK: "ACTION_READ_LINK",
 }
 OFFSET_BEGINNING = -1
 OFFSET_CURRENT = 0
@@ -796,6 +798,20 @@ class HandlerLauncher:
                 fileentry_ptr,
             ],
         )
+
+    def send_read_link(
+        self, state: HandlerLaunchState, lock_bptr: int, name_addr: int,
+        buf_addr: int, buf_size: int,
+    ):
+        """ACTION_READ_LINK: read the target of the soft link at name.
+
+        name is a C string, relative to lock_bptr's directory, and the
+        handler writes the target as a C string into buf_size bytes at
+        buf_addr. Res1 is the target's length, -2 when it does not fit, or
+        -1 with an error code in res2.
+        """
+        return self.send_packet(
+            state, ACTION_READ_LINK, [lock_bptr, name_addr, buf_addr, buf_size])
 
     def send_flush(self, state: HandlerLaunchState):
         """ACTION_FLUSH: flush filesystem buffers."""

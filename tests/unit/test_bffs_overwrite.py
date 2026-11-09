@@ -169,7 +169,7 @@ def _bffs_bridge(volume):
     launcher.send_end_handle.side_effect = volume.end
     # BFFS reports the inode's size, which an ACTION_FINDOUTPUT handle
     # changes only at its end.
-    bridge.stat_path = lambda path: (
+    bridge.stat_path = lambda path, links=False: (
         {"dir_type": -3, "size": len(volume.files[path[1:]]), "protection": 0,
          "num_blocks": 1} if path[1:] in volume.files else None)
     return bridge
