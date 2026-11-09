@@ -91,7 +91,7 @@ class _InUseVolume:
             if p != "/" and _parent(p) == path
         ]
 
-    def stat_path(self, path):
+    def stat_path(self, path, links=False):
         if path in self.dirs:
             return {"dir_type": 2, "size": 0, "protection": 0, "num_blocks": 0}
         if path in self.files:

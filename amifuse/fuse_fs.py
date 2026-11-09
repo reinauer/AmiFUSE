@@ -176,6 +176,49 @@ ERROR_SEEK_ERROR = 219
 # ExamineNext signals normal directory exhaustion with this error.
 ERROR_NO_MORE_ENTRIES = 232
 
+# A handler refuses a lock on a soft link, or on a path through one, with
+# this code: AmigaDOS reads the link (ACTION_READ_LINK) and follows it.
+ERROR_IS_SOFT_LINK = 233
+# HandlerBridge.read_link() refuses a target longer than its largest buffer
+# with this code.
+ERROR_LINE_TOO_LONG = 120
+
+# fib_DirEntryType of a soft link. It is positive, as a directory's is, but
+# the link is neither a directory nor a file (_is_dir_entry).
+ST_SOFTLINK = 3
+
+
+def _is_dir_entry(ent: Dict) -> bool:
+    """Whether FileInfoBlock entry ent is a directory, or a hard link to one."""
+    dir_type = ent.get("dir_type", 0)
+    return dir_type >= 0 and dir_type != ST_SOFTLINK
+
+
+def _posix_link_target(target: str, link_path: str, volume: str) -> str:
+    """The target of the soft link at link_path, as FUSE reports it.
+
+    target is as the handler stores it, an AmigaDOS path: relative to the
+    link's directory, or from a volume or assign up to a colon. This volume,
+    named or not (":dir"), is the mount's root. Any other is not on this
+    mount, and target stays as it is, a link to nothing. The result is
+    relative to the link's directory, as WinFsp takes a target only without
+    its -o rellinks option. In an AmigaDOS path, a slash after a name ends
+    it, and any other slash, a leading one too, goes up to the parent.
+    """
+    vol, colon, rest = target.partition(":")
+    parts = []
+    if colon:
+        if vol.translate(_FOLD_LATIN1) not in ("", volume.translate(_FOLD_LATIN1)):
+            return target
+        parts = [".."] * link_path.strip("/").count("/")
+        target = rest
+    names = target.split("/") if target else []
+    if len(names) > 1 and names[-1] == "":
+        names.pop()  # "dir/" names dir
+    parts += [name or ".." for name in names]
+    return "/".join(parts) or "."
+
+
 # ACTION_SEEK and ACTION_SET_FILE_SIZE carry the offset in dp_Arg2, a
 # signed LONG.
 _LONG_MIN = -0x80000000
@@ -238,6 +281,8 @@ _RENAME_ERRNOS = {
     ERROR_OBJECT_NOT_FOUND: errno.ENOENT,
     ERROR_DIRECTORY_NOT_EMPTY: errno.ENOTEMPTY,
     ERROR_DELETE_PROTECTED: errno.EACCES,
+    # SmartFilesystem refuses to rename a soft link (#434).
+    ERROR_IS_SOFT_LINK: errno.EPERM,
 }
 
 # Busy-delete deferral and non-empty handling stay in the callbacks.
@@ -1848,24 +1893,95 @@ class HandlerBridge:
                 self.free_lock(l)
             return entries
 
-    def stat_path(self, path: str) -> Optional[Dict]:
+    def stat_path(self, path: str, links: bool = False) -> Optional[Dict]:
+        """Examine path; None when it can't be, a soft link too unless links.
+
+        The handler refuses a lock on a soft link, so it can't be examined:
+        with links, its entry comes from its directory's listing. The
+        handler refuses a lock on a path through a soft link too: then the
+        directory is not listed, and there is no entry.
+        """
         with self._lock:
-            lock, _, locks = self.locate_path(path)
+            info, res2 = self._stat_path(path)
+            if info is not None or not links or res2 != ERROR_IS_SOFT_LINK:
+                return info
+            parent, name = path.rstrip("/").rsplit("/", 1)
+            fold = _NAME_FOLDS.get(self.name_fold()) or {}
+            for ent in self.list_dir_path(parent or "/"):
+                if (ent["dir_type"] == ST_SOFTLINK
+                        and ent["name"].translate(fold) == name.translate(fold)):
+                    return ent
+            return None
+
+    def _stat_path(self, path: str) -> Tuple[Optional[Dict], int]:
+        """Return (entry, res2): path's entry, or None and why the lock failed."""
+        with self._lock:
+            lock, res2, locks = self.locate_path(path)
             if lock == 0 and path != "/":
-                return None
+                return None, res2
             if path == "/":
-                return {"dir_type": 2, "size": 0, "name": "", "protection": 0}
+                return {"dir_type": 2, "size": 0, "name": "", "protection": 0}, 0
             fib_mem = self._alloc_fib()
             pkt_addr, _ = self.launcher.send_examine(self.state, lock, fib_mem.addr)
             reply = self._run_until_reply(pkt_addr, "examine")
             if reply is None or reply[0] == 0:
                 for l in reversed(locks):
                     self.free_lock(l)
-                return None
+                return None, -1 if reply is None else reply[1]
             info = _parse_fib(self.mem, fib_mem.addr)
             for l in reversed(locks):
                 self.free_lock(l)
-            return info
+            return info, 0
+
+    # Buffers for ACTION_READ_LINK, tried in order while the target does not
+    # fit. A soft link's target is in one block of the disk.
+    _READ_LINK_SIZES = (256, 32768)
+
+    def read_link(self, path: str) -> Tuple[Optional[str], int]:
+        """Return (target, res2) of the soft link at path.
+
+        The target is as the handler stores it (_posix_link_target), or
+        None with the handler's error code. Not every handler tells a name
+        that is not a soft link from a missing one.
+        """
+        parent, name = path.rstrip("/").rsplit("/", 1)
+        encoded = unicodedata.normalize("NFC", name).encode("latin-1") + b"\x00"
+        with self._lock:
+            if parent:
+                lock, res2, locks = self.locate_path(parent)
+                if lock == 0:
+                    return None, res2
+            else:
+                lock, res2 = self.locate(0, "")
+                locks = [lock] if lock else []
+            try:
+                for size in self._READ_LINK_SIZES:
+                    name_mem = self.vh.alloc.alloc_memory(len(encoded), label="FUSE_LINKNAME")
+                    buf_mem = self.vh.alloc.alloc_memory(size, label="FUSE_LINKBUF")
+                    self.mem.w_block(name_mem.addr, encoded)
+                    self.mem.w_block(buf_mem.addr, b"\x00" * size)
+                    pkt_addr, _ = self.launcher.send_read_link(
+                        self.state, lock, name_mem.addr, buf_mem.addr, size)
+                    reply = self._run_until_reply(pkt_addr, "read_link")
+                    target = self.mem.r_block(buf_mem.addr, size).split(b"\x00", 1)[0]
+                    held = self._held_args()
+                    for mem_obj in (name_mem, buf_mem):
+                        # One still out, as after a timeout, is freed later.
+                        if not self._retire_if_held(mem_obj, held):
+                            self.vh.alloc.free_memory(mem_obj)
+                    if reply is None:
+                        return None, -1
+                    res1, res2 = reply
+                    if res1 >= 0 and target:
+                        return target.decode("latin-1"), 0
+                    if res1 != -2:
+                        # FastFileSystem 40.1 answers for any name, with no
+                        # target when there is no soft link there.
+                        return None, res2
+                return None, ERROR_LINE_TOO_LONG
+            finally:
+                for l in reversed(locks):
+                    self.free_lock(l)
 
     def get_disk_info(self) -> Optional[Dict]:
         """Query filesystem geometry via ACTION_DISK_INFO.
@@ -3359,7 +3475,7 @@ class AmigaFuseFS(_FuseOperations):
         # nothreads): no getattr() runs between the handler granting an
         # exclusive lock and the pin being set.
         self._track_op("getattr", path, cached=False)
-        info = self.bridge.stat_path(path)
+        info = self.bridge.stat_path(path, links=True)
         if not info:
             # Cache negative result
             self._set_neg_cached(path)
@@ -3367,6 +3483,28 @@ class AmigaFuseFS(_FuseOperations):
         result = self._stat_from_fib(info, path, int(time.time()))
         self._set_cached_stat(path, result)
         return self._logical_stat(path, result)
+
+    def readlink(self, path):
+        """Return the target of the soft link at path (#434).
+
+        EINVAL for anything else, as readlink(2) gives: WinFsp takes that
+        as "not a reparse point", and readlink("/") at mount as "symlinks
+        are supported".
+        """
+        self._check_handler_alive()
+        path = self._state_path(path)
+        if path == "/" or self._is_platform_special(path):
+            raise FuseOSError(errno.EINVAL if path == "/" else errno.ENOENT)
+        self._track_op("readlink", path)
+        target, res2 = self.bridge.read_link(path)
+        if target is not None:
+            return _posix_link_target(target, path, self.bridge.volume_name())
+        if res2 == ERROR_LINE_TOO_LONG:
+            raise FuseOSError(errno.ENAMETOOLONG)
+        info = self.bridge.stat_path(path, links=True)
+        if info is None:
+            raise FuseOSError(errno.ENOENT)
+        raise FuseOSError(errno.EIO if info["dir_type"] == ST_SOFTLINK else errno.EINVAL)
 
     def _logical_stat(self, path, result):
         pending = self._deferred_grows.get(path)
@@ -3434,7 +3572,7 @@ class AmigaFuseFS(_FuseOperations):
         pinned one). AmigaDOS keeps no access or change time.
         """
         mtime = ent.get("mtime", now)
-        is_dir = ent["dir_type"] >= 0
+        is_dir = _is_dir_entry(ent)
         # Convert Amiga protection bits to Unix mode
         prot = DosProtection(ent.get("protection", 0))
         base_mode = prot.to_host_mode()
@@ -3450,7 +3588,10 @@ class AmigaFuseFS(_FuseOperations):
         if sys.platform.startswith("win"):
             base_mode |= ((base_mode & 0o500) >> 3) | ((base_mode & 0o500) >> 6)
         result = {
-            "st_mode": base_mode | (0o040000 if is_dir else 0o100000),
+            "st_mode": base_mode | (
+                0o040000 if is_dir
+                else 0o120000 if ent["dir_type"] == ST_SOFTLINK  # S_IFLNK
+                else 0o100000),
             "st_nlink": 2 if is_dir else 1,
             "st_size": ent["size"],
             "st_ctime": mtime,
@@ -3811,7 +3952,7 @@ class AmigaFuseFS(_FuseOperations):
             if res2 == ERROR_OBJECT_IN_USE:
                 raise FuseOSError(errno.EBUSY)
             info = self.bridge.stat_path(path)
-            if info and info.get("dir_type", 0) >= 0:
+            if info and _is_dir_entry(info):
                 raise FuseOSError(errno.EISDIR)
             raise FuseOSError(errno.ENOENT)
         fh_addr, parent_lock = opened
@@ -4757,8 +4898,8 @@ class AmigaFuseFS(_FuseOperations):
             # Neither examined nor pinned: gone, or held on an exclusive lock.
             raise FuseOSError(errno.ENOENT if src is None else errno.EBUSY)
         dst_dir, _ = self._split_path(new)
-        src_is_dir = src["dir_type"] >= 0
-        dst_is_dir = dst["dir_type"] >= 0
+        src_is_dir = _is_dir_entry(src)
+        dst_is_dir = _is_dir_entry(dst)
         if dst_is_dir and not src_is_dir:
             raise FuseOSError(errno.EISDIR)
         if src_is_dir and not dst_is_dir:
@@ -4796,7 +4937,7 @@ class AmigaFuseFS(_FuseOperations):
         A file held on an exclusive lock can't be examined, but has a
         pinned entry (_pin_stat): a file whose name on disk is not known.
         """
-        info = self.bridge.stat_path(path)
+        info = self.bridge.stat_path(path, links=True)
         if info:
             return info
         with self._cache_lock:

@@ -31,7 +31,7 @@ class _SizedVolume(_FakeVolume):
                 "size": 0 if is_dir else len(content), "protection": 0,
                 "num_blocks": 0}
 
-    def stat_path(self, path):
+    def stat_path(self, path, links=False):
         found = self._find(path)
         if found is None or found in self.exclusive:
             return None
