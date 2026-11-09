@@ -326,13 +326,33 @@ class TestFindAmifuseMountsWindows:
             assert mounts[0]["parent_pid"] == 1
             assert mounts[0]["uptime_seconds"] is not None
 
-    @pytest.mark.parametrize("error", [False, True])
-    def test_query_failure_returns_empty(self, monkeypatch, error):
+    @pytest.mark.parametrize("stdout", [b"", b"\r\n", "\ufeff".encode("utf-8")])
+    def test_no_output_means_no_mounts(self, monkeypatch, stdout):
+        # PowerShell prints nothing when no process matches the filter.
         from amifuse import platform as plat
-        run = MagicMock(side_effect=OSError("not found")) if error else MagicMock(
-            return_value=MagicMock(returncode=1, stdout=b""))
-        monkeypatch.setattr(plat.subprocess, "run", run)
+        monkeypatch.setattr(plat.subprocess, "run", MagicMock(
+            return_value=MagicMock(returncode=0, stdout=stdout)))
         assert plat._find_amifuse_mounts_windows() == []
+
+    def test_missing_powershell_returns_empty(self, monkeypatch):
+        from amifuse import platform as plat
+        monkeypatch.setattr(plat.subprocess, "run",
+                            MagicMock(side_effect=FileNotFoundError("powershell")))
+        assert plat._find_amifuse_mounts_windows() == []
+
+    @pytest.mark.parametrize("run, message", [
+        (MagicMock(side_effect=subprocess.TimeoutExpired("powershell", 15)), "timed out"),
+        (MagicMock(return_value=MagicMock(returncode=1, stdout=b"")), "exited with code 1"),
+        (MagicMock(return_value=MagicMock(returncode=0, stdout=b"Get-CimInstance : ...")),
+         "no valid JSON"),
+    ], ids=["timeout", "exit-code", "not-json"])
+    def test_query_failure_is_not_taken_for_no_mounts(self, monkeypatch, run, message):
+        # "No mounts" would make status say so, unmount find no owner and
+        # the tray clear its menu and exit.
+        from amifuse import platform as plat
+        monkeypatch.setattr(plat.subprocess, "run", run)
+        with pytest.raises(OSError, match=message):
+            plat._find_amifuse_mounts_windows()
 
 
 # ---------------------------------------------------------------------------

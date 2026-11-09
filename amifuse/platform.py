@@ -884,6 +884,11 @@ def _find_amifuse_mounts_cim():
 
     Use UTF-8 explicitly; legacy wmic loses characters outside the OEM page.
 
+    A query that times out, fails or prints something other than JSON
+    raises OSError, so that callers can tell it from "no mounts": status
+    reports it and the tray keeps its menu. A missing PowerShell gives [],
+    as find_amifuse_mounts() describes.
+
     Note: The CIM filter does not restrict by session, so on multi-user systems
     this may return processes from other logged-in users.  A SessionId filter
     could be added if this becomes a practical issue.
@@ -903,15 +908,14 @@ def _find_amifuse_mounts_cim():
             timeout=15,
             creationflags=_CREATE_NO_WINDOW if sys.platform.startswith("win") else 0,
         )
-    except subprocess.TimeoutExpired:
-        logger.debug("PowerShell CIM query timed out")
-        return []
+    except subprocess.TimeoutExpired as exc:
+        raise OSError("the PowerShell process query timed out") from exc
     except OSError:
         logger.debug("PowerShell not available for mount discovery")
         return []
     if result.returncode != 0:
-        logger.debug("PowerShell CIM query exited with code %d", result.returncode)
-        return []
+        raise OSError(
+            f"the PowerShell process query exited with code {result.returncode}")
 
     # PowerShell may emit a BOM; handle utf-8-sig
     try:
@@ -919,12 +923,15 @@ def _find_amifuse_mounts_cim():
     except (UnicodeDecodeError, AttributeError):
         text = result.stdout if isinstance(result.stdout, str) else result.stdout.decode("utf-8", errors="replace")
 
+    # With no process matching, PowerShell prints nothing at all.
+    if not text.strip():
+        return []
+
     import json
     try:
         data = json.loads(text)
-    except (json.JSONDecodeError, ValueError):
-        logger.debug("Failed to parse CIM JSON output")
-        return []
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise OSError("the PowerShell process query printed no valid JSON") from exc
 
     # Single result comes as a dict, multiple as a list
     if isinstance(data, dict):
