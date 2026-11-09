@@ -24,9 +24,10 @@ import pytest
 class _FakeMenuItem:
     SEPARATOR = object()
 
-    def __init__(self, text=None, action=None):
+    def __init__(self, text=None, action=None, enabled=True):
         self.text = text
         self.action = action
+        self.enabled = enabled
 
 
 class _FakeMenu:
@@ -510,6 +511,92 @@ class TestUnmount:
 
         tray_app._unmount_all()
         assert calls == [[1, 2]]
+
+
+class TestStartingMounts:
+    """A mount still starting can't take an unmount request (#428)."""
+
+    @pytest.fixture
+    def ready(self, monkeypatch):
+        """PIDs whose mount reached FUSE init; the others are starting."""
+        pids = set()
+        monkeypatch.setattr("sys.platform", "win32")
+        monkeypatch.setattr("amifuse.windows_unmount.is_mount_ready",
+                            lambda pid: pid in pids)
+        return pids
+
+    @pytest.fixture
+    def stop(self, monkeypatch):
+        stop = MagicMock(side_effect=lambda pids: list(pids))
+        monkeypatch.setattr("amifuse.platform.stop_mount_processes", stop)
+        monkeypatch.setattr("amifuse.platform.notify_shell_drive_change", MagicMock())
+        return stop
+
+    def test_unmount_all_leaves_out_a_starting_mount(self, tray_app, ready, stop,
+                                                      monkeypatch):
+        report = MagicMock()
+        monkeypatch.setattr(tray_app, "_report_unmount_error", report)
+        ready.add(1)
+        tray_app._mounts = [{"pid": 1, "mountpoint": "D:"},
+                            {"pid": 2, "mountpoint": "R:"}]
+
+        tray_app._unmount_all()
+
+        stop.assert_called_once_with([1])
+        report.assert_not_called()
+        assert tray_app._mounts == [{"pid": 2, "mountpoint": "R:"}]
+
+    def test_unmount_of_a_starting_mount_says_so(self, tray_app, ready, stop,
+                                                 monkeypatch):
+        report = MagicMock()
+        monkeypatch.setattr(tray_app, "_report_unmount_error", report)
+
+        tray_app._unmount_single({"pid": 2, "mountpoint": "R:"})
+
+        stop.assert_not_called()
+        report.assert_called_once_with(
+            "AmiFUSE at R: is still starting; try unmounting again once the "
+            "mount is ready.")
+
+    def test_readiness_is_read_at_the_click(self, tray_app, ready, stop):
+        # The menu was built while it started; it is ready by the click.
+        mount = {"pid": 2, "mountpoint": "R:", "starting": True}
+        ready.add(2)
+        tray_app._unmount_single(mount)
+        stop.assert_called_once_with([2])
+
+    def test_menu_disables_unmount_of_a_starting_mount(self, tray_app, fake_pystray):
+        tray_app._mounts = [
+            {"pid": 1, "mountpoint": "D:", "image": "a.hdf", "starting": False},
+            {"pid": 2, "mountpoint": "R:", "image": "b.hdf", "starting": True}]
+        items = tray_app._build_menu().items
+        labels = [item.text for item in items[:2]]
+        assert labels == ["D: - a.hdf", "R: - b.hdf (starting)"]
+        unmount = [next(i for i in item.action.items if i.text == "Unmount")
+                   for item in items[:2]]
+        assert [item.enabled for item in unmount] == [True, False]
+
+    def test_poll_rebuilds_the_menu_when_a_mount_becomes_ready(
+            self, tray_app, fake_pystray, monkeypatch):
+        tray_app.POLL_INTERVAL = 0.01
+        polls = [[{"pid": 2, "mountpoint": "R:", "image": "b.hdf", "starting": True}],
+                 [{"pid": 2, "mountpoint": "R:", "image": "b.hdf", "starting": False}]]
+        menus = []
+
+        def fake_find():
+            if len(polls) == 1:
+                tray_app._stop_event.set()
+            return polls.pop(0)
+
+        class RecordingIcon(_FakeIcon):
+            menu = property(lambda self: menus[-1] if menus else None,
+                            lambda self, menu: menu is not None and menus.append(menu))
+
+        monkeypatch.setattr("amifuse.platform.find_amifuse_mounts", fake_find)
+        tray_app._icon = RecordingIcon("test", None, "test")
+        tray_app._poll_loop()
+        assert [menu.items[0].text for menu in menus] == [
+            "R: - b.hdf (starting)", "R: - b.hdf"]
 
 
 # ---------------------------------------------------------------------------
