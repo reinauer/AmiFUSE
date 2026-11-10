@@ -428,11 +428,6 @@ class TestMountWithoutDriver:
         assert "Kept.bin" in _xdftool(image, "list")
         assert _xdf_read(image, "Kept.bin", tmp_path) == NEW_DATA
 
-    @pytest.mark.skip(reason=(
-        "FastFileSystem v0.2 refuses to rename an open or locked object "
-        "(ERROR_OBJECT_IN_USE), and Windows opens a file before renaming it; "
-        "remove this skip when the pinned release fixes it"
-    ))
     def test_file_rename(self, mount_image, tmp_path, no_user_driver):
         image = _seed_adf(tmp_path, "DOS1")
         proc, mp = mount_image(image, driver=None, extra_args=["--write"])

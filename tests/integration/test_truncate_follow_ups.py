@@ -172,6 +172,8 @@ def test_pfs3_reader_past_2_gib_after_shrink(request, tmp_path):
     bridge = _bridge(image, driver, read_only=False)
     try:
         ops = AmigaFuseFS(bridge)
+        # This test edits the handler's native fileentry offset directly.
+        ops._winfsp = False
         _make_file(ops, "/a.bin", content)
         _make_file(ops, "/b.bin", content)
         reader = ops.open("/a.bin", os.O_RDONLY)

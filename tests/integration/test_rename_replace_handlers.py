@@ -426,6 +426,393 @@ def test_delete_on_close_while_a_directory_renamed_from_the_name_is_open(winfsp_
     assert ops._pending_deletes == set()
 
 
+def test_getpath_returns_stored_parent_and_child_spelling(ops):
+    if ops._name_fold is None:
+        pytest.skip("handler does not advertise case folding")
+    ops.mkdir("/Canonical", 0o755)
+    _write(ops, "/Canonical/MixedName", b"data")
+    assert ops.getpath("/") == "/"
+    assert ops.getpath("/canonical/mixedname") == "/Canonical/MixedName"
+    ops.rename("/Canonical/MixedName", "/Canonical/MIXEDNAME")
+    assert ops.getpath("/canonical/mixedname") == "/Canonical/MIXEDNAME"
+    assert _errno(ops.getpath, "/canonical/missing") == errno.ENOENT
+
+
+def test_getpath_does_not_enumerate_unlocked_directories(ops, monkeypatch):
+    if ops._name_fold is None:
+        pytest.skip("handler does not advertise case folding")
+    ops.mkdir("/Canonical", 0o755)
+    _write(ops, "/Canonical/MixedName", b"data")
+
+    def refuse_listing(*args):
+        raise AssertionError("getpath enumerated an unlocked directory")
+
+    monkeypatch.setattr(ops, "_list_names", refuse_listing)
+    assert ops.getpath("/canonical/mixedname") == "/Canonical/MixedName"
+
+
+@pytest.mark.parametrize("readdir_plus", [False, True])
+def test_getpath_lists_only_the_parent_of_a_refused_lock(ops, monkeypatch, readdir_plus):
+    # With READDIR_PLUS readdir() gives (name, attributes, offset) tuples;
+    # getpath compares names alone.
+    if ops._name_fold is None:
+        pytest.skip("handler does not advertise case folding")
+    ops._readdir_plus = readdir_plus
+    ops.mkdir("/Canonical", 0o755)
+    _write(ops, "/Canonical/MixedName", b"data")
+    stat_path, list_names = ops.bridge.stat_path, ops._list_names
+    listed = []
+
+    def stat(path):
+        return None if path == "/Canonical/mixedname" else stat_path(path)
+
+    def listing(path, names):
+        listed.append(path)
+        return list_names(path, names)
+
+    monkeypatch.setattr(ops.bridge, "stat_path", stat)
+    monkeypatch.setattr(ops, "_list_names", listing)
+    assert ops.getpath("/canonical/mixedname") == "/Canonical/MixedName"
+    assert listed == ["/Canonical"]
+
+
+def test_getpath_of_a_created_file_does_not_list_its_parent(ops, monkeypatch):
+    # WinFsp calls getpath right after create(), while the new file is open
+    # for writing and the handler may refuse its lock. Listing the parent
+    # there made every copy onto a mount quadratic in the folder's size.
+    if ops._name_fold is None:
+        pytest.skip("handler does not advertise case folding")
+    ops.mkdir("/Canonical", 0o755)
+    list_names = ops._list_names
+
+    def refuse_listing(*args):
+        raise AssertionError("getpath listed the parent of a created file")
+
+    handle = ops.create("/Canonical/NewFile", 0o644)
+    try:
+        monkeypatch.setattr(ops, "_list_names", refuse_listing)
+        assert ops.getpath("/canonical/newfile", handle) == "/Canonical/NewFile"
+    finally:
+        monkeypatch.setattr(ops, "_list_names", list_names)
+        ops.release("/Canonical/NewFile", handle)
+
+
+def test_getpath_does_not_trust_an_opened_handles_spelling(ops, monkeypatch):
+    # open() may name the file in any case; only the disk has its spelling.
+    if ops._name_fold is None:
+        pytest.skip("handler does not advertise case folding")
+    ops.mkdir("/Canonical", 0o755)
+    _write(ops, "/Canonical/MixedName", b"data")
+    handle = ops.open("/canonical/mixedname", os.O_RDONLY)
+    stat_path = ops.bridge.stat_path
+    try:
+        monkeypatch.setattr(ops.bridge, "stat_path", lambda path: (
+            None if path == "/Canonical/mixedname" else stat_path(path)))
+        assert ops.getpath("/canonical/mixedname", handle) == "/Canonical/MixedName"
+    finally:
+        ops.release("/canonical/mixedname", handle)
+
+
+def _hard_link_image(tmp_path):
+    """An FFS floppy with lf, a hard link to TargetFile.txt, and L, a hard
+    link to the directory TargetDir, which holds inner.txt."""
+    import struct
+    from tests.integration.test_ls_recursive_ffs import BLOCK, _edit_block, _xdftool
+
+    image = tmp_path / "links.adf"
+    content, empty = tmp_path / "content.txt", tmp_path / "empty.txt"
+    content.write_bytes(b"target\n")
+    empty.write_bytes(b"")
+    _xdftool(image, "create", "+", "format", "Links", "ffs",
+             "+", "write", str(content), "TargetFile.txt",
+             "+", "write", str(empty), "lf",
+             "+", "makedir", "TargetDir", "+", "write", str(content), "TargetDir/inner.txt",
+             "+", "makedir", "L")
+    data = bytearray(image.read_bytes())
+
+    def header(name, sec_type):
+        for key in range(len(data) // BLOCK):
+            block = data[key * BLOCK:(key + 1) * BLOCK]
+            if (struct.unpack(">I", block[:4])[0] == 2
+                    and struct.unpack(">i", block[-4:])[0] == sec_type
+                    and block[433:433 + block[432]] == name):
+                return key
+        raise AssertionError(f"no header for {name!r}")
+
+    for link, target, sec_type, link_type in (
+            (b"lf", b"TargetFile.txt", -3, -4),  # ST_FILE -> ST_LINKFILE
+            (b"L", b"TargetDir", 2, 4)):         # ST_USERDIR -> ST_LINKDIR
+        link_key, target_key = header(link, sec_type), header(target, sec_type)
+
+        def to_link(block, target_key=target_key, link_type=link_type):
+            struct.pack_into(">i", block, BLOCK - 4, link_type)
+            struct.pack_into(">I", block, BLOCK - 11 * 4, target_key)  # real_entry
+
+        def link_back(block, link_key=link_key):
+            struct.pack_into(">I", block, BLOCK - 10 * 4, link_key)  # next_link
+
+        _edit_block(data, link_key, to_link)
+        _edit_block(data, target_key, link_back)
+    image.write_bytes(data)
+    return image
+
+
+def test_exclusive_create_of_an_existing_name_fails_on_winfsp(ops):
+    # WinFsp sends CREATE_NEW to create() without opening the name first,
+    # and the handler matches a name in any case: without the check, this
+    # create emptied CaseX.
+    if ops._name_fold is None:
+        pytest.skip("handler does not advertise case folding")
+    ops._winfsp = True
+    _write(ops, "/CaseX", b"keep me")
+    for name in ("/CaseX", "/CASEX"):
+        assert _errno(ops.create, name, 0o644) == errno.EEXIST
+    assert _read(ops, "/casex") == b"keep me"
+    assert "CaseX" in _on_disk(ops)
+
+
+def test_exclusive_create_of_a_held_file_fails_on_winfsp(ops):
+    # A file still open from its create() can't be examined; its pin
+    # tells that it exists.
+    if ops._name_fold is None:
+        pytest.skip("handler does not advertise case folding")
+    ops._winfsp = True
+    fh = ops.create("/Held", 0o644)
+    try:
+        assert ops.write("/Held", b"data", 0, fh) == 4
+        assert _errno(ops.create, "/HELD", 0o644) == errno.EEXIST
+    finally:
+        ops.release("/Held", fh)
+    assert _read(ops, "/Held") == b"data"
+
+
+def test_a_name_whose_delete_is_pending_is_not_taken_for_existing(ops):
+    # A pending delete hides its file, and create() takes the name over.
+    ops._winfsp = True
+    _write(ops, "/Pending", b"old")
+    fh = ops.open("/Pending", os.O_RDONLY)
+    try:
+        assert ops.unlink("/Pending") == 0
+        if "/Pending" not in ops._pending_deletes:
+            pytest.skip("handler deletes an open file at once")
+        ops._refuse_existing("/PENDING" if ops._name_fold else "/Pending")
+    finally:
+        ops.release("/Pending", fh)
+
+
+def test_getpath_names_a_hard_link_not_its_target(tmp_path):
+    # FastFileSystem resolves a hard link when it locks it, so Examine on
+    # the lock names the target. getpath must give the link's own name, or
+    # WinFsp rejects every open through it.
+    image = _hard_link_image(_bundled_image(tmp_path).parent)
+    bridge = HandlerBridge(image, BUNDLED_DRIVER, read_only=False,
+                           adf_info=detect_adf(image))
+    try:
+        ops = AmigaFuseFS(bridge)
+        assert ops._name_fold is not None
+        assert ops.getpath("/lf") == "/lf"
+        assert ops.getpath("/LF") == "/lf"
+        assert ops.getpath("/l") == "/L"
+        assert ops.getpath("/l/INNER.TXT") == "/L/inner.txt"
+        assert ops.getpath("/targetfile.txt") == "/TargetFile.txt"
+    finally:
+        bridge.close()
+
+
+def test_windows_reader_uses_independent_offsets(ops):
+    ops._winfsp = True
+    writer = ops.create("/busy", 0o644)
+    reader = None
+    try:
+        ops.write("/busy", b"first", 0, writer)
+        reader = ops.open("/busy", os.O_RDONLY)
+        assert ops.getattr("/busy", reader)["st_size"] == 5
+        assert ops.read("/busy", 2, 1, reader) == b"ir"
+        ops.write("/busy", b"tail", 5, writer)
+        assert ops.read("/busy", 100, 0, reader) == b"firsttail"
+        ops.release("/busy", reader)
+        reader = None
+        assert ops.getattr("/busy")["st_size"] == 9
+    finally:
+        if reader is not None:
+            ops.release("/busy", reader)
+        ops.release("/busy", writer)
+    assert _read(ops, "/busy") == b"firsttail"
+
+
+def test_windows_metadata_open_allows_rename(ops):
+    ops._winfsp = True
+    _write(ops, "/before", b"keep")
+    handle = ops.open("/before", os.O_RDONLY)
+    try:
+        ops.rename("/before", "/after")
+        assert ops.getattr("/before", handle)["st_size"] == 4
+        assert ops.read("/before", 100, 0, handle) == b"keep"
+    finally:
+        ops.release("/before", handle)
+    assert "before" not in ops.readdir("/", None)
+    assert _read(ops, "/after") == b"keep"
+
+
+def test_windows_logical_reader_keeps_replaced_content(ops):
+    # The callback also supports replacement requested with POSIX rename
+    # semantics; ordinary WinFsp MoveFileEx refuses an open destination.
+    ops._winfsp = True
+    _write(ops, "/new", NEW)
+    _write(ops, "/old", OLD)
+    handle = ops.open("/old", os.O_RDONLY)
+    try:
+        ops.rename("/new", "/old")
+        assert _read(ops, "/old") == NEW
+        assert ops.read("/old", 100, 0, handle) == OLD
+    finally:
+        ops.release("/old", handle)
+    _no_temp_names(ops)
+
+
+def test_windows_metadata_open_allows_truncate(ops):
+    ops._winfsp = True
+    _write(ops, "/before", b"keep")
+    handle = ops.open("/before", os.O_RDONLY)
+    try:
+        assert ops.truncate("/before", 0, handle) == 0
+        assert ops.getattr("/before", handle)["st_size"] == 0
+        assert ops.read("/before", 100, 0, handle) == b""
+    finally:
+        ops.release("/before", handle)
+    assert ops.getattr("/before")["st_size"] == 0
+    assert not ops._fh_cache
+    assert _read(ops, "/before") == b""
+
+
+def test_windows_reader_truncates_through_this_mounts_writer(ops):
+    # CREATE_ALWAYS with GENERIC_READ while this mount holds the file open
+    # for writing: pfs3aio refuses a second writer, so the truncate goes
+    # through the one already open.
+    ops._winfsp = True
+    _write(ops, "/w", NEW)
+    writer = ops.open("/w", os.O_RDWR)
+    reader = None
+    try:
+        reader = ops.open("/w", os.O_RDONLY)
+        assert ops.truncate("/w", 0, reader) == 0
+        assert ops.getattr("/w", reader)["st_size"] == 0
+        assert ops.read("/w", 100, 0, reader) == b""
+    finally:
+        if reader is not None:
+            ops.release("/w", reader)
+        ops.release("/w", writer)
+    assert not ops._fh_cache
+    assert _read(ops, "/w") == b""
+
+
+def test_windows_read_only_concurrent_first_reads_share_one_handle(ops, monkeypatch):
+    # A read-only mount runs multithreaded. A read that arrives while the
+    # first one is still opening the data handle must use that handle, not
+    # open (and leak) another under the first one's cached position.
+    import threading
+    from unittest.mock import Mock
+
+    _write(ops, "/data", NEW)
+    ops._winfsp = True
+    monkeypatch.setattr(ops.bridge, "_write_enabled", False)
+    opened = Mock(wraps=ops.bridge.open_file_reply)
+    closed = Mock(wraps=ops.bridge.close_file)
+    monkeypatch.setattr(ops.bridge, "open_file_reply", opened)
+    monkeypatch.setattr(ops.bridge, "close_file", closed)
+
+    first_in, first_go = threading.Event(), threading.Event()
+    real_read_at = ops.bridge.read_handle_at
+
+    def held_read_at(*args):
+        if not first_in.is_set():
+            first_in.set()
+            assert first_go.wait(10)
+        return real_read_at(*args)
+
+    monkeypatch.setattr(ops.bridge, "read_handle_at", held_read_at)
+    handle = ops.open("/data", os.O_RDONLY)
+
+    class WatchedLock:
+        """The entry's lock; tells when a second read waits for it."""
+        def __init__(self, lock):
+            self.lock, self.waiting = lock, threading.Event()
+
+        def __enter__(self):
+            if not self.lock.acquire(blocking=False):
+                self.waiting.set()
+                self.lock.acquire()
+
+        def __exit__(self, *exc):
+            self.lock.release()
+
+    entry = ops._fh_cache[handle]
+    entry["lock"] = watched = WatchedLock(entry["lock"])
+    results = {}
+
+    def read(name, offset):
+        results[name] = ops.read("/data", 1000, offset, handle)
+
+    first = threading.Thread(target=read, args=("first", 0))
+    second = threading.Thread(target=read, args=("second", 1000))
+    try:
+        first.start()
+        assert first_in.wait(10)
+        second.start()
+        assert watched.waiting.wait(10)
+    finally:
+        first_go.set()
+        first.join(10)
+        second.join(10)
+    assert results == {"first": NEW[:1000], "second": NEW[1000:2000]}
+    # and a sequential read after them reads on from the second
+    assert ops.read("/data", 1000, 2000, handle) == NEW[2000:3000]
+    assert opened.call_count == 1
+    ops.release("/data", handle)
+    assert closed.call_count == 1
+    assert not ops._fh_cache
+
+
+def test_windows_read_only_reuses_data_handle(ops, monkeypatch):
+    from unittest.mock import Mock
+
+    _write(ops, "/data", NEW)
+    ops._winfsp = True
+    monkeypatch.setattr(ops.bridge, "_write_enabled", False)
+    opened = Mock(wraps=ops.bridge.open_file_reply)
+    closed = Mock(wraps=ops.bridge.close_file)
+    monkeypatch.setattr(ops.bridge, "open_file_reply", opened)
+    monkeypatch.setattr(ops.bridge, "close_file", closed)
+    handle = ops.open("/data", os.O_RDONLY)
+    assert opened.call_count == 0
+    for offset in (0, 128, 256, 7):
+        assert ops.read("/data", 128, offset, handle) == NEW[offset:offset + 128]
+    assert opened.call_count == 1
+    assert closed.call_count == 0
+    ops.release("/data", handle)
+    assert closed.call_count == 1
+    assert not ops._fh_cache
+
+
+def test_windows_pinned_reader_avoids_metadata_packets(ops, monkeypatch):
+    ops._winfsp = True
+    writer = ops.create("/busy", 0o644)
+    reader = None
+    try:
+        ops.write("/busy", NEW, 0, writer)
+        reader = ops.open("/busy", os.O_RDONLY)
+        def unexpected(*args):
+            pytest.fail("pinned reader must not examine or enumerate")
+        monkeypatch.setattr(ops.bridge, "stat_path", unexpected)
+        monkeypatch.setattr(ops.bridge, "list_dir_path", unexpected)
+        for offset in (0, 128, 256, 7):
+            assert ops.read("/busy", 128, offset, reader) == NEW[offset:offset + 128]
+    finally:
+        if reader is not None:
+            ops.release("/busy", reader)
+        ops.release("/busy", writer)
+
+
 def test_directory_renamed_through_its_handle_lists_with_attributes(ops):
     # WinFsp lists a directory handle under the path it was opened with,
     # and asks getattr() under that path for any entry given without
@@ -454,11 +841,9 @@ def test_directory_renamed_through_its_handle_lists_with_attributes(ops):
         ops.releasedir("/L2a", handle)
 
 
-def test_listing_gives_a_pending_grow_its_logical_length(ops, request):
+def test_listing_gives_a_pending_grow_its_logical_length(ops):
     # truncate() defers the zeros of a grow; getattr() reports the length
     # the file will have, and so must the listing WinFsp now takes it from.
-    if request.node.callspec.id == "FastFileSystem":
-        pytest.skip("FastFileSystem 47.4 refuses the grow until #426 is fixed")
     ops._winfsp = True
     ops._readdir_plus = True
     _write(ops, "/grown", b"abc")
