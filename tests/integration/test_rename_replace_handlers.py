@@ -472,6 +472,48 @@ def test_getpath_lists_only_the_parent_of_a_refused_lock(ops, monkeypatch):
     assert listed == ["/Canonical"]
 
 
+@pytest.mark.parametrize("recreate", [False, True])
+def test_windows_delete_access_after_file_rename(open_rename, recreate):
+    from amifuse.winfsp_fuse import DELETE_OK
+
+    ops = open_rename
+    ops._winfsp = True
+    _write(ops, "/before", OLD)
+    handle = ops.open("/before", os.O_RDONLY)
+    try:
+        assert ops.rename("/before", "/after") == 0
+        if recreate:
+            _write(ops, "/before", NEW)
+        assert ops.access("/before", DELETE_OK) == 0
+        assert ops.unlink("/before") == 0
+    finally:
+        ops.release("/before", handle)
+    assert "after" not in _on_disk(ops)
+    if recreate:
+        assert _read(ops, "/before") == NEW
+    assert not ops._pending_deletes
+
+
+@pytest.mark.parametrize("recreate", [False, True])
+def test_windows_delete_access_after_directory_rename(ops, recreate):
+    from amifuse.winfsp_fuse import DELETE_OK
+
+    ops._winfsp = True
+    assert ops.mkdir("/before", 0o755) == 0
+    handle = ops.opendir("/before")
+    try:
+        assert ops.rename("/before", "/after") == 0
+        if recreate:
+            assert ops.mkdir("/before", 0o755) == 0
+        assert ops.access("/before", DELETE_OK) == 0
+        assert ops.rmdir("/before") == 0
+    finally:
+        ops.releasedir("/before", handle)
+    assert "after" not in _on_disk(ops)
+    assert ("before" in _on_disk(ops)) == recreate
+    assert not ops._pending_deletes
+
+
 def test_getpath_of_a_created_file_does_not_list_its_parent(ops, monkeypatch):
     # WinFsp calls getpath right after create(), while the new file is open
     # for writing and the handler may refuse its lock. Listing the parent

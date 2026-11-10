@@ -33,6 +33,42 @@ def test_case_folding_capability(monkeypatch, fold, capable, version, supported)
     assert conn.capable == capable
 
 
+def test_delete_access_capability():
+    from amifuse.winfsp_fuse import DELETE_ACCESS
+    conn = _Connection()
+    conn.capable = DELETE_ACCESS
+
+    class FUSE:
+        operations = SimpleNamespace(_name_fold=None)
+
+        def init(self, pointer):
+            return 0
+
+    object.__new__(with_capabilities(FUSE)).init(ctypes.byref(conn))
+    assert conn.want == DELETE_ACCESS
+
+
+@pytest.mark.parametrize("directory", [False, True])
+@pytest.mark.parametrize("busy", [False, True])
+def test_delete_access_checks_amiga_protection(directory, busy):
+    import errno
+    from amifuse.fuse_fs import AmigaFuseFS, FuseOSError
+    from amifuse.winfsp_fuse import DELETE_OK
+    info = {"name": "locked", "protection": 1,
+            "dir_type": 2 if directory else -3}
+    bridge = SimpleNamespace(_write_enabled=True,
+        state=SimpleNamespace(crashed=False),
+        stat_path=lambda path: None if busy else info,
+        list_dir_path=lambda path: [info])
+    ops = AmigaFuseFS(bridge)
+    ops._winfsp = True
+    with pytest.raises(FuseOSError) as caught:
+        ops.access("/locked", DELETE_OK)
+    assert caught.value.errno == errno.EACCES
+    info["protection"] = 0
+    assert ops.access("/locked", DELETE_OK) == 0
+
+
 def test_getpath_extension_preserves_existing_offsets():
     from amifuse.winfsp_fuse import _extend_operations
 
@@ -66,6 +102,49 @@ def test_getpath_buffer_is_terminated_and_bounded(size):
         assert result == 0
         assert buffer.raw[:len(expected)] == expected
         assert buffer.raw[len(expected):20] == b"x" * (20 - len(expected))
+
+
+def test_delete_access_on_read_only_mount():
+    import errno
+    import os
+    from amifuse.fuse_fs import AmigaFuseFS, FuseOSError
+    from amifuse.winfsp_fuse import DELETE_OK
+
+    ops = AmigaFuseFS(SimpleNamespace(_write_enabled=False))
+    ops._winfsp = True
+    with pytest.raises(FuseOSError) as caught:
+        ops.access("/file", DELETE_OK)
+    assert caught.value.errno == errno.EROFS
+    assert ops.access("/file", os.R_OK) == 0
+
+
+@pytest.mark.parametrize("directory", [False, True])
+@pytest.mark.parametrize("protected", [False, True])
+@pytest.mark.parametrize("replacement", [None, 0, 1])
+def test_delete_access_uses_renamed_object_protection(directory, protected, replacement):
+    import errno
+    from amifuse.fuse_fs import AmigaFuseFS, FuseOSError
+    from amifuse.winfsp_fuse import DELETE_OK
+
+    paths = []
+    def stat(path):
+        paths.append(path)
+        if path == "/after":
+            return {"name": "after", "protection": int(protected)}
+        return None if replacement is None else {"name": "before", "protection": replacement}
+    bridge = SimpleNamespace(_write_enabled=True,
+        state=SimpleNamespace(crashed=False), stat_path=stat)
+    ops = AmigaFuseFS(bridge)
+    ops._winfsp = True
+    ops._fh_cache[42] = {"path": "/after", "opened_as": "/before",
+        **({"dir_handle": True} if directory else {"fh_addr": 7})}
+    if protected:
+        with pytest.raises(FuseOSError) as caught:
+            ops.access("/before", DELETE_OK)
+        assert caught.value.errno == errno.EACCES
+    else:
+        assert ops.access("/before", DELETE_OK) == 0
+    assert paths == ["/after"]
 
 
 @pytest.mark.parametrize("fh", [None, 7])

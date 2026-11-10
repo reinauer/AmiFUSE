@@ -5045,8 +5045,37 @@ class AmigaFuseFS(_FuseOperations):
         self._log_op("access", path, f"mode={mode}")
         if self._is_platform_special(path):
             raise FuseOSError(errno.ENOENT)
-        if not self.bridge._write_enabled and (mode & os.W_OK):
+        from .winfsp_fuse import DELETE_OK
+        deleting = self._winfsp and mode & DELETE_OK
+        if not self.bridge._write_enabled and (mode & os.W_OK or deleting):
             raise FuseOSError(errno.EROFS)
+        if deleting:
+            self._check_handler_alive()
+            path = self._state_path(path)
+            # Delete-on-close uses the handle's original name after rename.
+            # Match unlink/rmdir, including closed handles awaiting release.
+            with self._fh_lock:
+                targets = {
+                    value.get("path") for value in self._fh_cache.values()
+                    if ("fh_addr" in value or value.get("dir_handle"))
+                    and self._folded(value.get("opened_as", value.get("path")) or "")
+                    == self._folded(path)
+                }
+            if len(targets) == 1 and path not in targets:
+                target = targets.pop()
+                self._log_op("access", path, f"renamed delete target: {target}")
+                path = target
+            info = self.bridge.stat_path(path)
+            if info is None:
+                # An exclusive writer can prevent Examine by path. A
+                # parent listing still carries the object's protection.
+                parent, name = self._split_path(path)
+                info = next((entry for entry in self.bridge.list_dir_path(parent)
+                             if self._folded(entry["name"]) == self._folded(name)), None)
+            if info is None:
+                raise FuseOSError(errno.ENOENT)
+            if info.get("protection", 0) & 1:  # FIBF_DELETE: set forbids delete
+                raise FuseOSError(errno.EACCES)
         return 0
 
     def listxattr(self, path):
