@@ -416,7 +416,7 @@ class TestQuitLifecycle:
         tray_app.run()
 
         notify.assert_called_once_with("E:", added=False)
-        report.assert_called_once_with(failure)
+        report.assert_called_once_with(str(failure))
 
 
 # ---------------------------------------------------------------------------
@@ -443,7 +443,7 @@ class TestUnmount:
 
         stop.assert_called_once_with([1, 2])
         notify.assert_called_once_with("E:", added=False)
-        report.assert_called_once_with(failure)
+        report.assert_called_once_with(str(failure))
         assert tray_app._mounts == mounts[:1]
         assert tray_app._wake_event.is_set()
 
@@ -576,12 +576,35 @@ class TestStartingMounts:
         tray_app._mounts = [{"pid": 1, "mountpoint": "D:"},
                             {"pid": 2, "mountpoint": "R:"}]
 
+        calls = MagicMock()
+        calls.attach_mock(stop, "stop")
+        calls.attach_mock(report, "report")
+
         tray_app._unmount_all()
+
+        # The ready mount goes before the modal dialog (#440), whose advice
+        # doesn't point at the tray Exit removes.
+        assert calls.mock_calls == [
+            call.stop([1]),
+            call.report('AmiFUSE at R: is still starting; once it is ready, '
+                        'unmount it with "amifuse unmount R:".')]
+
+    def test_one_dialog_reports_an_error_and_a_starting_mount(
+            self, tray_app, ready, stop, monkeypatch):
+        from amifuse.windows_unmount import UnmountError
+
+        report = MagicMock()
+        monkeypatch.setattr(tray_app, "_report_unmount_error", report)
+        stop.side_effect = UnmountError([], {1: OSError("D: flush failed")})
+        ready.add(1)
+
+        tray_app._unmount_mounts([{"pid": 1, "mountpoint": "D:"},
+                                  {"pid": 2, "mountpoint": "R:"}])
 
         stop.assert_called_once_with([1])
         report.assert_called_once_with(
-            "AmiFUSE at R: is still starting; try unmounting again once the "
-            "mount is ready.")
+            "D: flush failed\nAmiFUSE at R: is still starting; try unmounting "
+            "again once the mount is ready.")
 
     def test_exit_drops_a_mount_whose_process_ended(self, tray_app, ready, stop,
                                                     monkeypatch):

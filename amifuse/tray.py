@@ -156,8 +156,8 @@ class TrayApp:
         Exit leaves no tray to unmount from later, so a mount still starting
         gets EXIT_START_WAIT seconds to become ready (starting takes well
         under a second). One whose process ended meanwhile is dropped, and
-        one still starting after that is reported: the dialog outlasts the
-        icon.
+        one still starting after that is reported, after the ready mounts
+        are unmounted: the dialog outlasts the icon.
         """
         from .platform import find_amifuse_mounts, mount_is_starting
 
@@ -173,9 +173,9 @@ class TrayApp:
                 mounts_copy = [m for m in mounts_copy if m["pid"] in live]
                 break
             time.sleep(0.1)
-        self._unmount_mounts(mounts_copy)
+        self._unmount_mounts(mounts_copy, exiting=True)
 
-    def _unmount_mounts(self, mounts, *, report_starting=True):
+    def _unmount_mounts(self, mounts, *, report_starting=True, exiting=False):
         from .platform import (mount_is_starting, notify_shell_drive_change,
                                stop_mount_processes)
         from .windows_unmount import UnmountError
@@ -185,33 +185,45 @@ class TrayApp:
         # (#428). Its state is read now, not when the menu was built.
         starting = [m for m in mounts if mount_is_starting(m["pid"])]
         mounts = [m for m in mounts if m not in starting]
+        problems = []
+        pids = [m["pid"] for m in mounts]
+        if pids:
+            try:
+                completed = stop_mount_processes(pids)
+            except UnmountError as exc:
+                completed = exc.completed
+                problems.append(str(exc))
+            except Exception as exc:
+                completed = []
+                problems.append(str(exc))
+            for mount in mounts:
+                mountpoint = mount.get("mountpoint")
+                if mount["pid"] in completed and mountpoint:
+                    notify_shell_drive_change(mountpoint, added=False)
+            with self._lock:
+                self._mounts = [m for m in self._mounts if m["pid"] not in completed]
+            self._wake_event.set()
         if starting:
             logger.info("Not unmounting mounts still starting: %s",
                         [m.get("mountpoint") for m in starting])
             if report_starting:
-                self._report_unmount_error("\n".join(
-                    f"AmiFUSE at {m.get('mountpoint') or m['pid']} is still "
-                    "starting; try unmounting again once the mount is ready."
-                    for m in starting))
-        pids = [m["pid"] for m in mounts]
-        if not pids:
-            return
-        error = None
-        try:
-            completed = stop_mount_processes(pids)
-        except UnmountError as exc:
-            completed, error = exc.completed, exc
-        except Exception as exc:
-            completed, error = [], exc
-        for mount in mounts:
-            mountpoint = mount.get("mountpoint")
-            if mount["pid"] in completed and mountpoint:
-                notify_shell_drive_change(mountpoint, added=False)
-        with self._lock:
-            self._mounts = [m for m in self._mounts if m["pid"] not in completed]
-        self._wake_event.set()
-        if error is not None:
-            self._report_unmount_error(error)
+                problems.extend(self._still_starting(m, exiting) for m in starting)
+        # One dialog, after every ready mount is unmounted: it is modal, and
+        # on Exit nothing else would unmount them (#440).
+        if problems:
+            self._report_unmount_error("\n".join(problems))
+
+    @staticmethod
+    def _still_starting(mount, exiting):
+        mountpoint = mount.get("mountpoint")
+        name = f"AmiFUSE at {mountpoint or mount['pid']} is still starting"
+        if not exiting:
+            return f"{name}; try unmounting again once the mount is ready."
+        # The tray is gone; the command line is left.
+        if mountpoint:
+            return (f"{name}; once it is ready, unmount it with "
+                    f"\"amifuse unmount {mountpoint}\".")
+        return f"{name} and was left running."
 
     def _report_unmount_error(self, error):
         logger.error("Unmount failed: %s", error)
