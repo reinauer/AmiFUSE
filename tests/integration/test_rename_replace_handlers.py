@@ -426,6 +426,195 @@ def test_delete_on_close_while_a_directory_renamed_from_the_name_is_open(winfsp_
     assert ops._pending_deletes == set()
 
 
+def test_getpath_returns_stored_parent_and_child_spelling(ops):
+    if ops._name_fold is None:
+        pytest.skip("handler does not advertise case folding")
+    ops.mkdir("/Canonical", 0o755)
+    _write(ops, "/Canonical/MixedName", b"data")
+    assert ops.getpath("/") == "/"
+    assert ops.getpath("/canonical/mixedname") == "/Canonical/MixedName"
+    ops.rename("/Canonical/MixedName", "/Canonical/MIXEDNAME")
+    assert ops.getpath("/canonical/mixedname") == "/Canonical/MIXEDNAME"
+    assert _errno(ops.getpath, "/canonical/missing") == errno.ENOENT
+
+
+def test_getpath_does_not_enumerate_unlocked_directories(ops, monkeypatch):
+    if ops._name_fold is None:
+        pytest.skip("handler does not advertise case folding")
+    ops.mkdir("/Canonical", 0o755)
+    _write(ops, "/Canonical/MixedName", b"data")
+
+    def refuse_listing(*args):
+        raise AssertionError("getpath enumerated an unlocked directory")
+
+    monkeypatch.setattr(ops, "readdir", refuse_listing)
+    assert ops.getpath("/canonical/mixedname") == "/Canonical/MixedName"
+
+
+def test_getpath_lists_only_the_parent_of_a_refused_lock(ops, monkeypatch):
+    if ops._name_fold is None:
+        pytest.skip("handler does not advertise case folding")
+    ops.mkdir("/Canonical", 0o755)
+    _write(ops, "/Canonical/MixedName", b"data")
+    stat_path, readdir = ops.bridge.stat_path, ops.readdir
+    listed = []
+
+    def stat(path):
+        return None if path == "/Canonical/mixedname" else stat_path(path)
+
+    def listing(path, fh):
+        listed.append(path)
+        return readdir(path, fh)
+
+    monkeypatch.setattr(ops.bridge, "stat_path", stat)
+    monkeypatch.setattr(ops, "readdir", listing)
+    assert ops.getpath("/canonical/mixedname") == "/Canonical/MixedName"
+    assert listed == ["/Canonical"]
+
+
+def test_getpath_of_a_created_file_does_not_list_its_parent(ops, monkeypatch):
+    # WinFsp calls getpath right after create(), while the new file is open
+    # for writing and the handler may refuse its lock. Listing the parent
+    # there made every copy onto a mount quadratic in the folder's size.
+    if ops._name_fold is None:
+        pytest.skip("handler does not advertise case folding")
+    ops.mkdir("/Canonical", 0o755)
+    readdir = ops.readdir
+
+    def refuse_listing(*args):
+        raise AssertionError("getpath listed the parent of a created file")
+
+    handle = ops.create("/Canonical/NewFile", 0o644)
+    try:
+        monkeypatch.setattr(ops, "readdir", refuse_listing)
+        assert ops.getpath("/canonical/newfile", handle) == "/Canonical/NewFile"
+    finally:
+        monkeypatch.setattr(ops, "readdir", readdir)
+        ops.release("/Canonical/NewFile", handle)
+
+
+def test_getpath_does_not_trust_an_opened_handles_spelling(ops, monkeypatch):
+    # open() may name the file in any case; only the disk has its spelling.
+    if ops._name_fold is None:
+        pytest.skip("handler does not advertise case folding")
+    ops.mkdir("/Canonical", 0o755)
+    _write(ops, "/Canonical/MixedName", b"data")
+    handle = ops.open("/canonical/mixedname", os.O_RDONLY)
+    stat_path = ops.bridge.stat_path
+    try:
+        monkeypatch.setattr(ops.bridge, "stat_path", lambda path: (
+            None if path == "/Canonical/mixedname" else stat_path(path)))
+        assert ops.getpath("/canonical/mixedname", handle) == "/Canonical/MixedName"
+    finally:
+        ops.release("/canonical/mixedname", handle)
+
+
+def _hard_link_image(tmp_path):
+    """An FFS floppy with lf, a hard link to TargetFile.txt, and L, a hard
+    link to the directory TargetDir, which holds inner.txt."""
+    import struct
+    from tests.integration.test_ls_recursive_ffs import BLOCK, _edit_block, _xdftool
+
+    image = tmp_path / "links.adf"
+    content, empty = tmp_path / "content.txt", tmp_path / "empty.txt"
+    content.write_bytes(b"target\n")
+    empty.write_bytes(b"")
+    _xdftool(image, "create", "+", "format", "Links", "ffs",
+             "+", "write", str(content), "TargetFile.txt",
+             "+", "write", str(empty), "lf",
+             "+", "makedir", "TargetDir", "+", "write", str(content), "TargetDir/inner.txt",
+             "+", "makedir", "L")
+    data = bytearray(image.read_bytes())
+
+    def header(name, sec_type):
+        for key in range(len(data) // BLOCK):
+            block = data[key * BLOCK:(key + 1) * BLOCK]
+            if (struct.unpack(">I", block[:4])[0] == 2
+                    and struct.unpack(">i", block[-4:])[0] == sec_type
+                    and block[433:433 + block[432]] == name):
+                return key
+        raise AssertionError(f"no header for {name!r}")
+
+    for link, target, sec_type, link_type in (
+            (b"lf", b"TargetFile.txt", -3, -4),  # ST_FILE -> ST_LINKFILE
+            (b"L", b"TargetDir", 2, 4)):         # ST_USERDIR -> ST_LINKDIR
+        link_key, target_key = header(link, sec_type), header(target, sec_type)
+
+        def to_link(block, target_key=target_key, link_type=link_type):
+            struct.pack_into(">i", block, BLOCK - 4, link_type)
+            struct.pack_into(">I", block, BLOCK - 11 * 4, target_key)  # real_entry
+
+        def link_back(block, link_key=link_key):
+            struct.pack_into(">I", block, BLOCK - 10 * 4, link_key)  # next_link
+
+        _edit_block(data, link_key, to_link)
+        _edit_block(data, target_key, link_back)
+    image.write_bytes(data)
+    return image
+
+
+def test_exclusive_create_of_an_existing_name_fails_on_winfsp(ops):
+    # WinFsp sends CREATE_NEW to create() without opening the name first,
+    # and the handler matches a name in any case: without the check, this
+    # create emptied CaseX.
+    if ops._name_fold is None:
+        pytest.skip("handler does not advertise case folding")
+    ops._winfsp = True
+    _write(ops, "/CaseX", b"keep me")
+    for name in ("/CaseX", "/CASEX"):
+        assert _errno(ops.create, name, 0o644) == errno.EEXIST
+    assert _read(ops, "/casex") == b"keep me"
+    assert "CaseX" in _on_disk(ops)
+
+
+def test_exclusive_create_of_a_held_file_fails_on_winfsp(ops):
+    # A file still open from its create() can't be examined; its pin
+    # tells that it exists.
+    if ops._name_fold is None:
+        pytest.skip("handler does not advertise case folding")
+    ops._winfsp = True
+    fh = ops.create("/Held", 0o644)
+    try:
+        assert ops.write("/Held", b"data", 0, fh) == 4
+        assert _errno(ops.create, "/HELD", 0o644) == errno.EEXIST
+    finally:
+        ops.release("/Held", fh)
+    assert _read(ops, "/Held") == b"data"
+
+
+def test_a_name_whose_delete_is_pending_is_not_taken_for_existing(ops):
+    # A pending delete hides its file, and create() takes the name over.
+    ops._winfsp = True
+    _write(ops, "/Pending", b"old")
+    fh = ops.open("/Pending", os.O_RDONLY)
+    try:
+        assert ops.unlink("/Pending") == 0
+        if "/Pending" not in ops._pending_deletes:
+            pytest.skip("handler deletes an open file at once")
+        ops._refuse_existing("/PENDING" if ops._name_fold else "/Pending")
+    finally:
+        ops.release("/Pending", fh)
+
+
+def test_getpath_names_a_hard_link_not_its_target(tmp_path):
+    # FastFileSystem resolves a hard link when it locks it, so Examine on
+    # the lock names the target. getpath must give the link's own name, or
+    # WinFsp rejects every open through it.
+    image = _hard_link_image(_bundled_image(tmp_path).parent)
+    bridge = HandlerBridge(image, BUNDLED_DRIVER, read_only=False,
+                           adf_info=detect_adf(image))
+    try:
+        ops = AmigaFuseFS(bridge)
+        assert ops._name_fold is not None
+        assert ops.getpath("/lf") == "/lf"
+        assert ops.getpath("/LF") == "/lf"
+        assert ops.getpath("/l") == "/L"
+        assert ops.getpath("/l/INNER.TXT") == "/L/inner.txt"
+        assert ops.getpath("/targetfile.txt") == "/TargetFile.txt"
+    finally:
+        bridge.close()
+
+
 def test_windows_reader_uses_independent_offsets(ops):
     ops._winfsp = True
     writer = ops.create("/busy", 0o644)

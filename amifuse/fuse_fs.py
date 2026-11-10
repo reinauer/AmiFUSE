@@ -385,6 +385,9 @@ def _require_fuse():
             "Install fusepy (pip install fusepy) and a supported FUSE backend."
         ) from None
 
+    if sys.platform.startswith("win"):
+        from .winfsp_fuse import with_capabilities
+        fuse_class = with_capabilities(fuse_class)
     FUSE = fuse_class
     return FUSE
 
@@ -3576,6 +3579,54 @@ class AmigaFuseFS(_FuseOperations):
         self._resolve_pending_dir_deletes(resolved_path)
         return 0
 
+    def getpath(self, path, fh=None):
+        """Return stored spelling for WinFsp's case-insensitive lookups.
+
+        WinFsp needs the canonical name when opening an existing object;
+        otherwise a case-only rename can look like an exact-name no-op.
+        Examine each component to avoid enumerating whole directories on
+        every open. The parent is listed only when Examine can't name the
+        component: a writer can refuse its lock, and a hard link's lock
+        names the link's target. fh is the handle WinFsp passes after
+        create(), whose path is the new object's spelling on disk; that of
+        an open() may be an alias, so only a created handle's is used.
+        """
+        self._check_handler_alive()
+        created = None
+        if fh is not None:
+            with self._fh_lock:
+                entry = self._fh_cache.get(fh)
+            if entry is not None and entry.get("created"):
+                created = _handle_path(entry, path)
+        components = [component for component in path.strip("/").split("/")
+                      if component]
+        canonical = "/"
+        for at, component in enumerate(components):
+            child = canonical.rstrip("/") + "/" + component
+            info = self.bridge.stat_path(child)
+            name = info.get("name") if info is not None else None
+            if name is not None and self._folded(name) != self._folded(component):
+                # A hard link: Examine names its target. A link whose name
+                # folds equal to its target's, differing only in letter
+                # case, isn't told apart and gets the target's spelling;
+                # that would take a listing for each component.
+                name = None
+            if (name is None and info is None and at == len(components) - 1
+                    and created is not None
+                    and self._folded(created) == self._folded(child)):
+                # The handler refuses a lock on the file create() holds;
+                # it is stored under exactly the name create() sent.
+                name = created.rsplit("/", 1)[-1]
+            if name is None:
+                name = next((name for name in self.readdir(canonical, None)
+                             if self._folded(name) == self._folded(component)), None)
+            elif not self._filter_pending_deletes(canonical, [name]):
+                name = None
+            if name is None:
+                raise FuseOSError(errno.ENOENT)
+            canonical = canonical.rstrip("/") + "/" + name
+        return canonical
+
     def readdir(self, path, fh):
         self._check_handler_alive()
         if self._winfsp:
@@ -4227,6 +4278,8 @@ class AmigaFuseFS(_FuseOperations):
             if self._is_platform_special(path):
                 raise FuseOSError(errno.ENOENT)
             path = self._state_path(path)
+            if self._winfsp:
+                self._refuse_existing(path)
             self._materialize_grows(except_path=path)
             opened = self.bridge.open_file(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
             if opened is None:
@@ -4247,6 +4300,11 @@ class AmigaFuseFS(_FuseOperations):
                     "dirty": True,  # New files are always dirty
                     "writable": True,
                     "path": path,
+                    # getpath takes this as the spelling on disk. On
+                    # WinFsp create() refuses a name an existing object
+                    # folds to (_refuse_existing), so the handler stores the
+                    # name as sent.
+                    "created": True,
                 }
             # Prime stat/dir cache so immediate getattr after create doesn't fail.
             # Pin the entry: in write mode _cache_ttl is 0, so without pinning
@@ -4263,6 +4321,27 @@ class AmigaFuseFS(_FuseOperations):
         except Exception as e:
             self._log_op("create", path, f"EXCEPTION: {type(e).__name__}: {e}")
             raise FuseOSError(errno.EIO) from e
+
+    def _refuse_existing(self, path):
+        """Fail a WinFsp create() of a name an object already has.
+
+        WinFsp sends CREATE_NEW (an exclusive create) to create() without
+        opening the name first; its other dispositions open it first and
+        call create() only when that reports it missing. create() opens
+        with O_CREAT | O_TRUNC, which the handler matches in any letter
+        case, so an exclusive create of CASEX would empty CaseX, where
+        Windows expects "file exists". A file a writer holds on an
+        exclusive lock can't be examined, but is pinned. A file with a
+        pending delete is hidden, and create() takes its name over.
+        """
+        folded = self._folded(path)
+        with self._fh_lock:
+            if any(self._folded(p) == folded for p in self._pending_deletes):
+                return
+            pinned = any(self._folded(p) == folded for p in self._pinned_stats)
+        if pinned or self.bridge.stat_path(path) is not None:
+            self._log_op("create", path, "exists")
+            raise FuseOSError(errno.EEXIST)
 
     def _retain_deferred_readers(self, path):
         """Keep an unlinked/replaced file alive until its readers close.
