@@ -4337,6 +4337,9 @@ class AmigaFuseFS(_FuseOperations):
                 raise FuseOSError(errno.EROFS)
             if self._is_platform_special(path):
                 raise FuseOSError(errno.ENOENT)
+            # Before _state_path(), which would give the new file the
+            # spelling of the held one.
+            self._free_pending_name(path)
             path = self._state_path(path)
             if self._winfsp:
                 self._refuse_existing(path)
@@ -4402,6 +4405,38 @@ class AmigaFuseFS(_FuseOperations):
         if pinned or self.bridge.stat_path(path) is not None:
             self._log_op("create", path, "exists")
             raise FuseOSError(errno.EEXIST)
+
+    def _free_pending_name(self, path):
+        """Move an object whose delete is pending off path, to create there.
+
+        The handler deletes an object only once nothing holds it, so one
+        deleted while open keeps its name on disk until its last release(),
+        and a create of that name, in any letter case, would open the held
+        object, which the handler refuses (#439). It goes to a temporary
+        name in its directory, with its handles and its pending delete, as
+        _replace_existing() moves a replaced file that is still open. A
+        rename the handler refuses fails with EACCES, as Windows refuses to
+        create a name whose delete is pending. An object no longer there
+        leaves the name free.
+        """
+        folded = self._folded(path)
+        with self._fh_lock:
+            pending = next((p for p in self._pending_deletes
+                            if self._folded(p) == folded), None)
+        if pending is None:
+            return
+        dir_path, _ = self._split_path(pending)
+        for _ in range(8):
+            temp = dir_path.rstrip("/") + f"/.amifuse-{os.urandom(4).hex()}"
+            res1, res2 = self._rename_object(pending, temp)
+            if res1 or res2 != ERROR_OBJECT_EXISTS:
+                break
+        if res1 == 0 and res2 == ERROR_OBJECT_NOT_FOUND:
+            return
+        if res1 == 0:
+            self._log_op("create", path, f"pending delete holds the name (DOS error {res2})")
+            raise FuseOSError(errno.EACCES)
+        self._log_op("create", path, f"moved its pending delete to {temp}")
 
     def _retain_deferred_readers(self, path):
         """Keep an unlinked/replaced file alive until its readers close.
@@ -4666,6 +4701,7 @@ class AmigaFuseFS(_FuseOperations):
         self._check_handler_alive()
         if not self.bridge._write_enabled:
             raise FuseOSError(errno.EROFS)
+        self._free_pending_name(path)
         path = self._state_path(path)
         dir_path, name = self._split_path(path)
         if not name:

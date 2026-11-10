@@ -123,6 +123,24 @@ class _InUseVolume:
     def delete_dir_atomic(self, path):
         return self._delete(path)
 
+    def rename_object(self, src_lock, src_name, dst_lock, dst_name):
+        """Rename an object; open handles stay on it, under its new name."""
+        old = self._lock_paths[src_lock].rstrip("/") + "/" + src_name
+        new = self._lock_paths[dst_lock].rstrip("/") + "/" + dst_name
+        if old not in self.dirs | self.files:
+            return 0, 205  # ERROR_OBJECT_NOT_FOUND
+        if new in self.dirs | self.files:
+            return 0, ERROR_OBJECT_EXISTS
+
+        def moved(p):
+            return new + p[len(old):] if p == old or p.startswith(old + "/") else p
+
+        self.dirs = {moved(p) for p in self.dirs}
+        self.files = {moved(p) for p in self.files}
+        self.busy = {moved(p) for p in self.busy}
+        self.open_files = {a: moved(p) for a, p in self.open_files.items()}
+        return -1, 0
+
 
 @pytest.fixture
 def make_fs(fuse_mock):
@@ -321,6 +339,7 @@ def test_create_over_an_unlinked_open_file_survives_the_old_release(make_fs):
     fs.release("/f", old)
     fs.release("/f", new)
 
-    assert "/f" in volume.files
-    assert volume.deleted == []
+    # The old file moved off the name, and its release deleted it (#439).
+    assert volume.files == {"/f"}
+    assert [p.startswith("/.amifuse-") for p in volume.deleted] == [True]
     assert fs._pending_deletes == set()

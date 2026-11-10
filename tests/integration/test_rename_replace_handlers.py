@@ -642,6 +642,71 @@ def test_a_name_whose_delete_is_pending_is_not_taken_for_existing(ops):
         ops.release("/Pending", fh)
 
 
+
+@pytest.mark.parametrize("winfsp", [True, False], ids=["winfsp", "posix"])
+@pytest.mark.parametrize("old_first", [True, False], ids=["old-first", "new-first"])
+@pytest.mark.parametrize("spelling", ["/Pend", "/PEND"])
+def test_create_at_the_name_of_a_file_deleted_while_open(ops, request, winfsp,
+                                                         old_first, spelling):
+    # The handler deletes the file only at its last release(), and it keeps
+    # its name on disk until then; a create of the name opened the held
+    # file, which the handler refused, and create() failed with EIO (#439).
+    # The held file moves to a temporary name, which frees the name.
+    if spelling != "/Pend" and ops._name_fold is None:
+        pytest.skip("handler does not advertise case folding")
+    ops._winfsp = winfsp
+    _write(ops, "/Pend", OLD)
+    old = ops.open("/Pend", os.O_RDONLY)
+    new = None
+    try:
+        assert ops.unlink("/Pend") == 0
+        if "/Pend" not in ops._pending_deletes:
+            pytest.skip("handler deletes an open file at once")
+        if request.node.callspec.params["ops"][1] == BUNDLED:
+            # It refuses to rename an open file: the name is free only
+            # once the file is deleted, at its release().
+            assert _errno(ops.create, spelling, 0o644) == errno.EACCES
+            ops.release("/Pend", old)
+            old = None
+        new = ops.create(spelling, 0o644)
+        assert ops.write(spelling, NEW, 0, new) == len(NEW)
+        if old is not None:
+            assert ops.read("/Pend", 1 << 16, 0, old) == OLD
+            first, second = (old, new) if old_first else (new, old)
+            ops.release(spelling if first is new else "/Pend", first)
+            ops.release(spelling if second is new else "/Pend", second)
+        else:
+            ops.release(spelling, new)
+        new = old = None
+    finally:
+        if new is not None:
+            ops.release(spelling, new)
+        if old is not None:
+            ops.release("/Pend", old)
+    assert {n for n in _on_disk(ops) if n.lower() == "pend"} == {spelling[1:]}
+    _no_temp_names(ops)
+    assert _read(ops, spelling) == NEW
+    assert not ops._pending_deletes
+
+
+def test_mkdir_at_the_name_of_a_file_deleted_while_open(open_rename):
+    ops = open_rename
+    ops._winfsp = True
+    _write(ops, "/Pend", OLD)
+    old = ops.open("/Pend", os.O_RDONLY)
+    try:
+        assert ops.unlink("/Pend") == 0
+        if "/Pend" not in ops._pending_deletes:
+            pytest.skip("handler deletes an open file at once")
+        assert ops.mkdir("/Pend", 0o755) == 0
+        assert ops.read("/Pend", 1 << 16, 0, old) == OLD
+    finally:
+        ops.release("/Pend", old)
+    assert {n for n in _on_disk(ops) if n.lower() == "pend"} == {"Pend"}
+    _no_temp_names(ops)
+    assert ops.getattr("/Pend")["st_mode"] & 0o170000 == 0o040000
+    assert not ops._pending_deletes
+
 def test_getpath_names_a_hard_link_not_its_target(tmp_path):
     # FastFileSystem resolves a hard link when it locks it, so Examine on
     # the lock names the target. getpath must give the link's own name, or
