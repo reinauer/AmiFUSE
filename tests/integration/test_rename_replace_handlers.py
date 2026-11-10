@@ -615,6 +615,200 @@ def test_getpath_names_a_hard_link_not_its_target(tmp_path):
         bridge.close()
 
 
+def test_windows_reader_uses_independent_offsets(ops):
+    ops._winfsp = True
+    writer = ops.create("/busy", 0o644)
+    reader = None
+    try:
+        ops.write("/busy", b"first", 0, writer)
+        reader = ops.open("/busy", os.O_RDONLY)
+        assert ops.getattr("/busy", reader)["st_size"] == 5
+        assert ops.read("/busy", 2, 1, reader) == b"ir"
+        ops.write("/busy", b"tail", 5, writer)
+        assert ops.read("/busy", 100, 0, reader) == b"firsttail"
+        ops.release("/busy", reader)
+        reader = None
+        assert ops.getattr("/busy")["st_size"] == 9
+    finally:
+        if reader is not None:
+            ops.release("/busy", reader)
+        ops.release("/busy", writer)
+    assert _read(ops, "/busy") == b"firsttail"
+
+
+def test_windows_metadata_open_allows_rename(ops):
+    ops._winfsp = True
+    _write(ops, "/before", b"keep")
+    handle = ops.open("/before", os.O_RDONLY)
+    try:
+        ops.rename("/before", "/after")
+        assert ops.getattr("/before", handle)["st_size"] == 4
+        assert ops.read("/before", 100, 0, handle) == b"keep"
+    finally:
+        ops.release("/before", handle)
+    assert "before" not in ops.readdir("/", None)
+    assert _read(ops, "/after") == b"keep"
+
+
+def test_windows_logical_reader_keeps_replaced_content(ops):
+    # The callback also supports replacement requested with POSIX rename
+    # semantics; ordinary WinFsp MoveFileEx refuses an open destination.
+    ops._winfsp = True
+    _write(ops, "/new", NEW)
+    _write(ops, "/old", OLD)
+    handle = ops.open("/old", os.O_RDONLY)
+    try:
+        ops.rename("/new", "/old")
+        assert _read(ops, "/old") == NEW
+        assert ops.read("/old", 100, 0, handle) == OLD
+    finally:
+        ops.release("/old", handle)
+    _no_temp_names(ops)
+
+
+def test_windows_metadata_open_allows_truncate(ops):
+    ops._winfsp = True
+    _write(ops, "/before", b"keep")
+    handle = ops.open("/before", os.O_RDONLY)
+    try:
+        assert ops.truncate("/before", 0, handle) == 0
+        assert ops.getattr("/before", handle)["st_size"] == 0
+        assert ops.read("/before", 100, 0, handle) == b""
+    finally:
+        ops.release("/before", handle)
+    assert ops.getattr("/before")["st_size"] == 0
+    assert not ops._fh_cache
+    assert _read(ops, "/before") == b""
+
+
+def test_windows_reader_truncates_through_this_mounts_writer(ops):
+    # CREATE_ALWAYS with GENERIC_READ while this mount holds the file open
+    # for writing: pfs3aio refuses a second writer, so the truncate goes
+    # through the one already open.
+    ops._winfsp = True
+    _write(ops, "/w", NEW)
+    writer = ops.open("/w", os.O_RDWR)
+    reader = None
+    try:
+        reader = ops.open("/w", os.O_RDONLY)
+        assert ops.truncate("/w", 0, reader) == 0
+        assert ops.getattr("/w", reader)["st_size"] == 0
+        assert ops.read("/w", 100, 0, reader) == b""
+    finally:
+        if reader is not None:
+            ops.release("/w", reader)
+        ops.release("/w", writer)
+    assert not ops._fh_cache
+    assert _read(ops, "/w") == b""
+
+
+def test_windows_read_only_concurrent_first_reads_share_one_handle(ops, monkeypatch):
+    # A read-only mount runs multithreaded. A read that arrives while the
+    # first one is still opening the data handle must use that handle, not
+    # open (and leak) another under the first one's cached position.
+    import threading
+    from unittest.mock import Mock
+
+    _write(ops, "/data", NEW)
+    ops._winfsp = True
+    monkeypatch.setattr(ops.bridge, "_write_enabled", False)
+    opened = Mock(wraps=ops.bridge.open_file_reply)
+    closed = Mock(wraps=ops.bridge.close_file)
+    monkeypatch.setattr(ops.bridge, "open_file_reply", opened)
+    monkeypatch.setattr(ops.bridge, "close_file", closed)
+
+    first_in, first_go = threading.Event(), threading.Event()
+    real_read_at = ops.bridge.read_handle_at
+
+    def held_read_at(*args):
+        if not first_in.is_set():
+            first_in.set()
+            assert first_go.wait(10)
+        return real_read_at(*args)
+
+    monkeypatch.setattr(ops.bridge, "read_handle_at", held_read_at)
+    handle = ops.open("/data", os.O_RDONLY)
+
+    class WatchedLock:
+        """The entry's lock; tells when a second read waits for it."""
+        def __init__(self, lock):
+            self.lock, self.waiting = lock, threading.Event()
+
+        def __enter__(self):
+            if not self.lock.acquire(blocking=False):
+                self.waiting.set()
+                self.lock.acquire()
+
+        def __exit__(self, *exc):
+            self.lock.release()
+
+    entry = ops._fh_cache[handle]
+    entry["lock"] = watched = WatchedLock(entry["lock"])
+    results = {}
+
+    def read(name, offset):
+        results[name] = ops.read("/data", 1000, offset, handle)
+
+    first = threading.Thread(target=read, args=("first", 0))
+    second = threading.Thread(target=read, args=("second", 1000))
+    try:
+        first.start()
+        assert first_in.wait(10)
+        second.start()
+        assert watched.waiting.wait(10)
+    finally:
+        first_go.set()
+        first.join(10)
+        second.join(10)
+    assert results == {"first": NEW[:1000], "second": NEW[1000:2000]}
+    # and a sequential read after them reads on from the second
+    assert ops.read("/data", 1000, 2000, handle) == NEW[2000:3000]
+    assert opened.call_count == 1
+    ops.release("/data", handle)
+    assert closed.call_count == 1
+    assert not ops._fh_cache
+
+
+def test_windows_read_only_reuses_data_handle(ops, monkeypatch):
+    from unittest.mock import Mock
+
+    _write(ops, "/data", NEW)
+    ops._winfsp = True
+    monkeypatch.setattr(ops.bridge, "_write_enabled", False)
+    opened = Mock(wraps=ops.bridge.open_file_reply)
+    closed = Mock(wraps=ops.bridge.close_file)
+    monkeypatch.setattr(ops.bridge, "open_file_reply", opened)
+    monkeypatch.setattr(ops.bridge, "close_file", closed)
+    handle = ops.open("/data", os.O_RDONLY)
+    assert opened.call_count == 0
+    for offset in (0, 128, 256, 7):
+        assert ops.read("/data", 128, offset, handle) == NEW[offset:offset + 128]
+    assert opened.call_count == 1
+    assert closed.call_count == 0
+    ops.release("/data", handle)
+    assert closed.call_count == 1
+    assert not ops._fh_cache
+
+
+def test_windows_pinned_reader_avoids_metadata_packets(ops, monkeypatch):
+    ops._winfsp = True
+    writer = ops.create("/busy", 0o644)
+    reader = None
+    try:
+        ops.write("/busy", NEW, 0, writer)
+        reader = ops.open("/busy", os.O_RDONLY)
+        def unexpected(*args):
+            pytest.fail("pinned reader must not examine or enumerate")
+        monkeypatch.setattr(ops.bridge, "stat_path", unexpected)
+        monkeypatch.setattr(ops.bridge, "list_dir_path", unexpected)
+        for offset in (0, 128, 256, 7):
+            assert ops.read("/busy", 128, offset, reader) == NEW[offset:offset + 128]
+    finally:
+        if reader is not None:
+            ops.release("/busy", reader)
+        ops.release("/busy", writer)
+
+
 def test_delete_renamed_directory_preserves_old_name(ops):
     ops._winfsp = True
     ops.mkdir("/before", 0o755)
@@ -626,3 +820,52 @@ def test_delete_renamed_directory_preserves_old_name(ops):
     assert "before" in _on_disk(ops)
     assert "after" not in _on_disk(ops)
     assert ops._pending_deletes == set()
+
+
+@pytest.mark.parametrize("replacement", [False, True])
+def test_windows_readdir_follows_renamed_directory(ops, replacement):
+    ops._winfsp = True
+    assert ops.mkdir("/before", 0o755) == 0
+    _write(ops, "/before/child", OLD)
+    handle = ops.opendir("/before")
+    try:
+        assert ops.rename("/before", "/after") == 0
+        if replacement:
+            assert ops.mkdir("/before", 0o755) == 0
+        assert "child" in ops.readdir("/before", handle)
+        assert "child" not in ops.readdir("/before", None)
+    finally:
+        ops.releasedir("/before", handle)
+    assert _read(ops, "/after/child") == OLD
+
+
+@pytest.mark.parametrize("back", [False, True])
+def test_windows_repeated_file_rename_uses_opened_name(open_rename, back):
+    ops = open_rename
+    ops._winfsp = True
+    _write(ops, "/before", OLD)
+    handle = ops.open("/before", os.O_RDONLY)
+    target = "/before" if back else "/last"
+    try:
+        assert ops.rename("/before", "/after") == 0
+        assert ops.rename("/before", target) == 0
+        assert ops._fh_cache[handle]["path"] == target
+    finally:
+        ops.release("/before", handle)
+    assert "after" not in _on_disk(ops)
+    assert _read(ops, target) == OLD
+
+
+@pytest.mark.parametrize("target", ["/before", "/last", "/BEFORE"])
+def test_windows_repeated_directory_rename_uses_opened_name(ops, target):
+    ops._winfsp = True
+    assert ops.mkdir("/before", 0o755) == 0
+    handle = ops.opendir("/before")
+    try:
+        assert ops.rename("/before", "/after") == 0
+        assert ops.rename("/before", target) == 0
+        assert ops._fh_cache[handle]["path"] == target
+    finally:
+        ops.releasedir("/before", handle)
+    assert "after" not in _on_disk(ops)
+    assert target[1:] in _on_disk(ops)

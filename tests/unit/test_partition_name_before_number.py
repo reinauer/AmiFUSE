@@ -21,7 +21,7 @@ from amitools.fs.block.rdb.RDBlock import RDBlock
 from amitools.fs.rdb.RDisk import RDisk
 
 from amifuse import rdb_inspect
-from amifuse.fuse_fs import get_partition_info, main
+from amifuse.fuse_fs import PartitionNotFound, get_partition_info, main
 from amifuse.rdb_inspect import (MBRContext, MBRInfo, MBRPartition,
                                  find_partition_mbr_index)
 from tests.unit.test_mbr_rdb_block_size import _make_mbr, _make_parceiro
@@ -163,14 +163,20 @@ def test_inspect_json_gives_the_named_partition_a_driver(
     # The first RDB with a partition of that number holds it.
     ([("DH2", DOS3)], "1", 0, "DH1"),
     ([("DH2", DOS3)], "0", 0, "DH0"),
-    # Numbers restart in each RDB, so neither RDB has a partition 2.
-    ([("DH2", DOS3), ("DH3", DOS3)], "2", None, "AmigaFS"),
 ])
 def test_number_selects_a_partition_when_no_rdb_has_the_name(
         tmp_path, second, number, index, name):
     image = _image(tmp_path, second)
     assert find_partition_mbr_index(image, None, number) == index
     assert get_partition_info(image, None, number)["name"] == name
+
+
+def test_missing_number_in_multiple_rdbs(tmp_path):
+    # Numbers restart in each RDB, so neither RDB has a partition 2.
+    image = _image(tmp_path, [("DH2", DOS3), ("DH3", DOS3)])
+    assert find_partition_mbr_index(image, None, "2") is None
+    with pytest.raises(PartitionNotFound, match="Partition not found: 2"):
+        get_partition_info(image, None, "2")
 
 
 def test_number_in_later_rdb_when_earlier_lacks_it(tmp_path):

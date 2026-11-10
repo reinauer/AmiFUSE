@@ -365,3 +365,17 @@ def test_nfc_same_name_and_case_only_rename_keep_open_state(request, tmp_path, m
     finally:
         ops("release", decomposed, fh)
     assert ops.bridge.read_file("/CAF\xc9", 4, 0) == b"kept"
+
+
+@pytest.mark.parametrize("ops", MOVE_WHAT_IS_OPEN, indirect=True)
+def test_case_rename_to_open_spelling_changes_stored_name(ops):
+    # Exercise the non-Windows callback order even on a Windows test host.
+    ops._winfsp = False
+    _write(ops, "/foo", b"kept")
+    handle = ops("open", "/FOO", os.O_RDONLY)
+    try:
+        assert ops("rename", "/foo", "/FOO") == 0
+    finally:
+        ops("release", "/FOO", handle)
+    names = [entry["name"] for entry in ops.bridge.list_dir_path("/")]
+    assert "FOO" in names and "foo" not in names

@@ -632,7 +632,7 @@ class TestFormatVolume:
         monkeypatch.setattr(
             fuse_fs_mod,
             "get_partition_info",
-            lambda image, block_size, partition: {"dostype": 0x53465300},
+            lambda image, block_size, partition, *, write=False: {"dostype": 0x53465300},
         )
 
         mock_bridge = MagicMock()
@@ -682,7 +682,7 @@ class TestFormatVolume:
         image.write_bytes(b"")
         monkeypatch.setattr(
             fuse_fs_mod, "get_partition_info",
-            lambda image, block_size, partition: {"name": "DH0", "dostype": 0x444F5303},
+            lambda image, block_size, partition, *, write=False: {"name": "DH0", "dostype": 0x444F5303},
         )
         monkeypatch.setattr(fuse_fs_mod, "extract_embedded_driver", lambda *a: None)
         mock_bridge = MagicMock()
@@ -729,7 +729,7 @@ class TestFormatVolume:
         monkeypatch.setattr(
             fuse_fs_mod,
             "get_partition_info",
-            lambda image, block_size, partition: {"dostype": 0x50465303},
+            lambda image, block_size, partition, *, write=False: {"dostype": 0x50465303},
         )
         bridge_cls = MagicMock(side_effect=error)
         monkeypatch.setattr(fuse_fs_mod, "HandlerBridge", bridge_cls)
@@ -825,7 +825,7 @@ class TestFormatVolume:
         monkeypatch.setattr(
             fuse_fs_mod,
             "get_partition_info",
-            lambda image, block_size, partition: {"dostype": 0x50465303},
+            lambda image, block_size, partition, *, write=False: {"dostype": 0x50465303},
         )
         monkeypatch.setattr(fuse_fs_mod, failing, MagicMock(side_effect=error))
         bridge_cls = MagicMock()
@@ -868,7 +868,7 @@ class TestFormatVolume:
         monkeypatch.setattr(
             fuse_fs_mod,
             "get_partition_info",
-            lambda image, block_size, partition: {"dostype": 0x50465303},
+            lambda image, block_size, partition, *, write=False: {"dostype": 0x50465303},
         )
         monkeypatch.setattr(
             fuse_fs_mod,

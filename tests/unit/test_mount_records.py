@@ -89,6 +89,21 @@ def test_status_shows_the_recorded_mountpoint(record_dir, mount_process, argumen
     assert mount["image"] == "/Users/a/disk.hdf"
 
 
+@pytest.mark.parametrize("language", ["de_DE.UTF-8", "fr_FR.UTF-8"] if sys.platform == "darwin"
+                         else ["C.UTF-8"])
+def test_non_ascii_paths_come_through_ps_without_a_record(record_dir, mount_process,
+                                                           monkeypatch, language):
+    # LC_ALL is what a user's shell may set; on macOS its day and month
+    # names must not reach lstart, nor the C character set the paths.
+    monkeypatch.setenv("LC_ALL", language)
+    image, mountpoint = "/tmp/José-Ω-漢.hdf", "/tmp/mnt-ā-漢"
+    pid = mount_process(image, "--mountpoint", mountpoint)
+
+    mount = _discovered(pid)
+    assert (mount["image"], mount["mountpoint"]) == (image, mountpoint)
+    assert 0 <= mount["uptime_seconds"] < 60
+
+
 @pytest.mark.parametrize("arguments, mountpoint, from_ps", CASES.values(), ids=CASES)
 def test_owner_is_found_from_any_working_directory(record_dir, mount_process, tmp_path,
                                                    monkeypatch, arguments, mountpoint,
@@ -278,3 +293,32 @@ def test_record_from_previous_pid_owner_is_ignored(monkeypatch, created, expecte
     plat._apply_mount_records(mounts)
 
     assert mounts[0]["mountpoint"] == expected
+
+
+@pytest.mark.parametrize("zone", ["UTC0", "CET-1CEST,M3.5.0,M10.5.0/3", "JST-9", "PST8PDT,M3.2.0,M11.1.0",
+                                  "AEST-10AEDT,M10.1.0,M4.1.0/3"])
+# 2026-11-07 19:00 UTC, when of these zones only AEST is on daylight time,
+# and 2026-07-15 12:00 UTC, when CET and PST are and AEST is not.
+@pytest.mark.parametrize("now", [1794078000, 1784116800])
+@pytest.mark.parametrize("created_delta", [3, -3600])
+def test_local_start_time_validates_mount_record(monkeypatch, zone, now, created_delta):
+    previous = os.environ.get("TZ")
+    try:
+        os.environ["TZ"] = zone
+        time.tzset()
+        start = now - 120
+        stamp = time.strftime("%a %b %d %H:%M:%S %Y", time.localtime(start))
+        monkeypatch.setattr(plat.time, "time", lambda: now)
+        uptime = plat._parse_lstart_uptime(stamp)
+        assert uptime == 120
+        mounts = [{"pid": 42, "mountpoint": "mnt", "uptime_seconds": uptime}]
+        monkeypatch.setattr(plat, "_read_mount_records", lambda: {
+            42: {"created_at": start + created_delta, "mountpoint": "/Users/a/mnt"}})
+        plat._apply_mount_records(mounts)
+        assert mounts[0]["mountpoint"] == ("/Users/a/mnt" if created_delta > 0 else "mnt")
+    finally:
+        if previous is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = previous
+        time.tzset()
