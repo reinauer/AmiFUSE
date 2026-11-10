@@ -181,6 +181,9 @@ def test_unlinked_file_held_by_its_writer(ops, opener):
     file until then (#263)."""
     _write_file(ops, "/u.bin", OLD)
     if opener == "create":
+        # create() over an existing file is a POSIX O_TRUNC create; WinFsp
+        # sends create() only for a name that doesn't exist (_refuse_existing).
+        ops._winfsp = False
         fh = ops.create("/u.bin", 0o644)
     else:
         fh = ops.open("/u.bin", os.O_RDWR | os.O_TRUNC)

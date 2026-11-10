@@ -91,7 +91,7 @@ def test_getpath_buffer_is_terminated_and_bounded(size):
 
     adapter = object.__new__(with_capabilities(object))
     adapter.encoding = "utf-8"
-    adapter.operations = lambda op, path: "/Caf\N{LATIN SMALL LETTER E WITH ACUTE}"
+    adapter.operations = lambda op, path, fh: "/Caf\N{LATIN SMALL LETTER E WITH ACUTE}"
     buffer = ctypes.create_string_buffer(b"x" * 20)
     expected = "/Caf\N{LATIN SMALL LETTER E WITH ACUTE}".encode() + b"\0"
     result = adapter.getpath(b"/caf\xc3\xa9", buffer, size, None)
@@ -145,3 +145,18 @@ def test_delete_access_uses_renamed_object_protection(directory, protected, repl
     else:
         assert ops.access("/before", DELETE_OK) == 0
     assert paths == ["/after"]
+
+
+@pytest.mark.parametrize("fh", [None, 7])
+def test_getpath_passes_the_handle_winfsp_gives(fh):
+    class FileInfo(ctypes.Structure):
+        _fields_ = [("flags", ctypes.c_int), ("fh", ctypes.c_uint64)]
+
+    calls = []
+    adapter = object.__new__(with_capabilities(object))
+    adapter.encoding = "utf-8"
+    adapter.operations = lambda op, path, handle: calls.append((op, path, handle)) or path
+    fi = None if fh is None else ctypes.pointer(FileInfo(0, fh))
+    buffer = ctypes.create_string_buffer(16)
+    assert adapter.getpath(b"/new", buffer, 16, fi) == 0
+    assert calls == [("getpath", "/new", fh)]

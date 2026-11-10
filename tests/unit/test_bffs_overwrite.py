@@ -459,6 +459,9 @@ def _unlinked_while_held(opener):
     delete to release()."""
     volume = _FakeBFFS({"file": ORIGINAL})
     fs = _bffs_fs(volume)
+    # create() over an existing file is a POSIX O_TRUNC create; WinFsp
+    # sends create() only for a name that doesn't exist (_refuse_existing).
+    fs._winfsp = False
 
     def delete_object(lock, name, **kwargs):
         if any(h["name"] == name for h in volume.handles.values()):

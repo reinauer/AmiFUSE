@@ -58,7 +58,10 @@ def with_capabilities(fuse_class):
             super().__init__(*args, **kwargs)
 
         def getpath(self, path, buffer, size, fi):
-            canonical = self.operations("getpath", path.decode(self.encoding))
+            # After create() WinFsp passes the new file's handle, which
+            # spares listing its parent while the handler refuses its lock.
+            fh = fi.contents.fh if fi else None
+            canonical = self.operations("getpath", path.decode(self.encoding), fh)
             encoded = canonical.encode(self.encoding) + b"\0"
             if len(encoded) > size:
                 return -errno.ENAMETOOLONG

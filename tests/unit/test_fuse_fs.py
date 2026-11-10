@@ -632,7 +632,7 @@ class TestFormatVolume:
         monkeypatch.setattr(
             fuse_fs_mod,
             "get_partition_info",
-            lambda image, block_size, partition: {"dostype": 0x53465300},
+            lambda image, block_size, partition, *, write=False: {"dostype": 0x53465300},
         )
 
         mock_bridge = MagicMock()
@@ -682,7 +682,7 @@ class TestFormatVolume:
         image.write_bytes(b"")
         monkeypatch.setattr(
             fuse_fs_mod, "get_partition_info",
-            lambda image, block_size, partition: {"name": "DH0", "dostype": 0x444F5303},
+            lambda image, block_size, partition, *, write=False: {"name": "DH0", "dostype": 0x444F5303},
         )
         monkeypatch.setattr(fuse_fs_mod, "extract_embedded_driver", lambda *a: None)
         mock_bridge = MagicMock()
@@ -729,7 +729,7 @@ class TestFormatVolume:
         monkeypatch.setattr(
             fuse_fs_mod,
             "get_partition_info",
-            lambda image, block_size, partition: {"dostype": 0x50465303},
+            lambda image, block_size, partition, *, write=False: {"dostype": 0x50465303},
         )
         bridge_cls = MagicMock(side_effect=error)
         monkeypatch.setattr(fuse_fs_mod, "HandlerBridge", bridge_cls)
@@ -825,7 +825,7 @@ class TestFormatVolume:
         monkeypatch.setattr(
             fuse_fs_mod,
             "get_partition_info",
-            lambda image, block_size, partition: {"dostype": 0x50465303},
+            lambda image, block_size, partition, *, write=False: {"dostype": 0x50465303},
         )
         monkeypatch.setattr(fuse_fs_mod, failing, MagicMock(side_effect=error))
         bridge_cls = MagicMock()
@@ -868,7 +868,7 @@ class TestFormatVolume:
         monkeypatch.setattr(
             fuse_fs_mod,
             "get_partition_info",
-            lambda image, block_size, partition: {"dostype": 0x50465303},
+            lambda image, block_size, partition, *, write=False: {"dostype": 0x50465303},
         )
         monkeypatch.setattr(
             fuse_fs_mod,
@@ -2358,6 +2358,9 @@ def _fake_write_bridge(fuse_fs_mod, handler, free_blocks=2048):
         info = {"num_blocks": 4096, "num_blocks_used": 4096 - free_blocks,
                 "bytes_per_block": 512}
     bridge.get_disk_info = MagicMock(return_value=info)
+    # The fake file is examined only through its handle; on WinFsp,
+    # create() refuses a name stat_path finds (_refuse_existing).
+    bridge.stat_path = MagicMock(return_value=None)
     return bridge
 
 
@@ -7718,6 +7721,9 @@ def write_fs(fuse_mock):
     bridge = MagicMock()
     bridge._write_enabled = True
     bridge.state = None  # _check_handler_alive treats this as "not crashed"
+    # Nothing exists until a test says so: on WinFsp, create() refuses a
+    # name stat_path finds (_refuse_existing).
+    bridge.stat_path.return_value = None
     _answer_open_file_reply(bridge)
     fs = AmigaFuseFS(bridge, debug=False, icons=False)
     return fs, bridge
@@ -7787,6 +7793,8 @@ class TestPinnedStatCache:
 
         # Tripwire: any call to stat_path means the cache miss happened
         # and the bug is back. The actual bug path returned None here.
+        # (On WinFsp, create() itself looks the name up first.)
+        bridge.stat_path.reset_mock()
         bridge.stat_path.side_effect = AssertionError(
             "post-create getattr fell through to handler instead of "
             "hitting the pinned stat cache"
