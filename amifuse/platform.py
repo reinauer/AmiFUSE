@@ -1225,7 +1225,11 @@ def _pid_exists(pid: int) -> bool:
 
 
 def _find_mount_owner_pids(mountpoint: Path) -> List[int]:
-    """Find serving processes, excluding Windows mounts still starting."""
+    """Find serving processes, excluding Windows mounts still starting.
+
+    A Windows mount that has begun to unmount is an owner: an unmount
+    request waits for the one under way (#441).
+    """
     return _find_mount_pids(mountpoint, ready=True)
 
 
@@ -1260,13 +1264,13 @@ def _find_mount_pids(mountpoint: Path, *, ready: bool) -> List[int]:
             # resolving through WinFsp can produce a different device path.
             return ntpath.normcase(ntpath.abspath(path))
 
-        from .windows_unmount import is_mount_ready
+        from .windows_unmount import mount_reached_init
 
         target = key(mountpoint)
         return [mount["pid"] for mount in all_mounts
                 if mount.get("mountpoint") is not None
                 and key(mount["mountpoint"]) == target
-                and is_mount_ready(mount["pid"]) == ready]
+                and mount_reached_init(mount["pid"]) == ready]
 
     raw_mountpoint = str(mountpoint)
     abs_mountpoint = str(mountpoint.resolve(strict=False))

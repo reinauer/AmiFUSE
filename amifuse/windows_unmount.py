@@ -26,7 +26,6 @@ class _Events:
             "CreateEventW": (ptr, [ptr, ctypes.c_int, ctypes.c_int, ctypes.c_wchar_p]),
             "OpenEventW": (ptr, [word, ctypes.c_int, ctypes.c_wchar_p]),
             "SetEvent": (ctypes.c_int, [ptr]),
-            "ResetEvent": (ctypes.c_int, [ptr]),
             "WaitForSingleObject": (word, [ptr, word]),
             "CloseHandle": (ctypes.c_int, [ptr]),
         }
@@ -61,10 +60,6 @@ class _Events:
 
     def set(self, handle):
         if not self.dll.SetEvent(handle):
-            raise ctypes.WinError(ctypes.get_last_error())
-
-    def reset(self, handle):
-        if not self.dll.ResetEvent(handle):
             raise ctypes.WinError(ctypes.get_last_error())
 
     def wait(self, handle, timeout):
@@ -141,16 +136,9 @@ class UnmountControl:
         handle = self.handles.pop("ready", None)
         if handle is not None:
             self.api.close(handle)
-        # Reset "mounted" rather than close it, so that is_mount_ready() is
-        # false from here on while mount_reached_init() stays true: during
-        # destroy's flush the mount is ending, not starting (#428). close()
-        # closes it.
-        handle = self.handles.get("mounted")
-        if handle is not None:
-            try:
-                self.api.reset(handle)
-            except OSError:
-                self.api.close(self.handles.pop("mounted"))
+        # "mounted" stays until close(): during destroy's flush the mount
+        # is ending, not starting, and an unmount request waits for the
+        # one under way (#428, #441).
         self.stopped.set()
         if self.thread is not None:
             self.thread.join()
@@ -188,20 +176,6 @@ def mount_reached_init(pid):
     api.close(handle)
     return True
 
-
-def is_mount_ready(pid):
-    """Whether this process reached FUSE init and has not begun teardown."""
-    api = _Events()
-    try:
-        handle = api.open(pid, "mounted")
-    except OSError as exc:
-        if getattr(exc, "winerror", None) == 2:
-            return False
-        raise
-    try:
-        return api.wait(handle, 0)
-    finally:
-        api.close(handle)
 
 
 class UnmountError(OSError):
