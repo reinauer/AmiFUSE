@@ -28,6 +28,9 @@ class Events:
     def set(self, handle):
         self.events[handle].set()
 
+    def reset(self, handle):
+        self.events[handle].clear()
+
     def wait(self, handle, timeout):
         return self.events[handle].wait(timeout)
 
@@ -205,6 +208,7 @@ def test_mount_owner_is_process_behind_venv_launcher(monkeypatch):
     # A venv's python.exe re-runs the same command line under the base
     # interpreter; only that child creates the PID-named unmount events.
     monkeypatch.setattr(unmount, "is_mount_ready", lambda pid: True)
+    monkeypatch.setattr(unmount, "mount_reached_init", lambda pid: True)
     from amifuse import platform
 
     cmd = {"mountpoint": "J:", "image": "pfs.hdf", "uptime_seconds": 1,
@@ -315,8 +319,12 @@ def test_mounted_marker_lifetime(monkeypatch):
         control.start()
         assert events.events["mounted"].is_set()
         assert unmount.is_mount_ready(os.getpid())
+        assert unmount.mount_reached_init(os.getpid())
         control.stop()
-        assert "mounted" in events.closed
-        assert "mounted" not in control.handles
+        # Unmounting, not starting, until close() (#428).
+        assert not unmount.is_mount_ready(os.getpid())
+        assert unmount.mount_reached_init(os.getpid())
+        assert "mounted" in control.handles
     finally:
         control.close()
+    assert "mounted" not in control.handles

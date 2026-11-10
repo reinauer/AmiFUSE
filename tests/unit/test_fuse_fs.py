@@ -73,14 +73,19 @@ class TestFuseLazyLoad:
     def test_imports_and_caches_fuse_on_demand(self, monkeypatch):
         import amifuse.fuse_fs as fuse_fs_mod
 
-        sentinel = object()
+        sentinel = type("FUSE", (), {})
         fake_fuse = types.ModuleType("fuse")
         fake_fuse.FUSE = sentinel
         monkeypatch.setitem(sys.modules, "fuse", fake_fuse)
         monkeypatch.setattr(fuse_fs_mod, "FUSE", None)
 
-        assert fuse_fs_mod._require_fuse() is sentinel
-        assert fuse_fs_mod.FUSE is sentinel
+        loaded = fuse_fs_mod._require_fuse()
+        if sys.platform.startswith("win"):
+            assert issubclass(loaded, sentinel)
+        else:
+            assert loaded is sentinel
+        assert fuse_fs_mod.FUSE is loaded
+        assert fuse_fs_mod._require_fuse() is loaded
 
     @pytest.mark.parametrize("failure", [ImportError, OSError])
     def test_reports_unavailable_fuse(self, monkeypatch, failure):
@@ -2353,6 +2358,9 @@ def _fake_write_bridge(fuse_fs_mod, handler, free_blocks=2048):
         info = {"num_blocks": 4096, "num_blocks_used": 4096 - free_blocks,
                 "bytes_per_block": 512}
     bridge.get_disk_info = MagicMock(return_value=info)
+    # The fake file is examined only through its handle; on WinFsp,
+    # create() refuses a name stat_path finds (_refuse_existing).
+    bridge.stat_path = MagicMock(return_value=None)
     return bridge
 
 
@@ -7713,6 +7721,9 @@ def write_fs(fuse_mock):
     bridge = MagicMock()
     bridge._write_enabled = True
     bridge.state = None  # _check_handler_alive treats this as "not crashed"
+    # Nothing exists until a test says so: on WinFsp, create() refuses a
+    # name stat_path finds (_refuse_existing).
+    bridge.stat_path.return_value = None
     _answer_open_file_reply(bridge)
     fs = AmigaFuseFS(bridge, debug=False, icons=False)
     return fs, bridge
@@ -7782,6 +7793,8 @@ class TestPinnedStatCache:
 
         # Tripwire: any call to stat_path means the cache miss happened
         # and the bug is back. The actual bug path returned None here.
+        # (On WinFsp, create() itself looks the name up first.)
+        bridge.stat_path.reset_mock()
         bridge.stat_path.side_effect = AssertionError(
             "post-create getattr fell through to handler instead of "
             "hitting the pinned stat cache"

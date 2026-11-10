@@ -26,6 +26,7 @@ class _Events:
             "CreateEventW": (ptr, [ptr, ctypes.c_int, ctypes.c_int, ctypes.c_wchar_p]),
             "OpenEventW": (ptr, [word, ctypes.c_int, ctypes.c_wchar_p]),
             "SetEvent": (ctypes.c_int, [ptr]),
+            "ResetEvent": (ctypes.c_int, [ptr]),
             "WaitForSingleObject": (word, [ptr, word]),
             "CloseHandle": (ctypes.c_int, [ptr]),
         }
@@ -60,6 +61,10 @@ class _Events:
 
     def set(self, handle):
         if not self.dll.SetEvent(handle):
+            raise ctypes.WinError(ctypes.get_last_error())
+
+    def reset(self, handle):
+        if not self.dll.ResetEvent(handle):
             raise ctypes.WinError(ctypes.get_last_error())
 
     def wait(self, handle, timeout):
@@ -118,9 +123,9 @@ class UnmountControl:
         thread = threading.Thread(target=watch, daemon=True)
         thread.start()
         self.thread = thread
-        # stop(), which destroy() and close() call first, drops it, so the
-        # event goes when the mount ends. A launch that never sees it
-        # reports a timeout.
+        # stop(), which destroy() and close() call first, drops the ready
+        # event, so it goes when the mount ends. A launch that never sees
+        # it reports a timeout.
         token = os.environ.get(READY_TOKEN_ENV)
         if token:
             try:
@@ -133,10 +138,19 @@ class UnmountControl:
         # The mount is going: drop the ready event before destroy's flush,
         # which may take seconds, so that a launch never reads a mount whose
         # mount point WinFsp refused after init as up.
-        for kind in ("ready", "mounted"):
-            handle = self.handles.pop(kind, None)
-            if handle is not None:
-                self.api.close(handle)
+        handle = self.handles.pop("ready", None)
+        if handle is not None:
+            self.api.close(handle)
+        # Reset "mounted" rather than close it, so that is_mount_ready() is
+        # false from here on while mount_reached_init() stays true: during
+        # destroy's flush the mount is ending, not starting (#428). close()
+        # closes it.
+        handle = self.handles.get("mounted")
+        if handle is not None:
+            try:
+                self.api.reset(handle)
+            except OSError:
+                self.api.close(self.handles.pop("mounted"))
         self.stopped.set()
         if self.thread is not None:
             self.thread.join()
@@ -156,6 +170,23 @@ class UnmountControl:
         for handle in self.handles.values():
             self.api.close(handle)
         self.handles.clear()
+
+
+def mount_reached_init(pid):
+    """Whether this process reached FUSE init, also once teardown began.
+
+    Its "mounted" event exists from FUSE init until the process closes its
+    unmount control, which follows destroy's flush.
+    """
+    api = _Events()
+    try:
+        handle = api.open(pid, "mounted")
+    except OSError as exc:
+        if getattr(exc, "winerror", None) == 2:
+            return False
+        raise
+    api.close(handle)
+    return True
 
 
 def is_mount_ready(pid):

@@ -176,6 +176,9 @@ def _fs(volume, free_blocks=4096):
     bridge.open_file_reply = lambda path, flags: (volume.open(flags), 0)
     bridge.close_file = volume.end
     bridge.free_lock = MagicMock()
+    # The file is examined only through its handle; on WinFsp, create()
+    # refuses a name stat_path finds (_refuse_existing).
+    bridge.stat_path = MagicMock(return_value=None)
     return fuse_fs.AmigaFuseFS(bridge, debug=False, icons=False)
 
 

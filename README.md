@@ -275,6 +275,13 @@ shutdown and waits for handler flushing and disk cleanup. A timeout or flush
 failure is reported as an error; the unmount request never falls back to
 force-killing the process.
 Check the mount log and wait for a successful unmount before removing the card.
+On Windows, flushing the root directory or the volume waits for pending close
+callbacks; a flush of any other directory waits for nothing, so do not rely on
+flushing a file's own folder. Neither flushes data buffered by an open file:
+applications must flush each open file itself (for example, with
+`FlushFileBuffers`) before relying on its data being stored. Closing a file is
+asynchronous; a successful close alone does not mean its pending metadata has
+reached the image.
 No extra pywin32 dependency is required.
 
 When running this change from source, install the accompanying amitools
