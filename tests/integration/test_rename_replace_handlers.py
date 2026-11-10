@@ -899,10 +899,9 @@ def test_listing_gives_a_pending_grow_its_logical_length(ops):
         ops.release("/grown", fh)
 
 
-def test_listing_leaves_a_soft_link_to_getattr(tmp_path):
-    # The handler refuses a lock on a soft link, so getattr() fails on it,
-    # and WinFsp drops an entry whose getattr() fails. Its listed
-    # attributes, a directory's, would list it as one nothing can open.
+def test_listing_gives_a_soft_link_as_a_symbolic_link(tmp_path):
+    # Listed as a directory, a soft link would be one nothing can open;
+    # its listed attributes are a symbolic link's, as getattr() gives (#434).
     import struct
     from tests.integration.test_ls_recursive_ffs import BLOCK, _edit_block, _xdftool
 
@@ -930,7 +929,8 @@ def test_listing_leaves_a_soft_link_to_getattr(tmp_path):
         assert any(e["name"] == "sl" and e["dir_type"] == 3
                    for e in bridge.list_dir_path("/"))
         attrs = {name: st for name, st, _ in ops.readdir("/", None)}
-        assert "sl" in attrs and attrs["sl"] is None
+        assert attrs["sl"]["st_mode"] & 0o170000 == 0o120000
+        assert attrs["sl"] == ops.getattr("/sl")
         assert attrs["Target"]["st_mode"] & 0o170000 == 0o040000
     finally:
         bridge.close()

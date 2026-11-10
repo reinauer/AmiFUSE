@@ -3879,11 +3879,9 @@ class AmigaFuseFS(_FuseOperations):
             # Pre-populate stat cache from directory listing
             child_path = path.rstrip("/") + "/" + name if path != "/" else "/" + name
             stat_result = self._stat_from_fib(ent, name, int(now))
-            if ent.get("dir_type") != 3:  # ST_SOFTLINK
-                # A soft link lists as a directory (dir_type >= 0), but the
-                # handler refuses a lock on it, so getattr() fails. It goes
-                # without attributes, so WinFsp asks getattr(), as before.
-                listed[name] = stat_result
+            # A soft link's attributes are a symbolic link's, as getattr()
+            # gives them (#434).
+            listed[name] = stat_result
             with self._cache_lock:
                 _prune_cache(self._stat_cache, self._pinned_stats)
                 # A pinned entry stands until release (_pin_stat), and
@@ -7238,7 +7236,7 @@ def _not_walked_reason(ent):
     would split the name, and `q:` is the root of the volume, which holds
     `q:` again.
     """
-    if ent.get("dir_type") == 3:  # ST_SOFTLINK
+    if ent.get("dir_type") == ST_SOFTLINK:
         return "it is a soft link"
     if ent.get("dir_type") == 4:  # ST_LINKDIR
         return "it is a hard link to a directory"
