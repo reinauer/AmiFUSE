@@ -117,6 +117,28 @@ def test_real_release_commits_pending_changes(monkeypatch, reason):
     assert not fs._fh_cache and not fs._pending_deletes
 
 
+
+def test_release_of_a_link_holder_commits_its_deferred_delete():
+    # The delete of T.txt waited on l, a hard link to it, open as 42 (#425):
+    # l's release sends it, though nothing is pending under l's own name.
+    import threading
+
+    order = []
+    bridge = SimpleNamespace(_write_enabled=True,
+        close_file=lambda address: order.append("close"),
+        flush_volume=lambda: order.append("flush"),
+        locate_path=lambda path: (1, 0, []),
+        delete_object=lambda lock, name: (order.append("delete") or -1, 0))
+    fs = AmigaFuseFS(bridge)
+    fs._winfsp = True
+    fs._fh_cache[42] = {"path": "/l", "fh_addr": 7, "dirty": False,
+                        "lock": threading.Lock()}
+    fs._pending_deletes.add("/T.txt")
+    fs._link_deletes["/T.txt"] = {42}
+    assert fs("release", "/l", 42) == 0
+    assert order == ["close", "delete", "flush"]
+    assert not fs._fh_cache and not fs._pending_deletes and not fs._link_deletes
+
 def test_real_releasedir_commits_deferred_delete():
     order = []
     bridge = SimpleNamespace(_write_enabled=True,

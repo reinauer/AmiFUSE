@@ -3006,9 +3006,13 @@ class AmigaFuseFS(_FuseOperations):
             with self._fh_lock:
                 entry = self._fh_cache.get(args[-1], {})
                 path = _handle_path(entry, args[0])
+                # A delete waiting on this handle, open through a hard
+                # link, is pending under the other name (_link_deletes).
                 flush_metadata = bool(entry.get("dirty") or path in self._held_dates
                                       or path in self._pending_deletes
-                                      or self._pending_dir_deletes)
+                                      or self._pending_dir_deletes
+                                      or any(args[-1] in holders
+                                             for holders in self._link_deletes.values()))
         pending_before = set(self._pending_deletes) if op in {"unlink", "rmdir"} else set()
         result = super().__call__(op, *args)
         if flush_metadata and op in {"unlink", "rmdir"}:

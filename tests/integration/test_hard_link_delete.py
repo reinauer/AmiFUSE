@@ -7,6 +7,9 @@ the release() of that handle. The tests call the AmigaFuseFS callbacks
 directly, as a mount would, on an ADF the bundled FastFileSystem serves.
 xdftool can't write a hard link, so a file's header is turned into an
 ST_LINKFILE block, as test_ls_recursive_ffs makes its directory link.
+The handles are opened read/write: on WinFsp a read-only handle holds no
+AmigaDOS lock (#408), so FastFileSystem deletes the file at once and the
+link takes over its data.
 """
 
 import errno
@@ -108,7 +111,7 @@ def _names(ops):
                                            ("/lf", "/TargetFile.txt")])
 def test_delete_waits_for_a_handle_open_through_a_link(ops, winfsp, deleted, held):
     ops._winfsp = winfsp
-    fh = ops.open(held, os.O_RDONLY)
+    fh = ops.open(held, os.O_RDWR)
     try:
         # Answered as done: WinFsp would discard a refusal, and the file goes
         # once the handle on its other name closes.
@@ -122,7 +125,7 @@ def test_delete_waits_for_a_handle_open_through_a_link(ops, winfsp, deleted, hel
         ops.release(held, fh)
     assert _names(ops) == {os.path.basename(held), "other.txt"}
     assert ops.bridge.stat_path(deleted) is None
-    fh = ops.open(held, os.O_RDONLY)
+    fh = ops.open(held, os.O_RDWR)
     try:
         assert ops.read(held, 7, 0, fh) == b"target\n"
     finally:
@@ -131,8 +134,8 @@ def test_delete_waits_for_a_handle_open_through_a_link(ops, winfsp, deleted, hel
 
 def test_delete_waits_for_the_last_handle_through_a_link(ops):
     ops._winfsp = True
-    first = ops.open("/lf", os.O_RDONLY)
-    second = ops.open("/lf", os.O_RDONLY)
+    first = ops.open("/lf", os.O_RDWR)
+    second = ops.open("/lf", os.O_RDWR)
     assert ops.unlink("/TargetFile.txt") == 0
     ops.release("/lf", first)
     assert ops.bridge.stat_path("/TargetFile.txt") is not None
@@ -145,8 +148,8 @@ def test_delete_with_a_handle_on_both_names(ops):
     # The deleted name's own release() is refused while the link's handle is
     # open; the link's release() sends the delete again.
     ops._winfsp = True
-    own = ops.open("/TargetFile.txt", os.O_RDONLY)
-    link = ops.open("/lf", os.O_RDONLY)
+    own = ops.open("/TargetFile.txt", os.O_RDWR)
+    link = ops.open("/lf", os.O_RDWR)
     assert ops.unlink("/TargetFile.txt") == 0
     ops.release("/TargetFile.txt", own)
     assert "TargetFile.txt" not in _names(ops)
@@ -158,7 +161,7 @@ def test_delete_with_a_handle_on_both_names(ops):
 
 def test_an_unrelated_open_file_does_not_hold_a_delete(ops):
     ops._winfsp = True
-    fh = ops.open("/other.txt", os.O_RDONLY)
+    fh = ops.open("/other.txt", os.O_RDWR)
     try:
         assert ops._link_holders("/TargetFile.txt") == set()
         assert ops.unlink("/TargetFile.txt") == 0
@@ -173,7 +176,7 @@ def test_folder_delete_waits_for_a_file_held_through_a_link(folder_ops):
     # waits for the file's, as for a file open under its own name.
     ops = folder_ops
     ops._winfsp = True
-    fh = ops.open("/l", os.O_RDONLY)
+    fh = ops.open("/l", os.O_RDWR)
     try:
         assert ops.unlink("/D/T.txt") == 0
         assert ops.readdir("/D", None) == [".", ".."]
@@ -185,7 +188,7 @@ def test_folder_delete_waits_for_a_file_held_through_a_link(folder_ops):
     assert ops.bridge.stat_path("/D/T.txt") is None
     assert ops.bridge.stat_path("/D") is None
     assert _names(ops) == {"l"}
-    fh = ops.open("/l", os.O_RDONLY)
+    fh = ops.open("/l", os.O_RDWR)
     try:
         assert ops.read("/l", 7, 0, fh) == b"target\n"
     finally:
