@@ -9,6 +9,8 @@ import errno
 
 READDIR_PLUS = 1 << 21  # FSP_FUSE_CAP_READDIR_PLUS
 CASE_INSENSITIVE = 1 << 29
+DELETE_ACCESS = 1 << 24
+DELETE_OK = 0x40000000
 
 
 class _Connection(ctypes.Structure):
@@ -84,8 +86,10 @@ def with_capabilities(fuse_class):
                 # behavior too. Windows folds Unicode even on DOS0/DOS1's
                 # ASCII-only fold, so non-ASCII case pairs can still alias
                 # on those volumes.
+                wanted = DELETE_ACCESS
                 if getpath_supported and self.operations._name_fold is not None:
-                    info.want |= info.capable & CASE_INSENSITIVE
+                    wanted |= CASE_INSENSITIVE
+                info.want |= info.capable & wanted
             return super().init(conn)
 
     return WinFspFUSE
