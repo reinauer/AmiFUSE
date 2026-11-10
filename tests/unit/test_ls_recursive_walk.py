@@ -91,13 +91,19 @@ def test_a_hard_link_to_an_ancestor_is_not_followed(capsys):
     assert "/a/b/loop not listed (it is a hard link" in capsys.readouterr().err
 
 
-def test_a_soft_link_is_not_followed(capsys):
+def test_a_soft_link_is_listed_as_a_link_and_not_followed(capsys):
+    # Not a directory the walk leaves alone: a link, with its target (#436).
     handler = _FakeHandler({"/": [_entry("up", ST_SOFTLINK)]},
                            aliases=[("/up", "/")])
+    handler.read_link = Mock(return_value=("Links:", 0))
 
-    assert _names(fs._ls_recursive(handler, "/")) == ["/up"]
+    entries = fs._ls_recursive(handler, "/")
+
+    assert [(e["path"], e["type"], e["target"]) for e in entries] == [
+        ("/up", "link", "Links:")]
+    handler.read_link.assert_called_once_with("/up")
     assert handler.calls == ["/"]
-    assert "/up not listed (it is a soft link" in capsys.readouterr().err
+    assert capsys.readouterr().err == ""
 
 
 def test_the_walk_goes_on_past_a_directory_it_leaves_alone(capsys):

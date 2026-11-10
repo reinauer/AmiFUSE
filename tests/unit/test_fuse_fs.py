@@ -5777,7 +5777,7 @@ class TestCmdVerify:
 
         assert data["status"] == "ok"
         assert data["filesystem_responsive"] is None
-        mock_bridge.stat_path.assert_called_once_with("/")
+        mock_bridge.stat_path.assert_called_once_with("/", links=True)
 
     def test_verify_unknown_mount_status_is_reported_for_volume_json(
             self, mock_bridge_for_verify, capsys):

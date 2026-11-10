@@ -7266,14 +7266,12 @@ def _format_protection(prot_bits: int) -> str:
 def _not_walked_reason(ent):
     """Why _ls_recursive lists directory entry `ent` but stays out of it, or None.
 
-    A link may lead back to a directory the walk is inside, so it would never
-    end. The handler follows a hard link, and refuses a soft link in a path.
-    The names come from the disk, where a colon or a slash can be: a slash
-    would split the name, and `q:` is the root of the volume, which holds
-    `q:` again.
+    A hard link may lead back to a directory the walk is inside, so it
+    would never end; the handler follows it. A soft link is listed as a
+    link, not a directory (_ls_entry). The names come from the disk, where a
+    colon or a slash can be: a slash would split the name, and `q:` is the
+    root of the volume, which holds `q:` again.
     """
-    if ent.get("dir_type") == ST_SOFTLINK:
-        return "it is a soft link"
     if ent.get("dir_type") == 4:  # ST_LINKDIR
         return "it is a hard link to a directory"
     if "/" in ent["name"]:
@@ -7302,6 +7300,51 @@ def _listing_of(raw):
     )
 
 
+def _entry_type(ent) -> str:
+    """"dir", "file" or "link" (a soft link) for FileInfoBlock entry ent."""
+    if ent.get("dir_type") == ST_SOFTLINK:
+        return "link"
+    return "dir" if ent.get("dir_type", 0) > 0 else "file"
+
+
+def _ls_entry(bridge, ent, path: str) -> dict:
+    """The ls entry for FileInfoBlock entry ent at path.
+
+    A soft link has its target, as the handler stores it, an AmigaDOS path,
+    or None when the handler doesn't give it.
+    """
+    prot_bits = ent.get("protection", 0)
+    entry = {
+        "name": ent["name"],
+        "path": path,
+        "type": _entry_type(ent),
+        "size": ent.get("size", 0),
+        "protection": _format_protection(prot_bits),
+        "protection_bits": prot_bits,
+    }
+    if entry["type"] == "link":
+        entry["target"] = bridge.read_link(path)[0]
+    return entry
+
+
+def _soft_link_target(bridge, path: str):
+    """(True, target) when path is a soft link, else (False, None).
+
+    stat_path() can't examine a soft link, so a command that finds nothing
+    there asks this before it says the path is not found.
+    """
+    ent = bridge.stat_path(path, links=True)
+    if ent is None or ent.get("dir_type") != ST_SOFTLINK:
+        return False, None
+    return True, bridge.read_link(path)[0]
+
+
+def _soft_link_message(path: str, target) -> str:
+    if target is None:
+        return f"{path} is a soft link"
+    return f"{path} is a soft link to {target}"
+
+
 def _ls_recursive(bridge, root_path: str) -> list:
     """Recursively list all entries under root_path.
 
@@ -7323,19 +7366,10 @@ def _ls_recursive(bridge, root_path: str) -> list:
             above = above + (listing,)
         dir_children = []
         for ent in raw:
-            is_dir = ent.get("dir_type", 0) > 0
             child = "/" + ent["name"] if current == "/" else current + "/" + ent["name"]
-            prot_bits = ent.get("protection", 0)
-            prot_str = _format_protection(prot_bits)
-            entries.append({
-                "name": ent["name"],
-                "path": child,
-                "type": "dir" if is_dir else "file",
-                "size": ent.get("size", 0),
-                "protection": prot_str,
-                "protection_bits": prot_bits,
-            })
-            if is_dir:
+            entry = _ls_entry(bridge, ent, child)
+            entries.append(entry)
+            if entry["type"] == "dir":
                 reason = _not_walked_reason(ent)
                 if reason is None:
                     dir_children.append(child)
@@ -7387,7 +7421,7 @@ def cmd_ls(args):
             raw = bridge.list_dir_path(path)
             if not raw and path != "/":
                 # Path might not exist -- try stat to distinguish
-                stat = bridge.stat_path(path)
+                stat = bridge.stat_path(path, links=True)
                 _refuse_crashed_handler(bridge, "ls", use_json)
                 if stat is None:
                     # On an unmountable volume no path resolves, so this
@@ -7403,20 +7437,11 @@ def cmd_ls(args):
                         print(f"Warning: mount state unknown -- {mount_reason}",
                               file=sys.stderr)
                     raise SystemExit(f"Error: path not found: {path}")
-            entries = []
-            for ent in raw:
-                is_dir = ent.get("dir_type", 0) > 0
-                child = "/" + ent["name"] if path == "/" else path + "/" + ent["name"]
-                prot_bits = ent.get("protection", 0)
-                prot_str = _format_protection(prot_bits)
-                entries.append({
-                    "name": ent["name"],
-                    "path": child,
-                    "type": "dir" if is_dir else "file",
-                    "size": ent.get("size", 0),
-                    "protection": prot_str,
-                    "protection_bits": prot_bits,
-                })
+            entries = [
+                _ls_entry(bridge, ent,
+                          "/" + ent["name"] if path == "/" else path + "/" + ent["name"])
+                for ent in raw
+            ]
 
         # A crash during the listing cuts it short.
         _refuse_crashed_handler(bridge, "ls", use_json)
@@ -7433,6 +7458,10 @@ def cmd_ls(args):
                 name = escape_text(ent["name"])
                 if ent["type"] == "dir":
                     print(f"  {name:30s}  <dir>     {ent['protection']}")
+                elif ent["type"] == "link":
+                    target = ent["target"]
+                    arrow = "" if target is None else f"  -> {escape_text(target)}"
+                    print(f"  {name:30s}  <link>    {ent['protection']}{arrow}")
                 else:
                     print(f"  {name:30s}  {ent['size']:>10d}  {ent['protection']}")
             # An empty listing that we could not confirm is a real listing
@@ -7451,6 +7480,26 @@ def cmd_ls(args):
         raise SystemExit(f"Error during directory listing: {e}")
     finally:
         _cleanup_bridge(bridge, temp_driver)
+
+
+def _refuse_soft_link(bridge, command: str, path: str, use_json: bool, state):
+    """Exit with an IS_SOFT_LINK error when path, which stat_path() can't
+    examine, is a soft link; return otherwise.
+
+    The command doesn't follow it: the target is an AmigaDOS path, which can
+    name another volume.
+    """
+    import json
+
+    is_link, target = _soft_link_target(bridge, path)
+    if not is_link:
+        return
+    message = _soft_link_message(path, target)
+    if use_json:
+        details = dict(_mount_state_details(state) or {}, target=target)
+        print(json.dumps(_json_error(command, "IS_SOFT_LINK", message, details=details)))
+        sys.exit(1)
+    raise SystemExit(f"Error: {message}")
 
 
 def cmd_verify(args):
@@ -7515,7 +7564,7 @@ def cmd_verify(args):
         if file_path:
             # Verify a specific file
             normalized = "/" + file_path.lstrip("/")
-            stat = bridge.stat_path(normalized)
+            stat = bridge.stat_path(normalized, links=True)
             _refuse_crashed_handler(bridge, "verify", use_json)
             if stat is None:
                 # A missing file on a volume whose mount could not be
@@ -7537,9 +7586,11 @@ def cmd_verify(args):
                 "file": file_path,
                 "exists": True,
                 "size": stat.get("size", 0),
-                "type": "dir" if stat.get("dir_type", 0) > 0 else "file",
+                "type": _entry_type(stat),
                 "filesystem_responsive": mounted,
             }
+            if result_data["type"] == "link":
+                result_data["target"] = bridge.read_link(normalized)[0]
             if expect_size is not None:
                 result_data["expected_size"] = expect_size
                 result_data["size_matches"] = stat.get("size", 0) == expect_size
@@ -7550,6 +7601,8 @@ def cmd_verify(args):
                 print(f"File: {file_path}")
                 print(f"  Exists: yes")
                 print(f"  Type: {result_data['type']}")
+                if result_data.get("target") is not None:
+                    print(f"  Target: {escape_text(result_data['target'])}")
                 print(f"  Size: {stat.get('size', 0)}")
                 print(f"  Filesystem responsive: {responsive_text}")
                 if expect_size is not None:
@@ -7629,6 +7682,7 @@ def cmd_hash(args):
         stat = bridge.stat_path(normalized)
         _refuse_crashed_handler(bridge, "hash", use_json)
         if stat is None:
+            _refuse_soft_link(bridge, "hash", normalized, use_json, state)
             if use_json:
                 print(json.dumps(_json_error("hash", "FILE_NOT_FOUND",
                     f"File not found: {file_path}", details=_mount_state_details(state))))
@@ -7819,6 +7873,7 @@ def cmd_read(args):
         stat = bridge.stat_path(normalized)
         _refuse_crashed_handler(bridge, "read", use_json)
         if stat is None:
+            _refuse_soft_link(bridge, "read", normalized, use_json, state)
             if use_json:
                 print(json.dumps(_json_error("read", "FILE_NOT_FOUND",
                     f"File not found: {file_path}", details=_mount_state_details(state))))
