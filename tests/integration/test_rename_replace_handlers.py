@@ -518,6 +518,43 @@ def test_windows_delete_access_after_directory_rename(ops, recreate):
     assert not ops._pending_deletes
 
 
+
+@pytest.mark.integration
+def test_windows_delete_access_of_a_protected_object_at_a_renamed_name(
+        tmp_path, fixture_root):
+    # hA opened Y, renamed it to Z and stays open; a delete-protected P is
+    # moved to Y. WinFsp checks a delete-on-close open of Y with the same
+    # call as a delete through hA, before the new handle exists, and Y's
+    # protection was skipped for Z's, so the open was accepted and Y kept
+    # at cleanup (#438). FastFileSystem 47.4 renames a delete-protected
+    # directory; the bundled one refuses.
+    from amifuse.winfsp_fuse import DELETE_OK
+    from tests.integration.test_ls_recursive_ffs import _xdftool
+
+    source = fixture_root / "fixtures" / "readonly" / "ofs.adf"
+    driver = fixture_root / "drivers" / "FastFileSystem"
+    if not source.exists() or not driver.exists():
+        pytest.skip("Missing ofs.adf or FastFileSystem")
+    image = tmp_path / "ofs.adf"
+    shutil.copy2(source, image)
+    _xdftool(image, "makedir", "P", "+", "protect", "P", "rwe", "+", "makedir", "Y")
+    bridge = HandlerBridge(image, driver, read_only=False, adf_info=detect_adf(image))
+    try:
+        ops = AmigaFuseFS(bridge)
+        ops._winfsp = True
+        handle = ops.opendir("/Y")
+        try:
+            assert ops.rename("/Y", "/Z") == 0
+            assert ops.rename("/P", "/Y") == 0
+            assert _errno(ops.access, "/Y", DELETE_OK) == errno.EACCES
+        finally:
+            ops.releasedir("/Y", handle)
+        # With hA closed, the name means Y alone.
+        assert _errno(ops.access, "/Y", DELETE_OK) == errno.EACCES
+        assert ops.access("/Z", DELETE_OK) == 0
+    finally:
+        bridge.close()
+
 def test_getpath_of_a_created_file_does_not_list_its_parent(ops, monkeypatch):
     # WinFsp calls getpath right after create(), while the new file is open
     # for writing and the handler may refuse its lock. Listing the parent

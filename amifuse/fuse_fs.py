@@ -5307,22 +5307,40 @@ class AmigaFuseFS(_FuseOperations):
                     and self._folded(value.get("opened_as", value.get("path")) or "")
                     == self._folded(path)
                 }
+            paths = [path]
             if len(targets) == 1 and path not in targets:
                 target = targets.pop()
                 self._log_op("access", path, f"renamed delete target: {target}")
-                path = target
-            info = self.bridge.stat_path(path)
-            if info is None:
-                # An exclusive writer can prevent Examine by path. A
-                # parent listing still carries the object's protection.
-                parent, name = self._split_path(path)
-                info = next((entry for entry in self.bridge.list_dir_path(parent)
-                             if self._folded(entry["name"]) == self._folded(name)), None)
-            if info is None:
+                # WinFsp makes the same call, with nothing else to tell it
+                # apart, when it opens path for delete-on-close, before the
+                # new handle exists: the handle opened under path can then
+                # be another object's, which a rename took away (#438). An
+                # object at path is checked too, so that a wrong guess
+                # refuses the delete, which the program sees, and never
+                # accepts one the handler refuses at cleanup.
+                paths = [target, path]
+            found = False
+            for checked in paths:
+                info = self._delete_info(checked)
+                if info is None:
+                    continue
+                found = True
+                if info.get("protection", 0) & 1:  # FIBF_DELETE: set forbids delete
+                    raise FuseOSError(errno.EACCES)
+            if not found:
                 raise FuseOSError(errno.ENOENT)
-            if info.get("protection", 0) & 1:  # FIBF_DELETE: set forbids delete
-                raise FuseOSError(errno.EACCES)
         return 0
+
+    def _delete_info(self, path):
+        """The FileInfoBlock entry access() reads path's protection from."""
+        info = self.bridge.stat_path(path)
+        if info is None:
+            # An exclusive writer can prevent Examine by path. A parent
+            # listing still carries the object's protection.
+            parent, name = self._split_path(path)
+            info = next((entry for entry in self.bridge.list_dir_path(parent)
+                         if self._folded(entry["name"]) == self._folded(name)), None)
+        return info
 
     def listxattr(self, path):
         if self._debug:

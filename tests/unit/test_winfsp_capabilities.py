@@ -164,18 +164,22 @@ def test_delete_access_uses_renamed_object_protection(directory, protected, repl
             return {"name": "after", "protection": int(protected)}
         return None if replacement is None else {"name": "before", "protection": replacement}
     bridge = SimpleNamespace(_write_enabled=True,
-        state=SimpleNamespace(crashed=False), stat_path=stat)
+        state=SimpleNamespace(crashed=False), stat_path=stat,
+        list_dir_path=lambda path: [])
     ops = AmigaFuseFS(bridge)
     ops._winfsp = True
     ops._fh_cache[42] = {"path": "/after", "opened_as": "/before",
         **({"dir_handle": True} if directory else {"fh_addr": 7})}
-    if protected:
+    # The same call comes when /before is opened for delete-on-close, so an
+    # object at /before is checked too, and either one's protection
+    # refuses the delete (#438).
+    if protected or replacement == 1:
         with pytest.raises(FuseOSError) as caught:
             ops.access("/before", DELETE_OK)
         assert caught.value.errno == errno.EACCES
     else:
         assert ops.access("/before", DELETE_OK) == 0
-    assert paths == ["/after"]
+    assert paths == (["/after"] if protected else ["/after", "/before"])
 
 
 @pytest.mark.parametrize("fh", [None, 7])
