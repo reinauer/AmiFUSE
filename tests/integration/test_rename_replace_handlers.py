@@ -447,27 +447,31 @@ def test_getpath_does_not_enumerate_unlocked_directories(ops, monkeypatch):
     def refuse_listing(*args):
         raise AssertionError("getpath enumerated an unlocked directory")
 
-    monkeypatch.setattr(ops, "readdir", refuse_listing)
+    monkeypatch.setattr(ops, "_list_names", refuse_listing)
     assert ops.getpath("/canonical/mixedname") == "/Canonical/MixedName"
 
 
-def test_getpath_lists_only_the_parent_of_a_refused_lock(ops, monkeypatch):
+@pytest.mark.parametrize("readdir_plus", [False, True])
+def test_getpath_lists_only_the_parent_of_a_refused_lock(ops, monkeypatch, readdir_plus):
+    # With READDIR_PLUS readdir() gives (name, attributes, offset) tuples;
+    # getpath compares names alone.
     if ops._name_fold is None:
         pytest.skip("handler does not advertise case folding")
+    ops._readdir_plus = readdir_plus
     ops.mkdir("/Canonical", 0o755)
     _write(ops, "/Canonical/MixedName", b"data")
-    stat_path, readdir = ops.bridge.stat_path, ops.readdir
+    stat_path, list_names = ops.bridge.stat_path, ops._list_names
     listed = []
 
     def stat(path):
         return None if path == "/Canonical/mixedname" else stat_path(path)
 
-    def listing(path, fh):
+    def listing(path, names):
         listed.append(path)
-        return readdir(path, fh)
+        return list_names(path, names)
 
     monkeypatch.setattr(ops.bridge, "stat_path", stat)
-    monkeypatch.setattr(ops, "readdir", listing)
+    monkeypatch.setattr(ops, "_list_names", listing)
     assert ops.getpath("/canonical/mixedname") == "/Canonical/MixedName"
     assert listed == ["/Canonical"]
 
@@ -521,17 +525,17 @@ def test_getpath_of_a_created_file_does_not_list_its_parent(ops, monkeypatch):
     if ops._name_fold is None:
         pytest.skip("handler does not advertise case folding")
     ops.mkdir("/Canonical", 0o755)
-    readdir = ops.readdir
+    list_names = ops._list_names
 
     def refuse_listing(*args):
         raise AssertionError("getpath listed the parent of a created file")
 
     handle = ops.create("/Canonical/NewFile", 0o644)
     try:
-        monkeypatch.setattr(ops, "readdir", refuse_listing)
+        monkeypatch.setattr(ops, "_list_names", refuse_listing)
         assert ops.getpath("/canonical/newfile", handle) == "/Canonical/NewFile"
     finally:
-        monkeypatch.setattr(ops, "readdir", readdir)
+        monkeypatch.setattr(ops, "_list_names", list_names)
         ops.release("/Canonical/NewFile", handle)
 
 
@@ -849,6 +853,87 @@ def test_windows_pinned_reader_avoids_metadata_packets(ops, monkeypatch):
         if reader is not None:
             ops.release("/busy", reader)
         ops.release("/busy", writer)
+
+
+def test_directory_renamed_through_its_handle_lists_with_attributes(ops):
+    # WinFsp lists a directory handle under the path it was opened with,
+    # and asks getattr() under that path for any entry given without
+    # attributes. After a rename through the handle that path is stale, so
+    # every entry failed and the listing came back empty (#427). With
+    # READDIR_PLUS granted, readdir() gives each entry's attributes.
+    # test_windows_renamed_directory checks the same through WinFsp.
+    ops._winfsp = True
+    ops._readdir_plus = True
+    ops.mkdir("/L2a", 0o755)
+    _write(ops, "/L2a/f", b"data")
+    handle = ops.opendir("/L2a")
+    try:
+        assert ops.rename("/L2a", "/L2b") == 0
+        listing = ops.readdir("/L2a", handle)
+        assert _errno(ops.getattr, "/L2a/f") == errno.ENOENT
+        attrs = {name: st for name, st, offset in listing}
+        assert sorted(attrs) == [".", "..", "f"]
+        assert attrs["f"]["st_size"] == 4
+        assert attrs["f"]["st_mode"] & 0o170000 == 0o100000
+        assert attrs["."]["st_mode"] & 0o170000 == 0o040000
+        assert attrs[".."] == ops.getattr("/")
+        # and by the new path, as a second handle lists it
+        assert sorted(name for name, _, _ in ops.readdir("/L2b", None)) == [".", "..", "f"]
+    finally:
+        ops.releasedir("/L2a", handle)
+
+
+def test_listing_gives_a_pending_grow_its_logical_length(ops):
+    # truncate() defers the zeros of a grow; getattr() reports the length
+    # the file will have, and so must the listing WinFsp now takes it from.
+    ops._winfsp = True
+    ops._readdir_plus = True
+    _write(ops, "/grown", b"abc")
+    fh = ops.open("/grown", os.O_RDWR)
+    try:
+        assert ops.truncate("/grown", 8192, fh) == 0
+        ops._dir_cache.clear()
+        attrs = {name: st for name, st, _ in ops.readdir("/", None)}
+        assert attrs["grown"]["st_size"] == ops.getattr("/grown")["st_size"] == 8192
+    finally:
+        ops.release("/grown", fh)
+
+
+def test_listing_leaves_a_soft_link_to_getattr(tmp_path):
+    # The handler refuses a lock on a soft link, so getattr() fails on it,
+    # and WinFsp drops an entry whose getattr() fails. Its listed
+    # attributes, a directory's, would list it as one nothing can open.
+    import struct
+    from tests.integration.test_ls_recursive_ffs import BLOCK, _edit_block, _xdftool
+
+    image = _bundled_image(tmp_path)
+    empty = tmp_path / "empty"
+    empty.write_bytes(b"")
+    _xdftool(image, "write", str(empty), "sl", "+", "makedir", "Target")
+    data = bytearray(image.read_bytes())
+    key = next(k for k in range(len(data) // BLOCK)
+               if struct.unpack(">I", data[k * BLOCK:k * BLOCK + 4])[0] == 2
+               and data[k * BLOCK + 433:k * BLOCK + 433 + data[k * BLOCK + 432]] == b"sl")
+
+    def to_soft_link(block):
+        struct.pack_into(">i", block, BLOCK - 4, 3)  # ST_SOFTLINK
+        block[24:24 + 7] = b"Target\0"  # the link's path, in the hash table
+
+    _edit_block(data, key, to_soft_link)
+    image.write_bytes(data)
+    bridge = HandlerBridge(image, BUNDLED_DRIVER, read_only=False,
+                           adf_info=detect_adf(image))
+    try:
+        ops = AmigaFuseFS(bridge)
+        ops._winfsp = True
+        ops._readdir_plus = True
+        assert any(e["name"] == "sl" and e["dir_type"] == 3
+                   for e in bridge.list_dir_path("/"))
+        attrs = {name: st for name, st, _ in ops.readdir("/", None)}
+        assert "sl" in attrs and attrs["sl"] is None
+        assert attrs["Target"]["st_mode"] & 0o170000 == 0o040000
+    finally:
+        bridge.close()
 
 
 def test_delete_renamed_directory_preserves_old_name(ops):

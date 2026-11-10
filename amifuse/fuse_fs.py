@@ -2877,6 +2877,9 @@ class AmigaFuseFS(_FuseOperations):
     # kernel's FUSE on Linux and macOS passes the current name, and libfuse
     # both times as asked for.
     _winfsp = sys.platform.startswith("win")
+    # Set when WinFsp granted READDIR_PLUS (winfsp_fuse): readdir() then
+    # gives each entry's attributes with its name.
+    _readdir_plus = False
     # macOS special files we should reject immediately without calling handler.
     # Note: "Icon\r" and ".VolumeIcon.icns" are NOT in this list - we handle them for custom icons.
     _MACOS_SPECIAL = frozenset([
@@ -3618,7 +3621,9 @@ class AmigaFuseFS(_FuseOperations):
                 # it is stored under exactly the name create() sent.
                 name = created.rsplit("/", 1)[-1]
             if name is None:
-                name = next((name for name in self.readdir(canonical, None)
+                # Names alone: with READDIR_PLUS, readdir() gives tuples.
+                names = self._list_names(self._state_path(canonical), {})
+                name = next((name for name in names
                              if self._folded(name) == self._folded(component)), None)
             elif not self._filter_pending_deletes(canonical, [name]):
                 name = None
@@ -3637,6 +3642,47 @@ class AmigaFuseFS(_FuseOperations):
                 if entry and entry.get("dir_handle") and not entry.get("closed"):
                     path = _handle_path(entry, path)
         path = self._state_path(path)
+        listed = {}
+        entries = self._list_names(path, listed)
+        if self._readdir_plus:
+            return self._with_attrs(path, entries, listed)
+        return entries
+
+    def _with_attrs(self, path, entries, listed):
+        """(name, attributes, 0) for each name readdir() lists in path.
+
+        WinFsp asks getattr() for any entry given without attributes, by
+        the path the directory was opened with, which is stale after a
+        rename through that handle (#427). listed holds the attributes the
+        listing just read, with a pending grow's logical length, as
+        getattr() reports it; "." and ".." and the rest come from getattr()
+        under the current path. An entry whose getattr() fails goes without
+        attributes, and WinFsp leaves it out as before.
+        """
+        result = []
+        for name in entries:
+            if name == ".":
+                child = path
+            elif name == "..":
+                child = self._get_parent_dir(path)
+            else:
+                child = path.rstrip("/") + "/" + name
+            attrs = listed.get(name)
+            with self._cache_lock:
+                pinned = child in self._pinned_stats
+            if attrs is None or pinned:
+                try:
+                    attrs = self.getattr(child)
+                except FuseOSError:
+                    attrs = None
+            else:
+                attrs = self._logical_stat(child, attrs)
+            result.append((name, attrs, 0))
+        return result
+
+    def _list_names(self, path, listed):
+        """The names readdir() gives for path; listed gets the attributes
+        of those the handler listed now, by name."""
         # Check directory cache first
         with self._cache_lock:
             if path in self._dir_cache:
@@ -3656,6 +3702,11 @@ class AmigaFuseFS(_FuseOperations):
             # Pre-populate stat cache from directory listing
             child_path = path.rstrip("/") + "/" + name if path != "/" else "/" + name
             stat_result = self._stat_from_fib(ent, name, int(now))
+            if ent.get("dir_type") != 3:  # ST_SOFTLINK
+                # A soft link lists as a directory (dir_type >= 0), but the
+                # handler refuses a lock on it, so getattr() fails. It goes
+                # without attributes, so WinFsp asks getattr(), as before.
+                listed[name] = stat_result
             with self._cache_lock:
                 _prune_cache(self._stat_cache, self._pinned_stats)
                 # A pinned entry stands until release (_pin_stat), and

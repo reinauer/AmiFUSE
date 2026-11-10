@@ -7,6 +7,7 @@ Keep this adapter Windows-only; other FUSE implementations differ.
 import ctypes
 import errno
 
+READDIR_PLUS = 1 << 21  # FSP_FUSE_CAP_READDIR_PLUS
 CASE_INSENSITIVE = 1 << 29
 DELETE_ACCESS = 1 << 24
 DELETE_OK = 0x40000000
@@ -69,13 +70,22 @@ def with_capabilities(fuse_class):
             return 0
 
         def init(self, conn):
-            # Pre-1.11 WinFsp drops getpath from the operations table;
-            # declaring case insensitivity there makes case-only renames
-            # silent no-ops. Unknown versions keep the old behavior too.
-            # Windows folds Unicode even on DOS0/DOS1's ASCII-only fold,
-            # so non-ASCII case pairs can still alias on those volumes.
             if conn:
                 info = ctypes.cast(conn, ctypes.POINTER(_Connection)).contents
+                # With READDIR_PLUS, WinFsp takes each entry's attributes
+                # from readdir(). Without it, it asks getattr() for each,
+                # under the path the directory was opened with, which a
+                # rename through that handle has made stale: every entry
+                # then fails and the listing comes back empty (#427).
+                if info.capable & READDIR_PLUS:
+                    info.want |= READDIR_PLUS
+                    self.operations._readdir_plus = True
+                # Pre-1.11 WinFsp drops getpath from the operations table;
+                # declaring case insensitivity there makes case-only
+                # renames silent no-ops. Unknown versions keep the old
+                # behavior too. Windows folds Unicode even on DOS0/DOS1's
+                # ASCII-only fold, so non-ASCII case pairs can still alias
+                # on those volumes.
                 wanted = DELETE_ACCESS
                 if getpath_supported and self.operations._name_fold is not None:
                     wanted |= CASE_INSENSITIVE
