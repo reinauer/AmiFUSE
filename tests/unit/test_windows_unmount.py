@@ -28,9 +28,6 @@ class Events:
     def set(self, handle):
         self.events[handle].set()
 
-    def reset(self, handle):
-        self.events[handle].clear()
-
     def wait(self, handle, timeout):
         return self.events[handle].wait(timeout)
 
@@ -192,7 +189,7 @@ def test_exit_callback_captures_mount_thread_context(monkeypatch):
 @pytest.mark.parametrize("requested", ["E:", "E:\\", "e:/", "e:\\."])
 @pytest.mark.parametrize("mounted", ["E:", "E:\\", "e:/"])
 def test_drive_mount_owner_matches_root_aliases(monkeypatch, requested, mounted):
-    monkeypatch.setattr(unmount, "is_mount_ready", lambda pid: True)
+    monkeypatch.setattr(unmount, "mount_reached_init", lambda pid: True)
     from amifuse import platform
 
     monkeypatch.setattr(platform, "sys", SimpleNamespace(platform="win32"))
@@ -207,7 +204,7 @@ def test_drive_mount_owner_matches_root_aliases(monkeypatch, requested, mounted)
 def test_mount_owner_is_process_behind_venv_launcher(monkeypatch):
     # A venv's python.exe re-runs the same command line under the base
     # interpreter; only that child creates the PID-named unmount events.
-    monkeypatch.setattr(unmount, "is_mount_ready", lambda pid: True)
+    monkeypatch.setattr(unmount, "mount_reached_init", lambda pid: True)
     monkeypatch.setattr(unmount, "mount_reached_init", lambda pid: True)
     from amifuse import platform
 
@@ -285,7 +282,7 @@ def test_mount_owner_ignores_starting_process(monkeypatch):
     monkeypatch.setattr(platform, "sys", SimpleNamespace(platform="win32"))
     monkeypatch.setattr(platform, "find_amifuse_mounts", lambda: [
         {"mountpoint": "R:", "pid": 10}, {"mountpoint": "R:", "pid": 11}])
-    monkeypatch.setattr(unmount, "is_mount_ready", lambda pid: pid == 10)
+    monkeypatch.setattr(unmount, "mount_reached_init", lambda pid: pid == 10)
     assert platform._find_mount_owner_pids(Path("R:")) == [10]
     assert platform._find_starting_mount_pids(Path("R:")) == [11]
     assert platform._find_starting_mount_pids(Path("S:")) == []
@@ -299,7 +296,7 @@ def test_unmount_reports_starting_mount_without_admin_hint(monkeypatch):
     monkeypatch.setattr(os.path, "ismount", lambda p: True)
     monkeypatch.setattr(platform, "find_amifuse_mounts", lambda: [
         {"mountpoint": "R:", "pid": 11}])
-    monkeypatch.setattr(unmount, "is_mount_ready", lambda pid: False)
+    monkeypatch.setattr(unmount, "mount_reached_init", lambda pid: False)
     request = Mock(return_value=[])
     monkeypatch.setattr(unmount, "request_unmount_many", request)
     with pytest.raises(SystemExit, match="still starting") as caught:
@@ -308,6 +305,24 @@ def test_unmount_reports_starting_mount_without_admin_hint(monkeypatch):
     assert "once the mount is ready" in str(caught.value)
     request.assert_called_once_with([], timeout=30.0)
 
+
+
+def test_unmount_waits_for_a_mount_already_unmounting(monkeypatch):
+    # During destroy's flush the mount has reached init and is ending; an
+    # unmount request waits for the unmount under way (#441).
+    from amifuse import fuse_fs, platform
+
+    monkeypatch.setattr(fuse_fs, "sys", SimpleNamespace(platform="win32"))
+    monkeypatch.setattr(platform, "sys", SimpleNamespace(platform="win32"))
+    monkeypatch.setattr(os.path, "ismount", lambda p: True)
+    monkeypatch.setattr(platform, "find_amifuse_mounts", lambda: [
+        {"mountpoint": "R:", "pid": 11}])
+    monkeypatch.setattr(unmount, "mount_reached_init", lambda pid: True)
+    request = Mock(side_effect=lambda pids, **kwargs: pids)
+    monkeypatch.setattr(unmount, "request_unmount_many", request)
+    fuse_fs.cmd_unmount(SimpleNamespace(mountpoint=Path("R:")))
+    request.assert_called_once_with([11], timeout=30.0)
+    assert platform._find_starting_mount_pids(Path("R:")) == []
 
 def test_mounted_marker_lifetime(monkeypatch):
     events = Events()
@@ -318,11 +333,9 @@ def test_mounted_marker_lifetime(monkeypatch):
         assert "mounted" not in events.events
         control.start()
         assert events.events["mounted"].is_set()
-        assert unmount.is_mount_ready(os.getpid())
         assert unmount.mount_reached_init(os.getpid())
         control.stop()
-        # Unmounting, not starting, until close() (#428).
-        assert not unmount.is_mount_ready(os.getpid())
+        # Unmounting, not starting, until close() (#428, #441).
         assert unmount.mount_reached_init(os.getpid())
         assert "mounted" in control.handles
     finally:
