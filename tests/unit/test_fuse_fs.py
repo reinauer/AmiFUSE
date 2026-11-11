@@ -6955,7 +6955,7 @@ class TestEnsureParentDirs:
 
         fuse_fs_mod._ensure_parent_dirs(mock_bridge, "/S/Startup-Sequence")
 
-        mock_bridge.stat_path.assert_called_once_with("/S")
+        mock_bridge.stat_path.assert_called_once_with("/S", links=True)
         mock_bridge.create_dir.assert_not_called()
 
     def test_single_parent_created(self, fuse_mock, monkeypatch):

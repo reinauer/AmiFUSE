@@ -186,6 +186,49 @@ def test_ls_of_an_empty_directory_is_still_empty(image, recursive):
     assert json.loads(result.stdout)["entries"] == []
 
 
+def _listing(image):
+    result = _amifuse("ls", str(image), "--json", "--recursive")
+    assert result.returncode == 0, result.stdout + result.stderr
+    return sorted((e["path"], e["type"], e["size"]) for e in json.loads(result.stdout)["entries"])
+
+
+@pytest.mark.parametrize("dest, link, target", [
+    ("dirlink/new.txt", "/dirlink", "a"),
+    ("dirlink/target.txt", "/dirlink", "a"),
+    ("a/sl", "/a/sl", "target.txt"),
+])
+@pytest.mark.parametrize("use_json", [False, True], ids=["text", "json"])
+def test_write_to_or_through_a_soft_link_is_refused(image, tmp_path, dest, link,
+                                                    target, use_json):
+    # A write through a link tried to make a directory of its name, and one
+    # at a link failed to open it, each with an error that didn't say why
+    # (#456). Nothing is followed or made.
+    source = tmp_path / "in.txt"
+    source.write_bytes(b"new\n")
+    before = _listing(image)
+    result = _amifuse("write", str(image), "--file", dest, "--in", str(source),
+                      *(["--json"] if use_json else []))
+    assert result.returncode == 1
+    if use_json:
+        error = json.loads(result.stdout)["error"]
+        assert error["code"] == "IS_SOFT_LINK"
+        assert (error["details"]["link"], error["details"]["link_target"]) == (link, target)
+    else:
+        assert f"{link} is a soft link to {target}" in result.stderr
+        if link != "/" + dest:
+            assert f"/{dest} goes through a soft link" in result.stderr
+    assert _listing(image) == before
+    assert _amifuse("read", str(image), "--file", "a/target.txt", "--out", "-").stdout == "target\n"
+
+
+def test_write_still_makes_missing_directories(image, tmp_path):
+    source = tmp_path / "in.txt"
+    source.write_bytes(b"new\n")
+    result = _amifuse("write", str(image), "--file", "b/c/new.txt", "--in", str(source))
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _amifuse("read", str(image), "--file", "b/c/new.txt", "--out", "-").stdout == "new\n"
+
+
 def test_a_path_not_through_a_soft_link_still_reads(image):
     result = _amifuse("read", str(image), "--file", "a/target.txt", "--out", "-")
     assert result.returncode == 0, result.stderr

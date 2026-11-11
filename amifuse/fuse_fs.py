@@ -7548,11 +7548,17 @@ def _refuse_soft_link(bridge, command: str, path: str, use_json: bool, state):
     found = _soft_link_on(bridge, path)
     if found is None:
         return
-    link, target = found
+    _soft_link_error(command, path, *found, use_json, _mount_state_details(state))
+
+
+def _soft_link_error(command: str, path: str, link: str, target, use_json: bool,
+                     details=None):
+    """Exit with an IS_SOFT_LINK error: path is, or goes through, link."""
+    import json
+
     message = _soft_link_message(path, link, target)
     if use_json:
-        details = dict(_mount_state_details(state) or {}, link=link,
-                       link_target=target)
+        details = dict(details or {}, link=link, link_target=target)
         print(json.dumps(_json_error(command, "IS_SOFT_LINK", message, details=details)))
         sys.exit(1)
     raise SystemExit(f"Error: {message}")
@@ -7837,7 +7843,8 @@ def _ensure_parent_dirs(bridge, path: str, use_json: bool = False,
     """Create parent directories for path if they don't exist.
 
     Walks each path component and creates missing directories via
-    create_dir(). Similar to 'mkdir -p' behavior.
+    create_dir(). Similar to 'mkdir -p' behavior. A soft link on the way
+    is refused with IS_SOFT_LINK, not followed or replaced (#456).
 
     Args:
         bridge: HandlerBridge instance with write enabled.
@@ -7858,7 +7865,10 @@ def _ensure_parent_dirs(bridge, path: str, use_json: bool = False,
     # Check/create each directory component (all except the last, which is the file)
     for i in range(1, len(parts)):
         dir_path = "/" + "/".join(parts[:i])
-        stat = bridge.stat_path(dir_path)
+        stat = bridge.stat_path(dir_path, links=True)
+        if stat is not None and stat.get("dir_type") == ST_SOFTLINK:
+            _soft_link_error("write", path, dir_path, bridge.read_link(dir_path)[0],
+                             use_json, error_details)
         if stat is not None:
             # Already exists -- verify it's a directory
             if stat.get("dir_type", 0) <= 0:
@@ -8308,6 +8318,10 @@ def cmd_write(args):
         lock, res2, locks = bridge.locate_path(normalized)
         for l in reversed(locks):
             bridge.free_lock(l)
+        if lock == 0 and res2 == ERROR_IS_SOFT_LINK:
+            # The destination is a soft link: refuse it rather than open it,
+            # which the handler refuses too (#456).
+            _refuse_soft_link(bridge, "write", normalized, use_json, state)
         existed = lock != 0
         new_name = lock == 0 and res2 in _NOT_FOUND_ERRORS
 
