@@ -140,6 +140,29 @@ def test_readlink_names_this_drive_as_the_root(ops):
     assert ops.readlink("/lower") == "d/f"
 
 
+@pytest.mark.parametrize("spelling", ["/sl", "/SL"])
+def test_an_exclusive_create_or_mkdir_at_a_soft_link_s_name(ops, spelling):
+    # WinFsp sends CREATE_NEW to create() without opening the name, and the
+    # handler can't lock a soft link to show it is there: create() opened
+    # the name, which the handler refused, and both failed with EIO (#448).
+    if spelling != "/sl" and ops._name_fold is None:
+        pytest.skip("handler does not advertise case folding")
+    ops._winfsp = True
+    _write(ops, "/target", b"data")
+    _make_soft_link(ops.bridge, "sl", "target")
+    assert _errno(ops.create, spelling, 0o644) == errno.EEXIST
+    assert _errno(ops.mkdir, spelling, 0o755) == errno.EEXIST
+    assert stat.S_ISLNK(ops.getattr("/sl")["st_mode"])
+    assert ops.readlink("/sl") == "target"
+    assert _read(ops, "/target") == b"data"
+
+
+def test_mkdir_at_a_file_s_name_says_it_exists(ops):
+    _write(ops, "/file", b"data")
+    assert _errno(ops.mkdir, "/file", 0o755) == errno.EEXIST
+    assert _read(ops, "/file") == b"data"
+
+
 def test_readlink_of_what_is_not_a_soft_link(ops):
     _write(ops, "/file", b"data")
     ops.mkdir("/dir", 0o755)
