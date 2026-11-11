@@ -99,7 +99,7 @@ def test_a_soft_link_is_listed_as_a_link_and_not_followed(capsys):
 
     entries = fs._ls_recursive(handler, "/")
 
-    assert [(e["path"], e["type"], e["target"]) for e in entries] == [
+    assert [(e["path"], e["type"], e["link_target"]) for e in entries] == [
         ("/up", "link", "Links:")]
     handler.read_link.assert_called_once_with("/up")
     assert handler.calls == ["/"]

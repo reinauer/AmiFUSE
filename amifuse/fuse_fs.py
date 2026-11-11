@@ -7310,8 +7310,8 @@ def _entry_type(ent) -> str:
 def _ls_entry(bridge, ent, path: str) -> dict:
     """The ls entry for FileInfoBlock entry ent at path.
 
-    A soft link has its target, as the handler stores it, an AmigaDOS path,
-    or None when the handler doesn't give it.
+    A soft link has its target under "link_target", as the handler stores
+    it, an AmigaDOS path, or None when the handler doesn't give it.
     """
     prot_bits = ent.get("protection", 0)
     entry = {
@@ -7323,7 +7323,7 @@ def _ls_entry(bridge, ent, path: str) -> dict:
         "protection_bits": prot_bits,
     }
     if entry["type"] == "link":
-        entry["target"] = bridge.read_link(path)[0]
+        entry["link_target"] = bridge.read_link(path)[0]
     return entry
 
 
@@ -7459,7 +7459,7 @@ def cmd_ls(args):
                 if ent["type"] == "dir":
                     print(f"  {name:30s}  <dir>     {ent['protection']}")
                 elif ent["type"] == "link":
-                    target = ent["target"]
+                    target = ent["link_target"]
                     arrow = "" if target is None else f"  -> {escape_text(target)}"
                     print(f"  {name:30s}  <link>    {ent['protection']}{arrow}")
                 else:
@@ -7496,7 +7496,7 @@ def _refuse_soft_link(bridge, command: str, path: str, use_json: bool, state):
         return
     message = _soft_link_message(path, target)
     if use_json:
-        details = dict(_mount_state_details(state) or {}, target=target)
+        details = dict(_mount_state_details(state) or {}, link_target=target)
         print(json.dumps(_json_error(command, "IS_SOFT_LINK", message, details=details)))
         sys.exit(1)
     raise SystemExit(f"Error: {message}")
@@ -7590,7 +7590,7 @@ def cmd_verify(args):
                 "filesystem_responsive": mounted,
             }
             if result_data["type"] == "link":
-                result_data["target"] = bridge.read_link(normalized)[0]
+                result_data["link_target"] = bridge.read_link(normalized)[0]
             if expect_size is not None:
                 result_data["expected_size"] = expect_size
                 result_data["size_matches"] = stat.get("size", 0) == expect_size
@@ -7601,22 +7601,25 @@ def cmd_verify(args):
                 print(f"File: {file_path}")
                 print(f"  Exists: yes")
                 print(f"  Type: {result_data['type']}")
-                if result_data.get("target") is not None:
-                    print(f"  Target: {escape_text(result_data['target'])}")
+                if result_data.get("link_target") is not None:
+                    print(f"  Link target: {escape_text(result_data['link_target'])}")
                 print(f"  Size: {stat.get('size', 0)}")
                 print(f"  Filesystem responsive: {responsive_text}")
                 if expect_size is not None:
                     match = "yes" if result_data["size_matches"] else "NO"
                     print(f"  Expected size: {expect_size} ({match})")
         else:
-            # Verify volume -- count files and dirs
+            # Verify volume -- count files, dirs and soft links
             total_files = 0
             total_dirs = 0
+            total_links = 0
             total_size = 0
             entries = _ls_recursive(bridge, "/")
             for ent in entries:
                 if ent["type"] == "dir":
                     total_dirs += 1
+                elif ent["type"] == "link":
+                    total_links += 1
                 else:
                     total_files += 1
                     total_size += ent.get("size", 0)
@@ -7629,6 +7632,7 @@ def cmd_verify(args):
                 "volume": volname,
                 "total_dirs": total_dirs,
                 "total_files": total_files,
+                "total_links": total_links,
                 "total_size_bytes": total_size,
                 "filesystem_responsive": mounted,
             }
@@ -7639,6 +7643,7 @@ def cmd_verify(args):
                 print(f"Volume: {escape_text(volname)}")
                 print(f"  Directories: {total_dirs}")
                 print(f"  Files: {total_files}")
+                print(f"  Soft links: {total_links}")
                 print(f"  Total size: {total_size:,} bytes")
                 print(f"  Filesystem responsive: {responsive_text}")
     except SystemExit:
