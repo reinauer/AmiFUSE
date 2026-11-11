@@ -194,13 +194,17 @@ def _is_dir_entry(ent: Dict) -> bool:
     return dir_type >= 0 and dir_type != ST_SOFTLINK
 
 
-def _posix_link_target(target: str, link_path: str, volume: str) -> str:
+def _posix_link_target(target: str, link_path: str, volume: str,
+                       drive: Optional[str] = None) -> str:
     """The target of the soft link at link_path, as FUSE reports it.
 
     target is as the handler stores it, an AmigaDOS path: relative to the
     link's directory, or from a volume or assign up to a colon. This volume,
-    named or not (":dir"), is the mount's root. Any other is not on this
-    mount, and target stays as it is, a link to nothing. The result is
+    by its volume name, by drive, the drive name of the partition it is on
+    (DH0:dir, as AmigaDOS resolves it; None for a floppy, whose drive
+    nothing records), or with no name (":dir"), is the mount's root. Any
+    other is not on this mount, and target stays as it is, a link to
+    nothing. The result is
     relative to the link's directory, as WinFsp takes a target only without
     its -o rellinks option. In an AmigaDOS path, a slash after a name ends
     it, and any other slash, a leading one too, goes up to the parent.
@@ -208,7 +212,10 @@ def _posix_link_target(target: str, link_path: str, volume: str) -> str:
     vol, colon, rest = target.partition(":")
     parts = []
     if colon:
-        if vol.translate(_FOLD_LATIN1) not in ("", volume.translate(_FOLD_LATIN1)):
+        roots = {"", volume.translate(_FOLD_LATIN1)}
+        if drive:
+            roots.add(drive.translate(_FOLD_LATIN1))
+        if vol.translate(_FOLD_LATIN1) not in roots:
             return target
         parts = [".."] * link_path.strip("/").count("/")
         target = rest
@@ -727,6 +734,8 @@ class HandlerBridge:
         self._flush_pending_signals()
         # cache a best-effort volume name
         self._volname = None
+        self._drive_name = None
+        self._drive_name_known = False
         self._fib_mem = None
         self._datestamp_mem = None
         self._read_buf_mem = None
@@ -2205,6 +2214,27 @@ class HandlerBridge:
             self._volname = "AmigaFS"
             return self._volname
 
+    def drive_name(self) -> Optional[str]:
+        """The drive name of the partition opened, as its RDB stores it.
+
+        DH0 even where the mount calls a repeated DH0 DH0.1: a soft link's
+        target names the drive as AmigaDOS knows it. None for an image with
+        no RDB, such as a floppy, or a damaged name.
+        """
+        with self._lock:
+            if not self._drive_name_known:
+                self._drive_name_known = True
+                try:
+                    if self.backend.rdb:
+                        part = self.backend.rdb.get_partition(
+                            self.backend.partition_number or 0)
+                        name = part.get_drive_name() if part is not None else None
+                        if name is not None and str(name):
+                            self._drive_name = str(name)
+                except Exception:
+                    pass
+            return self._drive_name
+
     def read_file(self, path: str, size: int, offset: int) -> Optional[bytes]:
         """Open path, read up to size bytes at offset, and close it again.
 
@@ -3525,7 +3555,8 @@ class AmigaFuseFS(_FuseOperations):
         self._track_op("readlink", path)
         target, res2 = self.bridge.read_link(path)
         if target is not None:
-            return _posix_link_target(target, path, self.bridge.volume_name())
+            return _posix_link_target(target, path, self.bridge.volume_name(),
+                                      self.bridge.drive_name())
         if res2 == ERROR_LINE_TOO_LONG:
             raise FuseOSError(errno.ENAMETOOLONG)
         info = self.bridge.stat_path(path, links=True)

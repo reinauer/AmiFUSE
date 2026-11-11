@@ -322,3 +322,34 @@ def test_volume_name_from_the_rdb_is_a_str():
     assert type(name) is str
     assert json.dumps(name) == '"DH0"'
     assert bridge.volume_name() is name
+
+
+def _bridge_on(backend):
+    bridge = object.__new__(fs.HandlerBridge)
+    bridge._lock = threading.RLock()
+    bridge._drive_name = None
+    bridge._drive_name_known = False
+    bridge.backend = backend
+    return bridge
+
+
+def test_drive_name_of_a_repeated_drive_name_is_the_rdb_s_own():
+    """A soft link's target says DH0:, not the DH0.1 the mount calls it (#447)."""
+    from amitools.fs.FSString import FSString
+
+    backend = _backend([FSString("DH0"), FSString("DH0")], partition_number=1,
+                       partition_name="DH0.1")
+    name = _bridge_on(backend).drive_name()
+    assert (type(name), name) == (str, "DH0")
+
+
+@pytest.mark.parametrize("case", ["no-rdb", "damaged", "empty"])
+def test_no_drive_name(case):
+    """A floppy has no drive name; nor has a partition with a damaged one."""
+    from amitools.fs.FSString import FSString
+
+    if case == "no-rdb":
+        backend = SimpleNamespace(partition_number=None, partition_name=None, rdb=None)
+    else:
+        backend = _backend([None if case == "damaged" else FSString("")])
+    assert _bridge_on(backend).drive_name() is None

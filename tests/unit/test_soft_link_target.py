@@ -30,5 +30,28 @@ def test_target(target, link, expected):
     assert _posix_link_target(target, link, "Links") == expected
 
 
+@pytest.mark.parametrize("target, link, expected", [
+    # The drive name of the partition, in any case, is the mount's root
+    # too, as AmigaDOS resolves DH0: to the volume in it (#447).
+    ("DH0:x", "/a/sl", "../x"),
+    ("dh0:x", "/a/sl", "../x"),
+    ("Links:x", "/sl", "x"),
+    (":x", "/sl", "x"),
+    # Another drive is not.
+    ("DH1:x", "/sl", "DH1:x"),
+])
+def test_target_by_drive_name(target, link, expected):
+    assert _posix_link_target(target, link, "Links", "DH0") == expected
+
+
+def test_no_drive_name_on_a_floppy():
+    # Nothing records which drive a floppy was in, so DF0: stays as it is.
+    assert _posix_link_target("DF0:x", "/sl", "Links", None) == "DF0:x"
+
+
+def test_drive_name_folds_latin1():
+    assert _posix_link_target("\xc4H0:x", "/sl", "Links", "\xe4h0") == "x"
+
+
 def test_volume_name_folds_latin1():
     assert _posix_link_target("\xc9t\xc9:x", "/sl", "\xe9t\xe9") == "x"
