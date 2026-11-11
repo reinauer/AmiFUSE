@@ -1069,3 +1069,51 @@ def test_windows_repeated_directory_rename_uses_opened_name(ops, target):
         ops.releasedir("/before", handle)
     assert "after" not in _on_disk(ops)
     assert target[1:] in _on_disk(ops)
+
+
+def _fill(ops):
+    """Write /big until the volume is full; return the errno that ended it."""
+    fh = ops.create("/big", 0o644)
+    chunk, offset = b"\0" * (64 << 10), 0
+    try:
+        while offset < (64 << 20):
+            try:
+                written = ops.write("/big", chunk, offset, fh)
+            except FuseOSError as exc:
+                return exc.errno
+            if written < len(chunk):
+                return errno.ENOSPC
+            offset += written
+    finally:
+        ops.release("/big", fh)
+    raise AssertionError("the volume never filled")
+
+
+def _until_refused(make):
+    """Call make(n) for n = 0, 1, ... until it fails; return (errno, n)."""
+    for count in range(4096):
+        try:
+            make(count)
+        except FuseOSError as exc:
+            return exc.errno, count
+    raise AssertionError("never ran out of space")
+
+
+def test_a_full_volume_is_enospc_for_mkdir_and_create(ops):
+    # The handler answers ERROR_DISK_FULL, which write() and truncate()
+    # already map to ENOSPC; mkdir() and create() gave EIO (#457).
+    ops._winfsp = True
+    assert _fill(ops) == errno.ENOSPC
+    # A directory or an empty file can still fit where a file's tail left
+    # room (SmartFilesystem keeps several objects in one block), so each
+    # goes on until the handler refuses one.
+    refused, n = _until_refused(lambda n: ops.mkdir(f"/d{n}", 0o755))
+    assert refused == errno.ENOSPC
+    assert f"d{n}" not in _on_disk(ops)
+
+    def create(n):
+        ops.release(f"/f{n}", ops.create(f"/f{n}", 0o644))
+
+    refused, n = _until_refused(create)
+    assert refused == errno.ENOSPC
+    assert f"f{n}" not in _on_disk(ops)
