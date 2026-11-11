@@ -4591,7 +4591,8 @@ class AmigaFuseFS(_FuseOperations):
         with O_CREAT | O_TRUNC, which the handler matches in any letter
         case, so an exclusive create of CASEX would empty CaseX, where
         Windows expects "file exists". A file a writer holds on an
-        exclusive lock can't be examined, but is pinned. A file with a
+        exclusive lock can't be examined, but is pinned. A soft link can't
+        be locked, but has its name in the listing (#448). A file with a
         pending delete is hidden, and create() takes its name over.
         """
         folded = self._folded(path)
@@ -4599,7 +4600,7 @@ class AmigaFuseFS(_FuseOperations):
             if any(self._folded(p) == folded for p in self._pending_deletes):
                 return
             pinned = any(self._folded(p) == folded for p in self._pinned_stats)
-        if pinned or self.bridge.stat_path(path) is not None:
+        if pinned or self.bridge.stat_path(path, links=True) is not None:
             self._log_op("create", path, "exists")
             raise FuseOSError(errno.EEXIST)
 
@@ -4908,8 +4909,11 @@ class AmigaFuseFS(_FuseOperations):
         try:
             if parent_lock == 0 and dir_path != "/":
                 raise FuseOSError(errno.ENOENT)
-            new_lock, _ = self.bridge.create_dir(parent_lock, name)
+            new_lock, res2 = self.bridge.create_dir(parent_lock, name)
             if new_lock == 0:
+                # The name is taken, by a soft link too (#448).
+                if res2 in (ERROR_OBJECT_EXISTS, ERROR_IS_SOFT_LINK):
+                    raise FuseOSError(errno.EEXIST)
                 raise FuseOSError(errno.EIO)
             self.bridge.free_lock(new_lock)
         finally:
