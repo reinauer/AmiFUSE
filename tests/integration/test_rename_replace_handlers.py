@@ -689,8 +689,7 @@ def test_create_at_the_name_of_a_file_deleted_while_open(ops, request, winfsp,
     assert not ops._pending_deletes
 
 
-def test_mkdir_at_the_name_of_a_file_deleted_while_open(open_rename):
-    ops = open_rename
+def test_mkdir_at_the_name_of_a_file_deleted_while_open(ops, request):
     ops._winfsp = True
     _write(ops, "/Pend", OLD)
     old = ops.open("/Pend", os.O_RDONLY)
@@ -698,14 +697,23 @@ def test_mkdir_at_the_name_of_a_file_deleted_while_open(open_rename):
         assert ops.unlink("/Pend") == 0
         if "/Pend" not in ops._pending_deletes:
             pytest.skip("handler deletes an open file at once")
+        if request.node.callspec.params["ops"][1] == BUNDLED:
+            # It refuses to rename an open file: the name is free only
+            # once the file is deleted, at its release().
+            assert _errno(ops.mkdir, "/Pend", 0o755) == errno.EACCES
+            ops.release("/Pend", old)
+            old = None
         assert ops.mkdir("/Pend", 0o755) == 0
-        assert ops.read("/Pend", 1 << 16, 0, old) == OLD
+        if old is not None:
+            assert ops.read("/Pend", 1 << 16, 0, old) == OLD
     finally:
-        ops.release("/Pend", old)
+        if old is not None:
+            ops.release("/Pend", old)
     assert {n for n in _on_disk(ops) if n.lower() == "pend"} == {"Pend"}
     _no_temp_names(ops)
     assert ops.getattr("/Pend")["st_mode"] & 0o170000 == 0o040000
     assert not ops._pending_deletes
+
 
 def test_getpath_names_a_hard_link_not_its_target(tmp_path):
     # FastFileSystem resolves a hard link when it locks it, so Examine on
