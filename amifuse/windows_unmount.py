@@ -177,7 +177,6 @@ def mount_reached_init(pid):
     return True
 
 
-
 class UnmountError(OSError):
     """A batch failed partially; completed PIDs still finished cleanup."""
 

@@ -205,7 +205,6 @@ def test_mount_owner_is_process_behind_venv_launcher(monkeypatch):
     # A venv's python.exe re-runs the same command line under the base
     # interpreter; only that child creates the PID-named unmount events.
     monkeypatch.setattr(unmount, "mount_reached_init", lambda pid: True)
-    monkeypatch.setattr(unmount, "mount_reached_init", lambda pid: True)
     from amifuse import platform
 
     cmd = {"mountpoint": "J:", "image": "pfs.hdf", "uptime_seconds": 1,
@@ -306,7 +305,6 @@ def test_unmount_reports_starting_mount_without_admin_hint(monkeypatch):
     request.assert_called_once_with([], timeout=30.0)
 
 
-
 def test_unmount_waits_for_a_mount_already_unmounting(monkeypatch):
     # During destroy's flush the mount has reached init and is ending; an
     # unmount request waits for the unmount under way (#441).
@@ -323,6 +321,30 @@ def test_unmount_waits_for_a_mount_already_unmounting(monkeypatch):
     fuse_fs.cmd_unmount(SimpleNamespace(mountpoint=Path("R:")))
     request.assert_called_once_with([11], timeout=30.0)
     assert platform._find_starting_mount_pids(Path("R:")) == []
+
+
+@pytest.mark.parametrize("mountpoint", ["R:", "C:\\mnt\\amiga"])
+def test_unmount_requests_a_mount_whose_state_cannot_be_read(monkeypatch, mountpoint):
+    # A mount an Administrator started has events this user can't open. As
+    # in status and the tray, it is not starting, so the unmount request is
+    # sent and reports why it can't proceed.
+    from amifuse import fuse_fs, platform
+
+    def denied(pid):
+        raise PermissionError(13, "Access is denied")
+
+    monkeypatch.setattr(fuse_fs, "sys", SimpleNamespace(platform="win32"))
+    monkeypatch.setattr(platform, "sys", SimpleNamespace(platform="win32"))
+    monkeypatch.setattr(os.path, "ismount", lambda p: True)
+    monkeypatch.setattr(platform, "find_amifuse_mounts", lambda: [
+        {"mountpoint": mountpoint, "pid": 11}])
+    monkeypatch.setattr(unmount, "mount_reached_init", denied)
+    request = Mock(side_effect=lambda pids, **kwargs: pids)
+    monkeypatch.setattr(unmount, "request_unmount_many", request)
+    fuse_fs.cmd_unmount(SimpleNamespace(mountpoint=Path(mountpoint)))
+    request.assert_called_once_with([11], timeout=30.0)
+    assert platform._find_starting_mount_pids(Path(mountpoint)) == []
+
 
 def test_mounted_marker_lifetime(monkeypatch):
     events = Events()
