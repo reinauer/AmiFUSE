@@ -125,6 +125,21 @@ def test_readlink_names_this_volume_as_the_root(ops):
     assert ops.readlink("/sl") == "d/f"
 
 
+def test_readlink_names_this_drive_as_the_root(ops):
+    # A link made from a device path keeps the drive name, which AmigaDOS
+    # resolves to this volume as well (#447). A floppy records no drive.
+    drive = ops.bridge.drive_name()
+    if drive is None:
+        assert ops.bridge.backend.rdb is None
+        _make_soft_link(ops.bridge, "sl", "DF0:d/f")
+        assert ops.readlink("/sl") == "DF0:d/f"
+        return
+    _make_soft_link(ops.bridge, "sl", drive + ":d/f")
+    _make_soft_link(ops.bridge, "lower", drive.lower() + ":d/f")
+    assert ops.readlink("/sl") == "d/f"
+    assert ops.readlink("/lower") == "d/f"
+
+
 def test_readlink_of_what_is_not_a_soft_link(ops):
     _write(ops, "/file", b"data")
     ops.mkdir("/dir", 0o755)
