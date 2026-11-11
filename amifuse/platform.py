@@ -1264,13 +1264,11 @@ def _find_mount_pids(mountpoint: Path, *, ready: bool) -> List[int]:
             # resolving through WinFsp can produce a different device path.
             return ntpath.normcase(ntpath.abspath(path))
 
-        from .windows_unmount import mount_reached_init
-
         target = key(mountpoint)
         return [mount["pid"] for mount in all_mounts
                 if mount.get("mountpoint") is not None
                 and key(mount["mountpoint"]) == target
-                and mount_reached_init(mount["pid"]) == ready]
+                and mount_is_starting(mount["pid"]) != ready]
 
     raw_mountpoint = str(mountpoint)
     abs_mountpoint = str(mountpoint.resolve(strict=False))
