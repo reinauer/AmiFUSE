@@ -1,9 +1,10 @@
 """The file commands name a soft link as one, with its target (#436).
 
 `ls` listed a soft link as a directory, and read, hash and verify, which
-can't examine it, reported it as not found. The image is the bundled
-FastFileSystem floppy of test_soft_links, with a/target.txt and a/sl, a
-soft link to target.txt.
+can't examine it, reported it as not found, as they did a path through a
+soft link to a directory (#449). The image is the bundled FastFileSystem
+floppy of test_soft_links, with a/target.txt and a/sl, a soft link to
+target.txt, and dirlink, a soft link to a.
 """
 
 import json
@@ -13,7 +14,9 @@ import sys
 import pytest
 
 from amifuse.driver_resolver import BUNDLED_DRIVER
-from tests.integration.test_soft_links import _soft_link_image
+from amifuse.fuse_fs import HandlerBridge
+from amifuse.rdb_inspect import detect_adf
+from tests.integration.test_soft_links import _make_soft_link, _soft_link_image
 
 pytestmark = pytest.mark.timeout(120)
 
@@ -24,7 +27,15 @@ def image(tmp_path):
 
     if not _machine68k_works():
         pytest.skip("machine68k CPU not functional")
-    return _soft_link_image(tmp_path)
+    image = _soft_link_image(tmp_path)
+    bridge = HandlerBridge(image, BUNDLED_DRIVER, read_only=False,
+                           adf_info=detect_adf(image))
+    try:
+        _make_soft_link(bridge, "dirlink", "a")
+        bridge.flush_volume()
+    finally:
+        bridge.close()
+    return image
 
 
 def _amifuse(*args):
@@ -104,9 +115,45 @@ def test_volume_verify_counts_soft_links_on_their_own(image):
     result = _amifuse("verify", str(image), "--json")
     assert result.returncode == 0, result.stdout + result.stderr
     data = json.loads(result.stdout)
-    # a, a/target.txt and the soft link a/sl.
-    assert (data["total_dirs"], data["total_files"], data["total_links"]) == (1, 1, 1)
+    # a, a/target.txt and the soft links a/sl and dirlink, which the walk
+    # doesn't follow.
+    assert (data["total_dirs"], data["total_files"], data["total_links"]) == (1, 1, 2)
     assert data["total_size_bytes"] == 7
+
+
+@pytest.mark.parametrize("command, extra", [
+    ("read", ["--out", "-"]),
+    ("hash", []),
+    ("verify", []),
+])
+def test_a_path_through_a_soft_link_names_the_link(image, command, extra):
+    result = _amifuse(command, str(image), "--file", "dirlink/target.txt", *extra)
+    assert result.returncode == 1
+    assert ("/dirlink/target.txt goes through a soft link: "
+            "/dirlink is a soft link to a") in result.stderr
+    assert "not found" not in result.stderr
+
+
+@pytest.mark.parametrize("command", ["read", "hash", "verify"])
+def test_a_path_through_a_soft_link_json_error(image, tmp_path, command):
+    extra = ["--out", str(tmp_path / "out")] if command == "read" else []
+    result = _amifuse(command, str(image), "--file", "dirlink/target.txt", "--json", *extra)
+    assert result.returncode == 1
+    error = json.loads(result.stdout)["error"]
+    assert error["code"] == "IS_SOFT_LINK"
+    assert (error["details"]["link"], error["details"]["link_target"]) == ("/dirlink", "a")
+
+
+def test_a_path_not_through_a_soft_link_still_reads(image):
+    result = _amifuse("read", str(image), "--file", "a/target.txt", "--out", "-")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "target\n"
+
+
+def test_a_missing_file_under_a_soft_link_is_still_through_it(image):
+    result = _amifuse("read", str(image), "--file", "dirlink/missing", "--out", "-")
+    assert result.returncode == 1
+    assert "/dirlink is a soft link to a" in result.stderr
 
 
 def test_a_missing_file_is_still_not_found(image):

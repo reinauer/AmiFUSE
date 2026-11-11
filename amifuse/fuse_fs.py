@@ -7327,22 +7327,33 @@ def _ls_entry(bridge, ent, path: str) -> dict:
     return entry
 
 
-def _soft_link_target(bridge, path: str):
-    """(True, target) when path is a soft link, else (False, None).
+def _soft_link_on(bridge, path: str):
+    """(link, target) for the first soft link on path, path itself or a
+    directory it goes through, or None when there is none.
 
-    stat_path() can't examine a soft link, so a command that finds nothing
-    there asks this before it says the path is not found.
+    The handler refuses a lock on a soft link and on a path through one, so
+    stat_path() can't examine either; a command that finds nothing at path
+    asks this before it says the path is not found (#449). Each prefix is
+    examined until one is missing or a soft link.
     """
-    ent = bridge.stat_path(path, links=True)
-    if ent is None or ent.get("dir_type") != ST_SOFTLINK:
-        return False, None
-    return True, bridge.read_link(path)[0]
+    names = path.strip("/").split("/")
+    for count in range(1, len(names) + 1):
+        prefix = "/" + "/".join(names[:count])
+        ent = bridge.stat_path(prefix, links=True)
+        if ent is None:
+            return None
+        if ent.get("dir_type") == ST_SOFTLINK:
+            return prefix, bridge.read_link(prefix)[0]
+    return None
 
 
-def _soft_link_message(path: str, target) -> str:
-    if target is None:
-        return f"{path} is a soft link"
-    return f"{path} is a soft link to {target}"
+def _soft_link_message(path: str, link: str, target) -> str:
+    message = f"{link} is a soft link"
+    if target is not None:
+        message += f" to {target}"
+    if link != path:
+        message = f"{path} goes through a soft link: {message}"
+    return message
 
 
 def _ls_recursive(bridge, root_path: str) -> list:
@@ -7484,19 +7495,21 @@ def cmd_ls(args):
 
 def _refuse_soft_link(bridge, command: str, path: str, use_json: bool, state):
     """Exit with an IS_SOFT_LINK error when path, which stat_path() can't
-    examine, is a soft link; return otherwise.
+    examine, is a soft link or goes through one; return otherwise.
 
     The command doesn't follow it: the target is an AmigaDOS path, which can
-    name another volume.
+    name another volume. The error names the link and its target.
     """
     import json
 
-    is_link, target = _soft_link_target(bridge, path)
-    if not is_link:
+    found = _soft_link_on(bridge, path)
+    if found is None:
         return
-    message = _soft_link_message(path, target)
+    link, target = found
+    message = _soft_link_message(path, link, target)
     if use_json:
-        details = dict(_mount_state_details(state) or {}, link_target=target)
+        details = dict(_mount_state_details(state) or {}, link=link,
+                       link_target=target)
         print(json.dumps(_json_error(command, "IS_SOFT_LINK", message, details=details)))
         sys.exit(1)
     raise SystemExit(f"Error: {message}")
@@ -7567,6 +7580,8 @@ def cmd_verify(args):
             stat = bridge.stat_path(normalized, links=True)
             _refuse_crashed_handler(bridge, "verify", use_json)
             if stat is None:
+                # A path through a soft link can't be examined (#449).
+                _refuse_soft_link(bridge, "verify", normalized, use_json, state)
                 # A missing file on a volume whose mount could not be
                 # confirmed is a different situation from a missing file on
                 # a healthy volume. Carry the mount state so the error path
