@@ -4541,10 +4541,12 @@ class AmigaFuseFS(_FuseOperations):
             if self._winfsp:
                 self._refuse_existing(path)
             self._materialize_grows(except_path=path)
-            opened = self.bridge.open_file(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
+            opened, res2 = self.bridge.open_file_reply(
+                path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
             if opened is None:
-                self._log_op("create", path, "FAILED: open_file returned None")
-                raise FuseOSError(errno.EIO)
+                self._log_op("create", path, f"FAILED: open_file res2={res2}")
+                # A full volume is ENOSPC, not an I/O error (#457).
+                raise FuseOSError(_WRITE_ERRNOS.get(res2, errno.EIO))
             fh_addr, parent_lock = opened
             self._forget_pending_delete(path)
             self._deferred_grows.pop(path, None)
@@ -4914,7 +4916,8 @@ class AmigaFuseFS(_FuseOperations):
                 # The name is taken, by a soft link too (#448).
                 if res2 in (ERROR_OBJECT_EXISTS, ERROR_IS_SOFT_LINK):
                     raise FuseOSError(errno.EEXIST)
-                raise FuseOSError(errno.EIO)
+                # A full volume is ENOSPC, not an I/O error (#457).
+                raise FuseOSError(_WRITE_ERRNOS.get(res2, errno.EIO))
             self.bridge.free_lock(new_lock)
         finally:
             for l in reversed(locks):

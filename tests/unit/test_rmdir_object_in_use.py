@@ -58,6 +58,10 @@ class _InUseVolume:
         self.files.add(path)
         return self.open(path), 0
 
+    def open_file_reply(self, path, flags):
+        opened = self.open_file(path, flags)
+        return opened, 0 if opened is not None else 205  # ERROR_OBJECT_NOT_FOUND
+
     def close_file(self, fh_addr):
         self.open_files.pop(fh_addr)
 
