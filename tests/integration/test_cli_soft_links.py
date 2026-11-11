@@ -144,6 +144,48 @@ def test_a_path_through_a_soft_link_json_error(image, tmp_path, command):
     assert (error["details"]["link"], error["details"]["link_target"]) == ("/dirlink", "a")
 
 
+def test_ls_of_a_path_through_a_soft_link_names_the_link(image):
+    # ls listed nothing there and said the path was not found (#455).
+    result = _amifuse("ls", str(image), "--path", "dirlink/target.txt")
+    assert result.returncode == 1
+    assert ("/dirlink/target.txt goes through a soft link: "
+            "/dirlink is a soft link to a") in result.stderr
+    assert "not found" not in result.stderr
+
+
+@pytest.mark.parametrize("recursive", [[], ["--recursive"]], ids=["ls", "ls-R"])
+@pytest.mark.parametrize("path", ["dirlink/target.txt", "dirlink/missing"])
+def test_ls_of_a_path_through_a_soft_link_json_error(image, path, recursive):
+    result = _amifuse("ls", str(image), "--path", path, "--json", *recursive)
+    assert result.returncode == 1
+    error = json.loads(result.stdout)["error"]
+    assert error["code"] == "IS_SOFT_LINK"
+    assert (error["details"]["link"], error["details"]["link_target"]) == ("/dirlink", "a")
+
+
+@pytest.mark.parametrize("recursive", [[], ["--recursive"]], ids=["ls", "ls-R"])
+def test_ls_of_a_missing_path_is_still_not_found(image, recursive):
+    # ls -R of a missing path listed nothing and exited 0.
+    result = _amifuse("ls", str(image), "--path", "a/missing", "--json", *recursive)
+    assert result.returncode == 1
+    assert json.loads(result.stdout)["error"]["code"] == "FILE_NOT_FOUND"
+
+
+@pytest.mark.parametrize("recursive", [[], ["--recursive"]], ids=["ls", "ls-R"])
+def test_ls_of_an_empty_directory_is_still_empty(image, recursive):
+    bridge = HandlerBridge(image, BUNDLED_DRIVER, read_only=False,
+                           adf_info=detect_adf(image))
+    try:
+        lock, _ = bridge.create_dir(0, "empty")
+        bridge.free_lock(lock)
+        bridge.flush_volume()
+    finally:
+        bridge.close()
+    result = _amifuse("ls", str(image), "--path", "empty", "--json", *recursive)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert json.loads(result.stdout)["entries"] == []
+
+
 def test_a_path_not_through_a_soft_link_still_reads(image):
     result = _amifuse("read", str(image), "--file", "a/target.txt", "--out", "-")
     assert result.returncode == 0, result.stderr

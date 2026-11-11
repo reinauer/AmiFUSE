@@ -7457,28 +7457,36 @@ def cmd_ls(args):
             raise SystemExit(
                 f"Error: no usable volume mounted: {mount_reason}")
 
+        def refuse_missing():
+            # An empty listing: the path might not exist, so stat it to tell.
+            stat = bridge.stat_path(path, links=True)
+            _refuse_crashed_handler(bridge, "ls", use_json)
+            if stat is not None:
+                return
+            # A path through a soft link can't be examined (#455).
+            _refuse_soft_link(bridge, "ls", path, use_json, state)
+            # On an unmountable volume no path resolves, so this branch is
+            # reachable for exactly the condition the check above exists
+            # for. Carry the mount state, or a missing directory on a
+            # healthy volume looks identical.
+            details = _mount_state_details(state)
+            if use_json:
+                print(json.dumps(_json_error("ls", "FILE_NOT_FOUND",
+                    f"Path not found: {path}", details=details)))
+                sys.exit(1)
+            if mounted is None:
+                print(f"Warning: mount state unknown -- {mount_reason}",
+                      file=sys.stderr)
+            raise SystemExit(f"Error: path not found: {path}")
+
         if recursive:
             entries = _ls_recursive(bridge, path)
+            if not entries and path != "/":
+                refuse_missing()
         else:
             raw = bridge.list_dir_path(path)
             if not raw and path != "/":
-                # Path might not exist -- try stat to distinguish
-                stat = bridge.stat_path(path, links=True)
-                _refuse_crashed_handler(bridge, "ls", use_json)
-                if stat is None:
-                    # On an unmountable volume no path resolves, so this
-                    # branch is reachable for exactly the condition the check
-                    # above exists for. Carry the mount state, or a missing
-                    # directory on a healthy volume looks identical.
-                    details = _mount_state_details(state)
-                    if use_json:
-                        print(json.dumps(_json_error("ls", "FILE_NOT_FOUND",
-                            f"Path not found: {path}", details=details)))
-                        sys.exit(1)
-                    if mounted is None:
-                        print(f"Warning: mount state unknown -- {mount_reason}",
-                              file=sys.stderr)
-                    raise SystemExit(f"Error: path not found: {path}")
+                refuse_missing()
             entries = [
                 _ls_entry(bridge, ent,
                           "/" + ent["name"] if path == "/" else path + "/" + ent["name"])
