@@ -4957,6 +4957,7 @@ class TestCmdLs:
         mock_bridge.list_dir_path.return_value = [
             {"name": "Startup-Sequence", "dir_type": 0, "size": 100, "protection": 0},
         ]
+        mock_bridge.stat_path.return_value = {"name": "S", "dir_type": 2}
 
         # Test with path "S/" (no leading slash, trailing slash)
         args = argparse.Namespace(
@@ -4971,7 +4972,8 @@ class TestCmdLs:
         )
         fuse_fs_mod.cmd_ls(args)
 
-        # Verify list_dir_path was called with normalized "/S"
+        # Verify the path was examined and listed normalized, as "/S"
+        mock_bridge.stat_path.assert_called_with("/S", links=True)
         mock_bridge.list_dir_path.assert_called_with("/S")
 
     def test_ls_human_shows_protection_for_dirs(self, mock_bridge_for_ls, capsys):
