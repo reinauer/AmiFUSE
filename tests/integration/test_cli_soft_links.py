@@ -164,6 +164,14 @@ def test_ls_of_a_path_through_a_soft_link_json_error(image, path, recursive):
 
 
 @pytest.mark.parametrize("recursive", [[], ["--recursive"]], ids=["ls", "ls-R"])
+def test_ls_of_a_soft_link_s_own_path_lists_nothing(image, recursive):
+    # As #446 chose: the link itself, not a path through it, is not refused.
+    result = _amifuse("ls", str(image), "--path", "dirlink", "--json", *recursive)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert json.loads(result.stdout)["entries"] == []
+
+
+@pytest.mark.parametrize("recursive", [[], ["--recursive"]], ids=["ls", "ls-R"])
 def test_ls_of_a_missing_path_is_still_not_found(image, recursive):
     # ls -R of a missing path listed nothing and exited 0.
     result = _amifuse("ls", str(image), "--path", "a/missing", "--json", *recursive)

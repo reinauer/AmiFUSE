@@ -4913,8 +4913,15 @@ class AmigaFuseFS(_FuseOperations):
                 raise FuseOSError(errno.ENOENT)
             new_lock, res2 = self.bridge.create_dir(parent_lock, name)
             if new_lock == 0:
-                # The name is taken, by a soft link too (#448).
-                if res2 in (ERROR_OBJECT_EXISTS, ERROR_IS_SOFT_LINK):
+                # The name is taken, by a soft link too (#448). FastFileSystem
+                # 47.4 answers ERROR_OBJECT_IN_USE for a file a writer holds,
+                # which can't be examined either.
+                if res2 in (ERROR_OBJECT_EXISTS, ERROR_IS_SOFT_LINK,
+                            ERROR_OBJECT_IN_USE):
+                    raise FuseOSError(errno.EEXIST)
+                # pfs3aio checks for space before the name, so on a full
+                # volume it refuses an existing name with ERROR_DISK_FULL.
+                if self.bridge.stat_path(path, links=True) is not None:
                     raise FuseOSError(errno.EEXIST)
                 # A full volume is ENOSPC, not an I/O error (#457).
                 raise FuseOSError(_WRITE_ERRNOS.get(res2, errno.EIO))
