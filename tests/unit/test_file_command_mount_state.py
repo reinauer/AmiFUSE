@@ -22,6 +22,8 @@ def command_context(monkeypatch, tmp_path):
     # write's destination name is new
     bridge.locate_path.return_value = (0, fs.ERROR_OBJECT_NOT_FOUND, [])
     bridge.delete_object.return_value = (-1, 0)
+    # write opens through open_file_reply(); tests set open_file().
+    bridge.open_file_reply.side_effect = lambda *a, **kw: (bridge.open_file(*a, **kw), 0)
     monkeypatch.setattr(fs, "_create_bridge_from_args", lambda *a, **kw: (bridge, None))
     return args, bridge, output
 
