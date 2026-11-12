@@ -1117,3 +1117,7 @@ def test_a_full_volume_is_enospc_for_mkdir_and_create(ops):
     refused, n = _until_refused(create)
     assert refused == errno.ENOSPC
     assert f"f{n}" not in _on_disk(ops)
+    # An existing name is still taken, though pfs3aio checks for space
+    # first and refuses it with ERROR_DISK_FULL.
+    assert _errno(ops.mkdir, "/d0", 0o755) == errno.EEXIST
+    assert _errno(ops.mkdir, "/big", 0o755) == errno.EEXIST

@@ -163,6 +163,22 @@ def test_mkdir_at_a_file_s_name_says_it_exists(ops):
     assert _read(ops, "/file") == b"data"
 
 
+@pytest.mark.parametrize("spelling", ["/held", "/HELD"])
+def test_mkdir_at_the_name_of_a_file_held_open_says_it_exists(ops, spelling):
+    # FastFileSystem 47.4 refuses with ERROR_OBJECT_IN_USE while a writer
+    # holds the file, where the others answer ERROR_OBJECT_EXISTS.
+    if spelling != "/held" and ops._name_fold is None:
+        pytest.skip("handler does not advertise case folding")
+    ops._winfsp = True
+    fh = ops.create("/held", 0o644)
+    try:
+        assert ops.write("/held", b"data", 0, fh) == 4
+        assert _errno(ops.mkdir, spelling, 0o755) == errno.EEXIST
+    finally:
+        ops.release("/held", fh)
+    assert _read(ops, "/held") == b"data"
+
+
 def test_readlink_of_what_is_not_a_soft_link(ops):
     _write(ops, "/file", b"data")
     ops.mkdir("/dir", 0o755)
