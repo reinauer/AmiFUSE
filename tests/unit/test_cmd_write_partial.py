@@ -31,6 +31,8 @@ def write_context(monkeypatch, tmp_path):
     bridge.is_mounted.return_value = fs.MountState(True, None, None)
     bridge.locate_path.return_value = (0, fs.ERROR_OBJECT_NOT_FOUND, [])
     bridge.open_file.return_value = (0x1000, 0x2000)
+    # write opens through open_file_reply(); tests set open_file().
+    bridge.open_file_reply.side_effect = lambda *a, **kw: (bridge.open_file(*a, **kw), 0)
     bridge.write_handle_reply.side_effect = lambda fh, data: (len(data), 0)
     bridge.delete_object.return_value = (-1, 0)
     created = []
