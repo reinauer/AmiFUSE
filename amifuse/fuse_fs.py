@@ -7903,9 +7903,12 @@ def _ensure_parent_dirs(bridge, path: str, use_json: bool = False,
             # pattern used by FUSE mkdir() in AmigaFuseOps.
             new_lock, res2 = bridge.create_dir(parent_lock, parts[i-1])
             if new_lock == 0:
-                msg = f"Failed to create directory: {dir_path} (error {res2})"
+                # Name the reason, as a failed write does: "disk full" (#462).
+                reason = _WRITE_ERROR_REASONS.get(res2, f"error {res2}")
+                msg = f"Failed to create directory: {dir_path} ({reason})"
                 if use_json:
-                    print(_json.dumps(_json_error("write", "HANDLER_ERROR", msg, error_details)))
+                    details = dict(error_details or {}, dos_error=res2)
+                    print(_json.dumps(_json_error("write", "HANDLER_ERROR", msg, details)))
                     sys.exit(1)
                 raise SystemExit(f"Error: {msg}")
             # Debug logging matching codebase pattern
@@ -8329,13 +8332,21 @@ def cmd_write(args):
         new_name = lock == 0 and res2 in _NOT_FOUND_ERRORS
 
         # Open for write (create/truncate)
-        fh_result = bridge.open_file(normalized, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
+        fh_result, res2 = bridge.open_file_reply(
+            normalized, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
         if fh_result is None:
+            # Name the reason the handler gave, as a failed write does: a
+            # full volume is "disk full" (#462).
+            message = f"failed to open file for writing: {amiga_path}"
+            details = mount_details
+            if res2:
+                message += f" ({_WRITE_ERROR_REASONS.get(res2, f'error code {res2}')})"
+                details = dict(mount_details or {}, dos_error=res2)
             if use_json:
                 print(json.dumps(_json_error("write", "HANDLER_ERROR",
-                    f"Failed to open file for writing: {amiga_path}", details=mount_details)))
+                    message[0].upper() + message[1:], details=details)))
                 sys.exit(1)
-            raise SystemExit(f"Error: failed to open file for writing: {amiga_path}")
+            raise SystemExit(f"Error: {message}")
 
         # Note: dir_lock from open_file() is never freed. This is a
         # pre-existing pattern also present in cmd_hash().
