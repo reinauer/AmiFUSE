@@ -53,6 +53,8 @@ def _make_mock_bridge():
     bridge.is_mounted.return_value = fuse_fs_mod.MountState(
         True, {"disk_type": 0x50465303, "volume_node": 1}, None,
     )
+    # write opens through open_file_reply(); tests set open_file().
+    bridge.open_file_reply.side_effect = lambda *a, **kw: (bridge.open_file(*a, **kw), 0)
     return bridge
 
 
@@ -7031,6 +7033,9 @@ class TestEnsureParentDirs:
         output = capsys.readouterr().out
         data = json.loads(output)
         assert data["error"]["code"] == "HANDLER_ERROR"
+        # A code without a name keeps its number (#462).
+        assert data["error"]["message"] == "Failed to create directory: /S (error 232)"
+        assert data["error"]["details"]["dos_error"] == 232
 
     def test_debug_logging(self, fuse_mock, monkeypatch, capsys):
         """Verify debug output when creating directories."""

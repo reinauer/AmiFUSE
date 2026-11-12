@@ -32,6 +32,8 @@ def write_context(monkeypatch, tmp_path):
     bridge.locate_path.return_value = (0, fs.ERROR_OBJECT_NOT_FOUND, [])  # a new name
     bridge.delete_object.return_value = (-1, 0)
     bridge.open_file.return_value = (0x1000, 0x2000)
+    # write opens through open_file_reply(); tests set open_file().
+    bridge.open_file_reply.side_effect = lambda *a, **kw: (bridge.open_file(*a, **kw), 0)
     created = []
 
     def fake_create(*a, **kw):
@@ -72,6 +74,36 @@ def test_failed_write_names_the_handler_error(write_context, capsys, use_json,
         assert str(caught.value) == f"Error: write failed at offset 0: {reason}"
     bridge.close_file.assert_called_once_with(0x1000)
     bridge.flush_volume.assert_called_once()
+
+
+@pytest.mark.parametrize("use_json", [True, False], ids=["json", "text"])
+@pytest.mark.parametrize("res2, suffix", [
+    (221, " (disk full)"),
+    (214, " (disk is write-protected)"),
+    (223, " (file is write-protected)"),
+    (225, " (error code 225)"),
+    (0, ""),
+])
+def test_failed_open_names_the_handler_error(write_context, capsys, use_json,
+                                             res2, suffix):
+    # The open of the destination named no reason (#462). FastFileSystem
+    # 47.4 refuses an existing file without the w bit with
+    # ERROR_WRITE_PROTECTED; 0 is no reply.
+    args, bridge, _ = write_context
+    args.json = use_json
+    bridge.open_file_reply.side_effect = None
+    bridge.open_file_reply.return_value = (None, res2)
+    with pytest.raises(SystemExit) as caught:
+        fs.cmd_write(args)
+    if use_json:
+        assert caught.value.code == 1
+        error = json.loads(capsys.readouterr().out)["error"]
+        assert error["code"] == "HANDLER_ERROR"
+        assert error["message"] == f"Failed to open file for writing: S/file{suffix}"
+        assert error["details"].get("dos_error") == (res2 or None)
+    else:
+        assert str(caught.value) == f"Error: failed to open file for writing: S/file{suffix}"
+    bridge.write_handle_reply.assert_not_called()
 
 
 @pytest.mark.parametrize("use_json", [True, False], ids=["json", "text"])
