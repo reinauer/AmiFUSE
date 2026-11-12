@@ -7365,6 +7365,18 @@ def _ls_entry(bridge, ent, path: str) -> dict:
     return entry
 
 
+def _ls_file_name(bridge, stat, path: str) -> str:
+    """The name ls gives the file at path, which stat examined.
+
+    The name as stored, in its own letter case, unless it is another name:
+    FastFileSystem names a hard link's target when it examines the link.
+    """
+    asked = path.rstrip("/").rsplit("/", 1)[-1]
+    fold = _NAME_FOLDS.get(bridge.name_fold()) or {}
+    stored = stat.get("name") or ""
+    return stored if stored.translate(fold) == asked.translate(fold) else asked
+
+
 def _soft_link_on(bridge, path: str):
     """(link, target) for the first soft link on path, path itself or a
     directory it goes through, or None when there is none.
@@ -7465,11 +7477,6 @@ def cmd_ls(args):
                 f"Error: no usable volume mounted: {mount_reason}")
 
         def refuse_missing():
-            # An empty listing: the path might not exist, so stat it to tell.
-            stat = bridge.stat_path(path, links=True)
-            _refuse_crashed_handler(bridge, "ls", use_json)
-            if stat is not None:
-                return
             # A path through a soft link can't be examined (#455).
             _refuse_soft_link(bridge, "ls", path, use_json, state)
             # On an unmountable volume no path resolves, so this branch is
@@ -7486,14 +7493,22 @@ def cmd_ls(args):
                       file=sys.stderr)
             raise SystemExit(f"Error: path not found: {path}")
 
-        if recursive:
+        # Examine the path first: a missing one is an error, and a file is
+        # listed as its own entry, as ls(1) lists a file (#461). Listing a
+        # file would ask the handler for the next entry of a file, which it
+        # refuses, and give an empty listing with a warning.
+        stat = None if path == "/" else bridge.stat_path(path, links=True)
+        _refuse_crashed_handler(bridge, "ls", use_json)
+        if path != "/" and stat is None:
+            refuse_missing()
+
+        if stat is not None and _entry_type(stat) == "file":
+            entries = [_ls_entry(bridge, dict(stat, name=_ls_file_name(bridge, stat, path)),
+                                 path)]
+        elif recursive:
             entries = _ls_recursive(bridge, path)
-            if not entries and path != "/":
-                refuse_missing()
         else:
             raw = bridge.list_dir_path(path)
-            if not raw and path != "/":
-                refuse_missing()
             entries = [
                 _ls_entry(bridge, ent,
                           "/" + ent["name"] if path == "/" else path + "/" + ent["name"])
