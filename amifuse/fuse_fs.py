@@ -4921,7 +4921,12 @@ class AmigaFuseFS(_FuseOperations):
                     raise FuseOSError(errno.EEXIST)
                 # pfs3aio checks for space before the name, so on a full
                 # volume it refuses an existing name with ERROR_DISK_FULL.
-                if self.bridge.stat_path(path, links=True) is not None:
+                # A writer's exclusive lock prevents stat_path() from
+                # examining its file, but its pinned name is still taken.
+                folded = self._folded(path)
+                with self._fh_lock:
+                    pinned = any(self._folded(p) == folded for p in self._pinned_stats)
+                if pinned or self.bridge.stat_path(path, links=True) is not None:
                     raise FuseOSError(errno.EEXIST)
                 # A full volume is ENOSPC, not an I/O error (#457).
                 raise FuseOSError(_WRITE_ERRNOS.get(res2, errno.EIO))

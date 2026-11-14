@@ -1121,3 +1121,21 @@ def test_a_full_volume_is_enospc_for_mkdir_and_create(ops):
     # first and refuses it with ERROR_DISK_FULL.
     assert _errno(ops.mkdir, "/d0", 0o755) == errno.EEXIST
     assert _errno(ops.mkdir, "/big", 0o755) == errno.EEXIST
+
+
+@pytest.mark.parametrize("winfsp", [False, True], ids=["posix", "winfsp"])
+def test_mkdir_at_a_held_file_s_name_on_a_full_volume(ops, winfsp):
+    # pfs3aio checks for space before the name, and a writer's exclusive
+    # lock prevents stat_path() from finding the existing file (#466).
+    ops._winfsp = winfsp
+    fh = ops.create("/held", 0o644)
+    try:
+        assert ops.write("/held", b"data", 0, fh) == 4
+        assert _fill(ops) == errno.ENOSPC
+        refused, _ = _until_refused(lambda n: ops.mkdir(f"/d{n}", 0o755))
+        assert refused == errno.ENOSPC
+        assert _errno(ops.mkdir, "/held", 0o755) == errno.EEXIST
+        assert _errno(ops.mkdir, "/HELD", 0o755) == errno.EEXIST
+    finally:
+        ops.release("/held", fh)
+    assert _read(ops, "/held") == b"data"
