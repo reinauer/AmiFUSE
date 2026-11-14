@@ -31,7 +31,7 @@ def full_image(tmp_path):
         pytest.skip("machine68k CPU not functional")
     image, fill = tmp_path / "full.adf", tmp_path / "fill.bin"
     fill.write_bytes(b"\0" * FILL_BYTES)
-    _xdftool(image, "create", "+", "format", "Full", "ffs", "+", "write", str(fill), "fill")
+    _xdftool(image, "create", "+", "format", "Full", "DOS3", "+", "write", str(fill), "fill")
     return image
 
 
