@@ -7375,13 +7375,19 @@ def _ls_entry(bridge, ent, path: str) -> dict:
 def _ls_file_name(bridge, stat, path: str) -> str:
     """The name ls gives the file at path, which stat examined.
 
-    The name as stored, in its own letter case, unless it is another name:
-    FastFileSystem names a hard link's target when it examines the link.
+    FastFileSystem names a hard link's target when it examines the link,
+    so take the link's stored name from its parent in that case.
     """
     asked = path.rstrip("/").rsplit("/", 1)[-1]
     fold = _NAME_FOLDS.get(bridge.name_fold()) or {}
     stored = stat.get("name") or ""
-    return stored if stored.translate(fold) == asked.translate(fold) else asked
+    if stored.translate(fold) == asked.translate(fold):
+        return stored
+    parent = path.rstrip("/").rsplit("/", 1)[0] or "/"
+    for entry in bridge.list_dir_path(parent):
+        if entry["name"].translate(fold) == asked.translate(fold):
+            return entry["name"]
+    return asked
 
 
 def _soft_link_on(bridge, path: str):

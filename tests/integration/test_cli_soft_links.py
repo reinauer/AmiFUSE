@@ -194,15 +194,16 @@ def test_ls_text_of_a_file(image, recursive):
     assert len(lines) == 1 and lines[0].split()[:2] == ["target.txt", "7"]
 
 
-def test_ls_of_a_hard_link_to_a_file_names_the_link(tmp_path):
+@pytest.mark.parametrize("path", ["lf", "LF"])
+def test_ls_of_a_hard_link_to_a_file_names_the_link(tmp_path, path):
     # FastFileSystem names the target when it examines a hard link.
     from tests.integration.test_rename_replace_handlers import _hard_link_image
 
     image = _hard_link_image(tmp_path)
-    result = _amifuse("ls", str(image), "--path", "lf", "--json")
+    result = _amifuse("ls", str(image), "--path", path, "--json")
     assert result.returncode == 0, result.stdout + result.stderr
     entries = json.loads(result.stdout)["entries"]
-    assert [(e["name"], e["path"], e["size"]) for e in entries] == [("lf", "/lf", 7)]
+    assert [(e["name"], e["path"], e["size"]) for e in entries] == [("lf", "/" + path, 7)]
 
 
 @pytest.mark.parametrize("recursive", [[], ["--recursive"]], ids=["ls", "ls-R"])
