@@ -7037,6 +7037,31 @@ class TestEnsureParentDirs:
         assert data["error"]["message"] == "Failed to create directory: /S (error 232)"
         assert data["error"]["details"]["dos_error"] == 232
 
+    @pytest.mark.parametrize("res2", [-1, 0])
+    @pytest.mark.parametrize("use_json", [False, True], ids=["text", "json"])
+    def test_create_dir_without_reply(self, fuse_mock, capsys, res2, use_json):
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        mock_bridge = MagicMock()
+        mock_bridge.stat_path.return_value = None
+        mock_bridge.locate_path.return_value = (100, 0, [100])
+        mock_bridge.create_dir.return_value = (0, res2)
+
+        with pytest.raises(SystemExit) as caught:
+            fuse_fs_mod._ensure_parent_dirs(
+                mock_bridge, "/S/Startup-Sequence", use_json=use_json,
+                error_details={"target": "disk.adf"})
+        message = "Failed to create directory: /S (no reply from handler)"
+        if use_json:
+            assert caught.value.code == 1
+            error = json.loads(capsys.readouterr().out)["error"]
+            assert error["code"] == "HANDLER_ERROR"
+            assert error["message"] == message
+            assert error["details"] == {"target": "disk.adf"}
+        else:
+            assert str(caught.value) == f"Error: {message}"
+        mock_bridge.free_lock.assert_called_once_with(100)
+
     def test_debug_logging(self, fuse_mock, monkeypatch, capsys):
         """Verify debug output when creating directories."""
         import amifuse.fuse_fs as fuse_fs_mod

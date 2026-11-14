@@ -7911,10 +7911,13 @@ def _ensure_parent_dirs(bridge, path: str, use_json: bool = False,
             new_lock, res2 = bridge.create_dir(parent_lock, parts[i-1])
             if new_lock == 0:
                 # Name the reason, as a failed write does: "disk full" (#462).
-                reason = _WRITE_ERROR_REASONS.get(res2, f"error {res2}")
+                reason = (_WRITE_ERROR_REASONS.get(res2, f"error {res2}")
+                          if res2 > 0 else "no reply from handler")
                 msg = f"Failed to create directory: {dir_path} ({reason})"
                 if use_json:
-                    details = dict(error_details or {}, dos_error=res2)
+                    details = dict(error_details or {})
+                    if res2 > 0:
+                        details["dos_error"] = res2
                     print(_json.dumps(_json_error("write", "HANDLER_ERROR", msg, details)))
                     sys.exit(1)
                 raise SystemExit(f"Error: {msg}")
