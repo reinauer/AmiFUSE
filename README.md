@@ -4,6 +4,11 @@ Mount Amiga filesystem images on macOS/Linux/Windows using native AmigaOS filesy
 
 AmiFUSE runs actual Amiga filesystem drivers (like PFS3) through m68k CPU emulation, allowing you to read Amiga hard disk images without relying on reverse-engineered implementations.
 
+Read-write access is supported on macOS and Linux. Writable Windows mounts
+remain experimental because of the [known Windows write
+limitations](#known-windows-write-limitations) below. Mounts are read-only
+by default on every platform; use `--write` to enable writes.
+
 ![amifuse](https://raw.githubusercontent.com/reinauer/AmiFUSE/main/Docs/amifuse.png)
 
 ## Requirements
@@ -60,9 +65,10 @@ pip install -e '.[windows]'         # Windows only: adds pystray + Pillow for tr
 ```
 
 The Windows installer downloads tested wheels built from upstream
-machine68k 0.5.0 for Python 3.11--3.15. Upstream PyPI currently provides
-only a source archive, so a direct pip installation on Windows needs a
-native compiler unless the matching wheel is installed first.
+machine68k 0.5.0 for Python 3.11--3.15. Direct pip installations can now
+use the upstream machine68k 0.5.1 wheels published on PyPI for Windows x64
+and those Python versions. Other platform/Python combinations without a
+matching wheel may need a native compiler.
 
 ### macOS-specific
 
@@ -187,7 +193,7 @@ amifuse mount /path/to/disk.hdf
 | `--interactive` / `--foreground` | No | Stay attached to the terminal; Ctrl+C unmounts |
 | `--debug` | No | Enable debug logging of FUSE operations |
 | `--profile` | No | Enable cProfile profiling and write stats to `profile.txt` on exit |
-| `--write` | No | Enable read-write mode (experimental, use with caution) |
+| `--write` | No | Enable read-write mode (experimental on Windows) |
 | `--icons` | No | Convert Amiga .info icons to native icons (experimental, macOS only) |
 
 Mount lifecycle:
@@ -541,7 +547,8 @@ Or use the installer's uninstall mode:
 
 ## Notes
 
-- The filesystem is mounted **read-only** by default; use `--write` for experimental read-write support
+- The filesystem is mounted **read-only** by default; use `--write` for
+  read-write access. Writable Windows mounts remain experimental.
 - macOS and Linux default to daemon mode; use `--interactive` if you want
   Ctrl+C to unmount from the same terminal
 - Use `amifuse unmount <mountpoint>` to tear down daemon mounts
@@ -557,3 +564,26 @@ Or use the installer's uninstall mode:
   the image is touched. A temporary directory on tmpfs, as `/tmp` often is,
   also holds the copy in RAM. Setting `TMPDIR` to an existing directory on a
   larger disk gets around both.
+
+### Known Windows write limitations
+
+Writable Windows mounts remain experimental while these WinFsp-related
+issues are open. Use read-only mounts for irreplaceable media, or work on
+a backup image when testing writes.
+
+- [#424](https://github.com/reinauer/AmiFUSE/issues/424): deleting through a
+  handle that renamed a file can delete a different file created at the
+  old name when WinFsp delivers closes late. The proposed upstream fix,
+  [WinFsp #704](https://github.com/winfsp/winfsp/pull/704), has not shipped.
+- [#438](https://github.com/reinauer/AmiFUSE/issues/438): a delete-on-close
+  open can incorrectly report success for a delete-protected object when
+  another open handle previously renamed its object away from that name.
+  The protected object remains on disk.
+- [#437](https://github.com/reinauer/AmiFUSE/issues/437): WinFsp builds that
+  include the proposed current-name fix need a corresponding AmiFUSE
+  compatibility change. Do not assume a custom WinFsp build with that
+  patch is safe with this release.
+
+These limitations concern writable Windows mounts. They do not apply to
+the FUSE-free file commands, read-only mounts, or the macOS and Linux FUSE
+interfaces.

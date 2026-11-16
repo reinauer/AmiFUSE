@@ -1,6 +1,7 @@
 """
 FUSE bridge that forwards basic filesystem ops into the Amiga handler
-via our vamos bootstrap. Read/write is experimental and enabled with --write.
+via our vamos bootstrap. Read/write is enabled with --write; writable
+Windows mounts remain experimental.
 """
 
 import cProfile
@@ -8993,7 +8994,7 @@ commands:
     --daemon                  Detach after mounting (default on macOS/Linux).
     --interactive             Stay attached; Ctrl+C unmounts the filesystem.
                               Windows uses this mode by default.
-    --write                   Enable read-write mode (experimental).
+    --write                   Enable read-write mode (experimental on Windows).
     --icons                   Convert Amiga .info icons to native macOS icons (experimental).
     --debug                   Enable debug logging of FUSE operations.
     --trace                   Enable vamos instruction tracing (very noisy).
@@ -9144,7 +9145,7 @@ commands:
         "--profile", action="store_true", help="Enable profiling and write stats to profile.txt."
     )
     mount_parser.add_argument(
-        "--write", action="store_true", help="Enable read-write mode (experimental)."
+        "--write", action="store_true", help="Enable read-write mode (experimental on Windows)."
     )
     mount_parser.add_argument(
         "--icons", action="store_true",

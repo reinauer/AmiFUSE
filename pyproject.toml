@@ -15,7 +15,7 @@ authors = [
 ]
 keywords = ["amiga", "fuse", "filesystem", "pfs3", "m68k"]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 5 - Production/Stable",
     "Environment :: Console",
     "Intended Audience :: Developers",
     "Operating System :: MacOS",
