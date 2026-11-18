@@ -504,7 +504,14 @@ def _parse_fib(mem, fib_addr: int) -> Dict:
       fib_Date: DateStamp (ds_Days, ds_Minute, ds_Tick: 3 LONGs) at 132
 
     "mtime" is fib_Date as host time. "disk_key" is only a handler's own
-    number: pfs3aio and ODFileSystem give it to many entries.
+    number, and doesn't identify an object: on pfs3aio it is the address of
+    the handler's entry for the lock examined (its FileLock at offset 8), so
+    it differs between two locks on one object and repeats for different
+    objects; ODFileSystem gives one to many entries. What identifies the
+    object is the lock's fl_Key, which _stat_path() adds as "lock_key": the
+    header block on FastFileSystem, the anode on pfs3aio, the object node
+    on SmartFilesystem and the inode on BFFS, the same through any hard
+    link to it.
 
     A name is read no further than fib_FileName, so a longer one gives its
     first 107 characters: the handler fills in the fields after it too, and
@@ -1974,9 +1981,7 @@ class HandlerBridge:
                     self.free_lock(l)
                 return None, -1 if reply is None else reply[1]
             info = _parse_fib(self.mem, fib_mem.addr)
-            # The lock's fl_Key: pfs3aio's fib_DiskKey is the address of
-            # the lock examined, and this its object's number (anode).
-            info["lock_key"] = self.mem.r32((lock << 2) + 4)
+            info["lock_key"] = self._lock_key(lock)  # see _parse_fib()
             for l in reversed(locks):
                 self.free_lock(l)
             return info, 0
@@ -5935,11 +5940,10 @@ class AmigaFuseFS(_FuseOperations):
         A lock taken through a hard link is a lock on the object it links
         to, so FastFileSystem refuses to delete any of its names, and
         pfs3aio the file's own, while such a handle is open
-        (ERROR_OBJECT_IN_USE). A lock through either name has the linked
-        object's fl_Key, which must match, and so must the entry type. The
-        name need not: BFFS's Examine gives the name the lock was taken
-        through. A file held on an exclusive lock can't be examined, and
-        doesn't count.
+        (ERROR_OBJECT_IN_USE). The two names' "lock_key" (see _parse_fib)
+        and entry type must match; the names need not, as BFFS's Examine
+        gives the name the lock was taken through. A file held on an
+        exclusive lock can't be examined, and doesn't count.
         """
         try:
             info = self.bridge.stat_path(path)

@@ -12,9 +12,8 @@ AmigaDOS lock (#408), so FastFileSystem deletes the file at once and the
 link takes over its data.
 
 pfs3aio refuses to delete the file's own name the same way, though not a
-link's. Its fib_DiskKey is the address of the lock examined, so the handle
-is found by the lock's fl_Key. Those tests copy the fixture images and make
-the link with ACTION_MAKE_LINK.
+link's. The handle is found by the lock's fl_Key (see _parse_fib). Those
+tests copy the fixture images and make the link with ACTION_MAKE_LINK.
 
 Renaming one name of a file onto another of its names does nothing, as
 rename(2) says; replacing the second name would delete it.
