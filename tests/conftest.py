@@ -85,6 +85,7 @@ def fuse_mock(monkeypatch):
         ACTION_FINDOUTPUT=1006,
         ACTION_FINDUPDATE=1004,
         ACTION_LOCATE_OBJECT=8,
+        ACTION_PARENT=29,
         HandlerLauncher=dummy_cls,
         # startup_runner's values, so tests can tell the seek modes apart.
         OFFSET_BEGINNING=-1,
