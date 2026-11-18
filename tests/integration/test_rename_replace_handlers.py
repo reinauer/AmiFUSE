@@ -459,6 +459,7 @@ def test_getpath_locates_each_component_once(ops, monkeypatch):
     ops.mkdir("/Deep", 0o755)
     ops.mkdir("/Deep/Er", 0o755)
     _write(ops, "/Deep/Er/File", b"data")
+    ops.getpath("/deep/er/file")  # the first also asks about disk keys, once
     launcher = ops.bridge.launcher
     send_locate, located = launcher.send_locate, []
 
@@ -583,8 +584,10 @@ def test_getpath_does_not_trust_an_opened_handles_spelling(ops, monkeypatch):
 
 def _hard_link_image(tmp_path):
     """An FFS floppy with lf and D/targetfile.txt, hard links to
-    TargetFile.txt, and L and D/targetdir, hard links to the directory
-    TargetDir, which holds inner.txt."""
+    TargetFile.txt; L and D/targetdir, hard links to the directory
+    TargetDir, which holds inner.txt; Inner.txt, a hard link to
+    TargetDir/inner.txt; and A/sub/note.txt, a hard link to
+    B/sub/Note.txt, where A/sub and B/sub have the same date."""
     import struct
     from tests.integration.test_ls_recursive_ffs import BLOCK, _edit_block, _xdftool
 
@@ -598,21 +601,42 @@ def _hard_link_image(tmp_path):
              "+", "makedir", "TargetDir", "+", "write", str(content), "TargetDir/inner.txt",
              "+", "makedir", "L",
              "+", "makedir", "D", "+", "write", str(empty), "D/targetfile.txt",
-             "+", "makedir", "D/targetdir")
+             "+", "makedir", "D/targetdir",
+             "+", "write", str(empty), "Inner.txt",
+             "+", "makedir", "A", "+", "makedir", "A/sub",
+             "+", "makedir", "B", "+", "makedir", "B/sub",
+             "+", "write", str(content), "B/sub/Note.txt",
+             "+", "write", str(empty), "A/sub/note.txt")
     data = bytearray(image.read_bytes())
 
+    def headers(name, sec_type):
+        return [key for key in range(len(data) // BLOCK)
+                if struct.unpack(">I", data[key * BLOCK:key * BLOCK + 4])[0] == 2
+                and struct.unpack(">i", data[(key + 1) * BLOCK - 4:(key + 1) * BLOCK])[0]
+                == sec_type
+                and data[key * BLOCK + 433:key * BLOCK + 433 + data[key * BLOCK + 432]]
+                == name]
+
     def header(name, sec_type):
-        for key in range(len(data) // BLOCK):
-            block = data[key * BLOCK:(key + 1) * BLOCK]
-            if (struct.unpack(">I", block[:4])[0] == 2
-                    and struct.unpack(">i", block[-4:])[0] == sec_type
-                    and block[433:433 + block[432]] == name):
-                return key
-        raise AssertionError(f"no header for {name!r}")
+        found = headers(name, sec_type)
+        assert len(found) == 1, f"{len(found)} headers for {name!r}"
+        return found[0]
+
+    # Both sub directories get one date, as from a copy that keeps dates:
+    # their entries are then equal but for the disk key.
+    first, second = headers(b"sub", 2)
+    date = data[(second + 1) * BLOCK - 92:(second + 1) * BLOCK - 80]
+
+    def same_date(block):
+        block[BLOCK - 92:BLOCK - 80] = date  # days, minutes, ticks
+
+    _edit_block(data, first, same_date)
 
     for link, target, sec_type, link_type in (
             (b"lf", b"TargetFile.txt", -3, -4),  # ST_FILE -> ST_LINKFILE
             (b"targetfile.txt", b"TargetFile.txt", -3, -4),
+            (b"Inner.txt", b"inner.txt", -3, -4),
+            (b"note.txt", b"Note.txt", -3, -4),
             (b"L", b"TargetDir", 2, 4),          # ST_USERDIR -> ST_LINKDIR
             (b"targetdir", b"TargetDir", 2, 4)):
         link_key, target_key = header(link, sec_type), header(target, sec_type)
@@ -788,6 +812,25 @@ def test_getpath_names_a_hard_link_named_like_its_target(tmp_path, spelling,
         assert ops.rename("/D/targetfile.txt", "/D/TargetFile.txt") == 0
         assert ops.getpath("/d/" + spelling) == "/D/TargetFile.txt"
         assert "TargetFile.txt" in _on_disk(ops, "/D")
+    finally:
+        bridge.close()
+
+
+@pytest.mark.parametrize("path, stored", [
+    # Inner.txt, in the root, links to TargetDir/inner.txt.
+    ("/inner.txt", "/Inner.txt"), ("/INNER.TXT", "/Inner.txt"),
+    ("/Inner.txt", "/Inner.txt"),
+    # A/sub/note.txt links to B/sub/Note.txt, and the two sub directories
+    # have equal entries but for their disk keys.
+    ("/a/sub/note.txt", "/A/sub/note.txt"), ("/A/SUB/NOTE.TXT", "/A/sub/note.txt"),
+    ("/A/sub/Note.txt", "/A/sub/note.txt")])
+def test_getpath_names_a_hard_link_to_a_target_in_a_directory_like_its_own(
+        tmp_path, path, stored):
+    image = _hard_link_image(_bundled_image(tmp_path).parent)
+    bridge = HandlerBridge(image, BUNDLED_DRIVER, read_only=False,
+                           adf_info=detect_adf(image))
+    try:
+        assert AmigaFuseFS(bridge).getpath(path) == stored
     finally:
         bridge.close()
 
