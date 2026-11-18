@@ -5931,9 +5931,9 @@ class AmigaFuseFS(_FuseOperations):
         to, so FastFileSystem refuses to delete any of its names, and
         pfs3aio the file's own, while such a handle is open
         (ERROR_OBJECT_IN_USE). A lock through either name has the linked
-        object's fl_Key, and Examine gives its name: both must match.
-        fib_DiskKey doesn't serve: pfs3aio gives each lock examined its
-        own. A file held on an exclusive lock can't be examined, and
+        object's fl_Key, which must match, and so must the entry type. The
+        name need not: BFFS's Examine gives the name the lock was taken
+        through. A file held on an exclusive lock can't be examined, and
         doesn't count.
         """
         try:
@@ -5942,7 +5942,7 @@ class AmigaFuseFS(_FuseOperations):
             return set()
         if not info or info.get("dir_type", 0) >= 0 or not info.get("lock_key"):
             return set()
-        key = (info["lock_key"], info.get("name"), info.get("dir_type"))
+        key = (info["lock_key"], info.get("dir_type"))
         with self._fh_lock:
             others = {
                 fh: v.get("path") for fh, v in self._fh_cache.items()
@@ -5956,8 +5956,7 @@ class AmigaFuseFS(_FuseOperations):
                     found = self.bridge.stat_path(other)
                 except Exception:
                     found = None
-                seen[other] = found and (
-                    found.get("lock_key"), found.get("name"), found.get("dir_type"))
+                seen[other] = found and (found.get("lock_key"), found.get("dir_type"))
             if seen[other] == key:
                 holders.add(fh)
         return holders

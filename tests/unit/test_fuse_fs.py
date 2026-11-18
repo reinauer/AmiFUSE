@@ -8303,6 +8303,37 @@ class TestDeferredDeleteAfterRename:
         assert not fs._pending_dir_deletes
 
 
+class TestLinkHolders:
+    """_link_holders() finds a handle open on a file under another name by
+    the lock's fl_Key and the entry type. BFFS's Examine gives the name the
+    lock was taken through, so the names of a file and its link differ."""
+
+    @staticmethod
+    def _holders(write_fs, entries, held):
+        fs, bridge = write_fs
+        bridge.stat_path.side_effect = lambda path, links=False: entries.get(path)
+        fs._fh_cache[42] = {"path": held, "fh_addr": 0x4abbc}
+        return fs._link_holders("/D/T.txt")
+
+    def test_a_link_examined_under_its_own_name_holds(self, write_fs):
+        assert self._holders(write_fs, {
+            "/D/T.txt": {"lock_key": 7, "name": "T.txt", "dir_type": -3},
+            "/l": {"lock_key": 7, "name": "l", "dir_type": -3},
+        }, "/l") == {42}
+
+    def test_a_file_of_the_same_name_with_another_key_does_not_hold(self, write_fs):
+        assert self._holders(write_fs, {
+            "/D/T.txt": {"lock_key": 7, "name": "T.txt", "dir_type": -3},
+            "/E/T.txt": {"lock_key": 8, "name": "T.txt", "dir_type": -3},
+        }, "/E/T.txt") == set()
+
+    def test_no_key_finds_no_holder(self, write_fs):
+        assert self._holders(write_fs, {
+            "/D/T.txt": {"lock_key": 0, "name": "T.txt", "dir_type": -3},
+            "/l": {"lock_key": 0, "name": "T.txt", "dir_type": -3},
+        }, "/l") == set()
+
+
 class TestCacheLocking:
     """Verify _cache_lock protects cache dicts from concurrent access."""
 
