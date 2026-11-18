@@ -173,16 +173,20 @@ def test_setup_sweeps_and_names_its_directory(temp_dir, monkeypatch):
         runtime._temp_dir.cleanup()
 
 
-@pytest.mark.parametrize("handle,error,gone", [
-    (123, 0, False), (0, 87, True), (0, 5, False), (0, 6, False),
+# wait: WaitForSingleObject's result for an opened process; 0 is
+# WAIT_OBJECT_0 (exited), 258 WAIT_TIMEOUT (running), 0xFFFFFFFF WAIT_FAILED.
+@pytest.mark.parametrize("handle,wait,error,gone", [
+    (123, 258, 0, False), (123, 0, 0, True), (123, 0xFFFFFFFF, 0, False),
+    (0, None, 87, True), (0, None, 5, False), (0, None, 6, False),
 ])
 def test_windows_cleanup_requires_a_definitely_gone_owner(
-        monkeypatch, handle, error, gone):
+        monkeypatch, handle, wait, error, gone):
     import ctypes
     from amifuse import platform as plat
 
     kernel = MagicMock()
     kernel.OpenProcess.return_value = handle
+    kernel.WaitForSingleObject.return_value = wait
     dll = MagicMock(return_value=kernel)
     monkeypatch.setattr(ctypes, "WinDLL", dll, raising=False)
     monkeypatch.setattr(ctypes, "get_last_error", lambda: error, raising=False)
@@ -190,7 +194,11 @@ def test_windows_cleanup_requires_a_definitely_gone_owner(
 
     assert plat._temp_owner_gone(12345) is gone
     dll.assert_called_once_with("kernel32", use_last_error=True)
+    # PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, which the wait needs.
+    kernel.OpenProcess.assert_called_once_with(0x1000 | 0x100000, False, 12345)
     if handle:
+        kernel.WaitForSingleObject.assert_called_once_with(handle, 0)
         kernel.CloseHandle.assert_called_once_with(handle)
     else:
+        kernel.WaitForSingleObject.assert_not_called()
         kernel.CloseHandle.assert_not_called()

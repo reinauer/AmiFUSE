@@ -1185,10 +1185,18 @@ def _temp_owner_gone(pid: int) -> bool:
         kernel.OpenProcess.restype = wintypes.HANDLE
         kernel.CloseHandle.argtypes = [wintypes.HANDLE]
         kernel.CloseHandle.restype = wintypes.BOOL
-        handle = kernel.OpenProcess(0x1000, False, pid)
+        kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel.WaitForSingleObject.restype = wintypes.DWORD
+        # PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE
+        handle = kernel.OpenProcess(0x1000 | 0x100000, False, pid)
         if handle:
-            kernel.CloseHandle(handle)
-            return False
+            # An exited process stays openable while anything references its
+            # object, and its PID is not reused until then: a signaled handle
+            # means the run that named the file has ended.
+            try:
+                return kernel.WaitForSingleObject(handle, 0) == 0  # WAIT_OBJECT_0
+            finally:
+                kernel.CloseHandle(handle)
         # Access denied and other failures do not prove the process exited.
         return ctypes.get_last_error() == 87  # ERROR_INVALID_PARAMETER
     except Exception:
