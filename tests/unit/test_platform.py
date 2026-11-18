@@ -1232,7 +1232,7 @@ class TestWindowsUnmountCommand:
 
 
 # ---------------------------------------------------------------------------
-# L. _pid_exists -- 4 tests
+# L. _pid_exists -- 6 tests
 # ---------------------------------------------------------------------------
 
 
@@ -1278,6 +1278,57 @@ class TestPidExists:
 
         monkeypatch.setattr("amifuse.platform.os.kill", raise_oserror)
         assert _pid_exists(12345) is False
+
+    # wait: WaitForSingleObject's result for an opened process; 0 is
+    # WAIT_OBJECT_0 (exited, still referenced), 258 WAIT_TIMEOUT (running),
+    # 0xFFFFFFFF WAIT_FAILED. error: the last error of a failed open; 5 is
+    # access denied, 87 no such process.
+    @pytest.mark.parametrize("handle,wait,error,exists", [
+        (123, 258, 0, True), (123, 0, 0, False), (123, 0xFFFFFFFF, 0, True),
+        (0, None, 87, False), (0, None, 5, True), (0, None, 6, True),
+    ])
+    def test_pid_exists_on_windows_until_proven_ended(
+            self, monkeypatch, handle, wait, error, exists):
+        import ctypes
+        from unittest.mock import MagicMock
+        from amifuse import platform as plat
+
+        kernel = MagicMock()
+        kernel.OpenProcess.return_value = handle
+        kernel.WaitForSingleObject.return_value = wait
+        dll = MagicMock(return_value=kernel)
+        monkeypatch.setattr(ctypes, "WinDLL", dll, raising=False)
+        monkeypatch.setattr(ctypes, "get_last_error", lambda: error,
+                            raising=False)
+        monkeypatch.setattr(plat.sys, "platform", "win32")
+
+        assert plat._pid_exists(12345) is exists
+        dll.assert_called_once_with("kernel32", use_last_error=True)
+        # PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, which the wait needs.
+        kernel.OpenProcess.assert_called_once_with(0x1000 | 0x100000, False,
+                                                   12345)
+        if handle:
+            kernel.WaitForSingleObject.assert_called_once_with(handle, 0)
+            kernel.CloseHandle.assert_called_once_with(handle)
+        else:
+            kernel.WaitForSingleObject.assert_not_called()
+            kernel.CloseHandle.assert_not_called()
+
+    def test_pid_exists_on_windows_closes_the_handle_if_the_wait_raises(
+            self, monkeypatch):
+        import ctypes
+        from unittest.mock import MagicMock
+        from amifuse import platform as plat
+
+        kernel = MagicMock()
+        kernel.OpenProcess.return_value = 123
+        kernel.WaitForSingleObject.side_effect = OSError("wait")
+        monkeypatch.setattr(ctypes, "WinDLL", MagicMock(return_value=kernel),
+                            raising=False)
+        monkeypatch.setattr(plat.sys, "platform", "win32")
+
+        assert plat._pid_exists(12345) is True
+        kernel.CloseHandle.assert_called_once_with(123)
 
 
 # ---------------------------------------------------------------------------

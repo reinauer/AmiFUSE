@@ -90,7 +90,7 @@ def _windows_allocated_drive_letters() -> Set[str]:
     try:
         # windll is Windows-only; keep the reference inside the function body so
         # merely importing this module never touches it on macOS/Linux. Matches
-        # the ctypes idiom used elsewhere in this file (e.g. _pid_exists).
+        # the ctypes idiom used elsewhere in this file (e.g. _windows_process_ended).
         import ctypes
         mask = ctypes.windll.kernel32.GetLogicalDrives()
     except Exception:
@@ -1176,6 +1176,14 @@ def _temp_owner_gone(pid: int) -> bool:
     """Require evidence that an owner exited before deleting its files."""
     if not sys.platform.startswith("win"):
         return not _pid_exists(pid)
+    return _windows_process_ended(pid)
+
+
+def _windows_process_ended(pid: int) -> bool:
+    """Tell if Windows proves the process with this PID has ended.
+
+    Anything short of proof, such as access denied, is False.
+    """
     try:
         import ctypes
         from ctypes import wintypes
@@ -1192,7 +1200,7 @@ def _temp_owner_gone(pid: int) -> bool:
         if handle:
             # An exited process stays openable while anything references its
             # object, and its PID is not reused until then: a signaled handle
-            # means the run that named the file has ended.
+            # means the process this PID named has ended.
             try:
                 return kernel.WaitForSingleObject(handle, 0) == 0  # WAIT_OBJECT_0
             finally:
@@ -1208,19 +1216,10 @@ def _pid_exists(pid: int) -> bool:
     if sys.platform.startswith("win"):
         # os.kill(pid, 0) is unreliable on Windows -- it raises OSError with
         # errno EINVAL (WinError 87) for processes we didn't spawn, making
-        # live processes look dead.  Use OpenProcess instead.
-        try:
-            import ctypes
-            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-            handle = ctypes.windll.kernel32.OpenProcess(
-                PROCESS_QUERY_LIMITED_INFORMATION, False, pid,
-            )
-            if handle:
-                ctypes.windll.kernel32.CloseHandle(handle)
-                return True
-            return False
-        except Exception:
-            return False
+        # live processes look dead.  Use OpenProcess instead.  Whether it
+        # opens says little: it opens an exited process that something
+        # still references, and a live process can refuse it.
+        return not _windows_process_ended(pid)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
