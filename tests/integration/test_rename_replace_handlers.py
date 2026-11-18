@@ -459,7 +459,6 @@ def test_getpath_locates_each_component_once(ops, monkeypatch):
     ops.mkdir("/Deep", 0o755)
     ops.mkdir("/Deep/Er", 0o755)
     _write(ops, "/Deep/Er/File", b"data")
-    ops.getpath("/deep/er/file")  # the first also asks about lock keys, once
     launcher = ops.bridge.launcher
     send_locate, located = launcher.send_locate, []
 
