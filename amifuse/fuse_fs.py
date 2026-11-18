@@ -1853,7 +1853,10 @@ class HandlerBridge:
                 self._unwritten_outputs.add(fh_addr)
             return (fh_addr, dir_lock), 0
 
-    def list_dir(self, lock_bptr: int, path: Optional[str] = None) -> List[Dict]:
+    def list_dir(self, lock_bptr: int, path: Optional[str] = None, *,
+                 quiet: bool = False) -> List[Dict]:
+        """List a directory's entries. A listing cut short or with unnamed
+        entries is warned about on stderr, unless quiet."""
         with self._lock:
             # A path is supplied by list_dir_path; direct callers may only
             # have a lock. Escape names before including them in warnings.
@@ -1896,7 +1899,8 @@ class HandlerBridge:
                     if self._debug:
                         res2 = reply[1] if reply else -1
                         print(f"[amifuse] list_dir: ExamineNext #{iter_num} ended res2={res2}")
-                    if reply is not None and reply[1] != ERROR_NO_MORE_ENTRIES:
+                    if (reply is not None and reply[1] != ERROR_NO_MORE_ENTRIES
+                            and not quiet):
                         print(f"Warning: listing {shown} stopped early "
                               f"with error {reply[1]}; it may be incomplete",
                               file=sys.stderr)
@@ -1908,8 +1912,8 @@ class HandlerBridge:
                     unnamed += 1
                     continue
                 entries.append(entry)
-            if unnamed:
-                detail = ("entry with an empty name" if unnamed == 1
+            if unnamed and not quiet:
+                detail =("entry with an empty name" if unnamed == 1
                           else "entries with empty names")
                 print(f"Warning: listing {shown}: skipped {unnamed} directory "
                       f"{detail}", file=sys.stderr)
@@ -1917,15 +1921,15 @@ class HandlerBridge:
                 self.free_lock(root_lock)
             return entries
 
-    def list_dir_path(self, path: str) -> List[Dict]:
-        """List directory contents by path."""
+    def list_dir_path(self, path: str, *, quiet: bool = False) -> List[Dict]:
+        """List directory contents by path; quiet as for list_dir."""
         with self._lock:
             if path == "/":
-                return self.list_dir(0, path=path)
+                return self.list_dir(0, path=path, quiet=quiet)
             lock, _, locks = self.locate_path(path)
             if lock == 0:
                 return []
-            entries = self.list_dir(lock, path=path)
+            entries = self.list_dir(lock, path=path, quiet=quiet)
             for l in reversed(locks):
                 self.free_lock(l)
             return entries
@@ -7385,11 +7389,17 @@ def _ls_file_name(bridge, stat, path: str) -> str:
     and that name can fold to the link's own (#468), so the name comes
     from the parent's listing. Without a matching entry there, it is the
     examined name if that folds to the one asked for, else the one asked.
+    The listing is quiet: a damaged sibling is no concern of ls of a file.
     """
     asked = path.rstrip("/").rsplit("/", 1)[-1]
     fold = _NAME_FOLDS.get(bridge.name_fold()) or {}
     parent = path.rstrip("/").rsplit("/", 1)[0] or "/"
-    for entry in bridge.list_dir_path(parent):
+    try:
+        listing = bridge.list_dir_path(parent, quiet=True)
+    except Exception:
+        # The file was examined; the listing only refines its name.
+        listing = []
+    for entry in listing:
         if entry["name"].translate(fold) == asked.translate(fold):
             return entry["name"]
     stored = stat.get("name") or ""

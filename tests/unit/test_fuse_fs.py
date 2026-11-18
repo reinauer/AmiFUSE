@@ -5025,6 +5025,19 @@ class TestCmdLs:
         assert data["error"]["code"] == "HANDLER_ERROR"
         assert "handler crashed" in data["error"]["message"]
 
+    def test_ls_file_name_without_its_parent_listing(self, mock_bridge_for_ls, capsys):
+        """The parent's listing only refines a file's name: if it fails, the
+        file is still listed, under its examined name."""
+        mock_bridge, fuse_fs_mod = mock_bridge_for_ls
+        mock_bridge.stat_path.return_value = {
+            "name": "Foo", "dir_type": -3, "size": 3, "protection": 0}
+        mock_bridge.name_fold.return_value = "ascii"
+        mock_bridge.list_dir_path.side_effect = RuntimeError("listing failed")
+
+        fuse_fs_mod.cmd_ls(self._ls_args(path="d/FOO"))
+        data = json.loads(capsys.readouterr().out)
+        assert [(e["name"], e["path"]) for e in data["entries"]] == [("Foo", "/d/FOO")]
+
 
 # ---------------------------------------------------------------------------
 # TestQueryDiskInfo -- ACTION_DISK_INFO memory reads
