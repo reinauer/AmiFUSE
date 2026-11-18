@@ -755,9 +755,6 @@ class HandlerBridge:
         # Short negative cache for handler lookups; tune for RW.
         # A newly created file might be invisible for up to TTL seconds, then it will appear normally.
         self._neg_cache_ttl = 10.0
-        # Whether a lock's fl_Key names its object; see
-        # _lock_keys_name_objects.
-        self._lock_keys_stable: Optional[bool] = None
         self._write_enabled = not read_only
         if self._write_enabled:
             self._neg_cache_ttl = 0.0
@@ -2016,15 +2013,12 @@ class HandlerBridge:
                     lock, _ = self.locate(held, name)
                     if lock == 0:
                         break
-                    top, dir_key = held == 0, self._lock_key(held) if held else 0
-                    self.free_lock(held)
-                    held = lock
                     info = self._examine_lock(lock)
-                    in_dir = (info is not None and (top or directory is not None)
-                              and self._in_directory(lock, None if top else directory,
-                                                     dir_key))
+                    in_dir = (info is not None and (held == 0 or directory is not None)
+                              and self._in_directory(lock, held, directory))
                     result.append((info, in_dir))
-                    directory = info
+                    self.free_lock(held)
+                    held, directory = lock, info
             finally:
                 self.free_lock(held)
         return result + [(None, False)] * (len(names) - len(result))
@@ -2034,50 +2028,34 @@ class HandlerBridge:
         the object, where fib_DiskKey need not be one (_parse_fib)."""
         return self.mem.r32((lock << 2) + 4)
 
-    def _in_directory(self, lock: int, directory: Optional[Dict], dir_key: int) -> bool:
-        """Whether lock's object is in the directory whose lock had fl_Key
-        dir_key and which was examined as directory, or in the root when
-        directory is None.
+    def _in_directory(self, lock: int, dir_lock: int, directory: Optional[Dict]) -> bool:
+        """Whether lock's object is in the directory dir_lock holds, which
+        was examined as directory; dir_lock 0 is the root.
 
         The root is the directory without a parent. Another directory is
-        the same when its lock has the same fl_Key, where that names the
-        object (_lock_keys_name_objects). Elsewhere the entries are
-        compared but for fib_DiskKey, and two directories of one name and
-        date pass for one.
+        the same when its lock has the same fl_Key: the header block on
+        FastFileSystem, the anode on pfs3aio, the object node on
+        SmartFilesystem. Where a key is 0, as pfs3aio gives the root, the
+        entries are compared but for fib_DiskKey, and two directories of
+        one name and date pass for one.
         """
         parent, _ = self._parent_lock(lock)
         if parent == 0:
             return False
         try:
-            if directory is None:
+            if dir_lock == 0:
                 above, res2 = self._parent_lock(parent)
                 self.free_lock(above)
                 return above == 0 and res2 == 0
-            if dir_key and self._lock_keys_name_objects(parent):
-                return self._lock_key(parent) == dir_key
+            parent_key, dir_key = self._lock_key(parent), self._lock_key(dir_lock)
+            if parent_key and dir_key:
+                return parent_key == dir_key
             entry = self._examine_lock(parent)
             return entry is not None and all(
                 entry.get(field) == value for field, value in directory.items()
-                if field != "disk_key")
+                if field not in ("disk_key", "lock_key"))
         finally:
             self.free_lock(parent)
-
-    def _lock_keys_name_objects(self, lock: int) -> bool:
-        """Whether two locks on one object have one fl_Key.
-
-        FastFileSystem gives an object's header block, pfs3aio its anode
-        and SmartFilesystem its object node. Asked once per mount, of lock
-        and a second lock on its object; pfs3aio gives the root 0, so a
-        lock whose fl_Key is 0 leaves the question for a later one.
-        """
-        if self._lock_keys_stable is None and self._lock_key(lock):
-            other, _ = self.locate(lock, "")
-            try:
-                self._lock_keys_stable = bool(other) and (
-                    self._lock_key(other) == self._lock_key(lock))
-            finally:
-                self.free_lock(other)
-        return bool(self._lock_keys_stable)
 
     # Buffers for ACTION_READ_LINK, tried in order while the target does not
     # fit. A soft link's target is in one block of the disk.
