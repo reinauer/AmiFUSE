@@ -5101,6 +5101,11 @@ class AmigaFuseFS(_FuseOperations):
         if src is None or dst is None:
             # Neither examined nor pinned: gone, or held on an exclusive lock.
             raise FuseOSError(errno.ENOENT if src is None else errno.EBUSY)
+        # Two names of one object, hard links to it: rename(2) does nothing,
+        # and the replace would delete one of them.
+        if src.get("lock_key") and (src["lock_key"], src["dir_type"]) == (
+                dst.get("lock_key"), dst["dir_type"]):
+            return
         dst_dir, _ = self._split_path(new)
         src_is_dir = _is_dir_entry(src)
         dst_is_dir = _is_dir_entry(dst)

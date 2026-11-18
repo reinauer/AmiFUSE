@@ -15,6 +15,9 @@ pfs3aio refuses to delete the file's own name the same way, though not a
 link's. Its fib_DiskKey is the address of the lock examined, so the handle
 is found by the lock's fl_Key. Those tests copy the fixture images and make
 the link with ACTION_MAKE_LINK.
+
+Renaming one name of a file onto another of its names does nothing, as
+rename(2) says; replacing the second name would delete it.
 """
 
 import errno
@@ -288,3 +291,33 @@ def test_a_file_of_the_same_name_does_not_hold_a_delete(handler_ops):
         assert ops._link_holders("/D/T.txt") == set()
     finally:
         ops.release("/E/T.txt", fh)
+
+
+def _rename_does_nothing(ops, winfsp, old, new):
+    ops._winfsp = winfsp
+    dirs = {path.rsplit("/", 1)[0] or "/" for path in (old, new)}
+
+    def listings():
+        return {d: sorted(e["name"] for e in ops.bridge.list_dir_path(d)) for d in dirs}
+
+    before = listings()
+    assert ops.rename(old, new) == 0
+    assert listings() == before
+    for path in (old, new):
+        fh = ops.open(path, os.O_RDONLY)
+        try:
+            assert ops.read(path, 7, 0, fh) == b"target\n"
+        finally:
+            ops.release(path, fh)
+
+
+@pytest.mark.parametrize("winfsp", [True, False], ids=["winfsp", "posix"])
+@pytest.mark.parametrize("old, new", [("/l", "/D/T.txt"), ("/D/T.txt", "/l")])
+def test_a_rename_onto_another_name_of_the_file_does_nothing(handler_ops, winfsp, old, new):
+    _rename_does_nothing(handler_ops, winfsp, old, new)
+
+
+@pytest.mark.parametrize("winfsp", [True, False], ids=["winfsp", "posix"])
+@pytest.mark.parametrize("old, new", [("/lf", "/TargetFile.txt"), ("/TargetFile.txt", "/lf")])
+def test_a_rename_onto_another_name_of_the_file_does_nothing_bundled(ops, winfsp, old, new):
+    _rename_does_nothing(ops, winfsp, old, new)
