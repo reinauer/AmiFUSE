@@ -142,6 +142,7 @@ from .startup_runner import (
     ACTION_FINDOUTPUT,
     ACTION_FINDUPDATE,
     ACTION_LOCATE_OBJECT,
+    ACTION_PARENT,
     HandlerLauncher,
     OFFSET_BEGINNING,
     OFFSET_CURRENT,
@@ -1423,16 +1424,17 @@ class HandlerBridge:
     def _give_back_late_reply(self, packet, res1: int) -> None:
         """Free the lock or end the file that a dropped late reply grants.
 
-        packet is the (dp_Type, args) the reply answers, or None. A LOCATE
-        or CREATE_DIR that succeeded holds a lock, and an open a file that
-        no caller will close, each until the mount ends. The FREE_LOCK or
-        END goes out without a wait of its own, so that it cannot take a
-        reply another wait is for; its reply comes as another late one.
+        packet is the (dp_Type, args) the reply answers, or None. A LOCATE,
+        CREATE_DIR or PARENT that succeeded holds a lock, and an open a
+        file that no caller will close, each until the mount ends. The
+        FREE_LOCK or END goes out without a wait of its own, so that it
+        cannot take a reply another wait is for; its reply comes as another
+        late one.
         """
         if packet is None or res1 == 0:
             return
         pkt_type, args = packet
-        if pkt_type in (ACTION_LOCATE_OBJECT, ACTION_CREATE_DIR):
+        if pkt_type in (ACTION_LOCATE_OBJECT, ACTION_CREATE_DIR, ACTION_PARENT):
             self.launcher.send_free_lock(self.state, res1)
         elif pkt_type in (ACTION_FINDINPUT, ACTION_FINDUPDATE, ACTION_FINDOUTPUT):
             # Arg1 is the FileHandle's BPTR; the handler filled in its fh_Args.

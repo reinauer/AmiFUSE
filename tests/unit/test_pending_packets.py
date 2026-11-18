@@ -40,6 +40,7 @@ from amifuse.startup_runner import (
     ACTION_FREE_LOCK,
     ACTION_INHIBIT,
     ACTION_LOCATE_OBJECT,
+    ACTION_PARENT,
     ACTION_READ,
     ACTION_RENAME_OBJECT,
     ACTION_SEEK,
@@ -721,6 +722,21 @@ def test_a_dropped_late_lock_is_freed(bridge):
 
     assert b.locate(0, "late") == (0, -1)
     handler.answer_now(ACTION_LOCATE_OBJECT)
+    assert b.locate(0, "next") == (0x400, 0)
+    b.locate(0, "after")  # the handler takes what was queued meanwhile
+
+    assert [args[0] for _, _, _, args, _ in handler.taken(ACTION_FREE_LOCK)] == [0x777]
+
+
+def test_a_dropped_late_parent_lock_is_freed(bridge):
+    # A lock on the directory would keep it from being deleted.
+    b, handler = bridge
+    handler.delay = lambda pkt_type, name: NEVER if pkt_type == ACTION_PARENT else 0
+    handler.answer = lambda pkt_type, args, name: (
+        (0x777, 0) if pkt_type == ACTION_PARENT else (0x400, 0))
+
+    assert b._parent_lock(0x400) == (0, -1)
+    handler.answer_now(ACTION_PARENT)
     assert b.locate(0, "next") == (0x400, 0)
     b.locate(0, "after")  # the handler takes what was queued meanwhile
 
