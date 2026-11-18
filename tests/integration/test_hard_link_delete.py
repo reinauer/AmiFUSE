@@ -16,7 +16,9 @@ link's. The handle is found by the lock's fl_Key (see _parse_fib). Those
 tests copy the fixture images and make the link with ACTION_MAKE_LINK.
 
 Renaming one name of a file onto another of its names does nothing, as
-rename(2) says; replacing the second name would delete it.
+rename(2) says; replacing the second name would delete it. Unless that
+name was deleted while the file is open: then it is hidden, and the file
+moves to it.
 """
 
 import errno
@@ -320,3 +322,50 @@ def test_a_rename_onto_another_name_of_the_file_does_nothing(handler_ops, winfsp
 @pytest.mark.parametrize("old, new", [("/lf", "/TargetFile.txt"), ("/TargetFile.txt", "/lf")])
 def test_a_rename_onto_another_name_of_the_file_does_nothing_bundled(ops, winfsp, old, new):
     _rename_does_nothing(ops, winfsp, old, new)
+
+
+def _rename_onto_a_deleted_name(ops, winfsp, held, deleted, refused=False):
+    """Rename held, open, onto deleted, another name of its file whose
+    delete waits for that handle. The file takes the name, or, where the
+    handler refuses to rename an open file, keeps its own."""
+    ops._winfsp = winfsp
+    dirs = {path.rsplit("/", 1)[0] or "/" for path in (held, deleted)}
+    fh = ops.open(held, os.O_RDWR)
+    try:
+        assert ops.unlink(deleted) == 0
+        if refused:
+            with pytest.raises(FuseOSError) as exc:
+                ops.rename(held, deleted)
+            assert exc.value.errno in (errno.EACCES, errno.EBUSY)
+            held, deleted = deleted, held
+        else:
+            assert ops.rename(held, deleted) == 0
+        # The handle follows the file to its new name.
+        assert ops.read(deleted, 7, 0, fh) == b"target\n"
+        assert ops.getattr(deleted)
+        with pytest.raises(FuseOSError) as exc:
+            ops.getattr(held)
+        assert exc.value.errno == errno.ENOENT
+    finally:
+        ops.release(deleted, fh)
+    assert ops.bridge.stat_path(held) is None
+    assert not any(e["name"].startswith(".amifuse")
+                   for d in dirs for e in ops.bridge.list_dir_path(d))
+    fh = ops.open(deleted, os.O_RDWR)
+    try:
+        assert ops.read(deleted, 7, 0, fh) == b"target\n"
+    finally:
+        ops.release(deleted, fh)
+
+
+@pytest.mark.parametrize("winfsp", [True, False], ids=["winfsp", "posix"])
+@pytest.mark.parametrize("held, deleted", [("/l", "/D/T.txt"), ("/D/T.txt", "/l")])
+def test_a_rename_onto_a_deleted_name_of_the_file_moves_it(handler_ops, winfsp, held, deleted):
+    _rename_onto_a_deleted_name(handler_ops, winfsp, held, deleted)
+
+
+@pytest.mark.parametrize("winfsp", [True, False], ids=["winfsp", "posix"])
+@pytest.mark.parametrize("held, deleted", [("/lf", "/TargetFile.txt"), ("/TargetFile.txt", "/lf")])
+def test_a_rename_onto_a_deleted_name_of_the_file_is_refused_bundled(ops, winfsp, held, deleted):
+    # The bundled FastFileSystem refuses to rename a file while it is open.
+    _rename_onto_a_deleted_name(ops, winfsp, held, deleted, refused=True)

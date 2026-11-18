@@ -5110,6 +5110,15 @@ class AmigaFuseFS(_FuseOperations):
         # and the replace would delete one of them.
         if src.get("lock_key") and (src["lock_key"], src["dir_type"]) == (
                 dst.get("lock_key"), dst["dir_type"]):
+            with self._fh_lock:
+                pending = replaced in self._pending_deletes
+            if pending:
+                # new is deleted, hidden while the file is open: it moves
+                # aside with its delete, as for a create(), and old takes it.
+                self._free_pending_name(replaced)
+                res1, res2 = self._rename_object(old, new)
+                if res1 == 0:
+                    raise FuseOSError(_RENAME_ERRNOS.get(res2, errno.EIO))
             return
         dst_dir, _ = self._split_path(new)
         src_is_dir = _is_dir_entry(src)
