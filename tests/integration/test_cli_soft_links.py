@@ -257,6 +257,41 @@ def test_ls_of_a_hard_link_named_like_its_target_names_the_link(tmp_path, path):
         ("targetfile.txt", "/" + path, 7)]
 
 
+@pytest.mark.parametrize("damage", ["empty-name", "checksum"])
+def test_ls_of_a_file_is_quiet_about_a_damaged_sibling(tmp_path, damage):
+    # ls of a file lists its parent for the name; the parent's warnings
+    # are about entries nobody asked for. other.txt hashes after good.txt.
+    import struct
+    from tests.integration.test_ls_recursive_ffs import BLOCK, _edit_block, _xdftool
+
+    image = tmp_path / "sibling.adf"
+    content = tmp_path / "content.txt"
+    content.write_bytes(b"target\n")
+    _xdftool(image, "create", "+", "format", "Sibling", "ffs", "+", "makedir", "E",
+             "+", "write", str(content), "E/good.txt", "+", "write", str(content), "E/other.txt")
+    data = bytearray(image.read_bytes())
+    for key in range(len(data) // BLOCK):
+        block = data[key * BLOCK:(key + 1) * BLOCK]
+        if (struct.unpack(">I", block[:4])[0] == 2
+                and struct.unpack(">i", block[-4:])[0] == -3  # ST_FILE
+                and block[433:433 + block[432]] == b"other.txt"):
+            break
+    else:
+        raise AssertionError("no header for other.txt")
+    if damage == "empty-name":
+        _edit_block(data, key, lambda b: b.__setitem__(432, 0))
+    else:
+        data[key * BLOCK + 20] ^= 0x5A  # the checksum
+    image.write_bytes(data)
+
+    result = _amifuse("ls", str(image), "--path", "E/GOOD.TXT", "--json")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stderr == ""
+    entries = json.loads(result.stdout)["entries"]
+    assert [(e["name"], e["path"], e["size"]) for e in entries] == [
+        ("good.txt", "/E/GOOD.TXT", 7)]
+
+
 @pytest.mark.parametrize("recursive", [[], ["--recursive"]], ids=["ls", "ls-R"])
 def test_ls_of_a_missing_path_is_still_not_found(image, recursive):
     # ls -R of a missing path listed nothing and exited 0.
