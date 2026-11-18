@@ -1913,7 +1913,7 @@ class HandlerBridge:
                     continue
                 entries.append(entry)
             if unnamed and not quiet:
-                detail =("entry with an empty name" if unnamed == 1
+                detail = ("entry with an empty name" if unnamed == 1
                           else "entries with empty names")
                 print(f"Warning: listing {shown}: skipped {unnamed} directory "
                       f"{detail}", file=sys.stderr)
