@@ -755,6 +755,9 @@ class HandlerBridge:
         # Short negative cache for handler lookups; tune for RW.
         # A newly created file might be invisible for up to TTL seconds, then it will appear normally.
         self._neg_cache_ttl = 10.0
+        # Whether fib_DiskKey names an object whatever lock examines it;
+        # see _stable_keys.
+        self._keys_stable: Optional[bool] = None
         self._write_enabled = not read_only
         if self._write_enabled:
             self._neg_cache_ttl = 0.0
@@ -2030,8 +2033,9 @@ class HandlerBridge:
         or in the root when that is None.
 
         The root is the directory without a parent. Another directory is
-        compared by its entry but for fib_DiskKey, which pfs3aio gives per
-        lock (_parse_fib).
+        compared by its entry, and by fib_DiskKey only where that names the
+        object (_stable_keys): two directories of one name, created
+        together, can have equal entries but for it.
         """
         parent, _ = self._parent_lock(lock)
         if parent == 0:
@@ -2044,9 +2048,29 @@ class HandlerBridge:
             entry = self._examine_lock(parent)
             return entry is not None and all(
                 entry.get(field) == value for field, value in directory.items()
-                if field != "disk_key")
+                if field != "disk_key" or self._stable_keys())
         finally:
             self.free_lock(parent)
+
+    def _stable_keys(self) -> bool:
+        """Whether fib_DiskKey names an object whatever lock examines it.
+
+        FastFileSystem gives an object's header block, and SmartFilesystem
+        its object node, but pfs3aio gives the root, examined through two
+        locks held at once, two keys. Asked once per mount, on the root.
+        """
+        if self._keys_stable is None:
+            first, _ = self.locate(0, "")
+            second, _ = self.locate(0, "") if first else (0, 0)
+            try:
+                entries = [self._examine_lock(lock) for lock in (first, second, first)
+                           if lock]
+                self._keys_stable = (len(entries) == 3 and None not in entries
+                                     and len({e["disk_key"] for e in entries}) == 1)
+            finally:
+                self.free_lock(second)
+                self.free_lock(first)
+        return self._keys_stable
 
     # Buffers for ACTION_READ_LINK, tried in order while the target does not
     # fit. A soft link's target is in one block of the disk.
