@@ -124,6 +124,7 @@ class TestLazyFuseImport:
         proc = _run_amifuse("status", "--json", env=env)
 
         assert not marker.exists()
+        assert proc.stdout, proc.stderr
         data = json.loads(proc.stdout)
         # status queries live processes. When that query fails (PowerShell
         # can time out on a cold Windows runner), status reports the failure
