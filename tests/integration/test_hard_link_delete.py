@@ -10,15 +10,22 @@ ST_LINKFILE block, as test_ls_recursive_ffs makes its directory link.
 The handles are opened read/write: on WinFsp a read-only handle holds no
 AmigaDOS lock (#408), so FastFileSystem deletes the file at once and the
 link takes over its data.
+
+pfs3aio refuses to delete the file's own name the same way, though not a
+link's. Its fib_DiskKey is the address of the lock examined, so the handle
+is found by the lock's fl_Key. Those tests copy the fixture images and make
+the link with ACTION_MAKE_LINK.
 """
 
 import errno
 import os
+import shutil
 import struct
 
 import pytest
 
 from amifuse.driver_resolver import BUNDLED_DRIVER
+from amifuse.emu_thread import on_emu_thread
 from amifuse.fuse_fs import AmigaFuseFS, FuseOSError, HandlerBridge
 from amifuse.rdb_inspect import detect_adf
 from tests.integration.test_ls_recursive_ffs import BLOCK, _edit_block, _xdftool
@@ -193,3 +200,91 @@ def test_folder_delete_waits_for_a_file_held_through_a_link(folder_ops):
         assert ops.read("/l", 7, 0, fh) == b"target\n"
     finally:
         ops.release("/l", fh)
+
+
+ACTION_MAKE_LINK = 1021
+LINK_HARD = 0
+
+
+@on_emu_thread
+def _make_hard_link(bridge, directory, name, target):
+    """Make hard link name in directory to target, as MakeLink() does."""
+    with bridge._lock:
+        if directory == "/":
+            dir_lock, _ = bridge.locate(0, "")
+            locks = [dir_lock]
+        else:
+            dir_lock, _, locks = bridge.locate_path(directory)
+        target_lock, _, target_locks = bridge.locate_path(target)
+        _, name_bptr = bridge._alloc_bstr(name)
+        pkt_addr, _ = bridge.launcher.send_packet(
+            bridge.state, ACTION_MAKE_LINK, [dir_lock, name_bptr, target_lock, LINK_HARD])
+        reply = bridge._run_until_reply(pkt_addr, "make_link")
+        for lock in reversed(locks + target_locks):
+            bridge.free_lock(lock)
+    assert reply is not None and reply[0], reply
+
+
+@pytest.fixture(params=[
+    pytest.param(("pfs.hdf", "pfs3aio"), marks=pytest.mark.integration, id="pfs3aio"),
+    pytest.param(("ofs.adf", "FastFileSystem"), marks=pytest.mark.integration,
+                 id="FastFileSystem"),
+])
+def handler_ops(request, tmp_path):
+    """A copy of a fixture image with D/T.txt, E/T.txt, T.txt, l, a hard
+    link to D/T.txt, and E/l, a hard link to T.txt."""
+    image_name, driver_name = request.param
+    fixture_root = request.getfixturevalue("fixture_root")
+    source = fixture_root / "fixtures" / "readonly" / image_name
+    driver = fixture_root / "drivers" / driver_name
+    if not source.exists() or not driver.exists():
+        pytest.skip(f"Missing {image_name} or {driver_name}")
+    image = tmp_path / image_name
+    shutil.copy2(source, image)
+    bridge = HandlerBridge(image, driver, read_only=False, adf_info=detect_adf(image))
+    try:
+        ops = AmigaFuseFS(bridge)
+        ops.mkdir("/D", 0o755)
+        ops.mkdir("/E", 0o755)
+        for path in ("/D/T.txt", "/E/T.txt", "/T.txt"):
+            fh = ops.create(path, 0o644)
+            ops.write(path, b"target\n", 0, fh)
+            ops.release(path, fh)
+        _make_hard_link(bridge, "/", "l", "/D/T.txt")
+        _make_hard_link(bridge, "/E", "l", "/T.txt")
+        yield ops
+    finally:
+        bridge.close()
+
+
+@pytest.mark.parametrize("winfsp", [True, False], ids=["winfsp", "posix"])
+@pytest.mark.parametrize("deleted, held", [("/D/T.txt", "/l"), ("/T.txt", "/E/l")])
+def test_delete_waits_for_a_handle_through_a_link_in_another_directory(
+        handler_ops, winfsp, deleted, held):
+    # pfs3aio examined the two names through locks at different addresses.
+    ops = handler_ops
+    ops._winfsp = winfsp
+    fh = ops.open(held, os.O_RDWR)
+    try:
+        assert ops.unlink(deleted) == 0
+        with pytest.raises(FuseOSError) as exc:
+            ops.getattr(deleted)
+        assert exc.value.errno == errno.ENOENT
+        assert ops.read(held, 7, 0, fh) == b"target\n"
+    finally:
+        ops.release(held, fh)
+    assert ops.bridge.stat_path(deleted) is None
+    fh = ops.open(held, os.O_RDWR)
+    try:
+        assert ops.read(held, 7, 0, fh) == b"target\n"
+    finally:
+        ops.release(held, fh)
+
+
+def test_a_file_of_the_same_name_does_not_hold_a_delete(handler_ops):
+    ops = handler_ops
+    fh = ops.open("/E/T.txt", os.O_RDWR)
+    try:
+        assert ops._link_holders("/D/T.txt") == set()
+    finally:
+        ops.release("/E/T.txt", fh)

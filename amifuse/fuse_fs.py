@@ -1974,6 +1974,9 @@ class HandlerBridge:
                     self.free_lock(l)
                 return None, -1 if reply is None else reply[1]
             info = _parse_fib(self.mem, fib_mem.addr)
+            # The lock's fl_Key: pfs3aio's fib_DiskKey is the address of
+            # the lock examined, and this its object's number (anode).
+            info["lock_key"] = self.mem.r32((lock << 2) + 4)
             for l in reversed(locks):
                 self.free_lock(l)
             return info, 0
@@ -5925,20 +5928,21 @@ class AmigaFuseFS(_FuseOperations):
         """The file handles open on path's file under another name.
 
         A lock taken through a hard link is a lock on the object it links
-        to, so FastFileSystem refuses to delete any of its names while such
-        a handle is open (ERROR_OBJECT_IN_USE). Examine through either name
-        gives the linked object's fib_DiskKey and name, which must both
-        match, as pfs3aio and ODFileSystem give one disk key to many
-        entries. A file held on an exclusive lock can't be examined, and
+        to, so FastFileSystem refuses to delete any of its names, and
+        pfs3aio the file's own, while such a handle is open
+        (ERROR_OBJECT_IN_USE). A lock through either name has the linked
+        object's fl_Key, and Examine gives its name: both must match.
+        fib_DiskKey doesn't serve: pfs3aio gives each lock examined its
+        own. A file held on an exclusive lock can't be examined, and
         doesn't count.
         """
         try:
             info = self.bridge.stat_path(path)
         except Exception:
             return set()
-        if not info or info.get("dir_type", 0) >= 0 or not info.get("disk_key"):
+        if not info or info.get("dir_type", 0) >= 0 or not info.get("lock_key"):
             return set()
-        key = (info["disk_key"], info.get("name"), info.get("dir_type"))
+        key = (info["lock_key"], info.get("name"), info.get("dir_type"))
         with self._fh_lock:
             others = {
                 fh: v.get("path") for fh, v in self._fh_cache.items()
@@ -5953,7 +5957,7 @@ class AmigaFuseFS(_FuseOperations):
                 except Exception:
                     found = None
                 seen[other] = found and (
-                    found.get("disk_key"), found.get("name"), found.get("dir_type"))
+                    found.get("lock_key"), found.get("name"), found.get("dir_type"))
             if seen[other] == key:
                 holders.add(fh)
         return holders
