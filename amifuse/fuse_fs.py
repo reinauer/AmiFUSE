@@ -1992,50 +1992,61 @@ class HandlerBridge:
         reply = self._run_until_reply(pkt_addr, "parent")
         return reply if reply is not None else (0, -1)
 
-    def stat_in_dir(self, path: str) -> Tuple[Optional[Dict], bool]:
-        """Examine path, which is not "/"; and whether the object is in
-        path's directory.
+    def stat_components(self, path: str) -> List[Tuple[Optional[Dict], bool]]:
+        """(entry, in_dir) for each component of path, in one walk.
 
-        A hard link's lock is on its target, so Examine gives the target's
-        entry and ACTION_PARENT the target's directory, which is another
-        one unless the link and the target share it. The directories are
-        compared by their entries but for fib_DiskKey, which pfs3aio gives
-        a directory per lock (_parse_fib); the root is the directory
-        without a parent. (None, False) when path can't be examined.
+        entry is the component's Examine, or None; in_dir tells whether the
+        object is in the directory the path names before it. A hard link's
+        lock is on its target, so Examine gives the target's entry and
+        ACTION_PARENT the target's directory, which is another one unless
+        the link and the target share it. The walk holds the lock of one
+        component to locate the next, so each costs a fixed number of
+        packets. From the first component that can't be locked, as one the
+        handler refuses or a soft link, each gets (None, False).
         """
-        directory, name = path.rstrip("/").rsplit("/", 1)
+        names = [name for name in path.split("/") if name]
+        result: List[Tuple[Optional[Dict], bool]] = []
         with self._lock:
-            dir_lock, locks = 0, []
-            if directory:
-                dir_lock, _, locks = self.locate_path(directory)
-                if dir_lock == 0:
-                    return None, False
+            held, directory = 0, None
             try:
-                lock, _ = self.locate(dir_lock, name)
-                if lock == 0:
-                    return None, False
-                locks.append(lock)
-                info = self._examine_lock(lock)
-                if info is None:
-                    return None, False
-                parent_lock, _ = self._parent_lock(lock)
-                if parent_lock == 0:
-                    return info, False
-                locks.append(parent_lock)
-                if not directory:
-                    above, res2 = self._parent_lock(parent_lock)
-                    locks.append(above)
-                    return info, above == 0 and res2 == 0
-                parent = self._examine_lock(parent_lock)
-                held = self._examine_lock(dir_lock)
-                if parent is None or held is None:
-                    return info, False
-                parent.pop("disk_key")
-                held.pop("disk_key")
-                return info, parent == held
+                for name in names:
+                    lock, _ = self.locate(held, name)
+                    if lock == 0:
+                        break
+                    top = held == 0
+                    self.free_lock(held)
+                    held = lock
+                    info = self._examine_lock(lock)
+                    in_dir = (info is not None and (top or directory is not None)
+                              and self._in_directory(lock, None if top else directory))
+                    result.append((info, in_dir))
+                    directory = info
             finally:
-                for l in reversed(locks):
-                    self.free_lock(l)
+                self.free_lock(held)
+        return result + [(None, False)] * (len(names) - len(result))
+
+    def _in_directory(self, lock: int, directory: Optional[Dict]) -> bool:
+        """Whether lock's object is in the directory examined as directory,
+        or in the root when that is None.
+
+        The root is the directory without a parent. Another directory is
+        compared by its entry but for fib_DiskKey, which pfs3aio gives per
+        lock (_parse_fib).
+        """
+        parent, _ = self._parent_lock(lock)
+        if parent == 0:
+            return False
+        try:
+            if directory is None:
+                above, res2 = self._parent_lock(parent)
+                self.free_lock(above)
+                return above == 0 and res2 == 0
+            entry = self._examine_lock(parent)
+            return entry is not None and all(
+                entry.get(field) == value for field, value in directory.items()
+                if field != "disk_key")
+        finally:
+            self.free_lock(parent)
 
     # Buffers for ACTION_READ_LINK, tried in order while the target does not
     # fit. A soft link's target is in one block of the disk.
@@ -3867,7 +3878,7 @@ class AmigaFuseFS(_FuseOperations):
         every open. The parent is listed only when Examine can't name the
         component: a writer can refuse its lock, and a hard link's lock is
         on the link's target, which Examine names and which can be in
-        another directory (stat_in_dir). fh is the handle WinFsp passes
+        another directory (stat_components). fh is the handle WinFsp passes
         after create(), whose path is the new object's spelling on disk;
         that of an open() may be an alias, so only a created handle's is
         used.
@@ -3881,10 +3892,11 @@ class AmigaFuseFS(_FuseOperations):
                 created = _handle_path(entry, path)
         components = [component for component in path.strip("/").split("/")
                       if component]
+        entries = self.bridge.stat_components(path)
         canonical = "/"
         for at, component in enumerate(components):
             child = canonical.rstrip("/") + "/" + component
-            info, in_dir = self.bridge.stat_in_dir(child)
+            info, in_dir = entries[at]
             name = info.get("name") if info is not None else None
             if name is not None and (not in_dir or self._folded(name) != self._folded(component)):
                 # A hard link: Examine names its target. Its name can fold
