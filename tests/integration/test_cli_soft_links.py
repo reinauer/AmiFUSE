@@ -206,6 +206,57 @@ def test_ls_of_a_hard_link_to_a_file_names_the_link(tmp_path, path):
     assert [(e["name"], e["path"], e["size"]) for e in entries] == [("lf", "/" + path, 7)]
 
 
+def _case_link_image(tmp_path):
+    """An FFS floppy with TargetFile.txt and D/targetfile.txt, a hard link
+    to it whose name differs from the target's only in case."""
+    import struct
+    from tests.integration.test_ls_recursive_ffs import BLOCK, _edit_block, _xdftool
+
+    image = tmp_path / "case.adf"
+    content, empty = tmp_path / "content.txt", tmp_path / "empty.txt"
+    content.write_bytes(b"target\n")
+    empty.write_bytes(b"")
+    _xdftool(image, "create", "+", "format", "Case", "ffs",
+             "+", "write", str(content), "TargetFile.txt",
+             "+", "makedir", "D", "+", "write", str(empty), "D/targetfile.txt")
+    data = bytearray(image.read_bytes())
+
+    def header(name):
+        for key in range(len(data) // BLOCK):
+            block = data[key * BLOCK:(key + 1) * BLOCK]
+            if (struct.unpack(">I", block[:4])[0] == 2
+                    and struct.unpack(">i", block[-4:])[0] == -3  # ST_FILE
+                    and block[433:433 + block[432]] == name):
+                return key
+        raise AssertionError(f"no header for {name!r}")
+
+    link_key, target_key = header(b"targetfile.txt"), header(b"TargetFile.txt")
+
+    def to_link(block):
+        struct.pack_into(">i", block, BLOCK - 4, -4)  # ST_LINKFILE
+        struct.pack_into(">I", block, BLOCK - 11 * 4, target_key)  # real_entry
+
+    def link_back(block):
+        struct.pack_into(">I", block, BLOCK - 10 * 4, link_key)  # next_link
+
+    _edit_block(data, link_key, to_link)
+    _edit_block(data, target_key, link_back)
+    image.write_bytes(data)
+    return image
+
+
+@pytest.mark.parametrize("path", ["D/targetfile.txt", "D/TARGETFILE.TXT"])
+def test_ls_of_a_hard_link_named_like_its_target_names_the_link(tmp_path, path):
+    # The examined name, the target's, folds to the link's, so ls gave
+    # TargetFile.txt where the listing of D gives targetfile.txt (#468).
+    image = _case_link_image(tmp_path)
+    result = _amifuse("ls", str(image), "--path", path, "--json")
+    assert result.returncode == 0, result.stdout + result.stderr
+    entries = json.loads(result.stdout)["entries"]
+    assert [(e["name"], e["path"], e["size"]) for e in entries] == [
+        ("targetfile.txt", "/" + path, 7)]
+
+
 @pytest.mark.parametrize("recursive", [[], ["--recursive"]], ids=["ls", "ls-R"])
 def test_ls_of_a_missing_path_is_still_not_found(image, recursive):
     # ls -R of a missing path listed nothing and exited 0.
