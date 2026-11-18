@@ -5106,21 +5106,24 @@ class AmigaFuseFS(_FuseOperations):
         if src is None or dst is None:
             # Neither examined nor pinned: gone, or held on an exclusive lock.
             raise FuseOSError(errno.ENOENT if src is None else errno.EBUSY)
+        # Two names of one object, hard links to it: rename(2) does nothing,
+        # and the replace would delete one of them.
+        same = src.get("lock_key") and (src["lock_key"], src["dir_type"]) == (
+            dst.get("lock_key"), dst["dir_type"])
         with self._fh_lock:
             pending = replaced in self._pending_deletes
-        if pending:
-            # new is deleted, hidden while the file is open, also through a
-            # hard link: it moves aside with its delete, as for a create(),
-            # and old takes the name.
+            # Its delete waits on handles open through hard links, which
+            # the replace's own delete doesn't count.
+            through_link = replaced in self._link_deletes
+        if pending and (same or through_link):
+            # new is deleted, hidden while the file is open: it moves aside
+            # with its delete, as for a create(), and old takes the name.
             self._free_pending_name(replaced)
             res1, res2 = self._rename_object(old, new)
             if res1 == 0:
                 raise FuseOSError(_RENAME_ERRNOS.get(res2, errno.EIO))
             return
-        # Two names of one object, hard links to it: rename(2) does nothing,
-        # and the replace would delete one of them.
-        if src.get("lock_key") and (src["lock_key"], src["dir_type"]) == (
-                dst.get("lock_key"), dst["dir_type"]):
+        if same:
             return
         dst_dir, _ = self._split_path(new)
         src_is_dir = _is_dir_entry(src)
