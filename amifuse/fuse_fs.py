@@ -7399,10 +7399,15 @@ def _ls_file_name(bridge, stat, path: str) -> str:
     except Exception:
         # The file was examined; the listing only refines its name.
         listing = []
-    for entry in listing:
-        if entry["name"].translate(fold) == asked.translate(fold):
-            return entry["name"]
+    matches = [entry["name"] for entry in listing
+               if entry["name"].translate(fold) == asked.translate(fold)]
     stored = stat.get("name") or ""
+    # Several match only on a damaged volume or with the fold unknown.
+    for name in (asked, stored):
+        if name in matches:
+            return name
+    if matches:
+        return matches[0]
     return stored if stored.translate(fold) == asked.translate(fold) else asked
 
 

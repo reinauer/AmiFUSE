@@ -5038,6 +5038,22 @@ class TestCmdLs:
         data = json.loads(capsys.readouterr().out)
         assert [(e["name"], e["path"]) for e in data["entries"]] == [("Foo", "/d/FOO")]
 
+    @pytest.mark.parametrize("listed, asked, examined, name", [
+        (["FOO", "foo", "Foo"], "foo", "Foo", "foo"),  # as typed
+        (["FOO", "Foo"], "fOO", "Foo", "Foo"),         # as examined
+        (["FOO", "Foo"], "fOO", "Bar", "FOO"),         # the first
+    ])
+    def test_ls_file_name_among_several_matches(
+            self, mock_bridge_for_ls, listed, asked, examined, name):
+        """Only a damaged volume lists several names that fold alike; the
+        name as typed, then as examined, wins over the listing's order."""
+        mock_bridge, fuse_fs_mod = mock_bridge_for_ls
+        mock_bridge.name_fold.return_value = "ascii"
+        mock_bridge.list_dir_path.return_value = [
+            {"name": n, "dir_type": -3, "size": 0, "protection": 0} for n in listed]
+        assert fuse_fs_mod._ls_file_name(
+            mock_bridge, {"name": examined}, "/d/" + asked) == name
+
 
 # ---------------------------------------------------------------------------
 # TestQueryDiskInfo -- ACTION_DISK_INFO memory reads
