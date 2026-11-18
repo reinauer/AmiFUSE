@@ -7382,18 +7382,18 @@ def _ls_file_name(bridge, stat, path: str) -> str:
     """The name ls gives the file at path, which stat examined.
 
     FastFileSystem names a hard link's target when it examines the link,
-    so take the link's stored name from its parent in that case.
+    and that name can fold to the link's own (#468), so the name comes
+    from the parent's listing. Without a matching entry there, it is the
+    examined name if that folds to the one asked for, else the one asked.
     """
     asked = path.rstrip("/").rsplit("/", 1)[-1]
     fold = _NAME_FOLDS.get(bridge.name_fold()) or {}
-    stored = stat.get("name") or ""
-    if stored.translate(fold) == asked.translate(fold):
-        return stored
     parent = path.rstrip("/").rsplit("/", 1)[0] or "/"
     for entry in bridge.list_dir_path(parent):
         if entry["name"].translate(fold) == asked.translate(fold):
             return entry["name"]
-    return asked
+    stored = stat.get("name") or ""
+    return stored if stored.translate(fold) == asked.translate(fold) else asked
 
 
 def _soft_link_on(bridge, path: str):
