@@ -68,6 +68,7 @@ ACTION_SEEK = 1008
 ACTION_END = 1007
 ACTION_SET_FILE_SIZE = 1022
 ACTION_FREE_LOCK = 15
+ACTION_PARENT = 29
 ACTION_FINDUPDATE = 1004
 ACTION_FINDINPUT = 1005
 ACTION_FINDOUTPUT = 1006
@@ -628,6 +629,10 @@ class HandlerLauncher:
     def send_free_lock(self, state: HandlerLaunchState, lock_bptr: int):
         """ACTION_FREE_LOCK: release a lock returned by LOCATE."""
         return self.send_packet(state, ACTION_FREE_LOCK, [lock_bptr])
+
+    def send_parent(self, state: HandlerLaunchState, lock_bptr: int):
+        """ACTION_PARENT: a lock on the lock's directory in dp_Res1, 0 at the root."""
+        return self.send_packet(state, ACTION_PARENT, [lock_bptr])
 
     def send_findinput(
         self, state: HandlerLaunchState, name_bptr: int, dir_lock_bptr: int = 0, fh_addr: int = None

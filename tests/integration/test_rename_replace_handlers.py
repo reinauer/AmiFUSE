@@ -460,17 +460,17 @@ def test_getpath_lists_only_the_parent_of_a_refused_lock(ops, monkeypatch, readd
     ops._readdir_plus = readdir_plus
     ops.mkdir("/Canonical", 0o755)
     _write(ops, "/Canonical/MixedName", b"data")
-    stat_path, list_names = ops.bridge.stat_path, ops._list_names
+    stat_in_dir, list_names = ops.bridge.stat_in_dir, ops._list_names
     listed = []
 
     def stat(path):
-        return None if path == "/Canonical/mixedname" else stat_path(path)
+        return (None, False) if path == "/Canonical/mixedname" else stat_in_dir(path)
 
     def listing(path, names):
         listed.append(path)
         return list_names(path, names)
 
-    monkeypatch.setattr(ops.bridge, "stat_path", stat)
+    monkeypatch.setattr(ops.bridge, "stat_in_dir", stat)
     monkeypatch.setattr(ops, "_list_names", listing)
     assert ops.getpath("/canonical/mixedname") == "/Canonical/MixedName"
     assert listed == ["/Canonical"]
@@ -546,18 +546,19 @@ def test_getpath_does_not_trust_an_opened_handles_spelling(ops, monkeypatch):
     ops.mkdir("/Canonical", 0o755)
     _write(ops, "/Canonical/MixedName", b"data")
     handle = ops.open("/canonical/mixedname", os.O_RDONLY)
-    stat_path = ops.bridge.stat_path
+    stat_in_dir = ops.bridge.stat_in_dir
     try:
-        monkeypatch.setattr(ops.bridge, "stat_path", lambda path: (
-            None if path == "/Canonical/mixedname" else stat_path(path)))
+        monkeypatch.setattr(ops.bridge, "stat_in_dir", lambda path: (
+            (None, False) if path == "/Canonical/mixedname" else stat_in_dir(path)))
         assert ops.getpath("/canonical/mixedname", handle) == "/Canonical/MixedName"
     finally:
         ops.release("/canonical/mixedname", handle)
 
 
 def _hard_link_image(tmp_path):
-    """An FFS floppy with lf, a hard link to TargetFile.txt, and L, a hard
-    link to the directory TargetDir, which holds inner.txt."""
+    """An FFS floppy with lf and D/targetfile.txt, hard links to
+    TargetFile.txt, and L and D/targetdir, hard links to the directory
+    TargetDir, which holds inner.txt."""
     import struct
     from tests.integration.test_ls_recursive_ffs import BLOCK, _edit_block, _xdftool
 
@@ -569,7 +570,9 @@ def _hard_link_image(tmp_path):
              "+", "write", str(content), "TargetFile.txt",
              "+", "write", str(empty), "lf",
              "+", "makedir", "TargetDir", "+", "write", str(content), "TargetDir/inner.txt",
-             "+", "makedir", "L")
+             "+", "makedir", "L",
+             "+", "makedir", "D", "+", "write", str(empty), "D/targetfile.txt",
+             "+", "makedir", "D/targetdir")
     data = bytearray(image.read_bytes())
 
     def header(name, sec_type):
@@ -583,12 +586,17 @@ def _hard_link_image(tmp_path):
 
     for link, target, sec_type, link_type in (
             (b"lf", b"TargetFile.txt", -3, -4),  # ST_FILE -> ST_LINKFILE
-            (b"L", b"TargetDir", 2, 4)):         # ST_USERDIR -> ST_LINKDIR
+            (b"targetfile.txt", b"TargetFile.txt", -3, -4),
+            (b"L", b"TargetDir", 2, 4),          # ST_USERDIR -> ST_LINKDIR
+            (b"targetdir", b"TargetDir", 2, 4)):
         link_key, target_key = header(link, sec_type), header(target, sec_type)
+        # The target's chain of links so far goes on after this link.
+        chain = data[(target_key + 1) * BLOCK - 10 * 4:(target_key + 1) * BLOCK - 9 * 4]
 
-        def to_link(block, target_key=target_key, link_type=link_type):
+        def to_link(block, target_key=target_key, link_type=link_type, chain=chain):
             struct.pack_into(">i", block, BLOCK - 4, link_type)
             struct.pack_into(">I", block, BLOCK - 11 * 4, target_key)  # real_entry
+            block[BLOCK - 10 * 4:BLOCK - 9 * 4] = chain  # next_link
 
         def link_back(block, link_key=link_key):
             struct.pack_into(">I", block, BLOCK - 10 * 4, link_key)  # next_link
@@ -730,6 +738,30 @@ def test_getpath_names_a_hard_link_not_its_target(tmp_path):
         assert ops.getpath("/l") == "/L"
         assert ops.getpath("/l/INNER.TXT") == "/L/inner.txt"
         assert ops.getpath("/targetfile.txt") == "/TargetFile.txt"
+    finally:
+        bridge.close()
+
+
+@pytest.mark.parametrize("spelling, dir_spelling", [
+    ("targetfile.txt", "targetdir"), ("TargetFile.txt", "TargetDir"),
+    ("TARGETFILE.TXT", "TARGETDIR")])
+def test_getpath_names_a_hard_link_named_like_its_target(tmp_path, spelling,
+                                                          dir_spelling):
+    # D/targetfile.txt links to /TargetFile.txt, and Examine through it
+    # names the target, whose name folds to the link's. With the target's
+    # spelling, WinFsp took a rename of the link to D/TargetFile.txt for a
+    # no-op, and an open of the link for one of D/TargetFile.txt.
+    image = _hard_link_image(_bundled_image(tmp_path).parent)
+    bridge = HandlerBridge(image, BUNDLED_DRIVER, read_only=False,
+                           adf_info=detect_adf(image))
+    try:
+        ops = AmigaFuseFS(bridge)
+        assert ops.getpath("/d/" + spelling) == "/D/targetfile.txt"
+        assert ops.getpath(f"/d/{dir_spelling}/inner.txt") == "/D/targetdir/inner.txt"
+        assert ops.getpath("/" + spelling) == "/TargetFile.txt"
+        assert ops.rename("/D/targetfile.txt", "/D/TargetFile.txt") == 0
+        assert ops.getpath("/d/" + spelling) == "/D/TargetFile.txt"
+        assert "TargetFile.txt" in _on_disk(ops, "/D")
     finally:
         bridge.close()
 
