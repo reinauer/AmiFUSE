@@ -373,30 +373,28 @@ def test_a_rename_onto_a_deleted_name_of_the_file_is_refused_bundled(ops, winfsp
     _rename_onto_a_deleted_name(ops, winfsp, held, deleted, refused=True)
 
 
-def _rename_another_file_onto_a_deleted_name(ops, winfsp, held, deleted, other,
-                                             refused=False):
-    """Rename other, another file, onto deleted, whose delete waits for a
-    handle open through held, a hard link to it. other takes the name, and
-    the replaced file stays readable through the handle and through held;
-    or, where the handler refuses to rename the held file aside, nothing
-    moves."""
+def _replace_a_name_open_through_a_link(ops, winfsp, held, replaced, other,
+                                        unlinked, refused=False):
+    """Rename other, another file, onto replaced, a file open through held,
+    a hard link to it; first delete replaced if unlinked, which then waits
+    for that handle. other takes the name, and the replaced file stays
+    readable through the handle and through held; or, where the handler
+    refuses to rename the held file aside, nothing moves."""
     ops._winfsp = winfsp
-    dirs = {path.rsplit("/", 1)[0] or "/" for path in (held, deleted, other)}
+    dirs = {path.rsplit("/", 1)[0] or "/" for path in (held, replaced, other)}
     fh = ops.open(other, os.O_RDWR)
     ops.write(other, b"OTHER!\n", 0, fh)
     ops.release(other, fh)
     fh = ops.open(held, os.O_RDWR)
     try:
-        assert ops.unlink(deleted) == 0
+        if unlinked:
+            assert ops.unlink(replaced) == 0
         if refused:
             with pytest.raises(FuseOSError) as exc:
-                ops.rename(other, deleted)
+                ops.rename(other, replaced)
             assert exc.value.errno in (errno.EACCES, errno.EBUSY)
-            with pytest.raises(FuseOSError) as exc:
-                ops.getattr(deleted)
-            assert exc.value.errno == errno.ENOENT
         else:
-            assert ops.rename(other, deleted) == 0
+            assert ops.rename(other, replaced) == 0
             with pytest.raises(FuseOSError) as exc:
                 ops.getattr(other)
             assert exc.value.errno == errno.ENOENT
@@ -405,24 +403,29 @@ def _rename_another_file_onto_a_deleted_name(ops, winfsp, held, deleted, other,
         ops.release(held, fh)
     assert not any(e["name"].startswith(".amifuse")
                    for d in dirs for e in ops.bridge.list_dir_path(d))
-    survivors = {held: b"target\n", (other if refused else deleted): b"OTHER!\n"}
+    survivors = {held: b"target\n", (other if refused else replaced): b"OTHER!\n"}
+    if refused and not unlinked:
+        survivors[replaced] = b"target\n"
     for path, data in survivors.items():
         fh = ops.open(path, os.O_RDWR)
         try:
             assert ops.read(path, 7, 0, fh) == data
         finally:
             ops.release(path, fh)
-    if refused:
-        assert ops.bridge.stat_path(deleted) is None
+    if refused and unlinked:
+        assert ops.bridge.stat_path(replaced) is None
 
 
 @pytest.mark.parametrize("winfsp", [True, False], ids=["winfsp", "posix"])
-def test_a_rename_onto_a_name_deleted_while_open_through_a_link(handler_ops, winfsp):
-    _rename_another_file_onto_a_deleted_name(handler_ops, winfsp, "/l", "/D/T.txt", "/E/T.txt")
+@pytest.mark.parametrize("unlinked", [True, False], ids=["deleted", "not-deleted"])
+def test_a_rename_onto_a_name_open_through_a_link(handler_ops, winfsp, unlinked):
+    _replace_a_name_open_through_a_link(
+        handler_ops, winfsp, "/l", "/D/T.txt", "/E/T.txt", unlinked)
 
 
 @pytest.mark.parametrize("winfsp", [True, False], ids=["winfsp", "posix"])
-def test_a_rename_onto_a_name_deleted_while_open_through_a_link_bundled(ops, winfsp):
+@pytest.mark.parametrize("unlinked", [True, False], ids=["deleted", "not-deleted"])
+def test_a_rename_onto_a_name_open_through_a_link_bundled(ops, winfsp, unlinked):
     # The bundled FastFileSystem refuses to rename a file while it is open.
-    _rename_another_file_onto_a_deleted_name(
-        ops, winfsp, "/lf", "/TargetFile.txt", "/other.txt", refused=True)
+    _replace_a_name_open_through_a_link(
+        ops, winfsp, "/lf", "/TargetFile.txt", "/other.txt", unlinked, refused=True)

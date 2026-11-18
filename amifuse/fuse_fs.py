@@ -5107,24 +5107,13 @@ class AmigaFuseFS(_FuseOperations):
             # Neither examined nor pinned: gone, or held on an exclusive lock.
             raise FuseOSError(errno.ENOENT if src is None else errno.EBUSY)
         # Two names of one object, hard links to it: rename(2) does nothing,
-        # and the replace would delete one of them.
-        same = src.get("lock_key") and (src["lock_key"], src["dir_type"]) == (
-            dst.get("lock_key"), dst["dir_type"])
-        with self._fh_lock:
-            pending = replaced in self._pending_deletes
-            # Its delete waits on handles open through hard links, which
-            # the replace's own delete doesn't count.
-            through_link = replaced in self._link_deletes
-        if pending and (same or through_link):
-            # new is deleted, hidden while the file is open: it moves aside
-            # with its delete, as for a create(), and old takes the name.
-            self._free_pending_name(replaced)
-            res1, res2 = self._rename_object(old, new)
-            if res1 == 0:
-                raise FuseOSError(_RENAME_ERRNOS.get(res2, errno.EIO))
-            return
-        if same:
-            return
+        # and the replace would delete one of them. Unless new is deleted,
+        # hidden while the file is open: then old takes its place.
+        if src.get("lock_key") and (src["lock_key"], src["dir_type"]) == (
+                dst.get("lock_key"), dst["dir_type"]):
+            with self._fh_lock:
+                if replaced not in self._pending_deletes:
+                    return
         dst_dir, _ = self._split_path(new)
         src_is_dir = _is_dir_entry(src)
         dst_is_dir = _is_dir_entry(dst)
@@ -5176,8 +5165,8 @@ class AmigaFuseFS(_FuseOperations):
     def _delete_replaced(self, temp: str):
         """Delete the replaced object, now at temp, for _replace_existing().
 
-        A file still open is left to its release(), and hidden until then,
-        as unlink() does. A delete that gets no reply may still happen, so
+        A file still open, also through a hard link to it, is left to its
+        last release(), and hidden until then, as unlink() does. A delete that gets no reply may still happen, so
         the replace stands. Raises FuseOSError when the handler refuses.
         """
         # delete_dir_atomic() sends ACTION_DELETE_OBJECT, for a file too.
@@ -5190,6 +5179,15 @@ class AmigaFuseFS(_FuseOperations):
                                for v in self._fh_cache.values())
                 if deferred:
                     self._pending_deletes.add(temp)
+            if not deferred:
+                # Open through a hard link to it: as for unlink(), the
+                # release() of the last of those handles deletes it.
+                holders = self._link_holders(temp)
+                if holders:
+                    with self._fh_lock:
+                        self._pending_deletes.add(temp)
+                        self._link_deletes[temp] = holders
+                    deferred = True
         if res1 == 0 and not deferred:
             if res2 != -1:  # -1: no reply
                 raise FuseOSError(_RENAME_ERRNOS.get(res2, errno.EIO))
