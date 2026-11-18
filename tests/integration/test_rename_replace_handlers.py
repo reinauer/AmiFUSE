@@ -451,6 +451,37 @@ def test_getpath_does_not_enumerate_unlocked_directories(ops, monkeypatch):
     assert ops.getpath("/canonical/mixedname") == "/Canonical/MixedName"
 
 
+def test_getpath_locates_each_component_once(ops, monkeypatch):
+    # WinFsp asks on every open: one walk from the root, not one for each
+    # component, keeps the cost linear in the depth.
+    if ops._name_fold is None:
+        pytest.skip("handler does not advertise case folding")
+    ops.mkdir("/Deep", 0o755)
+    ops.mkdir("/Deep/Er", 0o755)
+    _write(ops, "/Deep/Er/File", b"data")
+    launcher = ops.bridge.launcher
+    send_locate, located = launcher.send_locate, []
+
+    def counting(state, lock, name_bptr, *args):
+        located.append(name_bptr)
+        return send_locate(state, lock, name_bptr, *args)
+
+    monkeypatch.setattr(launcher, "send_locate", counting)
+    assert ops.getpath("/deep/er/file") == "/Deep/Er/File"
+    assert len(located) == 3
+
+
+def _refuse_last_lock(ops, monkeypatch):
+    """Have getpath find the last component of a path as if the handler
+    refused its lock, as it does a writer's."""
+    stat_components = ops.bridge.stat_components
+
+    def stat(path):
+        return stat_components(path)[:-1] + [(None, False)]
+
+    monkeypatch.setattr(ops.bridge, "stat_components", stat)
+
+
 @pytest.mark.parametrize("readdir_plus", [False, True])
 def test_getpath_lists_only_the_parent_of_a_refused_lock(ops, monkeypatch, readdir_plus):
     # With READDIR_PLUS readdir() gives (name, attributes, offset) tuples;
@@ -460,17 +491,14 @@ def test_getpath_lists_only_the_parent_of_a_refused_lock(ops, monkeypatch, readd
     ops._readdir_plus = readdir_plus
     ops.mkdir("/Canonical", 0o755)
     _write(ops, "/Canonical/MixedName", b"data")
-    stat_in_dir, list_names = ops.bridge.stat_in_dir, ops._list_names
+    list_names = ops._list_names
     listed = []
-
-    def stat(path):
-        return (None, False) if path == "/Canonical/mixedname" else stat_in_dir(path)
 
     def listing(path, names):
         listed.append(path)
         return list_names(path, names)
 
-    monkeypatch.setattr(ops.bridge, "stat_in_dir", stat)
+    _refuse_last_lock(ops, monkeypatch)
     monkeypatch.setattr(ops, "_list_names", listing)
     assert ops.getpath("/canonical/mixedname") == "/Canonical/MixedName"
     assert listed == ["/Canonical"]
@@ -546,10 +574,8 @@ def test_getpath_does_not_trust_an_opened_handles_spelling(ops, monkeypatch):
     ops.mkdir("/Canonical", 0o755)
     _write(ops, "/Canonical/MixedName", b"data")
     handle = ops.open("/canonical/mixedname", os.O_RDONLY)
-    stat_in_dir = ops.bridge.stat_in_dir
     try:
-        monkeypatch.setattr(ops.bridge, "stat_in_dir", lambda path: (
-            (None, False) if path == "/Canonical/mixedname" else stat_in_dir(path)))
+        _refuse_last_lock(ops, monkeypatch)
         assert ops.getpath("/canonical/mixedname", handle) == "/Canonical/MixedName"
     finally:
         ops.release("/canonical/mixedname", handle)
