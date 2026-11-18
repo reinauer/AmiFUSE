@@ -302,11 +302,11 @@ def test_ls_of_a_file_typed_decomposed_names_it_as_stored(tmp_path):
     content = tmp_path / "content.txt"
     content.write_bytes(b"target\n")
     _xdftool(image, "create", "+", "format", "Nfc", "ffs",
-             "+", "write", str(content), "ä.txt")
-    result = _amifuse("ls", str(image), "--path", "ä.txt", "--json")
+             "+", "write", str(content), "\u00e4.txt")
+    result = _amifuse("ls", str(image), "--path", "a\u0308.txt", "--json")
     assert result.returncode == 0, result.stdout + result.stderr
     entries = json.loads(result.stdout)["entries"]
-    assert [(e["name"], e["size"]) for e in entries] == [("ä.txt", 7)]
+    assert [(e["name"], e["size"]) for e in entries] == [("\u00e4.txt", 7)]
 
 
 def test_stat_of_a_soft_link_typed_decomposed(image):
@@ -315,12 +315,12 @@ def test_stat_of_a_soft_link_typed_decomposed(image):
     bridge = HandlerBridge(image, BUNDLED_DRIVER, read_only=False,
                            adf_info=detect_adf(image))
     try:
-        _make_soft_link(bridge, "sä", "a/target.txt")
-        entry = bridge.stat_path("/sä", links=True)
+        _make_soft_link(bridge, "s\u00e4", "a/target.txt")
+        entry = bridge.stat_path("/sa\u0308", links=True)
     finally:
         bridge.close()
     assert entry is not None
-    assert (entry["name"], entry["dir_type"]) == ("sä", 3)  # ST_SOFTLINK
+    assert (entry["name"], entry["dir_type"]) == ("s\u00e4", 3)  # ST_SOFTLINK
 
 
 @pytest.mark.parametrize("recursive", [[], ["--recursive"]], ids=["ls", "ls-R"])
