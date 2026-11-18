@@ -1970,6 +1970,65 @@ class HandlerBridge:
                 self.free_lock(l)
             return info, 0
 
+    def _examine_lock(self, lock: int) -> Optional[Dict]:
+        fib_mem = self._alloc_fib()
+        pkt_addr, _ = self.launcher.send_examine(self.state, lock, fib_mem.addr)
+        reply = self._run_until_reply(pkt_addr, "examine")
+        if reply is None or reply[0] == 0:
+            return None
+        return _parse_fib(self.mem, fib_mem.addr)
+
+    def _parent_lock(self, lock: int) -> Tuple[int, int]:
+        """(lock, res2) on the directory of lock's object; 0 at the root."""
+        pkt_addr, _ = self.launcher.send_parent(self.state, lock)
+        reply = self._run_until_reply(pkt_addr, "parent")
+        return reply if reply is not None else (0, -1)
+
+    def stat_in_dir(self, path: str) -> Tuple[Optional[Dict], bool]:
+        """Examine path, which is not "/"; and whether the object is in
+        path's directory.
+
+        A hard link's lock is on its target, so Examine gives the target's
+        entry and ACTION_PARENT the target's directory, which is another
+        one unless the link and the target share it. The directories are
+        compared by their entries but for fib_DiskKey, which pfs3aio gives
+        a directory per lock (_parse_fib); the root is the directory
+        without a parent. (None, False) when path can't be examined.
+        """
+        directory, name = path.rstrip("/").rsplit("/", 1)
+        with self._lock:
+            dir_lock, locks = 0, []
+            if directory:
+                dir_lock, _, locks = self.locate_path(directory)
+                if dir_lock == 0:
+                    return None, False
+            try:
+                lock, _ = self.locate(dir_lock, name)
+                if lock == 0:
+                    return None, False
+                locks.append(lock)
+                info = self._examine_lock(lock)
+                if info is None:
+                    return None, False
+                parent_lock, _ = self._parent_lock(lock)
+                if parent_lock == 0:
+                    return info, False
+                locks.append(parent_lock)
+                if not directory:
+                    above, res2 = self._parent_lock(parent_lock)
+                    locks.append(above)
+                    return info, above == 0 and res2 == 0
+                parent = self._examine_lock(parent_lock)
+                held = self._examine_lock(dir_lock)
+                if parent is None or held is None:
+                    return info, False
+                parent.pop("disk_key")
+                held.pop("disk_key")
+                return info, parent == held
+            finally:
+                for l in reversed(locks):
+                    self.free_lock(l)
+
     # Buffers for ACTION_READ_LINK, tried in order while the target does not
     # fit. A soft link's target is in one block of the disk.
     _READ_LINK_SIZES = (256, 32768)
@@ -3798,10 +3857,12 @@ class AmigaFuseFS(_FuseOperations):
         otherwise a case-only rename can look like an exact-name no-op.
         Examine each component to avoid enumerating whole directories on
         every open. The parent is listed only when Examine can't name the
-        component: a writer can refuse its lock, and a hard link's lock
-        names the link's target. fh is the handle WinFsp passes after
-        create(), whose path is the new object's spelling on disk; that of
-        an open() may be an alias, so only a created handle's is used.
+        component: a writer can refuse its lock, and a hard link's lock is
+        on the link's target, which Examine names and which can be in
+        another directory (stat_in_dir). fh is the handle WinFsp passes
+        after create(), whose path is the new object's spelling on disk;
+        that of an open() may be an alias, so only a created handle's is
+        used.
         """
         self._check_handler_alive()
         created = None
@@ -3815,13 +3876,12 @@ class AmigaFuseFS(_FuseOperations):
         canonical = "/"
         for at, component in enumerate(components):
             child = canonical.rstrip("/") + "/" + component
-            info = self.bridge.stat_path(child)
+            info, in_dir = self.bridge.stat_in_dir(child)
             name = info.get("name") if info is not None else None
-            if name is not None and self._folded(name) != self._folded(component):
-                # A hard link: Examine names its target. A link whose name
-                # folds equal to its target's, differing only in letter
-                # case, isn't told apart and gets the target's spelling;
-                # that would take a listing for each component.
+            if name is not None and (not in_dir or self._folded(name) != self._folded(component)):
+                # A hard link: Examine names its target. Its name can fold
+                # to the link's, differing only in letter case, and the
+                # target is then in another directory.
                 name = None
             if (name is None and info is None and at == len(components) - 1
                     and created is not None
