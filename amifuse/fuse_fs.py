@@ -1947,6 +1947,8 @@ class HandlerBridge:
             if info is not None or not links or res2 != ERROR_IS_SOFT_LINK:
                 return info
             parent, name = path.rstrip("/").rsplit("/", 1)
+            # Composed, as _alloc_bstr sends it and the listing gives it.
+            name = unicodedata.normalize("NFC", name)
             fold = _NAME_FOLDS.get(self.name_fold()) or {}
             for ent in self.list_dir_path(parent or "/"):
                 if (ent["dir_type"] == ST_SOFTLINK
@@ -7391,7 +7393,8 @@ def _ls_file_name(bridge, stat, path: str) -> str:
     examined name if that folds to the one asked for, else the one asked.
     The listing is quiet: a damaged sibling is no concern of ls of a file.
     """
-    asked = path.rstrip("/").rsplit("/", 1)[-1]
+    # Composed, as _alloc_bstr sends it and the listing gives it.
+    asked = unicodedata.normalize("NFC", path.rstrip("/").rsplit("/", 1)[-1])
     fold = _NAME_FOLDS.get(bridge.name_fold()) or {}
     parent = path.rstrip("/").rsplit("/", 1)[0] or "/"
     try:

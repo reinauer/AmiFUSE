@@ -292,6 +292,37 @@ def test_ls_of_a_file_is_quiet_about_a_damaged_sibling(tmp_path, damage):
         ("good.txt", "/E/GOOD.TXT", 7)]
 
 
+def test_ls_of_a_file_typed_decomposed_names_it_as_stored(tmp_path):
+    # The handler is sent the name composed, so it finds the file, but the
+    # name was looked up in the parent's listing as typed, matched nothing,
+    # and was given back decomposed.
+    from tests.integration.test_ls_recursive_ffs import _xdftool
+
+    image = tmp_path / "nfc.adf"
+    content = tmp_path / "content.txt"
+    content.write_bytes(b"target\n")
+    _xdftool(image, "create", "+", "format", "Nfc", "ffs",
+             "+", "write", str(content), "ä.txt")
+    result = _amifuse("ls", str(image), "--path", "ä.txt", "--json")
+    assert result.returncode == 0, result.stdout + result.stderr
+    entries = json.loads(result.stdout)["entries"]
+    assert [(e["name"], e["size"]) for e in entries] == [("ä.txt", 7)]
+
+
+def test_stat_of_a_soft_link_typed_decomposed(image):
+    # A soft link's entry comes from its parent's listing, which gives the
+    # name composed.
+    bridge = HandlerBridge(image, BUNDLED_DRIVER, read_only=False,
+                           adf_info=detect_adf(image))
+    try:
+        _make_soft_link(bridge, "sä", "a/target.txt")
+        entry = bridge.stat_path("/sä", links=True)
+    finally:
+        bridge.close()
+    assert entry is not None
+    assert (entry["name"], entry["dir_type"]) == ("sä", 3)  # ST_SOFTLINK
+
+
 @pytest.mark.parametrize("recursive", [[], ["--recursive"]], ids=["ls", "ls-R"])
 def test_ls_of_a_missing_path_is_still_not_found(image, recursive):
     # ls -R of a missing path listed nothing and exited 0.
