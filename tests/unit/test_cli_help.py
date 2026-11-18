@@ -105,7 +105,6 @@ class TestLazyFuseImport:
         [
             (("--version",), 0),
             (("mount", "--help"), 0),
-            (("status", "--json"), 0),
             (("ls", "--json", "missing.hdf"), 1),
         ],
     )
@@ -118,6 +117,27 @@ class TestLazyFuseImport:
 
         assert proc.returncode == expected_returncode, proc.stderr
         assert not marker.exists()
+
+    def test_status_json_does_not_import_fusepy(self, tmp_path):
+        env, marker = _fuse_import_probe(tmp_path)
+
+        proc = _run_amifuse("status", "--json", env=env)
+
+        assert not marker.exists()
+        data = json.loads(proc.stdout)
+        # status queries live processes. When that query fails (PowerShell
+        # can time out on a cold Windows runner), status reports the failure
+        # and exits 1 rather than claiming there are no mounts.
+        if proc.returncode == 0:
+            assert set(data) == {"status", "command", "mounts"}, data
+            assert data["status"] == "ok"
+        else:
+            assert proc.returncode == 1, proc.stderr
+            assert set(data) == {"status", "command", "error", "mounts"}, data
+            assert data["status"] == "error"
+            assert data["error"].startswith("Process discovery failed:"), data
+            assert data["mounts"] == []
+        assert data["command"] == "status"
 
     def test_doctor_does_not_import_fusepy(self, tmp_path):
         env, marker = _fuse_import_probe(tmp_path)
