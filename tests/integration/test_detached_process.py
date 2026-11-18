@@ -69,3 +69,22 @@ class TestDetachedProcess:
         time.sleep(0.5)
 
         assert not _pid_exists(pid)
+
+    def test_pid_exists_false_for_an_exited_process_still_referenced(self):
+        """An exited process is gone though a handle to it keeps it openable."""
+        from amifuse.platform import _pid_exists
+
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "pass"],
+            creationflags=DETACHED_FLAGS,
+        )
+        proc.wait(timeout=5)
+
+        # proc still holds its process handle.
+        assert not _pid_exists(proc.pid)
+
+    def test_pid_exists_true_for_the_system_process(self):
+        """The System process (PID 4) is alive; unelevated, it refuses the open."""
+        from amifuse.platform import _pid_exists
+
+        assert _pid_exists(4)
