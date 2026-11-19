@@ -13,6 +13,7 @@ import shutil
 import pytest
 
 from amifuse.fuse_fs import AmigaFuseFS, HandlerBridge
+from amifuse.startup_runner import ACTION_DISK_INFO
 from amifuse.rdb_inspect import detect_adf
 
 pytestmark = pytest.mark.integration
@@ -33,17 +34,14 @@ def sfs_ops(fixture_root, tmp_path):
         bridge.close()
 
 
-def _late_disk_info_reply(bridge):
-    """Run an ACTION_DISK_INFO to its reply and return that reply burst."""
+def _abandon_disk_info(bridge):
+    """Leave an ACTION_DISK_INFO unanswered: its DOSTRUE comes late."""
     info = bridge.vh.alloc.alloc_memory(36, label="InfoData")
-    pkt_addr, _ = bridge.launcher.send_disk_info(bridge.state, info.addr)
-    replies = bridge._run_until_replies()
-    # Precondition, not the check: SmartFilesystem answers DISK_INFO alone.
-    assert [(pkt, res1) for _, pkt, res1, _ in replies] == [(pkt_addr, -1)]
-    return replies
+    assert bridge._packet(
+        ACTION_DISK_INFO, [info.addr >> 2], "disk_info", max_iters=0) is None
 
 
-def test_unlink_of_an_open_file_is_deferred_past_a_late_reply(sfs_ops, monkeypatch):
+def test_unlink_of_an_open_file_is_deferred_past_a_late_reply(sfs_ops):
     """The late DOSTRUE is not taken as the root lock.
 
     Taken as the lock, -1 goes out with the delete; SmartFilesystem
@@ -52,15 +50,8 @@ def test_unlink_of_an_open_file_is_deferred_past_a_late_reply(sfs_ops, monkeypat
     """
     bridge = sfs_ops.bridge
     fh = sfs_ops.open("/Prefs.info", os.O_RDONLY)
-    late = _late_disk_info_reply(bridge)
-
-    run = bridge._run_until_replies
-    pending = [late]
-
-    def wait_with_late_reply_first(*args, **kwargs):
-        return pending.pop() if pending else run(*args, **kwargs)
-
-    monkeypatch.setattr(bridge, "_run_until_replies", wait_with_late_reply_first)
+    # Its reply comes first in the unlink's wait for the root lock.
+    _abandon_disk_info(bridge)
 
     assert sfs_ops.unlink("/Prefs.info") == 0
     assert sfs_ops._pending_deletes == {"/Prefs.info"}

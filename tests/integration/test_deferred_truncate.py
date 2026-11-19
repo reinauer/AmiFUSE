@@ -5,6 +5,7 @@ import os
 import pytest
 
 from amifuse.fuse_fs import AmigaFuseFS, FuseOSError
+from amifuse.startup_runner import ACTION_WRITE
 from tests.fixtures.images import make_adf
 from tests.fixtures.paths import BUNDLED_FFS
 from tests.integration.test_handler_bridge_write import _bridge
@@ -49,11 +50,12 @@ def volume(request, tmp_path):
 def test_copy_does_not_write_the_grown_range_twice(volume, monkeypatch):
     ops, bridge, image, driver = volume
     writes = []
-    send = bridge.launcher.send_write_handle
-    def record(state, fh, address, size):
-        writes.append(size)
-        return send(state, fh, address, size)
-    monkeypatch.setattr(bridge.launcher, 'send_write_handle', record)
+    packet = bridge._packet
+    def record(action, args, label, *more, **kwargs):
+        if action == ACTION_WRITE:
+            writes.append(args[2])
+        return packet(action, args, label, *more, **kwargs)
+    monkeypatch.setattr(bridge, '_packet', record)
     h = ops.create('/copy', 0o644)
     data = bytes(range(256)) * 1024
     ops.truncate('/copy', len(data), h)

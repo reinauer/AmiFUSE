@@ -7,10 +7,11 @@ that the bridge drops gives back the lock or file it grants (#194). And
 unmount runs the handler until every packet has its reply before it
 flushes the volume (#118).
 
-A scripted handler on the real HandlerLauncher, in MockMemory, takes each
-packet the bridge queues and answers it at once, later, or never. It
-stands in for the scheduler: each run takes the queued packets and ends
-BUSY while an answer is still to come, IDLE once the handler waits.
+The bridge sends through amitools' DosPktHandler, in MockMemory, as on a
+mount. A scripted handler takes each packet queued on its port and
+answers it at once, later, or never. It stands in for the scheduler: each
+run takes the queued packets and ends BUSY while an answer is still to
+come, IDLE once the handler waits.
 """
 
 import errno
@@ -113,7 +114,8 @@ class Handler:
         port = self.state.port_addr
         while self.ports.has_msg(port) and not (self.in_order and self.waiting):
             msg = self.ports.get_msg(port)
-            pkt = msg + self.launcher._msg_size
+            # the message's ln_Name names its DosPacket, as handlers read it
+            pkt = self.mem.r32(msg + self.launcher._msg_ln_name_offset)
             pkt_type = self.mem.r32(pkt + self.launcher._dp_type_offset)
             args = [self.mem.r32(pkt + self.launcher._dp_arg1_offset + 4 * i)
                     for i in range(4)]
@@ -163,12 +165,17 @@ def bridge():
     handler = Handler(launcher, mem, ports, state)
     # the scripted handler stands in for the scheduler's run
     launcher.run = handler.run
+    # PutMsg() to the handler's port
+    launcher.put_msg = ports.put_msg
 
     b = fs.HandlerBridge.__new__(fs.HandlerBridge)
     b._lock = threading.RLock()
     b._debug = False
     b._closed = False
     b._busy_ran_out = False
+    b._idle_busy_cycles = 0
+    b._on_crash = None
+    b._packet_wait = None
     b.vh, b.mem, b.launcher, b.state = vh, mem, launcher, state
     b.backend = SimpleNamespace(sync=lambda: None, fsync=lambda: None,
                                 close=lambda: None)
@@ -187,6 +194,8 @@ def bridge():
     b._neg_cache = {}
     b._neg_cache_ttl = 0.0
     b._write_enabled = True
+    # every packet goes through amitools' DosPktHandler, as on a mount
+    b._attach_transport()
     return b, handler
 
 
@@ -1057,8 +1066,11 @@ def test_a_wait_past_its_deadline_leaves_a_handler_still_at_work_its_io_reply(
     b.launcher.run = lambda max_cycles=None: runs.append(max_cycles)
     b._busy_ran_out = True
 
-    b._run_until_replies(deadline=fs.time.monotonic() - 1)
+    wait = fs._PacketWait(b, None, deadline=fs.time.monotonic() - 1)
+    assert wait.pump() is False
+    wait.finish()
 
+    assert wait.stop == "deadline"
     assert handler.ports.has_msg(io_port)
     assert runs == []
 
@@ -1138,7 +1150,7 @@ def test_flush_wakes_a_handler_that_answers_only_on_a_packet(bridge, short_limit
     kinds = [(kind, pkt_type) for kind, pkt_type, *_ in handler.events]
     first = kinds.index(("answer", ACTION_SET_FILE_SIZE))
     assert ("take", ACTION_FLUSH) in kinds[first:]
-    assert not b._pending_packets()
+    assert not b._packets_out()
 
 
 def test_inhibit_cycle_waits_for_a_packet_still_out(bridge, short_limits):

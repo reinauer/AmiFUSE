@@ -29,6 +29,16 @@ def fuse_mock(monkeypatch):
     import amitools.util.Win32Disk
     # fuse_fs compares scheduler results even when the runtime is stubbed.
     import amitools.vamos.schedule
+    # fuse_fs sends its packets through DosPktHandler and catches its
+    # HandlerError; tests stand in for the transport (HandlerBridge._packet).
+    import amitools.vamos.handler.base
+    import amitools.vamos.handler.dospkt
+    # The stub below gives fuse_fs startup_runner's packet and lock constants.
+    from amifuse import startup_runner
+    packet_constants = {
+        name: value for name, value in vars(startup_runner).items()
+        if name.startswith(("ACTION_", "OFFSET_")) or name.endswith("_LOCK")
+    }
     # fuse_fs.main() takes --block-size's type from rdb_inspect, which needs
     # the real amitools.fs; load it before amitools is stubbed.
     import amifuse.rdb_inspect
@@ -74,17 +84,8 @@ def fuse_mock(monkeypatch):
     _stub_module("amifuse.process_mgr", ProcessManager=dummy_cls)
     _stub_module(
         "amifuse.startup_runner",
-        ACTION_CREATE_DIR=22,
-        ACTION_FINDINPUT=1005,
-        ACTION_FINDOUTPUT=1006,
-        ACTION_FINDUPDATE=1004,
-        ACTION_LOCATE_OBJECT=8,
-        ACTION_PARENT=29,
+        **packet_constants,
         HandlerLauncher=dummy_cls,
-        # startup_runner's values, so tests can tell the seek modes apart.
-        OFFSET_BEGINNING=-1,
-        OFFSET_CURRENT=0,
-        OFFSET_END=1,
         _get_block_state=lambda *args, **kwargs: None,
         _get_active_block_state=lambda *args, **kwargs: None,
         _clear_all_block_state=lambda *args, **kwargs: None,

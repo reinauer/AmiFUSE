@@ -56,7 +56,7 @@ def timer_probe(monkeypatch):
     counts = Counter()
     devices = []
     wait_port = ExecLibrary.WaitPort
-    run_until_replies = HandlerBridge._run_until_replies
+    packet = HandlerBridge._packet
 
     # Annotated as ExecLibrary's own: the stub converts arguments by them.
     def WaitPort(self, ctx, msg_port: MsgPort) -> Message:
@@ -66,13 +66,13 @@ def timer_probe(monkeypatch):
                 for dev in devices for io in dev._pending)
         return wait_port(self, ctx, msg_port)
 
-    def _run_until_replies(self, *args, **kwargs):
-        replies = run_until_replies(self, *args, **kwargs)
-        counts["NoReply"] += not replies and any(dev._pending for dev in devices)
-        return replies
+    def _packet(self, *args, **kwargs):
+        reply = packet(self, *args, **kwargs)
+        counts["NoReply"] += reply is None and any(dev._pending for dev in devices)
+        return reply
 
     monkeypatch.setattr(ExecLibrary, "WaitPort", WaitPort)
-    monkeypatch.setattr(HandlerBridge, "_run_until_replies", _run_until_replies)
+    monkeypatch.setattr(HandlerBridge, "_packet", _packet)
     return counts, devices
 
 

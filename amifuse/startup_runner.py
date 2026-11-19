@@ -367,16 +367,24 @@ class HandlerLauncher:
         for val in args[:7]:
             self.mem.w32(arg_addr, val & 0xFFFFFFFF)
             arg_addr += 4
-        # queue message to destination port - both Python queue and Amiga memory
-        self.port_mgr.put_msg(dest_port_addr, sp_addr)
-        # Also link the message into the port's mp_MsgList in memory
-        # This is necessary because some handlers (like FFS) read mp_MsgList directly
-        self._link_msg_to_port(dest_port_addr, sp_addr)
-        # Signal the port's task like PutMsg() does, so that a Wait() on the
-        # port's signal returns. A task not yet running finds the message
-        # on the port when it first waits for it.
-        self._signal_port(dest_port_addr)
+        # A task not yet running finds the message on the port when it
+        # first waits for it.
+        self.put_msg(dest_port_addr, sp_addr)
         return pkt_addr, sp_addr
+
+    def put_msg(self, port_addr: int, msg_addr: int):
+        """Deliver a message to the port at port_addr, as PutMsg() does.
+
+        It goes to the port manager's queue, which GetMsg() takes from,
+        and into the port's mp_MsgList, as some handlers (like FFS) read
+        that list directly. Then the port's task gets the port's signal,
+        so that a Wait() on it returns. Like PutMsg(), it makes the message
+        an NT_MESSAGE: a handler may leave anything else on its port.
+        """
+        self.mem.w8(msg_addr + self._msg_ln_type_offset, NodeType.NT_MESSAGE)
+        self.port_mgr.put_msg(port_addr, msg_addr)
+        self._link_msg_to_port(port_addr, msg_addr)
+        self._signal_port(port_addr)
 
     def _link_msg_to_port(self, port_addr: int, msg_addr: int):
         """Link a message into a port's mp_MsgList in Amiga memory.

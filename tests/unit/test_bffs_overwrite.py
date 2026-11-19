@@ -22,7 +22,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from amifuse import fuse_fs
-from tests.unit.test_fuse_fs import NO_REPLY, PKT, _fake_write_bridge, _reply
+from tests.unit.test_fuse_fs import NO_REPLY, _fake_write_bridge, _reply
 
 ORIGINAL = bytes(range(256)) * 12  # 3072 bytes
 NEW = b"n" * 100
@@ -66,6 +66,26 @@ class _FakeBFFS:
 
     # The memory and packet interface _fake_write_bridge wires up.
 
+    def packet(self, action, args, label, *more, **limits):
+        """Answer a packet as BFFS would; stands in for HandlerBridge._packet."""
+        finds = {fuse_fs.ACTION_FINDINPUT: FINDINPUT,
+                 fuse_fs.ACTION_FINDUPDATE: FINDUPDATE,
+                 fuse_fs.ACTION_FINDOUTPUT: FINDOUTPUT}
+        if action in finds:
+            # dp_Arg1 is the FileHandle's BPTR, dp_Arg3 the name, which the
+            # bridge's _alloc_bstr passes as is.
+            fh_bptr, lock, name = args
+            self.find(finds[action], name, fh_bptr << 2)
+        else:
+            {
+                fuse_fs.ACTION_READ: self.read,
+                fuse_fs.ACTION_WRITE: self.write,
+                fuse_fs.ACTION_SEEK: self.seek,
+                fuse_fs.ACTION_SET_FILE_SIZE: self.set_size,
+                fuse_fs.ACTION_END: self.end,
+            }[action](*args)
+        return self.reply
+
     def w_block(self, addr, data):
         self.buf = bytes(data)
 
@@ -77,41 +97,39 @@ class _FakeBFFS:
         self.opens.append((action, name))
         if number in self.open_replies:
             self.reply = self.open_replies[number]
-            return fh_addr, PKT, 0
+            return
         holders = [h for h in self.handles.values() if h["name"] == name]
         if action == FINDOUTPUT:
             if holders:
                 self.reply = _reply(0, fuse_fs.ERROR_OBJECT_IN_USE)
-                return fh_addr, PKT, 0
+                return
             self.files.setdefault(name, bytearray())
         elif name not in self.files:
             self.reply = _reply(0, fuse_fs.ERROR_OBJECT_NOT_FOUND)
-            return fh_addr, PKT, 0
+            return
         elif any(h["exclusive"] for h in holders):
             self.reply = _reply(0, fuse_fs.ERROR_OBJECT_IN_USE)
-            return fh_addr, PKT, 0
+            return
         self.handles[fh_addr] = {
             "name": name, "pos": 0, "max": 0, "write": False,
             "exclusive": action == FINDOUTPUT, "truncate": action == FINDOUTPUT,
         }
         self.reply = _reply(-1)
-        return fh_addr, PKT, 0
 
-    def read(self, state, fh_addr, addr, size):
+    def read(self, fh_addr, addr, size):
         h = self.handles[fh_addr]
         data = self.files[h["name"]]
         self.buf = bytes(data[h["pos"]:h["pos"] + size])
         h["pos"] += len(self.buf)
         h["max"] = max(h["max"], h["pos"])
         self.reply = _reply(len(self.buf))
-        return PKT, 0
 
-    def write(self, state, fh_addr, addr, size):
+    def write(self, fh_addr, addr, size):
         number = len(self.writes)
         self.writes.append(size)
         if number in self.write_replies:
             self.reply = self.write_replies[number]
-            return PKT, 0
+            return
         h = self.handles[fh_addr]
         h["write"] = True
         data = self.files[h["name"]]
@@ -119,9 +137,8 @@ class _FakeBFFS:
         h["pos"] += size
         h["max"] = max(h["max"], h["pos"])
         self.reply = _reply(size)
-        return PKT, 0
 
-    def seek(self, state, fh_addr, offset, mode):
+    def seek(self, fh_addr, offset, mode):
         h = self.handles[fh_addr]
         end = len(self.files[h["name"]])
         base = {fuse_fs.OFFSET_BEGINNING: 0, fuse_fs.OFFSET_CURRENT: h["pos"],
@@ -131,20 +148,17 @@ class _FakeBFFS:
             h["pos"] = base + offset
         else:
             self.reply = _reply(-1, fuse_fs.ERROR_SEEK_ERROR)
-        return PKT, 0
 
-    def set_size(self, state, fh_addr, size, mode):
+    def set_size(self, fh_addr, size, mode):
         self.set_sizes.append(size)
         self.reply = _reply(0, fuse_fs.ERROR_OBJECT_NOT_FOUND)
-        return PKT, 0
 
-    def end(self, state, fh_addr):
+    def end(self, fh_addr):
         self.ends.append(fh_addr)
         h = self.handles.pop(fh_addr)
         if h["write"] and h["truncate"]:
             del self.files[h["name"]][h["max"]:]
         self.reply = _reply(-1)
-        return PKT, 0
 
 
 def _bffs_bridge(volume):
@@ -161,12 +175,6 @@ def _bffs_bridge(volume):
     addresses = itertools.count(0x3000, 0x100)
     bridge._alloc_fh = lambda: next(addresses)
     bridge._free_fh = MagicMock()
-    launcher = bridge.launcher
-    for action in (FINDINPUT, FINDUPDATE, FINDOUTPUT):
-        getattr(launcher, f"send_{action.lower()}").side_effect = (
-            lambda state, name, lock, fh_addr, action=action:
-            volume.find(action, name, fh_addr))
-    launcher.send_end_handle.side_effect = volume.end
     # BFFS reports the inode's size, which an ACTION_FINDOUTPUT handle
     # changes only at its end.
     bridge.stat_path = lambda path, links=False: (
@@ -351,12 +359,9 @@ def test_read_stops_at_what_the_handle_wrote(fuse_mock, truncate):
     else:
         fh = fs.open("/file", os.O_RDWR | os.O_TRUNC)
 
-    launcher = fs.bridge.launcher
-    sent = (launcher.send_read_handle.call_count,
-            launcher.send_seek_handle.call_count)
+    sent = fs.bridge._packet.call_count
     assert fs.read("/file", 4096, 0, fh) == b""
-    assert (launcher.send_read_handle.call_count,
-            launcher.send_seek_handle.call_count) == sent
+    assert fs.bridge._packet.call_count == sent
     fs.write("/file", NEW, 0, fh)
     assert fs.read("/file", 4096, 0, fh) == NEW
     assert fs.read("/file", 10, len(NEW) - 4, fh) == NEW[-4:]

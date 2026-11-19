@@ -9,7 +9,6 @@ import pstats
 
 import argparse
 import errno
-import itertools
 import math
 import operator
 import os
@@ -138,18 +137,37 @@ from .vamos_runner import VamosHandlerRuntime
 from .bootstrap import BootstrapAllocator
 from .startup_runner import (
     ACTION_CREATE_DIR,
+    ACTION_DELETE_OBJECT,
+    ACTION_DISK_INFO,
+    ACTION_END,
+    ACTION_EXAMINE_NEXT,
+    ACTION_EXAMINE_OBJECT,
     ACTION_FINDINPUT,
     ACTION_FINDOUTPUT,
     ACTION_FINDUPDATE,
+    ACTION_FLUSH,
+    ACTION_FORMAT,
+    ACTION_FREE_LOCK,
+    ACTION_INHIBIT,
     ACTION_LOCATE_OBJECT,
     ACTION_PARENT,
+    ACTION_READ,
+    ACTION_READ_LINK,
+    ACTION_RENAME_OBJECT,
+    ACTION_SEEK,
+    ACTION_SET_DATE,
+    ACTION_SET_FILE_SIZE,
+    ACTION_WRITE,
     HandlerLauncher,
     OFFSET_BEGINNING,
     OFFSET_CURRENT,
     OFFSET_END,
+    SHARED_LOCK,
     _packet_type_name,
 )
 from amitools.vamos.schedule import RunResult  # type: ignore
+from amitools.vamos.handler.base import HandlerError  # type: ignore
+from amitools.vamos.handler.dospkt import DosPktHandler  # type: ignore
 from .emu_thread import EmuThread, route_methods_through_emu
 from amitools.vamos.libstructs.dos import FileInfoBlockStruct, FileHandleStruct, DosPacketStruct, InfoDataStruct  # type: ignore
 from amitools.vamos.lib.dos.DosProtection import DosProtection  # type: ignore
@@ -255,7 +273,7 @@ class SeekResult(Enum):
 #   for the life of the mount, out of 8 MiB of emulated memory.
 # - The handler's work on one packet, on OFS about 16.3 million cycles per
 #   MiB written and 9.8 million per MiB read, must end within the reply wait
-#   of _run_until_replies.
+#   of a packet wait (_PacketWait).
 IO_CHUNK = 64 * 1024
 
 # The size of the host-side buffer of zeros that fills the gap before a
@@ -538,6 +556,205 @@ def _parse_fib(mem, fib_addr: int) -> Dict:
     }
 
 
+class _PacketWait:
+    """The limits of one packet wait, kept by the pump that runs the handler.
+
+    DosPktHandler calls pump() until the packet's reply is queued, and
+    stops when it returns False. Each call is one run of the handler and
+    its children (HandlerBridge._run), for at most cycles emulated cycles
+    or until every task waits.
+
+    A wait goes in rounds. A reply to any packet ends a round: it may be
+    a late one, which DosPktHandler takes and gives back, and the next
+    round starts afresh, up to max_rounds of them (None: no limit). A
+    reply also ends the short busy limit. Within a round:
+
+    - A run that ends with a task still runnable counts against a busy
+      limit of _MAX_BUSY_CYCLES; the round stops once it runs out, and
+      says so on stderr. A handler whose wait ran out is still running,
+      and the next packet would resume it with the full busy limit again.
+      Until it replies to any packet or waits, later waits get
+      _SHORT_BUSY_CYCLES instead, and a mount's timer thread runs it on
+      while the mount idles (run_due_timers). With short_rounds, as in
+      wait_for_pending, every round starts with the short limit, and a
+      round that runs out of it is followed by another until the deadline.
+    - Timer requests that are due when a round starts are replied first,
+      so their signals wake the handler with the packet's. Once every
+      task waits without a reply, the round sleeps to the next timer
+      deadline if it comes within _PACKET_TIMER_WAIT of the round's
+      start, replies to it and runs on: a handler may reply only once its
+      own timer fires, or a child may wait on one. While a task delays,
+      the round sleeps to the next deadline however far off, but without
+      a deadline of its own for _DELAY_WAIT in all, as a task may delay
+      in a loop that never ends (_sleep_to_delay). It stops after
+      max_iters such sleeps, or when there is nothing to sleep to.
+    - The limits count cycles, not time: Delay() waits as a task and
+      spends no cycles. A deadline, on the time.monotonic() clock, also
+      stops the wait before the next run once it has passed; a handler
+      still at work then gets the short limit next, as when a limit runs
+      out, without the warning.
+
+    A wait that stops without its reply has another attempts - 1 goes,
+    each as a wait of its own. The other ports are drained only after a
+    round that leaves the handler waiting, as the idle timers do
+    (run_due_timers): in the middle of its work, a SendIO() reply it has
+    not taken yet is still its own (#240). stop names why the wait
+    stopped: busy, deadline, idle, done (the handler exited), crashed or
+    rounds.
+    """
+
+    def __init__(self, bridge, action, max_iters: int = 50,
+                 cycles: Optional[int] = None, deadline: Optional[float] = None,
+                 max_rounds: Optional[int] = None, short_rounds: bool = False,
+                 attempts: int = 1):
+        self.bridge = bridge
+        self.action = action
+        self.max_iters = max_iters
+        self.cycles = bridge._RUN_CHUNK_CYCLES if cycles is None else cycles
+        self.deadline = deadline
+        self.max_rounds = (bridge._MAX_REPLY_ROUNDS if max_rounds is None
+                           and not short_rounds else max_rounds)
+        self.short_rounds = short_rounds
+        self.attempts = attempts
+        self.stop = None
+        self.rounds = 0
+        self.round_over = True
+        self.busy = False
+        self.busy_cycles = 0
+        self.busy_limit = bridge._MAX_BUSY_CYCLES
+
+    def _start_round(self):
+        bridge = self.bridge
+        self.rounds += 1
+        self.round_over = False
+        self.busy = False
+        self.busy_cycles = 0
+        self.idle_iters = 0
+        timer = bridge._timer_device()
+        self.timer_wait_until = (
+            -math.inf if timer is None
+            else timer.clock() + bridge._PACKET_TIMER_WAIT)
+        self.delay_until = (
+            time.monotonic() + bridge._DELAY_WAIT if self.deadline is None
+            else self.deadline)
+        if self.short_rounds:
+            bridge._busy_ran_out = True
+        # Reply to timer requests that fell due since the handler last ran.
+        # Their signals wake it with the packet's.
+        bridge._deliver_timers()
+
+    def _end_round(self, replied: bool):
+        bridge = self.bridge
+        self.round_over = True
+        if replied:
+            # It answered a packet, so it is not caught in a loop, even if it
+            # went on to the next packet without waiting.
+            bridge._busy_ran_out = False
+            bridge._idle_busy_cycles = 0
+        elif self.busy_cycles >= self.busy_limit or (
+                self.stop == "deadline" and self.busy):
+            # A wait that ends at its deadline in the middle of the
+            # handler's work leaves it running, as one that runs out does.
+            if (self.busy_cycles >= self.busy_limit
+                    and self.busy_limit == bridge._MAX_BUSY_CYCLES):
+                # Shown even without --debug, as in --interactive mounts and
+                # CLI commands. It is lost where stderr is discarded: at
+                # /dev/null by libfuse's daemonize, or at DEVNULL for a mount
+                # the Windows launcher starts.
+                to = ("" if self.action is None
+                      else f" to {_packet_type_name(self.action)}")
+                print(
+                    f"[amifuse] WARNING: handler did not reply{to} within the "
+                    f"busy limit of {self.busy_limit:,} emulated cycles",
+                    file=sys.stderr,
+                )
+            bridge._busy_ran_out = True
+            timer = bridge._timer_device()
+            if timer is not None:
+                # The mount's timer thread runs the handler on while idle.
+                timer.event.set()
+        # Drain stray IO replies that accumulated during packet processing:
+        # SendIO queues them at once. timer.device replies stay, since they
+        # come only when due and the handler takes them.
+        if not self.busy and not bridge._busy_ran_out and not bridge.state.crashed:
+            bridge._drain_non_essential_ports(bridge.vh.slm.exec_impl.port_mgr)
+
+    def _stopped(self, why: str) -> bool:
+        """End the round without a reply; True if another attempt follows."""
+        self.stop = why
+        self._end_round(replied=False)
+        if why == "busy" and self.short_rounds:
+            # A handler still at work gets round after round, each of the
+            # short limit, until the deadline (wait_for_pending).
+            self.stop = None
+            return True
+        if why in ("busy", "idle") and self.attempts > 1:
+            self.attempts -= 1
+            self.rounds = 0
+            self.stop = None
+            return True
+        return False
+
+    def pump(self):
+        bridge = self.bridge
+        if self.round_over:
+            if self.max_rounds is not None and self.rounds >= self.max_rounds:
+                self.stop = "rounds"
+                return False
+            self._start_round()
+        if bridge.state.crashed:
+            self.stop = "crashed"
+            self.round_over = True
+            return False
+        self.busy_limit = (bridge._SHORT_BUSY_CYCLES if bridge._busy_ran_out
+                           else bridge._MAX_BUSY_CYCLES)
+        if self.busy_cycles >= self.busy_limit:
+            return self._stopped("busy")
+        if self.deadline is not None and time.monotonic() >= self.deadline:
+            return self._stopped("deadline")
+        if self.idle_iters >= self.max_iters:
+            return self._stopped("idle")
+        result = bridge._run(self.cycles)
+        if bridge.state.crashed:
+            self.stop = "crashed"
+            self.round_over = True
+            return False
+        # A run that ends with a task still runnable stopped the handler
+        # in the middle of its work.
+        self.busy = result == RunResult.BUSY
+        if self.busy:
+            self.busy_cycles += self.cycles
+            if bridge._debug and self.busy_cycles % (1000 * self.cycles) == 0:
+                print(f"[amifuse] packet wait: busy for {self.busy_cycles:,} cycles")
+        if bridge.vh.slm.exec_impl.port_mgr.has_msg(bridge.state.reply_port_addr):
+            self._end_round(replied=True)
+            return True
+        if self.busy:
+            return True
+        # It waited or exited, so it is not caught in a loop.
+        bridge._busy_ran_out = False
+        bridge._idle_busy_cycles = 0
+        if result == RunResult.DONE:
+            self.stop = "done"
+            self._end_round(replied=False)
+            return False
+        # Every task waits: only time can bring the reply now. The round
+        # sleeps to a Delay(), however far off, until delay_until. Past
+        # that the sleep returns at once, so the check is here too.
+        if time.monotonic() < self.delay_until and bridge._sleep_to_delay(self.delay_until):
+            return True
+        self.idle_iters += 1
+        # A timer request is slept to only within the round's window.
+        if bridge._sleep_to_timer_in_packet_wait(self.timer_wait_until):
+            return True
+        return self._stopped("idle")
+
+    def finish(self):
+        """The wait is over: close a round it left open."""
+        if not self.round_over:
+            self._end_round(replied=False)
+
+
 class HandlerBridge:
     """Maintains the handler state and issues DOS packets synchronously."""
 
@@ -565,8 +782,12 @@ class HandlerBridge:
         self._remove_driver = remove_driver
         self.backend = None
         self.vh = None
+        # The packet transport, once the handler has started.
+        self.dospkt = None
+        # The wait in progress, whose limits the pump keeps to.
+        self._packet_wait = None
         self._closed = False
-        # Set when a wait runs out of busy cycles; see _run_until_replies.
+        # Set when a wait runs out of busy cycles; see _PacketWait.
         self._busy_ran_out = False
         # Cycles the idle hook has run such a handler on without it waiting
         # or replying; see run_due_timers.
@@ -741,6 +962,7 @@ class HandlerBridge:
         # Run the deferred initialisation: PFS3 validates the volume on a
         # timer request, which is due at once here, as every pending one.
         self._flush_pending_signals()
+        self._attach_transport()
         # cache a best-effort volume name
         self._volname = None
         self._drive_name = None
@@ -837,14 +1059,24 @@ class HandlerBridge:
     def _close_runtime(self):
         runtime = getattr(self, "vh", None)
         backend = getattr(self, "backend", None)
+        dospkt = getattr(self, "dospkt", None)
         self.vh = None
         self.backend = None
+        self.dospkt = None
         first_error = None
+        try:
+            # The packets still out, and the memory they kept, go before
+            # the machine does.
+            if dospkt is not None and runtime is not None:
+                dospkt.shutdown()
+        except BaseException as exc:
+            first_error = exc
         try:
             if runtime is not None:
                 runtime.shutdown()
         except BaseException as exc:
-            first_error = exc
+            if first_error is None:
+                first_error = exc
         try:
             if backend is not None:
                 backend.close()
@@ -1000,7 +1232,7 @@ class HandlerBridge:
         delays, the wait sleeps to the earliest deadline, the delay's or a
         timer request's, however far off, replies to what fell due and runs
         on. A deadline, on the time.monotonic() clock, cuts the sleep short.
-        _run_until_replies passes the wait's own, or _DELAY_WAIT from its
+        A packet wait (_PacketWait) passes its own, or _DELAY_WAIT from its
         start: a task may also delay in a loop that never ends, and the wait
         holds the emulation thread. Returns whether a task was delaying.
         """
@@ -1133,181 +1365,62 @@ class HandlerBridge:
     # caught in a loop fails later than it did then.
     _SHORT_BUSY_CYCLES = 10_000_000
 
-    def _run_until_replies(self, max_iters: int = 50, cycles: Optional[int] = None, sleep_base: float = 0.0005, sleep_max: float = 0.01,
-                           deadline: Optional[float] = None):
-        """Run the handler until at least one reply is queued.
+    def _attach_transport(self):
+        """Send every packet from here on through amitools' DosPktHandler.
 
-        Each run (HandlerLauncher.run) runs the handler and its children
-        for at most cycles emulated cycles, or until every task waits. A
-        run that ends with a task still runnable counts against a busy
-        limit of _MAX_BUSY_CYCLES. Returns [] when every task waits with no
-        reply queued and no timer to wake one, or when the busy limit runs
-        out first, and says so on stderr when it is _MAX_BUSY_CYCLES.
-
-        A handler whose wait ran out is still running, and the next packet
-        would resume it with the full busy limit again. Until it replies to
-        any packet or waits, later waits get _SHORT_BUSY_CYCLES instead,
-        and a mount's timer thread runs it on while the mount idles
-        (run_due_timers). A reply may belong to an earlier packet, so every
-        packet wait must go through _run_until_reply, which drops such a
-        reply.
-
-        Timer requests that are due when the wait starts are replied first,
-        so their signals wake the handler with the packet's. Once every
-        task waits without a reply, the wait sleeps to the next timer
-        deadline if it comes within _PACKET_TIMER_WAIT of the wait's start,
-        replies to it and runs on: a handler may reply only once its own
-        timer fires, or a child may wait on one. While a task delays, the
-        wait sleeps to the next deadline however far off, but without a
-        deadline of its own for _DELAY_WAIT in all, as a task may delay in a
-        loop that never ends (_sleep_to_delay). Between packets, a mount's
-        timer thread replies to them (run_due_timers). The limits count
-        cycles, not time: Delay() waits as a task and spends no cycles. A
-        deadline, on the time.monotonic() clock, also ends the wait before
-        the next run once it has passed, whatever limit the handler has
-        then; a handler still at work then gets the short limit next, as
-        when a limit runs out, without the warning.
-
-        The other ports are drained only after a wait that leaves the
-        handler waiting, as the idle timers do (run_due_timers): in the
-        middle of its work, a SendIO() reply it has not taken yet is still
-        its own (#240). A wait can end so on a reply, too, since a handler
-        may answer a packet and go straight on to the next.
-
-        Known limit: a packet whose wait ran out, or ended at its
-        deadline, stays queued, or held by the handler, until the handler
-        answers it. It stays in HandlerLauncher.pending until then, and
-        neither it nor the bridge's memory its arguments name is reused
-        meanwhile; the handler's own locks and file entries it names are
-        not held back.
+        It matches each reply to its packet, keeps the memory an unanswered
+        packet names until the reply comes, and gives back what a late
+        reply grants: a lock with ACTION_FREE_LOCK, an open file with
+        ACTION_END. The bridge brings the pump, which runs the handler
+        within the limits of the wait in progress (_PacketWait), and the
+        launcher delivers each packet (HandlerLauncher.put_msg). The
+        replies come to the launcher's reply port, as the startup reply
+        did.
         """
-        if cycles is None:
-            cycles = self._RUN_CHUNK_CYCLES
-        replies = []
-        busy_cycles = 0
-        idle_iters = 0
-        timer = self._timer_device()
-        timer_wait_until = (
-            -math.inf if timer is None else timer.clock() + self._PACKET_TIMER_WAIT
-        )
-        delay_until = (
-            time.monotonic() + self._DELAY_WAIT if deadline is None else deadline
-        )
-        busy_limit = self._MAX_BUSY_CYCLES
+        dospkt = DosPktHandler("amifuse", self.vh.alloc, port=self.state.port_addr)
+        dospkt.reply_port = self.state.reply_port_addr
+        dospkt.attach_transport(
+            self.vh.alloc, self.vh.slm.exec_impl.port_mgr, self.mem, pump=self._pump,
+            put_msg=self.launcher.put_msg)
+        # The waits are bounded in emulated cycles, not in seconds.
+        dospkt.timeout = None
+        self.dospkt = dospkt
 
-        # Check if handler has crashed - if so, don't try to run it
-        if self.state.crashed:
+    def _pump(self):
+        """Run the handler once for DosPktHandler's wait; False to stop."""
+        wait = self._packet_wait
+        if wait is None:
+            wait = self._packet_wait = _PacketWait(self, None)
+        return wait.pump()
+
+    def _packet(self, action: int, args, label: str, attempts: int = 1,
+                **limits) -> Optional[Tuple[int, int]]:
+        """Send a packet and run the handler until it answers.
+
+        Returns (res1, res2), or None when no answer arrives within the
+        wait's limits (_PacketWait, which gets limits as its keyword
+        arguments). attempts is the number of such waits in a row. A packet
+        left without an answer is abandoned to DosPktHandler: its reply
+        comes later, while the bridge waits for another packet, or at
+        wait_for_pending(), and is never taken as another packet's answer.
+        """
+        wait = _PacketWait(self, action, attempts=attempts, **limits)
+        outer, self._packet_wait = self._packet_wait, wait
+        answer = None
+        try:
+            answer = self.dospkt.do_packet(action, *args)
+        except HandlerError as exc:
             if self._debug:
-                print("[amifuse] _run_until_replies: handler crashed, returning empty")
-            return []
-
-        # Reply to timer requests that fell due since the handler last ran.
-        # Their signals wake it with the packet's.
-        self._deliver_timers()
-
-        busy = timed_out = False
-        for i in itertools.count():
-            busy_limit = (
-                self._SHORT_BUSY_CYCLES if self._busy_ran_out
-                else self._MAX_BUSY_CYCLES
-            )
-            if busy_cycles >= busy_limit:
-                break
-            if deadline is not None and time.monotonic() >= deadline:
-                timed_out = True
-                break
-            if idle_iters >= max_iters:
-                break
-            result = self._run(cycles)
-            if self.state.crashed:
-                if self._debug:
-                    print(f"[amifuse] _run_until_replies: handler crashed at iter {i}")
-                return []
-            # A run that ends with a task still runnable stopped the handler
-            # in the middle of its work.
-            busy = result == RunResult.BUSY
-            if busy:
-                busy_cycles += cycles
-            # A wait can take thousands of busy runs, so --debug reports
-            # only every 1000th of them, with the busy cycles so far, and
-            # the poll of a busy run only then or when a reply is queued.
-            show = self._debug and (not busy or busy_cycles % (1000 * cycles) == 0)
-            if show and busy:
-                print(
-                    f"[amifuse] _run_until_replies: busy for {busy_cycles:,} "
-                    f"cycles"
-                )
-            debug_poll = show or (
-                self._debug
-                and self.vh.slm.exec_impl.port_mgr.has_msg(self.state.reply_port_addr)
-            )
-            polled = self.launcher.poll_replies(
-                self.state.reply_port_addr, debug=debug_poll
-            )
-            if polled:
-                replies = polled
-                if self._debug and i > 5:
-                    print(
-                        f"[amifuse] _run_until_replies: got {len(replies)} "
-                        f"replies after {i} iters"
-                    )
-                break
-            if busy:
-                continue
-            # It waited or exited, so it is not caught in a loop.
-            self._busy_ran_out = False
-            self._idle_busy_cycles = 0
-            if result == RunResult.DONE:
-                break
-            # Every task waits: only time can bring the reply now. The wait
-            # sleeps to a Delay(), however far off, until delay_until. Past
-            # that the sleep returns at once, so the check is here too: the
-            # wait would spin, as the loop's top sees only its own deadline.
-            if time.monotonic() < delay_until and self._sleep_to_delay(delay_until):
-                continue
-            idle_iters += 1
-            # A timer request is slept to only within the wait's window.
-            if self._sleep_to_timer_in_packet_wait(timer_wait_until):
-                continue
-            break
-        if self._debug and not replies:
-            print(
-                f"[amifuse] _run_until_replies: no replies after {idle_iters} "
-                f"idle iters and {busy_cycles:,} of {busy_limit:,} busy cycles"
-            )
-        if replies:
-            # It answered a packet, so it is not caught in a loop, even if it
-            # went on to the next packet without waiting.
-            self._busy_ran_out = False
-            self._idle_busy_cycles = 0
-        elif busy_cycles >= busy_limit or (timed_out and busy):
-            # A wait that ends at its deadline in the middle of the
-            # handler's work leaves it running, as one that runs out does.
-            if busy_cycles >= busy_limit and busy_limit == self._MAX_BUSY_CYCLES:
-                # Shown even without --debug, as in --interactive mounts and
-                # CLI commands. It is lost where stderr is discarded: at
-                # /dev/null by libfuse's daemonize, or at DEVNULL for a mount
-                # the Windows launcher starts.
-                pkt_type = self.launcher.last_pkt_type
-                to = "" if pkt_type is None else f" to {_packet_type_name(pkt_type)}"
-                print(
-                    f"[amifuse] WARNING: handler did not reply{to} within the "
-                    f"busy limit of {busy_limit:,} emulated cycles",
-                    file=sys.stderr,
-                )
-            self._busy_ran_out = True
-            if timer is not None:
-                # The mount's timer thread runs the handler on while idle.
-                timer.event.set()
-
-        # Drain stray IO replies that accumulated during packet processing:
-        # SendIO queues them at once. timer.device replies stay, since they
-        # come only when due and the handler takes them.
-        if not busy and not self._busy_ran_out:
-            pmgr = self.vh.slm.exec_impl.port_mgr
-            self._drain_non_essential_ports(pmgr)
-
-        return replies
+                print(f"[amifuse][{label}] no reply ({wait.stop}): {exc}")
+        finally:
+            self._packet_wait = outer
+            wait.finish()
+        if self._retired or self._retired_data:
+            # A late reply in this wait may have freed what a packet held.
+            self._free_retired()
+        if self._debug and answer is not None:
+            print(f"[amifuse][{label}] res1={answer[0]} res2={answer[1]}")
+        return answer
 
     def _flush_pending_signals(self, max_rounds: int = 20):
         """Run the handler's deferred initialisation.
@@ -1381,71 +1494,9 @@ class HandlerBridge:
                 if self._debug:
                     print(f"[amifuse] Switching to handler port 0x{new_port:x}")
                 self.state.port_addr = new_port
-    def _log_replies(self, label: str, replies):
-        if not self._debug:
-            return
-        for _, pkt_addr, res1, res2 in replies:
-            print(f"[amifuse][{label}] pkt=0x{pkt_addr:x} res1={res1} res2={res2}")
-
     # A handler answers each packet once, so late replies run out; this only
     # bounds the wait on a handler that never stops replying.
     _MAX_REPLY_ROUNDS = 8
-
-    def _run_until_reply(self, pkt_addr: int, label: str, **wait) -> Optional[Tuple[int, int]]:
-        """Run the handler until it answers the packet at pkt_addr.
-
-        Returns (res1, res2), or None when no answer arrives in time. A
-        packet that timed out is still answered later, while the bridge
-        waits for the next one. Such a reply is dropped: taken as this
-        packet's answer, a READ byte count would pass for a seek position.
-
-        Each round is one _run_until_replies wait, which gets wait as its
-        keyword arguments and its own busy limit. A late reply ends the
-        short limit, so the rounds after it get the full one. What a
-        dropped reply grants is given back (_give_back_late_reply) once
-        the wait has ended, so that nothing is queued behind this packet.
-        """
-        answer = None
-        dropped = []
-        for _ in range(self._MAX_REPLY_ROUNDS):
-            sent = dict(self._pending_packets())
-            replies = self._run_until_replies(**wait)
-            self._log_replies(label, replies)
-            for _, reply_pkt, res1, res2 in replies:
-                if reply_pkt == pkt_addr:
-                    answer = (res1, res2)
-                    continue
-                if self._debug:
-                    print(f"[amifuse][{label}] dropped late reply for "
-                          f"pkt=0x{reply_pkt:x}")
-                dropped.append((sent.get(reply_pkt), res1))
-            if not replies or answer is not None:
-                break
-        for packet, res1 in dropped:
-            self._give_back_late_reply(packet, res1)
-        if dropped:
-            # The memory those packets held back is no packet's now.
-            self._free_retired(self._held_args())
-        return answer
-
-    def _give_back_late_reply(self, packet, res1: int) -> None:
-        """Free the lock or end the file that a dropped late reply grants.
-
-        packet is the (dp_Type, args) the reply answers, or None. A LOCATE,
-        CREATE_DIR or PARENT that succeeded holds a lock, and an open a
-        file that no caller will close, each until the mount ends. The
-        FREE_LOCK or END goes out without a wait of its own, so that it
-        cannot take a reply another wait is for; its reply comes as another
-        late one.
-        """
-        if packet is None or res1 == 0:
-            return
-        pkt_type, args = packet
-        if pkt_type in (ACTION_LOCATE_OBJECT, ACTION_CREATE_DIR, ACTION_PARENT):
-            self.launcher.send_free_lock(self.state, res1)
-        elif pkt_type in (ACTION_FINDINPUT, ACTION_FINDUPDATE, ACTION_FINDOUTPUT):
-            # Arg1 is the FileHandle's BPTR; the handler filled in its fh_Args.
-            self.launcher.send_end_handle(self.state, args[0] << 2)
 
     # How long unmount, or a flush, runs the handler for packets still out:
     # well within the 30 s that the unmount requesters wait for the mount
@@ -1458,33 +1509,31 @@ class HandlerBridge:
         A packet whose wait ran out may still be at work in the handler,
         which can answer later packets, ACTION_FLUSH included, before it.
         Stopping it then leaves the volume half changed, so flushes wait
-        here first. The handler runs in waits of the short busy limit
+        here first. The handler runs in rounds of the short busy limit
         until no packet is out, it parks without replying, or timeout
-        seconds have passed. Each wait also ends at that deadline: a
-        handler that parks during a wait has the full busy limit for the
-        rest of it. Late replies are given back as in
-        _run_until_reply. _pending_wait_parked says whether it stopped
-        because the handler parked or exited, not at the deadline or with no
-        packet left. Returns the names of the packets still out.
+        seconds have passed. Each round also ends at that deadline: a
+        handler that parks during a round has the full busy limit for the
+        rest of it. DosPktHandler gives back what the late replies grant.
+        _pending_wait_parked says whether it stopped because the handler
+        parked or exited, not at the deadline or with no packet left.
+        Returns the names of the packets still out.
         """
         with self._lock:
             self._pending_wait_parked = False
-            deadline = time.monotonic() + timeout
-            while (self._pending_packets() and not self.state.crashed
-                   and time.monotonic() < deadline):
-                sent = dict(self._pending_packets())
-                self._busy_ran_out = True
-                replies = self._run_until_replies(deadline=deadline)
-                self._log_replies("pending", replies)
-                for _, reply_pkt, res1, _ in replies:
-                    self._give_back_late_reply(sent.get(reply_pkt), res1)
-                if replies:
-                    self._free_retired(self._held_args())
-                if not replies and not self._busy_ran_out:
+            if self._packets_out() and not self.state.crashed:
+                wait = _PacketWait(
+                    self, None, deadline=time.monotonic() + timeout,
+                    max_rounds=None, short_rounds=True)
+                outer, self._packet_wait = self._packet_wait, wait
+                try:
+                    self.dospkt.wait_pending(timeout=None)
+                finally:
+                    self._packet_wait = outer
+                    wait.finish()
+                self._free_retired()
+                if self._packets_out() and wait.stop in ("idle", "done", "crashed"):
                     self._pending_wait_parked = True
-                    break  # parked, or exited: nothing more comes
-            return [_packet_type_name(pkt_type)
-                    for pkt_type, _ in self._pending_packets().values()]
+            return [_packet_type_name(action) for action in self._packets_out()]
 
     # Whether the last wait_for_pending stopped at a park; see there.
     _pending_wait_parked = False
@@ -1511,13 +1560,13 @@ class HandlerBridge:
     # write_empty_reply's buffer; see _alloc_empty_buf.
     _empty_buf_mem = None
 
-    def _pending_packets(self) -> Dict[int, Tuple[int, Tuple[int, ...]]]:
-        """The launcher's packets with no reply yet, packet -> (type, args)."""
-        pending = getattr(getattr(self, "launcher", None), "pending", None)
-        return pending if isinstance(pending, dict) else {}
+    def _packets_out(self) -> List[int]:
+        """The actions of the packets abandoned without a reply so far."""
+        dospkt = getattr(self, "dospkt", None)
+        return dospkt.pending() if dospkt is not None else []
 
-    def _held_args(self) -> Set[int]:
-        """Every argument of the packets still out.
+    def _is_held(self, addr: int) -> bool:
+        """Does a packet still out name the bridge memory at addr?
 
         A handler reaches the bridge's memory only through a packet's
         arguments, as the start address or BPTR of a buffer, so every
@@ -1527,18 +1576,15 @@ class HandlerBridge:
         such an address keeps the memory out of use a little longer, no
         more.
         """
-        return {arg for _, args in self._pending_packets().values() for arg in args}
+        dospkt = getattr(self, "dospkt", None)
+        return dospkt is not None and dospkt.holds(addr)
 
-    @staticmethod
-    def _is_held(addr: int, held: Set[int]) -> bool:
-        return addr in held or addr >> 2 in held
-
-    def _free_retired(self, held: Set[int]) -> None:
+    def _free_retired(self) -> None:
         """Free retired memory that no packet still out points to."""
         def keep(retired):
             kept = []
             for mem_obj in retired:
-                if self._is_held(mem_obj.addr, held):
+                if self._is_held(mem_obj.addr):
                     kept.append(mem_obj)
                 else:
                     self.vh.alloc.free_memory(mem_obj)
@@ -1546,7 +1592,7 @@ class HandlerBridge:
         self._retired = keep(self._retired)
         self._retired_data = keep(self._retired_data)
 
-    def _retire_if_held(self, mem_obj, held: Set[int], data: bool = False) -> bool:
+    def _retire_if_held(self, mem_obj, data: bool = False) -> bool:
         """Retire mem_obj if a packet still out points to it; say whether.
 
         A read or write buffer (data) past _RETIRED_MAX stays where it is,
@@ -1558,7 +1604,7 @@ class HandlerBridge:
         and writes work again as soon as replies that free enough of it
         have come. A small buffer is always retired.
         """
-        if mem_obj is None or not self._is_held(mem_obj.addr, held):
+        if mem_obj is None or not self._is_held(mem_obj.addr):
             return False
         if not data:
             self._retired = [*self._retired, mem_obj]
@@ -1566,9 +1612,8 @@ class HandlerBridge:
         if sum(m.size for m in self._retired_data) + mem_obj.size > self._RETIRED_MAX:
             ran_out = self._busy_ran_out
             self._take_late_replies()
-            held = self._held_args()
-            self._free_retired(held)
-            if not self._is_held(mem_obj.addr, held):
+            self._free_retired()
+            if not self._is_held(mem_obj.addr):
                 return False
             if sum(m.size for m in self._retired_data) + mem_obj.size > self._RETIRED_MAX:
                 # No packet goes out, so no wait runs the handler on: only
@@ -1581,25 +1626,20 @@ class HandlerBridge:
     def _take_late_replies(self) -> None:
         """Take the replies queued for packets whose waits ran out.
 
-        No wait is in progress, so every reply queued is a late one. Each
-        is given back as in _run_until_reply, without running the handler.
-        A reply ends the short limit, as in _run_until_replies.
+        No wait is in progress, so every reply queued is a late one.
+        DosPktHandler gives each back without running the handler. A reply
+        ends the short limit, as in a wait.
         """
-        sent = dict(self._pending_packets())
-        replies = self.launcher.poll_replies(self.state.reply_port_addr)
-        self._log_replies("late", replies)
-        for _, reply_pkt, res1, _ in replies:
-            self._give_back_late_reply(sent.get(reply_pkt), res1)
-        if replies:
+        dospkt = getattr(self, "dospkt", None)
+        if dospkt is not None and dospkt.poll():
             # It answered a packet, so it is not caught in a loop, even if it
             # went on to the next packet without waiting.
             self._busy_ran_out = False
             self._idle_busy_cycles = 0
 
     def _alloc_fib(self):
-        held = self._held_args()
-        self._free_retired(held)
-        if self._retire_if_held(self._fib_mem, held):
+        self._free_retired()
+        if self._retire_if_held(self._fib_mem):
             self._fib_mem = None
         if self._fib_mem is None:
             self._fib_mem = self.vh.alloc.alloc_struct(
@@ -1612,9 +1652,8 @@ class HandlerBridge:
         return self._fib_mem
 
     def _alloc_read_buf(self, size: int):
-        held = self._held_args()
-        self._free_retired(held)
-        if self._retire_if_held(self._read_buf_mem, held, data=True):
+        self._free_retired()
+        if self._retire_if_held(self._read_buf_mem, data=True):
             # A READ or WRITE still out may yet use it: this one gets its own.
             self._read_buf_mem = None
         if self._read_buf_mem is None:
@@ -1634,9 +1673,8 @@ class HandlerBridge:
         A small buffer of its own, not the read buffer, so that the write
         never fails at _RETIRED_MAX.
         """
-        held = self._held_args()
-        self._free_retired(held)
-        if self._retire_if_held(self._empty_buf_mem, held):
+        self._free_retired()
+        if self._retire_if_held(self._empty_buf_mem):
             self._empty_buf_mem = None
         if self._empty_buf_mem is None:
             self._empty_buf_mem = self.vh.alloc.alloc_memory(4, label="FUSE_EMPTYBUF")
@@ -1648,9 +1686,8 @@ class HandlerBridge:
         One that a SET_DATE still out names stays where it is, so that a
         later set_date cannot change the date the handler has yet to set.
         """
-        held = self._held_args()
-        self._free_retired(held)
-        if self._retire_if_held(self._datestamp_mem, held):
+        self._free_retired()
+        if self._retire_if_held(self._datestamp_mem):
             self._datestamp_mem = None
         if self._datestamp_mem is None:
             self._datestamp_mem = self.vh.alloc.alloc_memory(12, label="FUSE_DATESTAMP")
@@ -1670,9 +1707,8 @@ class HandlerBridge:
         idx = self._bstr_index
         self._bstr_index = (idx + 1) % self._bstr_ring_size
         mem_obj = self._bstr_ring[idx]
-        held = self._held_args()
-        self._free_retired(held)
-        if self._retire_if_held(mem_obj, held):
+        self._free_retired()
+        if self._retire_if_held(mem_obj):
             # A packet still out names it: the slot gets a new BSTR.
             mem_obj = self._bstr_ring[idx] = None
         if mem_obj is None or len(data) > self._bstr_sizes[idx]:
@@ -1692,12 +1728,12 @@ class HandlerBridge:
         an open whose reply has not come (its BPTR), or a packet on the
         file it opened (its fh_Args), ACTION_END included.
         """
-        held = self._held_args()
+        out = bool(self._packets_out())
         for i in range(len(self._fh_pool) - 1, -1, -1):
             addr = self._fh_pool[i]
-            if held:
+            if out:
                 fh_args = FileHandleStruct(self.mem, addr).args.val
-                if addr >> 2 in held or (fh_args and fh_args in held):
+                if self._is_held(addr) or (fh_args and self._is_held(fh_args)):
                     continue
             del self._fh_pool[i]
             mem_obj = self._fh_mem.get(addr)
@@ -1708,6 +1744,10 @@ class HandlerBridge:
         self.mem.w_block(mem_obj.addr, b"\x00" * FileHandleStruct.get_size())
         self._fh_mem[mem_obj.addr] = mem_obj
         return mem_obj.addr
+
+    def _fh_arg(self, fh_addr: int) -> int:
+        """The fh_Arg1 the handler set in the FileHandle at fh_addr."""
+        return FileHandleStruct(self.mem, fh_addr).args.val
 
     def _free_fh(self, fh_addr: int):
         # Pooled twice, one FileHandle would go to two opens at once.
@@ -1732,9 +1772,8 @@ class HandlerBridge:
     def locate(self, lock_bptr: int, name: str):
         with self._lock:
             _, name_bptr = self._alloc_bstr(name)
-            pkt_addr, _ = self.launcher.send_locate(self.state, lock_bptr, name_bptr)
-            # A late reply to a packet that timed out would pass for the lock.
-            reply = self._run_until_reply(pkt_addr, "locate")
+            reply = self._packet(
+                ACTION_LOCATE_OBJECT, [lock_bptr, name_bptr, SHARED_LOCK], "locate")
             if self._debug:
                 if reply is not None:
                     print(f"[amifuse] locate(lock=0x{lock_bptr:x}, name='{name}'): res1=0x{reply[0]:x} res2={reply[1]}")
@@ -1745,8 +1784,7 @@ class HandlerBridge:
     def free_lock(self, lock_bptr: int):
         with self._lock:
             if lock_bptr:
-                pkt_addr, _ = self.launcher.send_free_lock(self.state, lock_bptr)
-                self._run_until_reply(pkt_addr, "free_lock")
+                self._packet(ACTION_FREE_LOCK, [lock_bptr], "free_lock")
 
     def locate_path(self, path: str) -> Tuple[int, int, List[int]]:
         """Return (lock BPTR, res2, locks_to_free) for the given absolute path.
@@ -1772,8 +1810,8 @@ class HandlerBridge:
                 return lock, res2, []
             for comp in parts:
                 _, name_bptr = self._alloc_bstr(comp)
-                pkt_addr, _ = self.launcher.send_locate(self.state, lock, name_bptr)
-                reply = self._run_until_reply(pkt_addr, "locate")
+                reply = self._packet(
+                    ACTION_LOCATE_OBJECT, [lock, name_bptr, SHARED_LOCK], "locate")
                 parent = lock
                 lock, res2 = reply if reply is not None else (0, -1)
                 if parent:
@@ -1824,8 +1862,7 @@ class HandlerBridge:
             output = mode != os.O_RDONLY and bool(flags & os.O_TRUNC)
             if mode == os.O_RDONLY:
                 fh_addr = self._alloc_fh()
-                _, pkt_addr, _ = self.launcher.send_findinput(
-                    self.state, name_bptr, dir_lock, fh_addr)
+                action = ACTION_FINDINPUT
             else:
                 if not self._write_enabled:
                     return None, 0
@@ -1833,16 +1870,13 @@ class HandlerBridge:
                     fh_addr = self._alloc_fh()
                     if self._debug:
                         print(f"[amifuse][open_file] FINDOUTPUT name={name!r} dir_lock=0x{dir_lock:x} fh_addr=0x{fh_addr:x}", flush=True)
-                    _, pkt_addr, _ = self.launcher.send_findoutput(
-                        self.state, name_bptr, dir_lock, fh_addr)
+                    action = ACTION_FINDOUTPUT
                 else:
                     fh_addr = self._alloc_fh()
                     if self._debug:
                         print(f"[amifuse][open_file] FINDUPDATE name={name!r} dir_lock=0x{dir_lock:x} fh_addr=0x{fh_addr:x}", flush=True)
-                    _, pkt_addr, _ = self.launcher.send_findupdate(
-                        self.state, name_bptr, dir_lock, fh_addr)
-            # A late nonzero res1 would pass for DOSTRUE on a failed open.
-            reply = self._run_until_reply(pkt_addr, "find")
+                    action = ACTION_FINDUPDATE
+            reply = self._packet(action, [fh_addr >> 2, dir_lock, name_bptr], "find")
             if reply is None or reply[0] == 0:
                 res2 = reply[1] if reply else 0
                 if self._debug:
@@ -1880,8 +1914,8 @@ class HandlerBridge:
                     print(f"[amifuse] list_dir: obtained root_lock=0x{root_lock:x}")
             fib_mem = self._alloc_fib()
             # First Examine returns info about the directory itself, not contents
-            pkt_addr, _ = self.launcher.send_examine(self.state, lock_bptr, fib_mem.addr)
-            reply = self._run_until_reply(pkt_addr, "examine")
+            reply = self._packet(
+                ACTION_EXAMINE_OBJECT, [lock_bptr, fib_mem.addr >> 2], "examine")
             entries: List[Dict] = []
             if reply is None or reply[0] == 0:
                 if self._debug:
@@ -1901,9 +1935,8 @@ class HandlerBridge:
             # (res1=0) when the directory is exhausted, which breaks the loop.
             unnamed = 0
             for iter_num in range(65536):
-                pkt_addr, _ = self.launcher.send_examine_next(
-                    self.state, lock_bptr, fib_mem.addr)
-                reply = self._run_until_reply(pkt_addr, "examine_next")
+                reply = self._packet(
+                    ACTION_EXAMINE_NEXT, [lock_bptr, fib_mem.addr >> 2], "examine_next")
                 if reply is None or reply[0] == 0:
                     if self._debug:
                         res2 = reply[1] if reply else -1
@@ -1974,8 +2007,8 @@ class HandlerBridge:
             if path == "/":
                 return {"dir_type": 2, "size": 0, "name": "", "protection": 0}, 0
             fib_mem = self._alloc_fib()
-            pkt_addr, _ = self.launcher.send_examine(self.state, lock, fib_mem.addr)
-            reply = self._run_until_reply(pkt_addr, "examine")
+            reply = self._packet(
+                ACTION_EXAMINE_OBJECT, [lock, fib_mem.addr >> 2], "examine")
             if reply is None or reply[0] == 0:
                 for l in reversed(locks):
                     self.free_lock(l)
@@ -1988,16 +2021,15 @@ class HandlerBridge:
 
     def _examine_lock(self, lock: int) -> Optional[Dict]:
         fib_mem = self._alloc_fib()
-        pkt_addr, _ = self.launcher.send_examine(self.state, lock, fib_mem.addr)
-        reply = self._run_until_reply(pkt_addr, "examine")
+        reply = self._packet(
+            ACTION_EXAMINE_OBJECT, [lock, fib_mem.addr >> 2], "examine")
         if reply is None or reply[0] == 0:
             return None
         return _parse_fib(self.mem, fib_mem.addr)
 
     def _parent_lock(self, lock: int) -> Tuple[int, int]:
         """(lock, res2) on the directory of lock's object; 0 at the root."""
-        pkt_addr, _ = self.launcher.send_parent(self.state, lock)
-        reply = self._run_until_reply(pkt_addr, "parent")
+        reply = self._packet(ACTION_PARENT, [lock], "parent")
         return reply if reply is not None else (0, -1)
 
     def stat_components(self, path: str) -> List[Tuple[Optional[Dict], bool]]:
@@ -2092,14 +2124,13 @@ class HandlerBridge:
                     buf_mem = self.vh.alloc.alloc_memory(size, label="FUSE_LINKBUF")
                     self.mem.w_block(name_mem.addr, encoded)
                     self.mem.w_block(buf_mem.addr, b"\x00" * size)
-                    pkt_addr, _ = self.launcher.send_read_link(
-                        self.state, lock, name_mem.addr, buf_mem.addr, size)
-                    reply = self._run_until_reply(pkt_addr, "read_link")
+                    reply = self._packet(
+                        ACTION_READ_LINK, [lock, name_mem.addr, buf_mem.addr, size],
+                        "read_link")
                     target = self.mem.r_block(buf_mem.addr, size).split(b"\x00", 1)[0]
-                    held = self._held_args()
                     for mem_obj in (name_mem, buf_mem):
                         # One still out, as after a timeout, is freed later.
-                        if not self._retire_if_held(mem_obj, held):
+                        if not self._retire_if_held(mem_obj):
                             self.vh.alloc.free_memory(mem_obj)
                     if reply is None:
                         return None, -1
@@ -2169,17 +2200,14 @@ class HandlerBridge:
         things. Silence (no reply at all) says nothing about the volume; an
         explicit DOSFALSE reply carries a res2 error code that often does.
         info is None in both cases, and res2 tells them apart: None for
-        silence, the DOS error code for a refusal. A late reply to an
-        earlier packet is not an answer.
+        silence, the DOS error code for a refusal.
         """
         with self._lock:
             # Allocate InfoDataStruct (9 LONGs = 36 bytes)
             info_mem = self.vh.alloc.alloc_memory(InfoDataStruct.get_size(), label="InfoData")
             self.mem.w_block(info_mem.addr, b"\x00" * InfoDataStruct.get_size())
 
-            # send_disk_info takes the buffer address (passes as BPTR internally)
-            pkt_addr, _ = self.launcher.send_disk_info(self.state, info_mem.addr)
-            reply = self._run_until_reply(pkt_addr, "disk_info")
+            reply = self._packet(ACTION_DISK_INFO, [info_mem.addr >> 2], "disk_info")
 
             if reply is None:
                 # The handler can still answer later and fill the buffer
@@ -2273,8 +2301,8 @@ class HandlerBridge:
                 fib_mem = self._alloc_fib()
                 # lock_bptr=0 -> current volume root
                 root_lock, _ = self.locate(0, "")
-                pkt_addr, _ = self.launcher.send_examine(self.state, root_lock, fib_mem.addr)
-                reply = self._run_until_reply(pkt_addr, "examine")
+                reply = self._packet(
+                    ACTION_EXAMINE_OBJECT, [root_lock, fib_mem.addr >> 2], "examine")
                 if reply is not None and reply[0]:
                     info = _parse_fib(self.mem, fib_mem.addr)
                     if info.get("name"):
@@ -2353,9 +2381,8 @@ class HandlerBridge:
                 return b"" if dir_res2 in _NOT_FOUND_ERRORS else None
             _, name_bptr = self._alloc_bstr(name)
             fh_addr = self._alloc_fh()
-            _, pkt_addr, _ = self.launcher.send_findinput(
-                self.state, name_bptr, dir_lock, fh_addr)
-            reply = self._run_until_reply(pkt_addr, "findinput")
+            reply = self._packet(
+                ACTION_FINDINPUT, [fh_addr >> 2, dir_lock, name_bptr], "findinput")
             if reply is None or reply[0] == 0:
                 res2 = reply[1] if reply else -1
                 if path and path != "/" and res2 in _NOT_FOUND_ERRORS:
@@ -2369,8 +2396,7 @@ class HandlerBridge:
                 data = self.read_handle_at(fh_addr, offset, size)
             else:
                 data = self.read_handle(fh_addr, size)
-            pkt_addr, _ = self.launcher.send_end_handle(self.state, fh_addr)
-            self._run_until_reply(pkt_addr, "end")
+            self._packet(ACTION_END, [self._fh_arg(fh_addr)], "end")
             self._free_fh(fh_addr)
             for l in reversed(locks):
                 self.free_lock(l)
@@ -2389,8 +2415,8 @@ class HandlerBridge:
         if not _LONG_MIN <= offset <= _LONG_MAX:
             return SeekResult.FAILED, None
         with self._lock:
-            pkt_addr, _ = self.launcher.send_seek_handle(self.state, fh_addr, offset, mode)
-            reply = self._run_until_reply(pkt_addr, "seek")
+            reply = self._packet(
+                ACTION_SEEK, [self._fh_arg(fh_addr), offset, mode], "seek")
         if reply is None:
             return SeekResult.FAILED, None
         res1, res2 = reply
@@ -2413,9 +2439,8 @@ class HandlerBridge:
         that dp_Res1, a signed LONG, carries as negative.
         """
         with self._lock:
-            pkt_addr, _ = self.launcher.send_seek_handle(
-                self.state, fh_addr, 0, OFFSET_CURRENT)
-            reply = self._run_until_reply(pkt_addr, "seek")
+            reply = self._packet(
+                ACTION_SEEK, [self._fh_arg(fh_addr), 0, OFFSET_CURRENT], "seek")
         if reply is None:
             return False, None
         position = reply[0]
@@ -2485,9 +2510,8 @@ class HandlerBridge:
                     buf_mem = self._alloc_read_buf(n)
                 except FuseOSError:
                     return None  # past _RETIRED_MAX; nothing was sent
-                pkt_addr, _ = self.launcher.send_read_handle(
-                    self.state, fh_addr, buf_mem.addr, n)
-                reply = self._run_until_reply(pkt_addr, "read")
+                reply = self._packet(
+                    ACTION_READ, [self._fh_arg(fh_addr), buf_mem.addr, n], "read")
                 if reply is None:
                     return None
                 res1 = reply[0]
@@ -2601,9 +2625,9 @@ class HandlerBridge:
                 except FuseOSError:
                     return -1, 0  # past _RETIRED_MAX; nothing was sent
                 self.mem.w_block(buf_mem.addr, chunk)
-                pkt_addr, _ = self.launcher.send_write_handle(
-                    self.state, fh_addr, buf_mem.addr, len(chunk))
-                reply = self._run_until_reply(pkt_addr, "write")
+                reply = self._packet(
+                    ACTION_WRITE, [self._fh_arg(fh_addr), buf_mem.addr, len(chunk)],
+                    "write")
                 # A write the handler accepted, or one it may still carry
                 # out, needs no zero-length write from close_file().
                 if reply is None:
@@ -2914,19 +2938,16 @@ class HandlerBridge:
         if mode != OFFSET_BEGINNING or not 0 <= size <= _LONG_MAX:
             return -1, 0
         with self._lock:
-            pkt_addr, _ = self.launcher.send_set_file_size(
-                self.state, fh_addr, size, mode)
-            reply = self._run_until_reply(pkt_addr, "setsize")
-            if reply is None:
-                reply = self._run_until_reply(pkt_addr, "setsize")
+            reply = self._packet(
+                ACTION_SET_FILE_SIZE, [self._fh_arg(fh_addr), size, mode], "setsize",
+                attempts=2)
         return (-1, 0) if reply is None else reply
 
     def delete_object(self, parent_lock_bptr: int, name: str) -> Tuple[int, int]:
         with self._lock:
             _, name_bptr = self._alloc_bstr(name)
-            pkt_addr, _ = self.launcher.send_delete_object(
-                self.state, parent_lock_bptr, name_bptr)
-            reply = self._run_until_reply(pkt_addr, "delete")
+            reply = self._packet(
+                ACTION_DELETE_OBJECT, [parent_lock_bptr, name_bptr], "delete")
             return reply if reply is not None else (0, -1)
 
     def delete_dir_atomic(self, path: str) -> Tuple[int, int]:
@@ -2940,8 +2961,8 @@ class HandlerBridge:
             lock = 0
             for comp in parts:
                 _, name_bptr = self._alloc_bstr(comp)
-                pkt_addr, _ = self.launcher.send_locate(self.state, lock, name_bptr)
-                reply = self._run_until_reply(pkt_addr, "locate")
+                reply = self._packet(
+                    ACTION_LOCATE_OBJECT, [lock, name_bptr, SHARED_LOCK], "locate")
                 parent = lock
                 lock = reply[0] if reply is not None else 0
                 if parent:
@@ -2959,8 +2980,8 @@ class HandlerBridge:
                     self.free_lock(l)
                 return 0, -1
             _, name_bptr = self._alloc_bstr(name)
-            pkt_addr, _ = self.launcher.send_delete_object(self.state, lock, name_bptr)
-            reply = self._run_until_reply(pkt_addr, "delete_dir_atomic")
+            reply = self._packet(
+                ACTION_DELETE_OBJECT, [lock, name_bptr], "delete_dir_atomic")
             for l in reversed(locks):
                 self.free_lock(l)
             return reply if reply is not None else (0, -1)
@@ -2971,20 +2992,16 @@ class HandlerBridge:
         with self._lock:
             _, src_bptr = self._alloc_bstr(src_name)
             _, dst_bptr = self._alloc_bstr(dst_name)
-            pkt_addr, _ = self.launcher.send_rename_object(
-                self.state, src_lock_bptr, src_bptr, dst_lock_bptr, dst_bptr
-            )
-            # A late reply to a packet that timed out, a WRITE's byte count
-            # say, would otherwise pass for DOSTRUE.
-            reply = self._run_until_reply(pkt_addr, "rename")
+            reply = self._packet(
+                ACTION_RENAME_OBJECT, [src_lock_bptr, src_bptr, dst_lock_bptr, dst_bptr],
+                "rename")
             return reply if reply is not None else (0, -1)
 
     def create_dir(self, parent_lock_bptr: int, name: str) -> Tuple[int, int]:
         with self._lock:
             _, name_bptr = self._alloc_bstr(name)
-            pkt_addr, _ = self.launcher.send_create_dir(
-                self.state, parent_lock_bptr, name_bptr)
-            reply = self._run_until_reply(pkt_addr, "mkdir")
+            reply = self._packet(
+                ACTION_CREATE_DIR, [parent_lock_bptr, name_bptr], "mkdir")
             return reply if reply is not None else (0, -1)
 
     def set_date(self, parent_lock_bptr: int, name: str, when: float) -> Tuple[int, int]:
@@ -2997,9 +3014,9 @@ class HandlerBridge:
             for offset, value in zip((0, 4, 8), to_datestamp(when)):
                 self.mem.w32(ds_addr + offset, value)
             _, name_bptr = self._alloc_bstr(name)
-            pkt_addr, _ = self.launcher.send_set_date(
-                self.state, parent_lock_bptr, name_bptr, ds_addr)
-            reply = self._run_until_reply(pkt_addr, "set_date")
+            # dp_Arg4 is the DateStamp's address, not a BPTR.
+            reply = self._packet(
+                ACTION_SET_DATE, [0, parent_lock_bptr, name_bptr, ds_addr], "set_date")
             return reply if reply is not None else (0, -1)
 
     def write_empty_reply(self, fh_addr: int) -> Tuple[int, int]:
@@ -3021,9 +3038,8 @@ class HandlerBridge:
         with self._lock:
             self._unwritten_outputs.discard(fh_addr)
             buf_mem = self._alloc_empty_buf()
-            pkt_addr, _ = self.launcher.send_write_handle(
-                self.state, fh_addr, buf_mem.addr, 0)
-            reply = self._run_until_reply(pkt_addr, "write")
+            reply = self._packet(
+                ACTION_WRITE, [self._fh_arg(fh_addr), buf_mem.addr, 0], "write")
         if reply is None:
             return -1, 0
         res1, res2 = reply
@@ -3040,8 +3056,7 @@ class HandlerBridge:
         with self._lock:
             if fh_addr in self._unwritten_outputs:
                 self.write_empty_reply(fh_addr)
-            pkt_addr, _ = self.launcher.send_end_handle(self.state, fh_addr)
-            self._run_until_reply(pkt_addr, "end")
+            self._packet(ACTION_END, [self._fh_arg(fh_addr)], "end")
             # Note: ACTION_FLUSH is for flushing volume buffers, not file-specific.
             # We call flush_volume() on unmount instead of after every file close.
             self._free_fh(fh_addr)
@@ -3086,9 +3101,8 @@ class HandlerBridge:
             raise OSError("handler crashed before volume flush")
         if self._debug:
             print("[amifuse] Flushing volume buffers to disk...", flush=True)
-        pkt_addr, _ = self.launcher.send_flush(self.state)
         # Only the flush's own reply says that the buffers are written.
-        reply = self._run_until_reply(pkt_addr, "flush_volume")
+        reply = self._packet(ACTION_FLUSH, [], "flush_volume")
         # Sync the underlying file to disk
         self.backend.sync()
         if self.state.crashed or reply is None or reply[0] == 0:
@@ -3117,10 +3131,8 @@ class HandlerBridge:
                 return
             # Each wait takes its own packet's reply: a late reply to another
             # packet would end the inhibit's wait before the handler inhibits.
-            pkt_addr, _ = self.launcher.send_inhibit(self.state, True)
-            self._run_until_reply(pkt_addr, "inhibit")
-            pkt_addr, _ = self.launcher.send_inhibit(self.state, False)
-            reply = self._run_until_reply(pkt_addr, "uninhibit")
+            self._packet(ACTION_INHIBIT, [-1], "inhibit")
+            reply = self._packet(ACTION_INHIBIT, [0], "uninhibit")
             # Sync the underlying file to disk
             self.backend.sync()
             if self._debug:
@@ -7017,20 +7029,19 @@ def format_volume(
         # Inhibit the volume so the handler releases it for formatting.
         # Each packet waits for its own reply, so that a late one cannot
         # pass for the next packet's.
-        pkt_addr, _ = bridge.launcher.send_inhibit(bridge.state, True)
-        reply = bridge._run_until_reply(pkt_addr, "format inhibit")
+        reply = bridge._packet(ACTION_INHIBIT, [-1], "format inhibit")
         _raise_if_handler_crashed(bridge, "format inhibit")
         if debug and reply:
             print(f"[amifuse] INHIBIT reply: res1={reply[0]} res2={reply[1]}")
 
         # Allocate volume name BSTR and send ACTION_FORMAT
         _, volname_bptr = bridge.launcher.alloc_bstr(volname, label="FormatVolName")
-        pkt_addr, _ = bridge.launcher.send_format(bridge.state, volname_bptr, dostype)
         # Format can take many cycles for large partitions — PFS3 must
         # initialize bitmap and root blocks proportional to partition size.
         # Use generous limits; the loop returns immediately once a reply arrives.
-        reply = bridge._run_until_reply(
-            pkt_addr, "format", max_iters=2000, cycles=2_000_000
+        reply = bridge._packet(
+            ACTION_FORMAT, [volname_bptr, dostype], "format",
+            max_iters=2000, cycles=2_000_000
         )
         _raise_if_handler_crashed(bridge, "format")
 
@@ -7054,9 +7065,8 @@ def format_volume(
 
         # FastFileSystem finishes the new bitmap when inhibition ends.
         # Wait for this packet before flushing, without restarting the bridge.
-        pkt_addr, _ = bridge.launcher.send_inhibit(bridge.state, False)
-        reply = bridge._run_until_reply(
-            pkt_addr, "format uninhibit", max_iters=500, cycles=2_000_000
+        reply = bridge._packet(
+            ACTION_INHIBIT, [0], "format uninhibit", max_iters=500, cycles=2_000_000
         )
         _raise_if_handler_crashed(bridge, "format uninhibit")
         if reply is None:
@@ -7067,9 +7077,8 @@ def format_volume(
                 f"(error code {reply[1]})")
 
         # Flush metadata written while the handler mounts the new volume.
-        pkt_addr, _ = bridge.launcher.send_flush(bridge.state)
-        reply = bridge._run_until_reply(
-            pkt_addr, "format flush", max_iters=500, cycles=2_000_000
+        reply = bridge._packet(
+            ACTION_FLUSH, [], "format flush", max_iters=500, cycles=2_000_000
         )
         _raise_if_handler_crashed(bridge, "format flush")
         # Uninhibit has mounted the new volume, so a refusal saying there

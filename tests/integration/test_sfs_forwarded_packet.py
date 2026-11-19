@@ -11,7 +11,10 @@ import shutil
 
 import pytest
 
+from amitools.vamos.libstructs.dos import InfoDataStruct  # type: ignore
+
 from amifuse.fuse_fs import HandlerBridge
+from amifuse.startup_runner import ACTION_DISK_INFO, ACTION_LOCATE_OBJECT, SHARED_LOCK
 from amifuse.rdb_inspect import detect_adf
 
 pytestmark = pytest.mark.integration
@@ -35,17 +38,15 @@ def sfs_bridge(fixture_root, tmp_path):
 def test_both_queued_packets_are_answered(sfs_bridge):
     bridge = sfs_bridge
     info = bridge.vh.alloc.alloc_memory(36, label="InfoData")
-    disk_info, _ = bridge.launcher.send_disk_info(bridge.state, info.addr)
+    bridge.mem.w_block(info.addr, bytes(36))
+    # Both waits end before the handler runs, so both packets are queued.
+    assert bridge._packet(
+        ACTION_DISK_INFO, [info.addr >> 2], "disk_info", max_iters=0) is None
     _, name_bptr = bridge._alloc_bstr("")
-    locate, _ = bridge.launcher.send_locate(bridge.state, 0, name_bptr)
+    assert bridge._packet(
+        ACTION_LOCATE_OBJECT, [0, name_bptr, SHARED_LOCK], "locate", max_iters=0) is None
+    assert bridge._packets_out() == [ACTION_DISK_INFO, ACTION_LOCATE_OBJECT]
 
-    answered = {}
-    for _ in range(6):
-        for _, pkt, res1, _ in bridge._run_until_replies():
-            answered[pkt] = res1
-        if len(answered) == 2:
-            break
-
-    assert answered.get(disk_info) == -1
-    # A lock on the root.
-    assert answered.get(locate, 0) != 0
+    # Both are answered; the late lock is given back with ACTION_FREE_LOCK.
+    assert bridge.wait_for_pending() == []
+    assert InfoDataStruct(bridge.mem, info.addr).id_NumBlocks.val > 0

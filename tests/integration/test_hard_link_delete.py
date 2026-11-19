@@ -221,9 +221,8 @@ def _make_hard_link(bridge, directory, name, target):
             dir_lock, _, locks = bridge.locate_path(directory)
         target_lock, _, target_locks = bridge.locate_path(target)
         _, name_bptr = bridge._alloc_bstr(name)
-        pkt_addr, _ = bridge.launcher.send_packet(
-            bridge.state, ACTION_MAKE_LINK, [dir_lock, name_bptr, target_lock, LINK_HARD])
-        reply = bridge._run_until_reply(pkt_addr, "make_link")
+        reply = bridge._packet(
+            ACTION_MAKE_LINK, [dir_lock, name_bptr, target_lock, LINK_HARD], "make_link")
         for lock in reversed(locks + target_locks):
             bridge.free_lock(lock)
     assert reply is not None and reply[0], reply

@@ -10,7 +10,7 @@ import pytest
 from pathlib import Path
 
 from amifuse.fuse_fs import HandlerBridge, resolve_driver
-from amifuse.startup_runner import OFFSET_CURRENT
+from amifuse.startup_runner import ACTION_SEEK, OFFSET_CURRENT
 
 pytestmark = pytest.mark.integration
 
@@ -179,9 +179,12 @@ class TestHandlerBridgeReadFailures:
             fh_addr, _ = bridge.open_file(path)
             try:
                 assert bridge.read_handle_at(fh_addr, 0, 4) == data[:4]
-                # Stands in for a request that timed out: its reply, the old
-                # position 4, arrives while the bridge waits for the next one.
-                bridge.launcher.send_seek_handle(bridge.state, fh_addr, 0, OFFSET_CURRENT)
+                # A request whose wait ends before the handler runs, as one
+                # that timed out: its reply, the old position 4, arrives
+                # while the bridge waits for the next one.
+                assert bridge._packet(
+                    ACTION_SEEK, [bridge._fh_arg(fh_addr), 0, OFFSET_CURRENT], "seek",
+                    max_iters=0) is None
                 assert bridge.read_handle_at(fh_addr, 0, len(data)) == data
                 assert bridge.read_handle(fh_addr, 16) == b""
             finally:
