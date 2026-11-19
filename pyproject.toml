@@ -32,7 +32,7 @@ classifiers = [
 
 dependencies = [
     "fusepy>=3.0",
-    "amitools[vamos]>=0.9.1",
+    "amitools[vamos]>=0.10.0",
     # amitools only asks for 0.5.0; 0.5.2 dispatches memory callbacks
     # across the full 32-bit address space and has Windows wheels on PyPI.
     "machine68k>=0.5.2",

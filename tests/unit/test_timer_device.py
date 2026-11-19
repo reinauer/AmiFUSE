@@ -491,7 +491,7 @@ class TestDelays:
         from amifuse.timer_device import SIGF_SINGLE
 
         lib, ctx, waits = self._dos(timer, ticks=50)
-        assert lib.Delay(ctx) == 0
+        assert lib.Delay(ctx, 50) == 0
         assert timer.device.next_delay() == 101.0
         assert waits == [SIGF_SINGLE]
 
@@ -499,9 +499,10 @@ class TestDelays:
         from amitools.vamos.lib.DosLibrary import DosLibrary
 
         slept = []
-        monkeypatch.setattr(DosLibrary, "Delay", lambda self, ctx: slept.append(1) or 0)
+        monkeypatch.setattr(DosLibrary, "Delay",
+                            lambda self, ctx, ticks: slept.append(1) or 0)
         lib, ctx, waits = self._dos(timer, ticks=0)
-        lib.Delay(ctx)
+        lib.Delay(ctx, 0)
         assert timer.device.next_delay() == float("inf")
         assert waits == []
         # amitools' Delay() takes it

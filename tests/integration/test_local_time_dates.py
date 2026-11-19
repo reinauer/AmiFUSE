@@ -138,7 +138,6 @@ def _mtime(ops, path):
 
 def test_clock_reads_tell_local_time():
     """DateStamp, GetSysTime and CurrentTime agree, at local time."""
-    from amitools.vamos.machine.regs import REG_D1
     from amifuse.vamos_runner import VamosHandlerRuntime
 
     _machine68k_or_skip()
@@ -151,8 +150,7 @@ def test_clock_reads_tell_local_time():
         lib_mgr = rt.slm.lib_mgr
         intuition = lib_mgr.get_vlib_by_addr(lib_mgr.open_lib("intuition.library", 0)).get_impl()
         expected = time.time() + OFFSET - AMIGA_EPOCH
-        ctx.cpu.w_reg(REG_D1, buf)
-        rt.slm.dos_impl.DateStamp(ctx)
+        rt.slm.dos_impl.DateStamp(ctx, buf)
         stamp = mem.r32(buf) * 86400 + mem.r32(buf + 4) * 60 + mem.r32(buf + 8) / 50
         sys_secs, _ = rt.timer_device.get_sys_time()
         intuition.CurrentTime(ctx, buf + 12, buf + 16)

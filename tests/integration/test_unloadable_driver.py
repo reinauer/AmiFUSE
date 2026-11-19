@@ -126,10 +126,10 @@ def test_unreadable_handler_keeps_its_os_error(runtime, tmp_path, monkeypatch):
     path.write_bytes(DRIVERS["random"])
     failure = PermissionError(13, "Permission denied", str(path))
 
-    def load_sys_seglist(*args, **kwargs):
+    def load_seglist(*args, **kwargs):
         raise failure
 
-    monkeypatch.setattr(runtime.slm.seg_loader, "load_sys_seglist", load_sys_seglist)
+    monkeypatch.setattr(runtime.slm.seg_loader, "load_seglist", load_seglist)
     with pytest.raises(PermissionError) as caught:
         runtime.load_handler(path)
     assert caught.value is failure
@@ -157,10 +157,10 @@ def test_handler_in_unreadable_folder_is_not_missing(runtime, tmp_path):
 
 
 def _failing_loader(runtime, monkeypatch, failure):
-    def load_sys_seglist(*args, **kwargs):
+    def load_seglist(*args, **kwargs):
         raise failure
 
-    monkeypatch.setattr(runtime.slm.seg_loader, "load_sys_seglist", load_sys_seglist)
+    monkeypatch.setattr(runtime.slm.seg_loader, "load_seglist", load_seglist)
 
 
 def test_read_error_names_the_driver(runtime, tmp_path, monkeypatch):
