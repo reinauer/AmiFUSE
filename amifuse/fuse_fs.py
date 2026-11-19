@@ -504,7 +504,14 @@ def _parse_fib(mem, fib_addr: int) -> Dict:
       fib_Date: DateStamp (ds_Days, ds_Minute, ds_Tick: 3 LONGs) at 132
 
     "mtime" is fib_Date as host time. "disk_key" is only a handler's own
-    number: pfs3aio and ODFileSystem give it to many entries.
+    number, and doesn't identify an object: on pfs3aio it is the address of
+    the handler's entry for the lock examined (its FileLock at offset 8), so
+    it differs between two locks on one object and repeats for different
+    objects; ODFileSystem gives one to many entries. What identifies the
+    object is the lock's fl_Key, which _stat_path() adds as "lock_key": the
+    header block on FastFileSystem, the anode on pfs3aio, the object node
+    on SmartFilesystem and the inode on BFFS, the same through any hard
+    link to it.
 
     A name is read no further than fib_FileName, so a longer one gives its
     first 107 characters: the handler fills in the fields after it too, and
@@ -1974,6 +1981,7 @@ class HandlerBridge:
                     self.free_lock(l)
                 return None, -1 if reply is None else reply[1]
             info = _parse_fib(self.mem, fib_mem.addr)
+            info["lock_key"] = self._lock_key(lock)  # see _parse_fib()
             for l in reversed(locks):
                 self.free_lock(l)
             return info, 0
@@ -5098,6 +5106,14 @@ class AmigaFuseFS(_FuseOperations):
         if src is None or dst is None:
             # Neither examined nor pinned: gone, or held on an exclusive lock.
             raise FuseOSError(errno.ENOENT if src is None else errno.EBUSY)
+        # Two names of one object, hard links to it: rename(2) does nothing,
+        # and the replace would delete one of them. Unless new is deleted,
+        # hidden while the file is open: then old takes its place.
+        if src.get("lock_key") and (src["lock_key"], src["dir_type"]) == (
+                dst.get("lock_key"), dst["dir_type"]):
+            with self._fh_lock:
+                if replaced not in self._pending_deletes:
+                    return
         dst_dir, _ = self._split_path(new)
         src_is_dir = _is_dir_entry(src)
         dst_is_dir = _is_dir_entry(dst)
@@ -5149,8 +5165,8 @@ class AmigaFuseFS(_FuseOperations):
     def _delete_replaced(self, temp: str):
         """Delete the replaced object, now at temp, for _replace_existing().
 
-        A file still open is left to its release(), and hidden until then,
-        as unlink() does. A delete that gets no reply may still happen, so
+        A file still open, also through a hard link to it, is left to its
+        last release(), and hidden until then, as unlink() does. A delete that gets no reply may still happen, so
         the replace stands. Raises FuseOSError when the handler refuses.
         """
         # delete_dir_atomic() sends ACTION_DELETE_OBJECT, for a file too.
@@ -5163,6 +5179,15 @@ class AmigaFuseFS(_FuseOperations):
                                for v in self._fh_cache.values())
                 if deferred:
                     self._pending_deletes.add(temp)
+            if not deferred:
+                # Open through a hard link to it: as for unlink(), the
+                # release() of the last of those handles deletes it.
+                holders = self._link_holders(temp)
+                if holders:
+                    with self._fh_lock:
+                        self._pending_deletes.add(temp)
+                        self._link_deletes[temp] = holders
+                    deferred = True
         if res1 == 0 and not deferred:
             if res2 != -1:  # -1: no reply
                 raise FuseOSError(_RENAME_ERRNOS.get(res2, errno.EIO))
@@ -5925,20 +5950,20 @@ class AmigaFuseFS(_FuseOperations):
         """The file handles open on path's file under another name.
 
         A lock taken through a hard link is a lock on the object it links
-        to, so FastFileSystem refuses to delete any of its names while such
-        a handle is open (ERROR_OBJECT_IN_USE). Examine through either name
-        gives the linked object's fib_DiskKey and name, which must both
-        match, as pfs3aio and ODFileSystem give one disk key to many
-        entries. A file held on an exclusive lock can't be examined, and
-        doesn't count.
+        to, so FastFileSystem refuses to delete any of its names, and
+        pfs3aio the file's own, while such a handle is open
+        (ERROR_OBJECT_IN_USE). The two names' "lock_key" (see _parse_fib)
+        and entry type must match; the names need not, as BFFS's Examine
+        gives the name the lock was taken through. A file held on an
+        exclusive lock can't be examined, and doesn't count.
         """
         try:
             info = self.bridge.stat_path(path)
         except Exception:
             return set()
-        if not info or info.get("dir_type", 0) >= 0 or not info.get("disk_key"):
+        if not info or info.get("dir_type", 0) >= 0 or not info.get("lock_key"):
             return set()
-        key = (info["disk_key"], info.get("name"), info.get("dir_type"))
+        key = (info["lock_key"], info.get("dir_type"))
         with self._fh_lock:
             others = {
                 fh: v.get("path") for fh, v in self._fh_cache.items()
@@ -5952,8 +5977,7 @@ class AmigaFuseFS(_FuseOperations):
                     found = self.bridge.stat_path(other)
                 except Exception:
                     found = None
-                seen[other] = found and (
-                    found.get("disk_key"), found.get("name"), found.get("dir_type"))
+                seen[other] = found and (found.get("lock_key"), found.get("dir_type"))
             if seen[other] == key:
                 holders.add(fh)
         return holders
