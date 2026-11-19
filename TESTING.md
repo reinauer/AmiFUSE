@@ -2,14 +2,15 @@
 
 ## Windows physical-disk release checks
 
-The amitools submodule is pinned to upstream v0.9.0, which includes the
+The amitools submodule is pinned to upstream v0.9.1, which includes the
 physical-disk support, partition range locks, and scheduler changes
 AmiFUSE needs.
 
 The installed-wheel CI job checks ordinary-image commands with the
-declared minimum `amitools[vamos]==0.9.0`. It installs the AmiFUSE wheel
-with dependency resolution enabled, checks the resulting dependencies,
-and exercises the installed package outside the checkout.
+declared minimums `amitools[vamos]==0.9.1` and `machine68k==0.5.2`. It
+installs the AmiFUSE wheel with dependency resolution enabled, checks the
+resulting dependencies, and exercises the installed package outside the
+checkout.
 
 Windows CI exercises named locks and unmount events across real processes
 without opening a physical disk. The mount persistence test requires a
@@ -519,10 +520,9 @@ With a variable set, `tests/integration/conftest.py` ends the run with exit
 status 1 instead of skipping. Set them locally to make the same check.
 
 The integration, tools-smoke and mount-tests jobs use upstream
-`machine68k>=0.5.0`. That release includes the opcode table over-read and
-JMP/CAS fixes previously supplied by the `machine68k-amifuse` fork.
-Windows jobs install wheels built from the unmodified upstream archive,
-tested by the amitools release workflow, and attached to its GitHub release.
+`machine68k>=0.5.2`. It includes the opcode table over-read and JMP/CAS
+fixes previously supplied by the `machine68k-amifuse` fork, and every
+job, Windows included, installs its wheel from PyPI.
 
 ## Current Gaps
 

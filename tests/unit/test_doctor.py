@@ -635,7 +635,7 @@ class TestPlatformSpecificChecks:
         patches = _patch_all_checks(subprocess_rc=-11)
         results = _run_with_patches(patches)
         c = _find_check(results, "machine68k")
-        assert c.fix_description == "pip install --upgrade 'machine68k>=0.5.0'"
+        assert c.fix_description == "pip install --upgrade 'machine68k>=0.5.2'"
 
     @pytest.mark.parametrize("rc", [-11, 1])
     def test_machine68k_fix_uses_windows_installer(self, rc):
@@ -649,7 +649,7 @@ class TestPlatformSpecificChecks:
         patches = _patch_all_checks(subprocess_rc=1)
         results = _run_with_patches(patches)
         c = _find_check(results, "machine68k")
-        assert c.fix_description == "pip install 'machine68k>=0.5.0'"
+        assert c.fix_description == "pip install 'machine68k>=0.5.2'"
 
 
 # ---------------------------------------------------------------------------

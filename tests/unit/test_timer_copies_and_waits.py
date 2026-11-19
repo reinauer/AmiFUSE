@@ -78,7 +78,7 @@ class TestCopiedRequest:
         timer.device.open_dev(timer.ctx, IO2, UNIT_WAITUNTIL, 0)
         _copy(timer, IO, COPY)
         _copy(timer, IO2, COPY + 0x40)
-        timer.send(COPY, secs=0, micro=5_000_000)  # 0.5 s of 10 MHz E-clock
+        timer.send(COPY, secs=0, micro=timer.device.ECLOCK_HZ // 2)  # 0.5 s
         assert timer.device.next_deadline() == pytest.approx(100.5)
         timer.send(COPY + 0x40, secs=5)
         assert timer.exec.port_mgr.ports[PORT].queue == [COPY + 0x40]

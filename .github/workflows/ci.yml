@@ -7,7 +7,6 @@ on:
     branches: [main]
 
 env:
-  MACHINE68K_WHEEL_BASE: https://github.com/reinauer/amitools/releases/download/v0.8.0.post12
   # The AmiFUSE-testing commit the fixture clone steps check out, so a push
   # to that repo can't change this repo's CI results. `git clone --depth 1`
   # takes a branch or tag, not a SHA, so those steps fetch this commit into
@@ -31,19 +30,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Install the upstream-source machine68k wheel (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $abi = python -c "import sys; print(f'cp{sys.version_info.major}{sys.version_info.minor}')"
-          python -m pip install --only-binary=:all: "$env:MACHINE68K_WHEEL_BASE/machine68k-0.5.0-$abi-$abi-win_amd64.whl"
-
       - name: Build and install with the declared minimum amitools release
         run: |
           python -m pip install build
           # As the release does: the sdist, then the wheel built from it.
           python -m build
-          python -c "import glob, subprocess, sys; subprocess.check_call([sys.executable, '-m', 'pip', 'install', glob.glob('dist/*.whl')[0], 'amitools==0.9.0'])"
+          python -c "import glob, subprocess, sys; subprocess.check_call([sys.executable, '-m', 'pip', 'install', glob.glob('dist/*.whl')[0], 'amitools==0.9.1', 'machine68k==0.5.2'])"
           python -m pip check
       - name: Check the licence text in the sdist and the wheel
         shell: python
@@ -64,7 +56,7 @@ jobs:
         working-directory: ${{ runner.temp }}
         run: |
           python -m amifuse --help
-          python -c "from importlib.metadata import version; import greenlet, machine68k; assert version('amitools') == '0.9.0'; print('greenlet', version('greenlet'), 'machine68k', version('machine68k'))"
+          python -c "from importlib.metadata import version; import greenlet, machine68k; assert version('amitools') == '0.9.1'; assert version('machine68k') == '0.5.2'; print('greenlet', version('greenlet'), 'machine68k', version('machine68k'))"
           python -c "from pathlib import Path; import tempfile; from amifuse.rdb_inspect import detect_adf; d=tempfile.TemporaryDirectory(); p=Path(d.name)/'test.adf'; p.write_bytes(b'DOS\0'+bytes(901116)); assert detect_adf(p) is not None"
       - name: Check the bundled FastFileSystem in the installed package
         working-directory: ${{ runner.temp }}
@@ -111,13 +103,6 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           cache: 'pip'
-
-      - name: Install the upstream-source machine68k wheel (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $abi = python -c "import sys; print(f'cp{sys.version_info.major}{sys.version_info.minor}')"
-          python -m pip install --only-binary=:all: "$env:MACHINE68K_WHEEL_BASE/machine68k-0.5.0-$abi-$abi-win_amd64.whl"
 
       - name: Install dependencies
         run: |
@@ -180,13 +165,6 @@ jobs:
           git -C ../AmiFUSE-testing.tmp checkout --quiet FETCH_HEAD
           mv ../AmiFUSE-testing.tmp ../AmiFUSE-testing
 
-      - name: Install the upstream-source machine68k wheel (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $abi = python -c "import sys; print(f'cp{sys.version_info.major}{sys.version_info.minor}')"
-          python -m pip install --only-binary=:all: "$env:MACHINE68K_WHEEL_BASE/machine68k-0.5.0-$abi-$abi-win_amd64.whl"
-
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
@@ -232,13 +210,6 @@ jobs:
           git -C ../AmiFUSE-testing.tmp fetch --depth 1 origin ${{ env.AMIFUSE_TESTING_SHA }}
           git -C ../AmiFUSE-testing.tmp checkout --quiet FETCH_HEAD
           mv ../AmiFUSE-testing.tmp ../AmiFUSE-testing
-
-      - name: Install the upstream-source machine68k wheel (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $abi = python -c "import sys; print(f'cp{sys.version_info.major}{sys.version_info.minor}')"
-          python -m pip install --only-binary=:all: "$env:MACHINE68K_WHEEL_BASE/machine68k-0.5.0-$abi-$abi-win_amd64.whl"
 
       - name: Install dependencies
         run: |
@@ -305,13 +276,6 @@ jobs:
           git -C ../AmiFUSE-testing.tmp fetch --depth 1 origin ${{ env.AMIFUSE_TESTING_SHA }}
           git -C ../AmiFUSE-testing.tmp checkout --quiet FETCH_HEAD
           mv ../AmiFUSE-testing.tmp ../AmiFUSE-testing
-
-      - name: Install the upstream-source machine68k wheel (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $abi = python -c "import sys; print(f'cp{sys.version_info.major}{sys.version_info.minor}')"
-          python -m pip install --only-binary=:all: "$env:MACHINE68K_WHEEL_BASE/machine68k-0.5.0-$abi-$abi-win_amd64.whl"
 
       - name: Install dependencies
         run: |

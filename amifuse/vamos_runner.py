@@ -236,14 +236,17 @@ class VamosHandlerRuntime:
 
         self.slm.lib_mgr.add_impl_cls("dos.library", make_dos_library)
         self.slm.lib_mgr.add_impl_cls("intuition.library", AmiFuseIntuitionLibrary)
-        self.slm.open_base_libs()
-        # Register the shared vamos disk device. The backend is supplied by
-        # HandlerBridge after it has applied AmiFUSE's image detection.
-        self.disk_session.install_devices(self.slm)
+        # Before dos.library opens: it opens timer.device for DOSBase's
+        # dl_TimeReq, and the device stays loaded with the implementation it
+        # opened with.
         from amifuse.null_device import NullDevice  # lazy import to avoid cycles
         self.slm.lib_mgr.add_impl_cls("keyboard.device", NullDevice)
         self.slm.lib_mgr.add_impl_cls("timer.device", self._get_timer_device)
         self.slm.lib_mgr.add_impl_cls("console.device", NullDevice)
+        self.slm.open_base_libs()
+        # Register the shared vamos disk device. The backend is supplied by
+        # HandlerBridge after it has applied AmiFUSE's image detection.
+        self.disk_session.install_devices(self.slm)
 
 
     def _get_timer_device(self):
@@ -339,6 +342,13 @@ class VamosHandlerRuntime:
                 self._stop_tasks(scheduler)
             except BaseException as exc:
                 first_error = exc
+        # amitools mirrors the allocator's free list into exec's MemHeader on
+        # every free, until exec.library's finish_lib() stops it. The base
+        # libraries stay open here (see below), so stop it now: a handler's
+        # exec Pool that the garbage collector frees after machine.cleanup()
+        # would otherwise write into the machine's freed memory.
+        if self.alloc is not None:
+            self.alloc.change_callback = None
         # Handlers may leave internal library/device state in a partially
         # torn-down state by the time AmiFuse unmounts. Calling
         # close_base_libs() here can end up touching stale Library structs
