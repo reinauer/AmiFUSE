@@ -45,7 +45,7 @@ def run_checks() -> List[CheckResult]:
     except ImportError:
         results.append(CheckResult(
             "amitools", "error", "amitools is not installed",
-            fixable=True, fix_description='pip install "amitools[vamos]>=0.9.0"',
+            fixable=True, fix_description='pip install "amitools[vamos]>=0.9.1"',
         ))
 
     # 3. machine68k (subprocess isolation -- segfaults can kill the process)
@@ -62,11 +62,11 @@ def run_checks() -> List[CheckResult]:
             # Segfault on Windows (-1073741819 = 0xC0000005) or Unix (-11 = SIGSEGV)
             results.append(CheckResult(
                 "machine68k", "warning",
-                "machine68k segfaults -- reinstall machine68k 0.5.0 or newer",
+                "machine68k segfaults -- reinstall machine68k 0.5.2 or newer",
                 fixable=True, fix_description=(
                     "Re-run tools/install-windows.ps1 to reinstall the upstream wheel"
                     if sys.platform == "win32"
-                    else "pip install --upgrade 'machine68k>=0.5.0'"
+                    else "pip install --upgrade 'machine68k>=0.5.2'"
                 ),
             ))
         else:
@@ -76,7 +76,7 @@ def run_checks() -> List[CheckResult]:
                 fixable=True, fix_description=(
                     "Re-run tools/install-windows.ps1 to install the upstream wheel"
                     if sys.platform == "win32"
-                    else "pip install 'machine68k>=0.5.0'"
+                    else "pip install 'machine68k>=0.5.2'"
                 ),
             ))
     except subprocess.TimeoutExpired:

@@ -35,7 +35,7 @@ $TargetPyVersion = "3.13.14"
 $PyInstallerUrl  = "https://www.python.org/ftp/python/3.13.14/python-3.13.14-amd64.exe"
 $PyInstallerSha  = "c54d9b9bbb8a36e6489363ddd01139707fd781d72f1f9e90c7ec65d0061368e0"
 $PerUserPy313    = Join-Path $env:LOCALAPPDATA "Programs\Python\Python313\python.exe"
-$Machine68kWheelBase = "https://github.com/reinauer/amitools/releases/download/v0.8.0.post12"
+$Machine68kRequirement = "machine68k>=0.5.2"
 
 # WinFSP: pinned MSI (account-agnostic install via msiexec; see G2). Verified.
 $WinFspVersion   = "2.1"
@@ -112,7 +112,7 @@ function Get-PythonVersionInfo {
     return $null
 }
 
-# Match the upstream-source Windows wheels attached to the amitools release.
+# Match the machine68k wheels on PyPI.
 # They cover CPython 3.11 through 3.15 on Windows x64.
 function Test-InRange {
     param($Info)
@@ -530,19 +530,21 @@ Write-Ok "pip ready: $pipVer"
 # ---------------------------------------------------------------------------
 # G5 -- Install AmiFUSE + dependencies
 # ---------------------------------------------------------------------------
-# Upstream 0.5.0 is source-only on PyPI. Download its tested release wheel
-# before changing the environment, so a network error leaves the old install.
-$pyTag = "cp3$($venvInfo.Minor)"
-$wheelFile = "machine68k-0.5.0-$pyTag-$pyTag-win_amd64.whl"
-$wheelUrl = "$Machine68kWheelBase/$wheelFile"
+# Download the machine68k wheel from PyPI before changing the environment, so a
+# network error leaves the old install. --only-binary keeps pip from falling
+# back to the source archive, which would need a native compiler.
 $wheelDir = Join-Path ([System.IO.Path]::GetTempPath()) ("amifuse-machine68k-" + [guid]::NewGuid().ToString("N"))
-$wheelPath = Join-Path $wheelDir $wheelFile
 New-Item -ItemType Directory -Path $wheelDir -Force | Out-Null
 try {
-    Write-Step "Downloading upstream machine68k 0.5.0 (wheel only)..."
-    if ((Invoke-Native python @('-m', 'pip', 'download', '--no-deps', '--only-binary=:all:', '--dest', $wheelDir, $wheelUrl)) -ne 0) {
-        Write-Err "Could not download the upstream machine68k wheel for Python $($venvInfo.Version)."
-        Write-Err "Expected release asset: $wheelUrl"
+    Write-Step "Downloading machine68k (wheel only)..."
+    if ((Invoke-Native python @('-m', 'pip', 'download', '--no-deps', '--only-binary=:all:', '--dest', $wheelDir, $Machine68kRequirement)) -ne 0) {
+        Write-Err "Could not download a machine68k wheel for Python $($venvInfo.Version)."
+        Write-Err "Expected a wheel satisfying '$Machine68kRequirement' on PyPI."
+        exit 1
+    }
+    $wheelPath = Get-ChildItem -LiteralPath $wheelDir -Filter "machine68k-*.whl" | Select-Object -First 1 -ExpandProperty FullName
+    if (-not $wheelPath) {
+        Write-Err "pip reported success but left no machine68k wheel in $wheelDir."
         exit 1
     }
 
@@ -556,9 +558,9 @@ try {
 
     # Reinstall even if upstream's metadata is already present: the fork's
     # uninstall may have removed files that both distributions owned.
-    Write-Step "Installing upstream machine68k 0.5.0..."
+    Write-Step "Installing machine68k..."
     if ((Invoke-Native python @('-m', 'pip', 'install', '--no-index', '--no-deps', '--force-reinstall', $wheelPath)) -ne 0) {
-        Write-Err "Could not install the downloaded upstream machine68k wheel."
+        Write-Err "Could not install the downloaded machine68k wheel."
         exit 1
     }
 } finally {
@@ -581,7 +583,7 @@ if ($pyprojectPath -and (Test-Path $pyprojectPath)) {
 
 if ($devMode) {
     Write-Step "Dev checkout detected -- installing in editable mode with [windows] extras..."
-    # The upstream machine68k wheel is installed before either install path,
+    # The machine68k wheel is installed before either install path,
     # so resolving amitools' vamos extra does not require a native compiler.
     #
     # setuptools_scm (upstream pyproject build config) lists tracked files at

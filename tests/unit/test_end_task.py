@@ -66,7 +66,10 @@ def test_a_task_whose_greenlet_died_does_not_stop_the_others(machine):
     child = _crashing_child(scheduler, machine)
     with pytest.raises(RuntimeError, match="injected"):
         scheduler.run_until_idle(1000)
-    assert child.glet.dead and child.get_state() != TaskState.TS_REMOVED
+    # amitools takes the crashed task off the scheduler before the
+    # exception propagates; the one it interrupted still waits.
+    assert child.glet.dead and child.get_state() == TaskState.TS_REMOVED
+    assert waiter.get_state() != TaskState.TS_REMOVED
     VamosHandlerRuntime._stop_tasks(scheduler)
     assert _removed(scheduler, child, waiter)
     assert waiter.glet.dead

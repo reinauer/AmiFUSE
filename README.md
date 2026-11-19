@@ -64,11 +64,10 @@ pip install -e .                     # Install AmiFUSE
 pip install -e '.[windows]'         # Windows only: adds pystray + Pillow for tray/shell integration
 ```
 
-The Windows installer downloads tested wheels built from upstream
-machine68k 0.5.0 for Python 3.11--3.15. Direct pip installations can now
-use the upstream machine68k 0.5.1 wheels published on PyPI for Windows x64
-and those Python versions. Other platform/Python combinations without a
-matching wheel may need a native compiler.
+machine68k 0.5.2 publishes wheels on PyPI for Python 3.11--3.15 on
+Windows x64, macOS (Intel and Apple silicon) and Linux x86-64, so those
+need no native compiler; other platforms build it from source. The
+Windows installer installs the wheel only, never the source archive.
 
 ### macOS-specific
 
@@ -298,9 +297,9 @@ python -m pip install -e './amitools[vamos]'
 python -m pip install -e '.[windows]'
 ```
 
-The upstream `amitools[vamos]>=0.9.0` dependency includes
+The upstream `amitools[vamos]>=0.9.1` dependency includes
 physical-disk support, partition range locks, and the scheduler runtime,
-and installs machine68k 0.5.0 or newer and greenlet. Plain
+and installs greenlet. AmiFUSE itself requires machine68k 0.5.2 or newer. Plain
 `pip install amitools` omits these optional vamos dependencies. The source
 installation above is only needed to test unreleased amitools changes.
 

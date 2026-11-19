@@ -84,10 +84,9 @@ Linux, macOS, and Windows:
   integration tests.
 
 Integration tests, tools smoke, and mount tests start once the unit
-tests pass. They use upstream `machine68k>=0.5.0`, which includes the
-Windows fixes previously supplied by the `machine68k-amifuse` fork.
-Windows jobs install the tested upstream-source wheels attached to the
-amitools release; upstream PyPI currently supplies only a source archive.
+tests pass. They use upstream `machine68k>=0.5.2`, which includes the
+Windows fixes previously supplied by the `machine68k-amifuse` fork and
+publishes Windows wheels on PyPI.
 
 ## Pull Requests
 
