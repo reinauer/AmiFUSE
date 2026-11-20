@@ -23,8 +23,11 @@ class TestProcessStackBase:
         assert "proc.stack_base.bptr = stack.get_lower() >> 2" not in source
 
 
-class TestStdpktRingBuffer:
-    """Verify stdpkt ring buffer frees old allocation on growth."""
+class TestStartupPacket:
+    """The startup packet is the one StandardPacket the launcher builds.
+
+    Every later packet goes through DosPktHandler.
+    """
 
     def _make_launcher(self):
         from amifuse.startup_runner import HandlerLauncher
@@ -34,12 +37,6 @@ class TestStdpktRingBuffer:
         launcher.alloc = MagicMock()
         launcher.mem = MagicMock()
         launcher.port_mgr = MagicMock()
-        launcher._stdpkt_ring = []
-        launcher._stdpkt_sizes = []
-        launcher._stdpkt_ring_size = 8
-        launcher._stdpkt_index = 0
-        launcher.pending = {}
-        launcher._stdpkt_retired = []
         # Minimal field offsets (actual values don't matter for allocation tests)
         launcher._msg_size = 20
         launcher._pkt_size = 48
@@ -59,56 +56,30 @@ class TestStdpktRingBuffer:
         launcher._signal_port = lambda *args, **kwargs: None
         return launcher
 
-    def test_stdpkt_first_alloc(self):
+    def test_packet_is_allocated_and_queued(self):
         launcher = self._make_launcher()
         new_mem = SimpleNamespace(addr=0x5000, size=68)
         launcher.alloc.alloc_memory.return_value = new_mem
 
-        launcher._build_std_packet(0x1000, 0x2000, 1, [])
+        pkt_addr, msg_addr = launcher._build_std_packet(0x1000, 0x2000, 1, [7, 8])
 
-        launcher.alloc.alloc_memory.assert_called_once()
+        assert launcher.alloc.alloc_memory.call_args.args[0] == 68
         launcher.alloc.free_memory.assert_not_called()
-        assert launcher._stdpkt_ring[0] is new_mem
+        assert (pkt_addr, msg_addr) == (0x5000 + 20, 0x5000)
         launcher.port_mgr.put_msg.assert_called_once_with(0x1000, 0x5000)
+        # dp_Type, then the args from dp_Arg1
+        launcher.mem.w32.assert_any_call(0x5014 + 8, 1)
+        launcher.mem.w32.assert_any_call(0x5014 + 12, 7)
+        launcher.mem.w32.assert_any_call(0x5014 + 16, 8)
 
-    def test_stdpkt_reuses_existing_slot(self):
+    def test_failed_allocation_queues_nothing(self):
         launcher = self._make_launcher()
-        existing = SimpleNamespace(addr=0x5000, size=68)
-        launcher._stdpkt_ring = [existing] + [None] * 7
-        launcher._stdpkt_sizes = [68] + [0] * 7
-
-        launcher._build_std_packet(0x1000, 0x2000, 1, [])
-
-        launcher.alloc.alloc_memory.assert_not_called()
-        launcher.alloc.free_memory.assert_not_called()
-
-    def test_stdpkt_grows_and_frees_old_slot(self):
-        launcher = self._make_launcher()
-        old_mem = SimpleNamespace(addr=0x5000, size=32)
-        new_mem = SimpleNamespace(addr=0x6000, size=68)
-        launcher._stdpkt_ring = [old_mem] + [None] * 7
-        launcher._stdpkt_sizes = [32] + [0] * 7
-        launcher.alloc.alloc_memory.return_value = new_mem
-
-        launcher._build_std_packet(0x1000, 0x2000, 1, [])
-
-        launcher.alloc.alloc_memory.assert_called_once()
-        launcher.alloc.free_memory.assert_called_once_with(old_mem)
-        assert launcher._stdpkt_ring[0] is new_mem
-
-    def test_stdpkt_failed_growth_keeps_old_slot(self):
-        launcher = self._make_launcher()
-        old_mem = SimpleNamespace(addr=0x5000, size=32)
-        launcher._stdpkt_ring = [old_mem] + [None] * 7
-        launcher._stdpkt_sizes = [32] + [0] * 7
         launcher.alloc.alloc_memory.side_effect = RuntimeError("oom")
 
         with pytest.raises(RuntimeError, match="oom"):
             launcher._build_std_packet(0x1000, 0x2000, 1, [])
 
-        assert launcher._stdpkt_ring[0] is old_mem
-        assert launcher._stdpkt_sizes[0] == 32
-        launcher.alloc.free_memory.assert_not_called()
+        launcher.port_mgr.put_msg.assert_not_called()
 
 
 class TestSignalTask:
