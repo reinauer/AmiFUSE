@@ -25,6 +25,7 @@ from amitools.vamos.trace import TraceManager
 from amitools.vamos.path import VamosPathManager
 from amitools.vamos.schedule import Scheduler, SchedulerConfig
 from amitools.vamos.libmgr import SetupLibManager
+from amitools.vamos.loader.fileobj import StreamFileObj
 from amitools.vamos.disk import DiskSession
 
 _LOG_SETUP_DONE = False
@@ -309,7 +310,9 @@ class VamosHandlerRuntime:
             raise ValueError(
                 f"Failed to load {name}: not a regular file")
         try:
-            seg_baddr = self.slm.seg_loader.load_sys_seglist(str(handler_path))
+            with open(handler_path, "rb") as stream:
+                seg_baddr = self.slm.seg_loader.load_seglist(
+                    StreamFileObj(stream), name=str(handler_path))
         except OSError as exc:
             raise_os_error(exc)
         except Exception as exc:

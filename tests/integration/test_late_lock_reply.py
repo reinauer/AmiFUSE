@@ -16,6 +16,7 @@ import pytest
 from amitools.fs import DosType
 
 from amifuse.fuse_fs import HandlerBridge
+from amifuse.startup_runner import ACTION_LOCATE_OBJECT, SHARED_LOCK
 from amifuse.rdb_inspect import detect_adf
 from tests.fixtures.images import make_adf
 from tests.fixtures.paths import BUNDLED_FFS
@@ -47,7 +48,10 @@ def test_a_dropped_late_lock_is_freed(request, tmp_path, image_name,
     try:
         root, _ = bridge.locate(0, "")
         _, name_bptr = bridge._alloc_bstr(name)
-        bridge.launcher.send_locate(bridge.state, root, name_bptr)
+        # A LOCATE whose wait ends before the handler gets to it.
+        assert bridge._packet(
+            ACTION_LOCATE_OBJECT, [root, name_bptr, SHARED_LOCK], "locate",
+            max_iters=0) is None
 
         # The lock is out when the handler reaches the delete.
         assert bridge.delete_object(root, name) == (0, ERROR_OBJECT_IN_USE)

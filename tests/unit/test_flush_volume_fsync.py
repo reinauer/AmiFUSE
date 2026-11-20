@@ -17,7 +17,6 @@ from amifuse import fuse_fs as fs
 from amifuse.driver_runtime import BlockDeviceBackend
 from amifuse.rdb_inspect import ADF_DD_SIZE, OffsetBlockDevice, detect_adf
 
-FLUSH_PKT = 0x2100
 ACK = (-1, 0)  # DOSTRUE: the handler wrote its buffers
 NAK = (0, 0)
 
@@ -51,14 +50,15 @@ def _bridge(backend, events, reply=ACK):
     bridge._debug = False
     bridge._lock = threading.RLock()
     bridge.state = SimpleNamespace(crashed=False)
-    bridge.launcher = SimpleNamespace(send_flush=lambda state: (FLUSH_PKT, 0))
+    # No packet is out, so flush_volume() sends ACTION_FLUSH at once.
+    bridge.dospkt = None
 
-    def run_until_reply(pkt_addr, label, **wait):
-        assert pkt_addr == FLUSH_PKT
+    def packet(action, args, label, *more, **limits):
+        assert action == fs.ACTION_FLUSH
         events.append("reply")
         return reply
 
-    bridge._run_until_reply = run_until_reply
+    bridge._packet = packet
     sync = backend.sync
 
     def logged_sync():

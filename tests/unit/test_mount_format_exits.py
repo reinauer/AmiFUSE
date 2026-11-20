@@ -18,7 +18,6 @@ from amifuse import fuse_fs, platform, rdb_inspect
 DOS3 = 0x444F5303
 CLOSE_ERROR = "[amifuse] could not close the bridge: [Errno 5] Input/output error"
 STARTUP_CRASH = "Filesystem handler crashed during startup; mount aborted."
-INHIBIT, FORMAT, FLUSH = 0x100, 0x200, 0x300
 
 
 def _failing_close():
@@ -38,15 +37,12 @@ def format_bridge(monkeypatch, tmp_path):
     bridge = MagicMock()
     bridge.state.crashed = False
     bridge.launcher.alloc_bstr.return_value = (None, 0x1234)
-    bridge.launcher.send_inhibit.return_value = (INHIBIT, 0)
-    bridge.launcher.send_format.return_value = (FORMAT, 0)
-    bridge.launcher.send_flush.return_value = (FLUSH, 0)
     bridge.format_reply = (-1, 0)
 
-    def run_until_reply(pkt, label, **kwargs):
-        return bridge.format_reply if pkt == FORMAT else (-1, 0)
+    def packet(action, args, label, *more, **limits):
+        return bridge.format_reply if action == fuse_fs.ACTION_FORMAT else (-1, 0)
 
-    bridge._run_until_reply.side_effect = run_until_reply
+    bridge._packet.side_effect = packet
     monkeypatch.setattr(fuse_fs, "HandlerBridge", MagicMock(return_value=bridge))
     monkeypatch.setattr(fuse_fs, "get_partition_info",
                         lambda *a, **kw: {"name": "DH0", "dostype": DOS3})

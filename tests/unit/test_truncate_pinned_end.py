@@ -23,15 +23,16 @@ import pytest
 
 from amifuse import fuse_fs
 
-PKT = 0x9999  # every packet the fake answers
-NO_REPLY = []  # _run_until_replies timed out
+NO_REPLY = None  # no answer within the wait
+# landed_write_reply's default: a write answered with its own byte count.
+ANSWER = object()
 CONTENT = bytes(range(256)) * 12  # 3072 bytes
 NEW = b"n" * 100
 FAR_POS = 0x80000000
 
 
 def _reply(res1, res2=0):
-    return [(0, PKT, res1, res2)]
+    return (res1, res2)
 
 
 class _FakeVolume:
@@ -55,6 +56,7 @@ class _FakeVolume:
     late does. With landed_write_reply set, ACTION_WRITE is carried out and
     gets that reply: NO_REPLY for a write the handler finishes late, or a
     failure for a handler that keeps what it wrote of a failed packet.
+    packet() stands in for HandlerBridge._packet.
     """
 
     def __init__(self, data, bffs):
@@ -67,7 +69,7 @@ class _FakeVolume:
         self.withhold_sizes = False
         self.withhold_writes = False
         self.withhold_seeks = False
-        self.landed_write_reply = None
+        self.landed_write_reply = ANSWER
         self.pending = None
         self.buf = b""
         self.reply = NO_REPLY
@@ -91,11 +93,22 @@ class _FakeVolume:
     def r_block(self, addr, size):
         return self.buf[:size]
 
-    def seek(self, state, fh_addr, offset, mode):
+    def packet(self, action, args, label, *more, **limits):
+        """Answer a SEEK, READ, WRITE or SET_FILE_SIZE as the handler would."""
+        handle = {
+            fuse_fs.ACTION_SEEK: self.seek,
+            fuse_fs.ACTION_READ: self.read,
+            fuse_fs.ACTION_WRITE: self.write,
+            fuse_fs.ACTION_SET_FILE_SIZE: self.set_size,
+        }[action]
+        handle(*args)
+        return self.reply
+
+    def seek(self, fh_addr, offset, mode):
         self.seeks.append((fh_addr, offset, mode))
         if self.withhold_seeks:
             self.reply = NO_REPLY
-            return PKT, 0
+            return
         h = self.handles[fh_addr]
         base = {fuse_fs.OFFSET_BEGINNING: 0, fuse_fs.OFFSET_CURRENT: h["pos"],
                 fuse_fs.OFFSET_END: len(self.data)}[mode]
@@ -104,29 +117,26 @@ class _FakeVolume:
             h["pos"] = base + offset
         else:
             self.reply = _reply(-1, fuse_fs.ERROR_SEEK_ERROR)
-        return PKT, 0
 
-    def read(self, state, fh_addr, addr, size):
+    def read(self, fh_addr, addr, size):
         h = self.handles[fh_addr]
         self.buf = bytes(self.data[h["pos"]:h["pos"] + size])
         h["pos"] += len(self.buf)
         h["max"] = max(h["max"], h["pos"])
         self.reply = _reply(len(self.buf))
-        return PKT, 0
 
-    def write(self, state, fh_addr, addr, size):
+    def write(self, fh_addr, addr, size):
         if self.withhold_writes:
             self.reply = NO_REPLY
-            return PKT, 0
+            return
         h = self.handles[fh_addr]
         self.data[h["pos"]:h["pos"] + size] = self.buf[:size]
         h["pos"] += size
         h["max"] = max(h["max"], h["pos"])
-        self.reply = (_reply(size) if self.landed_write_reply is None
+        self.reply = (_reply(size) if self.landed_write_reply is ANSWER
                       else self.landed_write_reply)
-        return PKT, 0
 
-    def set_size(self, state, fh_addr, size, mode):
+    def set_size(self, fh_addr, size, mode):
         self.set_sizes.append(size)
         if self.withhold_sizes:
             self.pending = size
@@ -136,7 +146,6 @@ class _FakeVolume:
         else:
             self._resize(size)
             self.reply = _reply(size)
-        return PKT, 0
 
     def land(self):
         self._resize(self.pending)
@@ -158,17 +167,14 @@ def _fs(volume, free_blocks=4096):
     bridge._write_enabled = True
     bridge._unwritten_outputs = set()
     bridge.state = MagicMock()
-    bridge.launcher = MagicMock()
-    bridge.launcher.send_seek_handle.side_effect = volume.seek
-    bridge.launcher.send_read_handle.side_effect = volume.read
-    bridge.launcher.send_write_handle.side_effect = volume.write
-    bridge.launcher.send_set_file_size.side_effect = volume.set_size
+    bridge._packet = volume.packet
+    # fh_Arg1 is the handle's address, as the fake keys its handles.
+    bridge._fh_arg = lambda fh_addr: fh_addr
     bridge.mem = MagicMock()
     bridge.mem.w_block.side_effect = volume.w_block
     bridge.mem.r_block.side_effect = volume.r_block
     bridge._alloc_read_buf = MagicMock(return_value=SimpleNamespace(addr=0x2000))
     bridge._alloc_empty_buf = MagicMock(return_value=SimpleNamespace(addr=0x2000))
-    bridge._run_until_replies = MagicMock(side_effect=lambda: volume.reply)
     bridge.get_disk_info = MagicMock(return_value={
         "num_blocks": 8192, "num_blocks_used": 8192 - free_blocks,
         "bytes_per_block": 512})
@@ -455,7 +461,7 @@ def test_truncate_after_failed_write_measures_end(fuse_mock, bffs, call,
         else:
             fs.truncate("/file", 2 * PIN, fh)
     landed = b"x" * PIN if call == "write" else bytes(PIN)
-    volume.landed_write_reply = None
+    volume.landed_write_reply = ANSWER
     volume.withhold_sizes = False
     sizes = len(volume.set_sizes)
     handler_end = len(volume.data)  # 3072 on BFFS, 2000 elsewhere
@@ -487,7 +493,7 @@ def test_gapped_write_after_lost_write_fills_from_pin(fuse_mock):
     fs.write("/file", NEW, 0, fh)
     volume.landed_write_reply = NO_REPLY
     _eio(lambda: fs.write("/file", b"x" * 100, len(NEW), fh))
-    volume.landed_write_reply = None
+    volume.landed_write_reply = ANSWER
 
     assert fs.write("/file", b"abc", 500, fh) == 3
     fs.release("/file", fh)
@@ -504,7 +510,7 @@ def test_reopen_after_lost_write_pins_zero(fuse_mock):
     fh = fs.open("/file", os.O_RDWR)
     volume.landed_write_reply = NO_REPLY
     _eio(lambda: fs.write("/file", NEW, 0, fh))
-    volume.landed_write_reply = None
+    volume.landed_write_reply = ANSWER
 
     assert fs.truncate("/file", 0, fh) == 0
     assert fs.truncate("/file", 100, fh) == 0
@@ -525,7 +531,7 @@ def test_failed_write_below_pin_keeps_truncate_to_pin(fuse_mock):
     volume.landed_write_reply = DISK_FULL
     with pytest.raises(fuse_fs.FuseOSError):
         fs.write("/file", b"y" * 100, 0, fh)
-    volume.landed_write_reply = None
+    volume.landed_write_reply = ANSWER
 
     assert fs.truncate("/file", PIN, fh) == 0
     assert volume.set_sizes == []

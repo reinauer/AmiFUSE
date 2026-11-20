@@ -11,7 +11,8 @@ import shutil
 
 import pytest
 
-from amifuse.fuse_fs import AmigaFuseFS, FuseOSError, SeekResult
+from amifuse.fuse_fs import AmigaFuseFS, FuseOSError, SeekResult, _PacketWait
+from amifuse.startup_runner import ACTION_SET_FILE_SIZE
 from tests.fixtures.images import make_adf
 from tests.fixtures.paths import BUNDLED_FFS
 from tests.integration.test_handler_bridge_write import _bridge
@@ -88,7 +89,7 @@ def test_sfs_write_at_new_end_on_nearly_full_volume(request, tmp_path):
     assert _read_back(image, driver, "/f.bin") == b"h" * 1000 + b"tail"
 
 
-def _answer_first_shrink_late(bridge):
+def _answer_first_shrink_late(monkeypatch):
     """Make the first ACTION_SET_FILE_SIZE's wait end before its reply.
 
     That wait returns no reply without running the handler, as one that
@@ -99,23 +100,17 @@ def _answer_first_shrink_late(bridge):
     either: a handler stopped mid-work runs on against the busy limit.
     Returns a list that holds True once the cut wait ran.
     """
-    send = bridge.launcher.send_set_file_size
-    run = bridge._run_until_replies
+    pump = _PacketWait.pump
     state = []
 
-    def send_set_file_size(*args, **kwargs):
-        if not state:
-            state.append(False)
-        return send(*args, **kwargs)
+    def cut_first_round(self):
+        if self.action == ACTION_SET_FILE_SIZE and not state:
+            state.append(True)
+            self._start_round()
+            return self._stopped("idle")
+        return pump(self)
 
-    def run_until_replies(*args, **kwargs):
-        if state == [False]:
-            state[0] = True
-            return []
-        return run(*args, **kwargs)
-
-    bridge.launcher.send_set_file_size = send_set_file_size
-    bridge._run_until_replies = run_until_replies
+    monkeypatch.setattr(_PacketWait, "pump", cut_first_round)
     return state
 
 
@@ -124,7 +119,7 @@ def _answer_first_shrink_late(bridge):
     pytest.param("pfs3aio", "pfs.hdf", id="pfs3"),
 ])
 def test_shrink_answered_after_the_wait(request, tmp_path, driver_name,
-                                        image_name):
+                                        image_name, monkeypatch):
     """The handler answered the shrink just after the wait ran out, and
     truncate() failed with EIO for a shrink it made. FastFileSystem stops
     it at the reader and needs the retry as well."""
@@ -141,7 +136,7 @@ def test_shrink_answered_after_the_wait(request, tmp_path, driver_name,
         assert ops.read("/a.bin", 2000, 0, reader) == data[:2000]
         other_reader = ops.open("/o.bin", os.O_RDONLY)
         assert ops.read("/o.bin", 1000, 0, other_reader) == other[:1000]
-        cut = _answer_first_shrink_late(bridge)
+        cut = _answer_first_shrink_late(monkeypatch)
 
         assert ops.truncate("/a.bin", 100, handle) == 0
         assert cut == [True]

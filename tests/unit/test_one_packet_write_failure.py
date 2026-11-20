@@ -15,7 +15,6 @@ import pytest
 
 from amifuse import fuse_fs
 from tests.unit.test_fuse_fs import (
-    PKT,
     _FakeHandlerFile,
     _fake_write_bridge,
     _fake_write_fs,
@@ -32,16 +31,15 @@ class _KeepsWhatFits(_FakeHandlerFile):
     """A fake file whose ACTION_WRITE past capacity writes what fits, then
     fails with ERROR_DISK_FULL, as FastFileSystem 47.4 does."""
 
-    def write(self, state, fh_addr, addr, size):
+    def write(self, fh_addr, addr, size):
         pos = self._pos(fh_addr)
         if pos + size <= self.capacity:
-            return super().write(state, fh_addr, addr, size)
+            return super().write(fh_addr, addr, size)
         self.writes.append(size)
         kept = max(self.capacity - pos, 0)
         self.data[pos:pos + kept] = self.buf[:kept]
         self._move(fh_addr, pos + kept)
         self.reply = _reply(-1, ERROR_DISK_FULL)
-        return PKT, 0
 
 
 @pytest.mark.parametrize("start", [len(HEAD), 400], ids=["at-end", "inside"])

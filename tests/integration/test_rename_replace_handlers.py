@@ -24,6 +24,7 @@ from amifuse.fuse_fs import (
     HandlerBridge,
 )
 from amifuse.rdb_inspect import detect_adf
+from amifuse.startup_runner import ACTION_LOCATE_OBJECT
 
 BUNDLED = "bundled FastFileSystem"
 
@@ -457,14 +458,15 @@ def test_getpath_locates_each_component_once(ops, monkeypatch):
     ops.mkdir("/Deep", 0o755)
     ops.mkdir("/Deep/Er", 0o755)
     _write(ops, "/Deep/Er/File", b"data")
-    launcher = ops.bridge.launcher
-    send_locate, located = launcher.send_locate, []
+    bridge = ops.bridge
+    packet, located = bridge._packet, []
 
-    def counting(state, lock, name_bptr, *args):
-        located.append(name_bptr)
-        return send_locate(state, lock, name_bptr, *args)
+    def counting(action, args, label, *more, **kwargs):
+        if action == ACTION_LOCATE_OBJECT:
+            located.append(args[1])
+        return packet(action, args, label, *more, **kwargs)
 
-    monkeypatch.setattr(launcher, "send_locate", counting)
+    monkeypatch.setattr(bridge, "_packet", counting)
     assert ops.getpath("/deep/er/file") == "/Deep/Er/File"
     assert len(located) == 3
 

@@ -7,6 +7,7 @@ import pytest
 from amitools.fs import DosType
 
 from amifuse.fuse_fs import HandlerBridge
+from amifuse.startup_runner import ACTION_READ, ACTION_WRITE
 from tests.fixtures.images import make_ffs_partition
 from tests.fixtures.paths import BUNDLED_FFS
 
@@ -26,8 +27,8 @@ def ofs_image(tmp_path):
     return image, BUNDLED_FFS
 
 
-def _wait_for_reply(bridge, pkt_addr, label):
-    """Wait for the reply to one packet; return it and the runs it took.
+def _wait_for_reply(bridge, action, args, label):
+    """Send one packet and wait for its reply; return it and the runs it took.
 
     The test sends each packet itself, in one piece, so that the wait stays
     long however the bridge's own read and write calls split their data.
@@ -42,7 +43,7 @@ def _wait_for_reply(bridge, pkt_addr, label):
 
     bridge.launcher.run = counted
     try:
-        return bridge._run_until_reply(pkt_addr, label), len(runs)
+        return bridge._packet(action, args, label), len(runs)
     finally:
         del bridge.launcher.run
 
@@ -61,9 +62,8 @@ def test_one_large_write_and_read_on_ofs(ofs_image):
         fh_addr, _ = opened
         buf = bridge._alloc_read_buf(SIZE)
         bridge.mem.w_block(buf.addr, DATA)
-        pkt_addr, _ = bridge.launcher.send_write_handle(
-            bridge.state, fh_addr, buf.addr, SIZE)
-        reply, runs = _wait_for_reply(bridge, pkt_addr, "write")
+        reply, runs = _wait_for_reply(
+            bridge, ACTION_WRITE, [bridge._fh_arg(fh_addr), buf.addr, SIZE], "write")
         assert reply is not None
         assert reply[0] == SIZE
         # Each packet must outlast the old budget, or this test proves nothing.
@@ -79,9 +79,8 @@ def test_one_large_write_and_read_on_ofs(ofs_image):
         assert opened is not None
         fh_addr, _ = opened
         buf = bridge._alloc_read_buf(SIZE)
-        pkt_addr, _ = bridge.launcher.send_read_handle(
-            bridge.state, fh_addr, buf.addr, SIZE)
-        reply, runs = _wait_for_reply(bridge, pkt_addr, "read")
+        reply, runs = _wait_for_reply(
+            bridge, ACTION_READ, [bridge._fh_arg(fh_addr), buf.addr, SIZE], "read")
         assert reply is not None
         assert reply[0] == SIZE
         assert runs > OLD_BUDGET_RUNS

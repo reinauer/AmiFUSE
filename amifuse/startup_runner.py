@@ -167,19 +167,6 @@ class HandlerLauncher:
         # the thread the emulation runs on (emu_thread.py); the bridge sets
         # it, and every method below then runs there
         self._emu = None
-        # Scratch packet buffers to avoid unbounded allocs (we serialize requests).
-        self._stdpkt_ring = []
-        self._stdpkt_sizes = []
-        self._stdpkt_index = 0
-        self._stdpkt_ring_size = 8
-        # Packets send_packet() queued that have no reply yet: packet
-        # address -> (dp_Type, args). poll_replies() removes each packet it
-        # sees answered. Until then the handler may still read the packet
-        # and the memory its args point to, so none of it is reused.
-        self.pending: Dict[int, Tuple[int, Tuple[int, ...]]] = {}
-        # StandardPackets taken out of the ring while their packet was
-        # still out; each is freed once its packet is answered.
-        self._stdpkt_retired = []
         # Cache hot struct sizes/offsets for packet marshalling.
         self._msg_size = MessageStruct.get_size()
         self._pkt_size = DosPacketStruct.get_size()
@@ -203,8 +190,6 @@ class HandlerLauncher:
         self._mp_msglist_offset = MsgPortStruct.sdef.find_field_def_by_name("mp_MsgList").offset
         # Debug flag (set by launch_with_startup); consistent with codebase self._debug pattern
         self._debug = False
-        # dp_Type of the last packet queued, for warnings about its reply
-        self.last_pkt_type = None
 
     # ---- low-level helpers ----
 
@@ -317,37 +302,13 @@ class HandlerLauncher:
     def _build_std_packet(
         self, dest_port_addr: int, reply_port_addr: int, pkt_type: int, args
     ) -> Tuple[int, int]:
-        """Allocate contiguous StandardPacket = Message + DosPacket, and queue it.
+        """Allocate a StandardPacket (Message + DosPacket) and queue it.
 
-        A ring slot whose packet is still out (pending) gets a new
-        StandardPacket, and the old one is freed once its reply has come,
-        so that no packet is built where the handler may still read
-        another, and a late reply's address names one packet only.
+        Only the startup packet goes out this way; every later one goes
+        through DosPktHandler (HandlerBridge._attach_transport).
         """
         total = self._msg_size + self._pkt_size
-        if not self._stdpkt_ring:
-            self._stdpkt_ring = [None] * self._stdpkt_ring_size
-            self._stdpkt_sizes = [0] * self._stdpkt_ring_size
-        retired = []
-        for old in self._stdpkt_retired:
-            if old.addr + self._msg_size in self.pending:
-                retired.append(old)
-            else:
-                self.alloc.free_memory(old)
-        self._stdpkt_retired = retired
-        idx = self._stdpkt_index
-        self._stdpkt_index = (idx + 1) % self._stdpkt_ring_size
-        sp_mem = self._stdpkt_ring[idx]
-        if sp_mem is not None and sp_mem.addr + self._msg_size in self.pending:
-            self._stdpkt_retired.append(sp_mem)
-            sp_mem = self._stdpkt_ring[idx] = None
-        if sp_mem is None or total > self._stdpkt_sizes[idx]:
-            new_mem = self.alloc.alloc_memory(total, label=f"stdpkt_scratch_{idx}")
-            if sp_mem is not None:
-                self.alloc.free_memory(sp_mem)
-            sp_mem = new_mem
-            self._stdpkt_ring[idx] = sp_mem
-            self._stdpkt_sizes[idx] = total
+        sp_mem = self.alloc.alloc_memory(total, label="startup_packet")
         sp_addr = sp_mem.addr
         self.mem.w_block(sp_addr, b"\x00" * total)
         pkt_addr = sp_addr + self._msg_size
@@ -362,21 +323,28 @@ class HandlerLauncher:
         self.mem.w32(pkt_addr + self._dp_link_offset, sp_addr & 0xFFFFFFFF)
         self.mem.w32(pkt_addr + self._dp_port_offset, reply_port_addr & 0xFFFFFFFF)
         self.mem.w32(pkt_addr + self._dp_type_offset, pkt_type & 0xFFFFFFFF)
-        self.last_pkt_type = pkt_type
         arg_addr = pkt_addr + self._dp_arg1_offset
         for val in args[:7]:
             self.mem.w32(arg_addr, val & 0xFFFFFFFF)
             arg_addr += 4
-        # queue message to destination port - both Python queue and Amiga memory
-        self.port_mgr.put_msg(dest_port_addr, sp_addr)
-        # Also link the message into the port's mp_MsgList in memory
-        # This is necessary because some handlers (like FFS) read mp_MsgList directly
-        self._link_msg_to_port(dest_port_addr, sp_addr)
-        # Signal the port's task like PutMsg() does, so that a Wait() on the
-        # port's signal returns. A task not yet running finds the message
-        # on the port when it first waits for it.
-        self._signal_port(dest_port_addr)
+        # A task not yet running finds the message on the port when it
+        # first waits for it.
+        self.put_msg(dest_port_addr, sp_addr)
         return pkt_addr, sp_addr
+
+    def put_msg(self, port_addr: int, msg_addr: int):
+        """Deliver a message to the port at port_addr, as PutMsg() does.
+
+        It goes to the port manager's queue, which GetMsg() takes from,
+        and into the port's mp_MsgList, as some handlers (like FFS) read
+        that list directly. Then the port's task gets the port's signal,
+        so that a Wait() on it returns. Like PutMsg(), it makes the message
+        an NT_MESSAGE: a handler may leave anything else on its port.
+        """
+        self.mem.w8(msg_addr + self._msg_ln_type_offset, NodeType.NT_MESSAGE)
+        self.port_mgr.put_msg(port_addr, msg_addr)
+        self._link_msg_to_port(port_addr, msg_addr)
+        self._signal_port(port_addr)
 
     def _link_msg_to_port(self, port_addr: int, msg_addr: int):
         """Link a message into a port's mp_MsgList in Amiga memory.
@@ -441,7 +409,7 @@ class HandlerLauncher:
 
     # ---- public orchestration ----
 
-    def launch_with_startup(self, extra_packets=None, debug=False) -> HandlerLaunchState:
+    def launch_with_startup(self, debug=False) -> HandlerLaunchState:
         """Set the handler up and queue its startup packet.
 
         The handler's task is added to the scheduler and runs at the first
@@ -476,10 +444,6 @@ class HandlerLauncher:
                 self.boot["dn_addr"] >> 2,
             ],
         )
-        # queue any additional packets before starting the handler
-        if extra_packets:
-            for pkt_type, args in extra_packets:
-                self._build_std_packet(port_addr, reply_port, pkt_type, args)
 
         task = handler.get_sched_task()
         self.scheduler.add_task(task)
@@ -555,24 +519,6 @@ class HandlerLauncher:
         """Whether the handler's task waits for a signal."""
         return self.state.task.get_state() == SchedTaskState.TS_WAIT
 
-    def send_disk_info(self, state: HandlerLaunchState, info_buf_addr: int):
-        # Arg1 = InfoData* (BPTR)
-        return self.send_packet(state, ACTION_DISK_INFO, [info_buf_addr >> 2])
-
-    def send_read(self, state: HandlerLaunchState, buf_addr: int, offset_bytes: int, length_bytes: int):
-        # Arg1 = window (not used), Arg2 = offset (block), Arg3 = buf, Arg4 = length
-        # pfs3 uses TD style; offset in bytes, length in bytes; Arg1 ignored
-        return self.send_packet(
-            state,
-            ACTION_READ,
-            [
-                0,
-                offset_bytes,
-                buf_addr,
-                length_bytes,
-            ],
-        )
-
     def poll_replies(self, port_addr: int, debug: bool = False):
         """Return a list of (msg_addr, pkt_addr, res1, res2) for all queued replies."""
         results = []
@@ -591,244 +537,8 @@ class HandlerLauncher:
             if debug:
                 print(f"[poll_replies] got msg=0x{msg_addr:x} pkt=0x{pkt_addr:x} res1=0x{res1:x} res2={res2}")
             results.append((msg_addr, pkt_addr, res1, res2))
-            self.pending.pop(pkt_addr, None)
             has_msg = pmgr.has_msg(port_addr)
         return results
-
-    def send_packet(self, state: HandlerLaunchState, pkt_type: int, args):
-        """Queue a packet to the handler and return the msg/pkt addresses.
-
-        The packet stays in pending until poll_replies() sees its reply.
-        """
-        pkt_addr, msg_addr = self._build_std_packet(
-            state.port_addr, state.reply_port_addr, pkt_type, args
-        )
-        self.pending[pkt_addr] = (
-            pkt_type, tuple(val & 0xFFFFFFFF for val in args[:7])
-        )
-        return pkt_addr, msg_addr
-
-    def send_locate(
-        self,
-        state: HandlerLaunchState,
-        lock_bptr: int,
-        name_bptr: int,
-        mode: int = SHARED_LOCK,
-    ):
-        """ACTION_LOCATE_OBJECT: returns a new lock BPTR in dp_Res1."""
-        return self.send_packet(state, ACTION_LOCATE_OBJECT, [lock_bptr, name_bptr, mode])
-
-    def send_examine(self, state: HandlerLaunchState, lock_bptr: int, fib_addr: int):
-        """ACTION_EXAMINE_OBJECT"""
-        return self.send_packet(state, ACTION_EXAMINE_OBJECT, [lock_bptr, fib_addr >> 2])
-
-    def send_examine_next(self, state: HandlerLaunchState, lock_bptr: int, fib_addr: int):
-        """ACTION_EXAMINE_NEXT"""
-        return self.send_packet(state, ACTION_EXAMINE_NEXT, [lock_bptr, fib_addr >> 2])
-
-    def send_free_lock(self, state: HandlerLaunchState, lock_bptr: int):
-        """ACTION_FREE_LOCK: release a lock returned by LOCATE."""
-        return self.send_packet(state, ACTION_FREE_LOCK, [lock_bptr])
-
-    def send_parent(self, state: HandlerLaunchState, lock_bptr: int):
-        """ACTION_PARENT: a lock on the lock's directory in dp_Res1, 0 at the root."""
-        return self.send_packet(state, ACTION_PARENT, [lock_bptr])
-
-    def send_findinput(
-        self, state: HandlerLaunchState, name_bptr: int, dir_lock_bptr: int = 0, fh_addr: int = None
-    ):
-        """ACTION_FINDINPUT: allocate a FileHandle if needed, return (fh_addr, pkt_addr, msg_addr)."""
-        if fh_addr is None:
-            fh_mem = self.alloc.alloc_struct(FileHandleStruct, label="FindInputFH")
-            self.mem.w_block(fh_mem.addr, b"\x00" * FileHandleStruct.get_size())
-            fh_addr = fh_mem.addr
-        pkt_addr, msg_addr = self.send_packet(
-            state,
-            ACTION_FINDINPUT,
-            [
-                fh_addr >> 2,  # BPTR to FileHandle
-                dir_lock_bptr,
-                name_bptr,
-            ],
-        )
-        return fh_addr, pkt_addr, msg_addr
-
-    def send_findupdate(
-        self, state: HandlerLaunchState, name_bptr: int, dir_lock_bptr: int = 0, fh_addr: int = None
-    ):
-        """ACTION_FINDUPDATE: open or create a file for read/write."""
-        if fh_addr is None:
-            fh_mem = self.alloc.alloc_struct(FileHandleStruct, label="FindUpdateFH")
-            self.mem.w_block(fh_mem.addr, b"\x00" * FileHandleStruct.get_size())
-            fh_addr = fh_mem.addr
-        pkt_addr, msg_addr = self.send_packet(
-            state,
-            ACTION_FINDUPDATE,
-            [
-                fh_addr >> 2,  # BPTR to FileHandle
-                dir_lock_bptr,
-                name_bptr,
-            ],
-        )
-        return fh_addr, pkt_addr, msg_addr
-
-    def send_findoutput(
-        self, state: HandlerLaunchState, name_bptr: int, dir_lock_bptr: int = 0, fh_addr: int = None, debug: bool = False
-    ):
-        """ACTION_FINDOUTPUT: open or create a file for output (truncate)."""
-        if fh_addr is None:
-            fh_mem = self.alloc.alloc_struct(FileHandleStruct, label="FindOutputFH")
-            self.mem.w_block(fh_mem.addr, b"\x00" * FileHandleStruct.get_size())
-            fh_addr = fh_mem.addr
-        pkt_addr, msg_addr = self.send_packet(
-            state,
-            ACTION_FINDOUTPUT,
-            [
-                fh_addr >> 2,  # BPTR to FileHandle
-                dir_lock_bptr,
-                name_bptr,
-            ],
-        )
-        return fh_addr, pkt_addr, msg_addr
-
-    def send_delete_object(self, state: HandlerLaunchState, lock_bptr: int, name_bptr: int):
-        """ACTION_DELETE_OBJECT: delete a file or directory."""
-        return self.send_packet(state, ACTION_DELETE_OBJECT, [lock_bptr, name_bptr])
-
-    def send_rename_object(
-        self,
-        state: HandlerLaunchState,
-        src_lock_bptr: int,
-        src_name_bptr: int,
-        dst_lock_bptr: int,
-        dst_name_bptr: int,
-    ):
-        """ACTION_RENAME_OBJECT: rename or move an object."""
-        return self.send_packet(
-            state,
-            ACTION_RENAME_OBJECT,
-            [
-                src_lock_bptr,
-                src_name_bptr,
-                dst_lock_bptr,
-                dst_name_bptr,
-            ],
-        )
-
-    def send_create_dir(self, state: HandlerLaunchState, lock_bptr: int, name_bptr: int):
-        """ACTION_CREATE_DIR: create a directory, returns new lock in res1."""
-        return self.send_packet(state, ACTION_CREATE_DIR, [lock_bptr, name_bptr])
-
-    def send_set_date(
-        self, state: HandlerLaunchState, lock_bptr: int, name_bptr: int, datestamp_addr: int
-    ):
-        """ACTION_SET_DATE: date the object name in directory lock_bptr.
-
-        dp_Arg1 is unused; dp_Arg4 is the address (not a BPTR) of a
-        struct DateStamp.
-        """
-        return self.send_packet(
-            state, ACTION_SET_DATE, [0, lock_bptr, name_bptr, datestamp_addr])
-
-    def send_read_handle(
-        self, state: HandlerLaunchState, fh_addr: int, buf_addr: int, length_bytes: int
-    ):
-        """ACTION_READ using a FileHandle filled by FINDINPUT; uses fh_Args as the fileentry pointer."""
-        fh = FileHandleStruct(self.mem, fh_addr)
-        fileentry_ptr = fh.args.val
-        return self.send_packet(
-            state,
-            ACTION_READ,
-            [
-                fileentry_ptr,
-                buf_addr,
-                length_bytes,
-            ],
-        )
-
-    def send_write_handle(
-        self, state: HandlerLaunchState, fh_addr: int, buf_addr: int, length_bytes: int
-    ):
-        """ACTION_WRITE using a FileHandle filled by FINDOUTPUT/FINDUPDATE."""
-        fh = FileHandleStruct(self.mem, fh_addr)
-        fileentry_ptr = fh.args.val
-        return self.send_packet(
-            state,
-            ACTION_WRITE,
-            [
-                fileentry_ptr,
-                buf_addr,
-                length_bytes,
-            ],
-        )
-
-    def send_set_file_size(
-        self, state: HandlerLaunchState, fh_addr: int, size: int, mode: int = OFFSET_BEGINNING
-    ):
-        """ACTION_SET_FILE_SIZE on a FileHandle; mode defaults to OFFSET_BEGINNING."""
-        fh = FileHandleStruct(self.mem, fh_addr)
-        fileentry_ptr = fh.args.val
-        return self.send_packet(
-            state,
-            ACTION_SET_FILE_SIZE,
-            [
-                fileentry_ptr,
-                size,
-                mode,
-            ],
-        )
-
-    def send_seek_handle(self, state: HandlerLaunchState, fh_addr: int, offset: int, mode: int = OFFSET_BEGINNING):
-        """ACTION_SEEK on a FileHandle; mode defaults to OFFSET_BEGINNING."""
-        fh = FileHandleStruct(self.mem, fh_addr)
-        fileentry_ptr = fh.args.val
-        return self.send_packet(
-            state,
-            ACTION_SEEK,
-            [
-                fileentry_ptr,
-                offset,
-                mode,
-            ],
-        )
-
-    def send_end_handle(self, state: HandlerLaunchState, fh_addr: int):
-        """ACTION_END on a FileHandle; closes the file handle in the handler."""
-        fh = FileHandleStruct(self.mem, fh_addr)
-        fileentry_ptr = fh.args.val
-        return self.send_packet(
-            state,
-            ACTION_END,
-            [
-                fileentry_ptr,
-            ],
-        )
-
-    def send_read_link(
-        self, state: HandlerLaunchState, lock_bptr: int, name_addr: int,
-        buf_addr: int, buf_size: int,
-    ):
-        """ACTION_READ_LINK: read the target of the soft link at name.
-
-        name is a C string, relative to lock_bptr's directory, and the
-        handler writes the target as a C string into buf_size bytes at
-        buf_addr. Res1 is the target's length, -2 when it does not fit, or
-        -1 with an error code in res2.
-        """
-        return self.send_packet(
-            state, ACTION_READ_LINK, [lock_bptr, name_addr, buf_addr, buf_size])
-
-    def send_flush(self, state: HandlerLaunchState):
-        """ACTION_FLUSH: flush filesystem buffers."""
-        return self.send_packet(state, ACTION_FLUSH, [])
-
-    def send_inhibit(self, state: HandlerLaunchState, inhibit: bool):
-        """ACTION_INHIBIT: dp_Arg1=DOSTRUE (-1) to inhibit, DOSFALSE (0) to uninhibit."""
-        return self.send_packet(state, ACTION_INHIBIT, [-1 if inhibit else 0])
-
-    def send_format(self, state: HandlerLaunchState, volname_bptr: int, dostype: int):
-        """ACTION_FORMAT: dp_Arg1=volume name BSTR (BPTR), dp_Arg2=DosType."""
-        return self.send_packet(state, ACTION_FORMAT, [volname_bptr, dostype])
 
 
 # Every call into the launcher may run or wake a task, so all of them run

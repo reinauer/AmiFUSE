@@ -81,15 +81,15 @@ def test_handler_ends_listing_with_a_failed_packet(
     bridge = HandlerBridge(image, driver, partition=partition,
                            adf_info=detect_adf(image), iso_info=detect_iso(image))
     replies = []
-    original = bridge._run_until_reply
+    original = bridge._packet
 
-    def record(packet, reason, *args, **kwargs):
-        reply = original(packet, reason, *args, **kwargs)
-        if reason == "examine_next":
+    def record(action, args, label, *more, **kwargs):
+        reply = original(action, args, label, *more, **kwargs)
+        if label == "examine_next":
             replies.append(reply)
         return reply
 
-    bridge._run_until_reply = record
+    bridge._packet = record
     try:
         assert bridge.list_dir_path("/")
         assert replies[-1] == (0, 232)  # ERROR_NO_MORE_ENTRIES

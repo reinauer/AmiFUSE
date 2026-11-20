@@ -230,7 +230,6 @@ def test_source_is_read_in_blocking_mode(write_context):
 # format: flush reply, fsync, and the extracted handler
 # ---------------------------------------------------------------------------
 
-INHIBIT_PKT, FORMAT_PKT, FLUSH_PKT = 0x100, 0x200, 0x300
 ACK = (-1, 0)
 NAK = (0, 0)
 NOT_KNOWN = (0, fs.ERROR_ACTION_NOT_KNOWN)  # SmartFilesystem, after a format
@@ -301,23 +300,20 @@ def format_context(monkeypatch, tmp_path):
         bridge.backend = FakeBackend(events, ctx.close_error, ctx.fsync_error)
         launcher = MagicMock()
         launcher.alloc_bstr.return_value = (None, 0x1234)
-        launcher.send_inhibit.return_value = (INHIBIT_PKT, 0)
-        launcher.send_format.return_value = (FORMAT_PKT, 0)
-        launcher.send_flush.return_value = (FLUSH_PKT, 0)
         bridge.launcher = launcher
-        replies = {INHIBIT_PKT: ACK, FORMAT_PKT: ACK}
 
-        def run_until_reply(pkt_addr, label, **wait):
-            ctx.waits[pkt_addr] = wait
+        def packet(action, args, label, *more, **wait):
+            ctx.waits[action] = wait
             if label == "format uninhibit":
                 events.append("uninhibit reply")
                 return getattr(ctx, "uninhibit_reply", ACK)
-            if pkt_addr == FLUSH_PKT:
+            if action == fs.ACTION_FLUSH:
                 events.append("flush reply")
                 return ctx.flush_reply
-            return replies[pkt_addr]
+            assert action in (fs.ACTION_INHIBIT, fs.ACTION_FORMAT)
+            return ACK
 
-        bridge._run_until_reply = run_until_reply
+        bridge._packet = packet
         return bridge
 
     monkeypatch.setattr(fs, "HandlerBridge", MagicMock(side_effect=make_bridge))
@@ -342,7 +338,7 @@ def test_format_fsyncs_after_the_flush_reply_before_complete(format_context, rep
     assert tail[3][0] == "print" and tail[3][1].startswith("Format complete.")
     assert tail[4] == "close"
     # format's longer wait reaches the flush.
-    assert ctx.waits[FLUSH_PKT] == {"max_iters": 500, "cycles": 2_000_000}
+    assert ctx.waits[fs.ACTION_FLUSH] == {"max_iters": 500, "cycles": 2_000_000}
     assert not ctx.handler.exists()
 
 

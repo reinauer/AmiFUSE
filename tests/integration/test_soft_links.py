@@ -49,9 +49,8 @@ def _make_soft_link(bridge, name, target):
         _, name_bptr = bridge._alloc_bstr(name)
         target_mem = bridge.vh.alloc.alloc_memory(len(target) + 1, label="LINK_TARGET")
         bridge.mem.w_block(target_mem.addr, target.encode("latin-1") + b"\x00")
-        pkt_addr, _ = bridge.launcher.send_packet(
-            bridge.state, ACTION_MAKE_LINK, [root, name_bptr, target_mem.addr, LINK_SOFT])
-        reply = bridge._run_until_reply(pkt_addr, "make_link")
+        reply = bridge._packet(
+            ACTION_MAKE_LINK, [root, name_bptr, target_mem.addr, LINK_SOFT], "make_link")
         bridge.free_lock(root)
     assert reply is not None and reply[0], reply
 
