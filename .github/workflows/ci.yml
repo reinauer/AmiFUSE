@@ -19,7 +19,7 @@ env:
   # needs unreleased amitools changes can point it at a git ref, such as
   # "amitools[vamos] @ git+https://github.com/cnvogelg/amitools.git@<sha>".
   # The installed-wheel job checks the declared minimum release instead.
-  AMITOOLS_SPEC: "amitools[vamos]"
+  AMITOOLS_SPEC: "amitools[vamos] @ git+https://github.com/reinauer/amitools.git@431a8a2c87e1d228a817f45fae996c3bb2588211"
 
 jobs:
   package-smoke:
