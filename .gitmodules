@@ -1,4 +1,0 @@
-[submodule "amitools"]
-	path = amitools
-	url = https://github.com/cnvogelg/amitools.git
-	branch = main

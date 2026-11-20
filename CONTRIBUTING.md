@@ -6,7 +6,7 @@ needed to clone, build, test, and submit changes.
 ## Prerequisites
 
 - **Python 3.11+** (CI tests 3.11 through 3.13)
-- **Git** with submodule support
+- **Git**
 - Optional: [macFUSE](https://osxfuse.github.io/) /
   [FUSE for Linux](https://github.com/libfuse/libfuse) /
   [WinFSP](https://winfsp.dev/) (only needed for live mount testing)
@@ -14,14 +14,14 @@ needed to clone, build, test, and submit changes.
 ## Clone and Setup
 
 ```sh
-git clone --recurse-submodules https://github.com/reinauer/AmiFUSE.git
+git clone https://github.com/reinauer/AmiFUSE.git
 cd AmiFUSE
 python3 -m venv .venv
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
-pip install -e "./amitools[vamos]"
-pip install "pytest>=7.0" "pytest-cov>=4.0" "pytest-timeout>=2.0"
-pip install -e "." --no-deps
+pip install -e ".[test]"
 ```
+
+To test unreleased amitools changes: `pip install -e "../amitools[vamos]"`.
 
 ## Running Tests
 

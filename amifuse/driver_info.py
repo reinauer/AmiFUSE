@@ -3,13 +3,10 @@ import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-AMITOOLS_PATH = REPO_ROOT / "amitools"
 
-# Prefer local checkout of amitools if it is not installed
+# Let the modules run as scripts from a source checkout
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
-if str(AMITOOLS_PATH) not in sys.path:
-    sys.path.insert(0, str(AMITOOLS_PATH))
 
 from amitools.binfmt.BinFmt import BinFmt  # type: ignore  # noqa: E402
 from amitools.binfmt.Relocate import Relocate  # type: ignore  # noqa: E402

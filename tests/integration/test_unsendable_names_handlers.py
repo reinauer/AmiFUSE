@@ -17,7 +17,6 @@ import os
 import shutil
 import subprocess
 import sys
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -27,7 +26,6 @@ from amifuse import fuse_fs
 from amifuse.fuse_fs import AmigaFuseFS, FuseOSError, HandlerBridge
 from amifuse.rdb_inspect import detect_adf
 
-AMITOOLS_ROOT = Path(__file__).resolve().parents[2] / "amitools"
 
 OLD = b"The contents of a?.txt\n"
 NOTES = b"the original notes\n"
@@ -36,7 +34,6 @@ NOTES = b"the original notes\n"
 def _xdftool(image, *args):
     proc = subprocess.run(
         [sys.executable, "-m", "amitools.tools.xdftool", str(image), *args],
-        cwd=AMITOOLS_ROOT if AMITOOLS_ROOT.is_dir() else None,
         capture_output=True, text=True, check=False,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr

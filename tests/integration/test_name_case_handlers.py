@@ -23,7 +23,6 @@ from amifuse.driver_resolver import BUNDLED_DRIVER
 from amifuse.fuse_fs import AmigaFuseFS, FuseOSError, HandlerBridge
 from amifuse.rdb_inspect import detect_adf
 
-AMITOOLS_ROOT = Path(__file__).resolve().parents[2] / "amitools"
 BUNDLED = "bundled FastFileSystem"
 
 HANDLERS = [
@@ -47,7 +46,6 @@ def _adf(tmp_path: Path, dos_type: str = "DOS3") -> Path:
     image = tmp_path / f"{dos_type}.adf"
     proc = subprocess.run(
         [sys.executable, "-m", "amitools.tools.xdftool", str(image), "format", "Gen", dos_type],
-        cwd=AMITOOLS_ROOT if AMITOOLS_ROOT.is_dir() else None,
         capture_output=True, text=True, check=False,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr

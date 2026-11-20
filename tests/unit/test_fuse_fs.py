@@ -29,7 +29,7 @@ import pytest
 try:
     from amitools.vamos.machine.mock.mem import MockMemory as _RealMockMemory
     from amitools.vamos.libstructs.dos import InfoDataStruct as _RealInfoData
-except ImportError:  # pragma: no cover - amitools submodule not checked out
+except ImportError:  # pragma: no cover - amitools not installed
     _RealMockMemory = None
     _RealInfoData = None
 
@@ -5100,7 +5100,7 @@ class TestQueryDiskInfo:
         import threading
 
         if _RealMockMemory is None:
-            pytest.skip("amitools submodule not available")
+            pytest.skip("amitools not installed")
         MockMemory = _RealMockMemory
         InfoDataStruct = _RealInfoData
         # fuse_mock bound a dummy InfoDataStruct into the module; the real

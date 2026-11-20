@@ -22,8 +22,6 @@ from amifuse import driver_resolver
 from amifuse import driver_runtime
 from amifuse import fuse_fs as fs
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-AMITOOLS_ROOT = REPO_ROOT / "amitools"
 
 OLD_DATA = b"The destination's old contents\n"
 NEW_DATA = bytes((i * 13 + 5) % 251 for i in range(3000))
@@ -50,7 +48,6 @@ def no_user_driver(monkeypatch, tmp_path):
 def _amitool(module: str, *args: str) -> str:
     proc = subprocess.run(
         [sys.executable, "-m", module, *args],
-        cwd=AMITOOLS_ROOT if AMITOOLS_ROOT.is_dir() else None,
         capture_output=True, text=True, check=False,
     )
     assert proc.returncode == 0, f"{module} {args} failed:\n{proc.stdout}\n{proc.stderr}"

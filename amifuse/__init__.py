@@ -14,15 +14,12 @@ except Exception:
     __version__ = "v1.0.0"
 
 
-def _ensure_local_amitools_on_path() -> None:
-    """Prefer the vendored amitools checkout when running from the repo."""
+def _ensure_repo_on_path() -> None:
+    """Let the package's modules import each other when run from the repo."""
     repo_root = Path(__file__).resolve().parents[1]
-    amitools_path = repo_root / "amitools"
 
     if str(repo_root) not in sys.path:
         sys.path.insert(0, str(repo_root))
-    if amitools_path.is_dir() and str(amitools_path) not in sys.path:
-        sys.path.insert(0, str(amitools_path))
 
 
-_ensure_local_amitools_on_path()
+_ensure_repo_on_path()

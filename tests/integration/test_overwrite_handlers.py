@@ -25,8 +25,6 @@ from tests.fixtures.paths import BUNDLED_FFS
 
 pytestmark = pytest.mark.integration
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-AMITOOLS_ROOT = REPO_ROOT / "amitools"
 
 OLD = bytes((i * 7) % 251 for i in range(3000))
 NEW = b"new data\n" * 11
@@ -45,7 +43,6 @@ def _bundled_image(tmp_path):
     subprocess.run(
         [sys.executable, "-m", "amitools.tools.xdftool", str(image),
          "format", "Overwrite", "DOS3"],
-        cwd=AMITOOLS_ROOT if AMITOOLS_ROOT.is_dir() else None,
         check=True, capture_output=True)
     return image, BUNDLED_FFS
 

@@ -2,7 +2,7 @@
 
 ## Windows physical-disk release checks
 
-The amitools submodule is pinned to upstream v0.9.1, which includes the
+AmiFUSE requires upstream amitools 0.9.1 or later, which includes the
 physical-disk support, partition range locks, and scheduler changes
 AmiFUSE needs.
 
@@ -49,7 +49,8 @@ visibility.
 This repo currently has two testing layers:
 
 - top-level AmiFuse integration and smoke tests
-- `amitools` unit / `pytask` / Amiga-side regression tests in the submodule
+- `amitools` unit / `pytask` / Amiga-side regression tests in an amitools
+  checkout
 
 `PERFORMANCE.md` records timing policy and current benchmark tables.
 It is not the main "how do I run the tests?" document. This file is.
@@ -349,9 +350,9 @@ the matrix is the main current performance harness.
 
 ## Amitools Tests
 
-The `amitools` submodule has its own test tree and README:
-
-[amitools/test/README.md](amitools/test/README.md)
+amitools has its own test tree and README, in a checkout of
+[cnvogelg/amitools](https://github.com/cnvogelg/amitools):
+[test/README.md](https://github.com/cnvogelg/amitools/blob/main/test/README.md)
 
 The important buckets there are:
 
@@ -359,7 +360,7 @@ The important buckets there are:
 - `test/pytask`
 - `test/suite`
 
-Typical runs from the submodule root:
+Typical runs from the amitools checkout's root:
 
 ```sh
 cd amitools
@@ -377,7 +378,7 @@ Notes:
 
 For the rebased `amifuse-0.5` work, many compatibility fixes landed with
 new `amitools` tests already. Top-level AmiFuse matrix failures should be
-triaged separately from submodule unit/suite failures.
+triaged separately from amitools unit/suite failures.
 
 ## Failure Triage
 

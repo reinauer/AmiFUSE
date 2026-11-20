@@ -17,7 +17,6 @@ import os
 import shutil
 import subprocess
 import sys
-from pathlib import Path
 
 import pytest
 
@@ -25,7 +24,6 @@ from amifuse import driver_resolver
 from amifuse.fuse_fs import AmigaFuseFS, FuseOSError, HandlerBridge
 from amifuse.rdb_inspect import detect_adf
 
-AMITOOLS_ROOT = Path(__file__).resolve().parents[2] / "amitools"
 
 PFS = ("pfs.hdf", "pfs3aio")
 SFS = ("sfs.hdf", "SmartFilesystem")
@@ -57,7 +55,6 @@ def open_ops(request, tmp_path):
             proc = subprocess.run(
                 [sys.executable, "-m", "amitools.tools.xdftool", str(image),
                  "create", "+", "format", "Gen", "DOS3"],
-                cwd=AMITOOLS_ROOT if AMITOOLS_ROOT.is_dir() else None,
                 capture_output=True, text=True, check=False,
             )
             assert proc.returncode == 0, proc.stdout + proc.stderr

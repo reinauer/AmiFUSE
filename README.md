@@ -28,8 +28,7 @@ The bootstrap scripts handle everything: Python, FUSE provider, virtual
 environment, pip dependencies, and `amifuse doctor --fix`.
 
 ```bash
-# Clone the repository with submodules
-git clone --recursive https://github.com/reinauer/AmiFUSE.git
+git clone https://github.com/reinauer/AmiFUSE.git
 cd AmiFUSE
 ```
 
@@ -50,16 +49,12 @@ cd AmiFUSE
 Use this if you are contributing to the project or need a custom setup.
 
 ```bash
-git clone --recursive https://github.com/reinauer/AmiFUSE.git
+git clone https://github.com/reinauer/AmiFUSE.git
 cd AmiFUSE
-
-# Or if already cloned, initialize submodules
-git submodule update --init
 
 python3 -m venv .venv
 source .venv/bin/activate   # On Windows: .venv\Scripts\activate
 
-pip install -e './amitools[vamos]'   # Install amitools from submodule (includes machine68k)
 pip install -e .                     # Install AmiFUSE
 pip install -e '.[windows]'         # Windows only: adds pystray + Pillow for tray/shell integration
 ```
@@ -288,20 +283,6 @@ applications must flush each open file itself (for example, with
 asynchronous; a successful close alone does not mean its pending metadata has
 reached the image.
 No extra pywin32 dependency is required.
-
-When running this change from source, install the accompanying amitools
-checkout as well as AmiFUSE into your Python environment:
-
-```powershell
-python -m pip install -e './amitools[vamos]'
-python -m pip install -e '.[windows]'
-```
-
-The upstream `amitools[vamos]>=0.9.1` dependency includes
-physical-disk support, partition range locks, and the scheduler runtime,
-and installs greenlet. AmiFUSE itself requires machine68k 0.5.2 or newer. Plain
-`pip install amitools` omits these optional vamos dependencies. The source
-installation above is only needed to test unreleased amitools changes.
 
 ### Formatting
 
