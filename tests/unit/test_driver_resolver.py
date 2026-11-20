@@ -595,7 +595,6 @@ class TestResolveDriver:
         extract.assert_not_called()
 
 
-AMITOOLS_ROOT = Path(__file__).resolve().parents[2] / "amitools"
 
 
 def _rdb(tmp_path, part, fs=(), name="disk.hdf", drive="DH0"):
@@ -611,7 +610,6 @@ def _rdb(tmp_path, part, fs=(), name="disk.hdf", drive="DH0"):
         args += ["+", "fsadd", str(driver_resolver.BUNDLED_DRIVER), f"dostype={dos_type}"]
     proc = subprocess.run(
         [sys.executable, "-m", "amitools.tools.rdbtool", str(image), *args],
-        cwd=AMITOOLS_ROOT if AMITOOLS_ROOT.is_dir() else None,
         capture_output=True, text=True, check=False,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
@@ -1140,7 +1138,6 @@ def _two_partitions(tmp_path, second_drive, second_type):
          "create", "size=8Mi", "+", "init",
          "+", "add", "size=3MiB", "name=DH0", "fs=DOS3",
          "+", "add", "size=3MiB", f"name={second_drive}", f"fs={second_type}"],
-        cwd=AMITOOLS_ROOT if AMITOOLS_ROOT.is_dir() else None,
         capture_output=True, text=True, check=False,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr

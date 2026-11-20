@@ -16,7 +16,6 @@ from pathlib import Path
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-AMITOOLS_ROOT = REPO_ROOT / "amitools"
 
 HUNK_HEADER = 0x3F3
 
@@ -47,7 +46,6 @@ def image(tmp_path):
         [sys.executable, "-m", "amitools.tools.rdbtool", str(path),
          "create", "size=8Mi", "+", "init", "rdb_cyls=2",
          "+", "add", "size=6MiB", "name=DH0", "fs=DOS3"],
-        cwd=AMITOOLS_ROOT if AMITOOLS_ROOT.is_dir() else None,
         capture_output=True, text=True, check=False,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
@@ -244,7 +242,6 @@ def rdb_image(tmp_path):
          "create", "size=8Mi", "+", "init", "rdb_cyls=2",
          "+", "add", "size=6MiB", "name=DH0", "fs=PFS3",
          "+", "fsadd", str(junk), "fs=PFS3"],
-        cwd=AMITOOLS_ROOT if AMITOOLS_ROOT.is_dir() else None,
         capture_output=True, text=True, check=False,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr

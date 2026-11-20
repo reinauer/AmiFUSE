@@ -8,13 +8,11 @@ import json
 import struct
 import subprocess
 import sys
-from pathlib import Path
 
 import pytest
 
 pytestmark = pytest.mark.integration
 
-AMITOOLS_ROOT = Path(__file__).resolve().parents[2] / "amitools"
 PFS3 = "0x50465303"
 PAST_END = 0x100000  # The image has 65536 blocks.
 
@@ -36,7 +34,6 @@ def pastend_image(tmp_path, pfs3_driver):
          "create", "size=32Mi", "+", "init", "rdb_cyls=40",
          "+", "fsadd", str(pfs3_driver), f"dostype={PFS3}",
          "+", "add", "size=50%", f"dostype={PFS3}", "name=DH0"],
-        cwd=AMITOOLS_ROOT if AMITOOLS_ROOT.is_dir() else None,
         capture_output=True, text=True, check=False,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr

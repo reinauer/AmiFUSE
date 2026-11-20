@@ -20,8 +20,6 @@ import pytest
 from amifuse import driver_resolver
 from amifuse import fuse_fs as fs
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-AMITOOLS_ROOT = REPO_ROOT / "amitools"
 OLD = b"The destination's old contents\n"
 
 
@@ -46,7 +44,6 @@ def no_user_driver(monkeypatch, tmp_path):
 def _xdftool(image: Path, *args) -> subprocess.CompletedProcess:
     return subprocess.run(
         [sys.executable, "-m", "amitools.tools.xdftool", str(image), *args],
-        cwd=AMITOOLS_ROOT if AMITOOLS_ROOT.is_dir() else None,
         capture_output=True, text=True, check=False,
     )
 

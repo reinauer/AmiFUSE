@@ -21,7 +21,6 @@ from generated_ffs import BUNDLED_FFS, make_adf, make_emu68
 from fixture_paths import PARCEIRO_FULL_URL, ensure_downloaded_fixture
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-AMITOOLS_ROOT = REPO_ROOT / "amitools"
 
 
 @dataclass(frozen=True)
@@ -123,8 +122,6 @@ CASES: List[FormatCase] = [
 def _ensure_import_path():
     if str(REPO_ROOT) not in sys.path:
         sys.path.insert(0, str(REPO_ROOT))
-    if str(AMITOOLS_ROOT) not in sys.path:
-        sys.path.insert(0, str(AMITOOLS_ROOT))
 
 
 def _load_runtime():

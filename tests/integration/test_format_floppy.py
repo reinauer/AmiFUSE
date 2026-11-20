@@ -17,8 +17,6 @@ from amifuse import driver_resolver
 from amifuse.fuse_fs import HandlerBridge
 from amifuse.rdb_inspect import detect_adf
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-AMITOOLS_ROOT = REPO_ROOT / "amitools"
 
 DD, HD = 901120, 1802240
 SEED_DATA = b"An old file\n"
@@ -49,7 +47,6 @@ def no_user_driver(monkeypatch, tmp_path):
 def _xdftool(image: Path, *args: str) -> str:
     proc = subprocess.run(
         [sys.executable, "-m", "amitools.tools.xdftool", str(image), *args],
-        cwd=AMITOOLS_ROOT if AMITOOLS_ROOT.is_dir() else None,
         capture_output=True, text=True, check=False,
     )
     assert proc.returncode == 0, f"xdftool {args} failed:\n{proc.stdout}\n{proc.stderr}"

@@ -17,9 +17,6 @@ import pytest
 from amifuse import driver_resolver
 from amifuse import fuse_fs as fs
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-AMITOOLS_ROOT = REPO_ROOT / "amitools"
-
 
 @pytest.fixture(scope="module", autouse=True)
 def _require_machine68k():
@@ -47,7 +44,6 @@ def _full_floppy(tmp_path: Path) -> Path:
     proc = subprocess.run(
         [sys.executable, "-m", "amitools.tools.xdftool", str(image),
          "create", "+", "format", "Full", "ffs", "+", "write", str(fill), "fill.bin"],
-        cwd=AMITOOLS_ROOT if AMITOOLS_ROOT.is_dir() else None,
         capture_output=True, text=True, check=False,
     )
     assert proc.returncode == 0, f"xdftool failed:\n{proc.stdout}\n{proc.stderr}"

@@ -10,7 +10,6 @@ with the first filesystem header at block 2 and its first LSEG at block 3.
 import struct
 import subprocess
 import sys
-from pathlib import Path
 
 import pytest
 from amitools.fs.blkdev.RawBlockDevice import RawBlockDevice
@@ -24,7 +23,6 @@ from amifuse.rdb_inspect import (
     print_inspect_report,
 )
 
-AMITOOLS_ROOT = Path(__file__).resolve().parents[2] / "amitools"
 FSHD, LSEG = 2, 3
 DOS1, DOS3 = 0x444F5301, 0x444F5303
 PAST_END = 0x100000  # The images have 16384 blocks.
@@ -40,7 +38,6 @@ def _rdb(tmp_path, fs=("DOS3", "DOS1")):
                  f"dostype={dos_type}"]
     proc = subprocess.run(
         [sys.executable, "-m", "amitools.tools.rdbtool", str(image), *args],
-        cwd=AMITOOLS_ROOT if AMITOOLS_ROOT.is_dir() else None,
         capture_output=True, text=True, check=False,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr

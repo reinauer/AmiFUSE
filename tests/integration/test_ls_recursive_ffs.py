@@ -10,14 +10,12 @@ import json
 import struct
 import subprocess
 import sys
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from amifuse import driver_resolver, fuse_fs
 
-AMITOOLS_ROOT = Path(__file__).resolve().parents[2] / "amitools"
 BLOCK = 512
 ST_USERDIR = 2
 ST_LINKDIR = 4
@@ -36,7 +34,6 @@ def needs_cpu():
 def _xdftool(image, *args):
     proc = subprocess.run(
         [sys.executable, "-m", "amitools.tools.xdftool", str(image), *args],
-        cwd=AMITOOLS_ROOT if AMITOOLS_ROOT.is_dir() else None,
         capture_output=True, text=True, check=False,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr

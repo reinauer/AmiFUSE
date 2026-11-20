@@ -12,11 +12,11 @@ import pytest
 # real class before any fixture patches sys.modules.
 try:
     from amitools.vamos.lib.dos.DosProtection import DosProtection as _RealDosProtection
-except ImportError:  # pragma: no cover - amitools submodule not checked out
+except ImportError:  # pragma: no cover - amitools not installed
     _RealDosProtection = None
 
 pytestmark = pytest.mark.skipif(
-    _RealDosProtection is None, reason="amitools submodule not available"
+    _RealDosProtection is None, reason="amitools not installed"
 )
 
 # Amiga protection masks (owner RWED bits are active low)

@@ -24,7 +24,6 @@ from fixture_paths import ensure_downloaded_fixture
 from generated_ffs import BUNDLED_FFS, make_adf, make_rdb
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-AMITOOLS_ROOT = REPO_ROOT / "amitools"
 DEFAULT_TIMEOUT = 60.0
 LOAD_FILE_COUNT = 256
 LOAD_FILE_SIZE_BYTES = 256
@@ -471,8 +470,6 @@ FIXTURES: Dict[str, Fixture] = {
 
 
 def _ensure_import_path():
-    if str(AMITOOLS_ROOT) not in sys.path:
-        sys.path.insert(0, str(AMITOOLS_ROOT))
     if str(REPO_ROOT) not in sys.path:
         sys.path.insert(0, str(REPO_ROOT))
 
@@ -724,7 +721,6 @@ def _prepare_rw_image(fixture: Fixture):
 def _run_amitools_tool(module: str, *args: str):
     proc = subprocess.run(
         [sys.executable, "-m", module, *args],
-        cwd=AMITOOLS_ROOT,
         capture_output=True,
         text=True,
         check=False,
