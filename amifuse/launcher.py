@@ -334,6 +334,13 @@ def _enumerate_mount_units(image: str) -> tuple[list[_MountUnit], Optional[str]]
             return [_MountUnit(name=None, label="floppy disk")], None
         if rdb_inspect.detect_iso(img) is not None:
             return [_MountUnit(name=None, label="disc")], None
+        from amifuse.rbf_image import find_rbf_volumes
+        rbf_volumes = find_rbf_volumes(img)
+        if len(rbf_volumes) == 1:
+            return [_MountUnit(name=None, label="OS-9 disk")], None
+        if rbf_volumes:
+            return [_MountUnit(name=str(vol.mbr_index), label=vol.volume_name or "OS-9 disk")
+                    for vol in rbf_volumes], None
         result = rdb_inspect.list_partitions(img)
     except Exception as exc:
         _log(

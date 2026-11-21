@@ -10,6 +10,7 @@ from amitools.fs.blkdev.RawBlockDevice import RawBlockDevice  # type: ignore
 
 from .amiga_structs import DosEnvecStruct, FileSysStartupMsgStruct, DeviceNodeStruct
 from .rdb_inspect import ADFInfo, ISOInfo
+from .rbf_image import RBFInfo
 
 
 def _scalar_field(struct, name: str):
@@ -89,10 +90,50 @@ class SyntheticIsoPartition:
         return self.iso_info.total_blocks
 
 
+class SyntheticRbfDosEnv:
+    """Synthetic DosEnvec-like object for OS-9 RBF images without an RDB.
+
+    One block per track and one surface, so the volume's first block is
+    its low cylinder (see RBFInfo).
+    """
+    def __init__(self, rbf_info: RBFInfo):
+        self.size = 16  # de_TableSize
+        self.block_size = rbf_info.block_size // 4  # de_SizeBlock in longwords
+        self.sec_org = 0
+        self.surfaces = rbf_info.heads
+        self.sec_per_blk = 1
+        self.blk_per_trk = rbf_info.sectors_per_track
+        self.reserved = 0
+        self.pre_alloc = 0
+        self.interleave = 0
+        self.low_cyl = rbf_info.low_block
+        self.high_cyl = rbf_info.low_block + rbf_info.num_blocks - 1
+        self.num_buffer = 20
+        self.buf_mem_type = 0
+        self.max_transfer = 0x7FFFFFFF
+        self.mask = 0xFFFFFFFF
+        self.boot_pri = 0
+        self.dos_type = rbf_info.dos_type
+        self.baud = 0
+        self.control = 0
+        self.boot_blocks = 0
+
+
+class SyntheticRbfPartition:
+    """Synthetic partition info for OS-9 RBF images."""
+    def __init__(self, rbf_info: RBFInfo):
+        self.num = 0
+        self.rbf_info = rbf_info
+
+    def get_num_blocks(self):
+        return self.rbf_info.num_blocks
+
+
 class BootstrapAllocator:
     def __init__(self, vh, image_path: Path, block_size=None, partition=None,
                  adf_info: Optional[ADFInfo] = None, iso_info: Optional[ISOInfo] = None,
-                 mbr_partition_index=None, partition_number=None):
+                 mbr_partition_index=None, partition_number=None,
+                 rbf_info: Optional[RBFInfo] = None):
         self.vh = vh
         self.alloc = vh.alloc
         self.mem = vh.alloc.get_mem()
@@ -101,6 +142,7 @@ class BootstrapAllocator:
         self.partition = partition  # name, index, or None for first
         self.adf_info = adf_info  # Pre-detected ADF info, if any
         self.iso_info = iso_info  # Pre-detected ISO info, if any
+        self.rbf_info = rbf_info  # Pre-detected OS-9 RBF volume, if any
         self.mbr_partition_index = mbr_partition_index  # For MBR disks with multiple 0x76 partitions
         # The partition's number in that RDB, as BlockDeviceBackend found it
         # for partition (rdb_inspect.find_partition).
@@ -143,12 +185,23 @@ class BootstrapAllocator:
         part = SyntheticIsoPartition(self.iso_info)
         return de, blk, None, part  # rd is None for ISO
 
+    def _read_rbf_env(self):
+        """Create synthetic partition info for OS-9 RBF images."""
+        blk = RawBlockDevice(str(self.image_path), read_only=True,
+                             block_bytes=self.rbf_info.block_size)
+        blk.open()
+        de = SyntheticRbfDosEnv(self.rbf_info)
+        part = SyntheticRbfPartition(self.rbf_info)
+        return de, blk, None, part  # rd is None for an RBF image
+
     def alloc_all(self, handler_seglist_baddr, handler_seglist_bptr, handler_name="PFS0:"):
         # Use ADF/ISO synthetic partition if detected, otherwise read from RDB
         if self.adf_info is not None:
             de, blk, rd, part = self._read_adf_env()
         elif self.iso_info is not None:
             de, blk, rd, part = self._read_iso_env()
+        elif self.rbf_info is not None:
+            de, blk, rd, part = self._read_rbf_env()
         else:
             de, blk, rd, part = self._read_partition_env()
         try:
