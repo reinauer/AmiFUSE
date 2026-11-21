@@ -358,11 +358,11 @@ separate sessions concurrently, including with `--write`. Read-only sessions
 can also share the same partition. A writable session excludes all other
 access to its partition, and whole-image sessions exclude partition mounts.
 Each handler is restricted to its selected partition; physical disks, ADFs,
-and ISOs retain whole-device or whole-image locking.
+ISOs and OS-9 disks without an RDB retain whole-device or whole-image locking.
 
 Without `--partition`, a session uses the first partition, so it can run
-alongside sessions on other partitions. Whole-image sessions are ADF, ISO and
-physical-disk sessions, and sessions from tools that lock the entire file.
+alongside sessions on other partitions. Whole-image sessions are ADF, ISO,
+OS-9 disk and physical-disk sessions, and sessions from tools that lock the entire file.
 On platforms without byte-range locks (for example 32-bit Linux and the BSDs),
 every session locks the whole image.
 
@@ -417,6 +417,7 @@ driver-info --base 0x200000 pfs3aio
 
 - **HDF/RDB** - Hard disk images with Rigid Disk Block. Filesystem drivers can be embedded in the RDB or specified via `--driver`. An FFS/OFS partition whose RDB has no driver for its DOS type uses the [bundled FastFileSystem](#bundled-fastfilesystem).
 - **Emu68-style MBR images** - Disk images with MBR partition table containing an RDB partition, as used by Emu68 on Raspberry Pi.
+- **OS-9 RBF disks** - OS-9/68k and OS-9000 disks and floppies without an RDB, including PC OS-9000 disks with a boot sector or an MBR; see [OS-9 disks](#os-9-disks).
 - **ADF** - Amiga Disk File floppy images (DD and HD). ADFs contain no driver, so DOS0-7 floppies use the [bundled FastFileSystem](#bundled-fastfilesystem) unless your drivers folder holds your own. A blank file of a floppy's size can be [formatted](#formatting) into one.
 
 ## Supported Filesystems
@@ -428,9 +429,41 @@ Currently tested with:
 - **SFS** (Smart File System 1.279) via [SmartFileSystem](https://aminet.net/package/disk/misc/SFS) handler
 - **BFFS** (Berkeley Fast File System) via Chris Hooper's [BFFSFilesystem](https://github.com/cdhooper/bffs) handler
 - **ODFileSystem** (Optical Disc Filesystem) via Stefan Reinauer's [ODFileSystem](https://github.com/reinauer/ODFileSystem) handler
+- **OS-9 RBF** (OS-9/68k and OS-9000, both byte orders) via Chris Hooper's [os9-rbf-handler](https://github.com/cdhooper/amiga_os9_rbf_handler); see [OS-9 disks](#os-9-disks)
 
 Other Amiga filesystem handlers may work but have not been tested. Reports are
 welcome.
+
+## OS-9 disks
+
+[`os9-rbf-handler`](https://github.com/cdhooper/amiga_os9_rbf_handler), an
+AmigaOS filesystem handler for OS-9 RBF disks, reads and writes OS-9/68k
+disks and OS-9000 disks of either byte order. AmiFUSE does not bundle it: copy it into your drivers folder
+(`~/.local/share/amifuse/drivers/` on macOS and Linux,
+`%LOCALAPPDATA%\amifuse\drivers\` on Windows) under that name, or give it
+with `--driver`.
+
+- **RDB partitions** of DOS type `OS9\0` (OS-9/68k), `OS9\1` (OS-9000
+  big-endian) or `OS9\2` (OS-9000 little-endian) use the handler stored in
+  the RDB, or else the one in your drivers folder. The handler detects the
+  format of the disk when it mounts it; the DOS type only chooses what
+  `amifuse format` writes.
+- **Disks without an RDB** are recognized by their contents: an OS-9/68k
+  identification sector or an OS-9000 ID block at the start of the image,
+  an OS-9000 ID block after a PC boot sector (PC OS-9000 floppies), or
+  either one in an MBR partition (PC OS-9000 hard disks). `inspect` lists
+  what it finds. When an MBR holds several OS-9 volumes, choose one with
+  `--partition` and its MBR entry number (0-3) or its volume name.
+
+```bash
+amifuse inspect os9000.img
+amifuse mount os9000.img --mountpoint ./mnt --write
+amifuse ls os9floppy.img --driver ./os9-rbf-handler
+```
+
+OS-9 names are case-insensitive for a-z, as on OS-9. Formatting is
+supported for RDB partitions; a disk without an RDB has to be formatted
+with OS-9 tools or from AmigaOS first.
 
 ## Bundled FastFileSystem
 

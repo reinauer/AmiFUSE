@@ -134,6 +134,9 @@ from .amiga_time import host_time, to_datestamp
 from .driver_resolver import DriverNotFound, ResolvedDriver
 from .driver_runtime import BlockDeviceBackend, ImageInUseError
 from .rdb_inspect import dos_type_tag, escape_text
+from .rbf_image import (
+    RBFInfo, find_rbf_volumes, is_os9_type, select_rbf_volume,
+)
 from .vamos_runner import VamosHandlerRuntime
 from .bootstrap import BootstrapAllocator
 from .startup_runner import (
@@ -397,6 +400,7 @@ _NAME_FOLDS = {"ascii": _FOLD_ASCII, "latin1": _FOLD_LATIN1}
 _DOS_FAMILY = 0x444F5300  # "DOS\x"
 _PFS_FAMILIES = (0x50465300, 0x50445300)  # "PFS\x", "PDS\x"
 _SFS_FAMILY = 0x53465300  # "SFS\x"
+_OS9_FAMILY = 0x4F533900  # "OS9\x"
 # struct fsRootBlock in SmartFilesystem: the block's id, and its bits field.
 _SFS_ROOT_ID = b"SFS\0"
 _SFS_ROOT_BITS_OFFSET = 20
@@ -554,6 +558,7 @@ class HandlerBridge:
         adf_info=None,
         iso_info=None,
         remove_driver: bool = False,
+        rbf_info=None,
     ):
         self._lock = threading.RLock()  # Reentrant lock for thread safety
         self._debug = debug
@@ -561,6 +566,7 @@ class HandlerBridge:
         self._driver_name = driver_name
         self._adf_info = adf_info
         self._iso_info = iso_info
+        self._rbf_info = rbf_info
         # driver is a temporary file, removed once it is loaded.
         self._remove_driver = remove_driver
         self.backend = None
@@ -579,7 +585,7 @@ class HandlerBridge:
         self._emu.start()
         try:
             self._emu.call(self._initialize, image, driver, block_size, read_only,
-                           debug, trace, partition, adf_info, iso_info)
+                           debug, trace, partition, adf_info, iso_info, rbf_info)
         except BaseException:
             # A failed constructor has no caller that can close it. Preserve
             # the startup error even if tearing down partial state also fails.
@@ -590,10 +596,14 @@ class HandlerBridge:
             raise
 
     def _initialize(self, image, driver, block_size, read_only, debug,
-                    trace, partition, adf_info, iso_info):
+                    trace, partition, adf_info, iso_info, rbf_info=None):
+        if rbf_info is not None:
+            # The image has no RDB; partition chose the volume already.
+            partition = None
         self.backend = BlockDeviceBackend(
             image, block_size=block_size, read_only=read_only, adf_info=adf_info,
             iso_info=iso_info, partition_scope=True, partition=partition,
+            rbf_info=rbf_info,
         )
         self.backend.open()
         mbr_idx = self.backend.mbr_partition_index
@@ -618,20 +628,25 @@ class HandlerBridge:
         ba = BootstrapAllocator(
             self.vh, image, block_size=block_size, partition=partition, adf_info=adf_info,
             iso_info=iso_info, mbr_partition_index=mbr_idx,
-            partition_number=self.backend.partition_number,
+            partition_number=self.backend.partition_number, rbf_info=rbf_info,
         )
+        # An image without an RDB: a floppy, a disc or an OS-9 disk.
+        synthetic = adf_info or iso_info or rbf_info
         if adf_info:
             handler_name = "DF0:"
         elif iso_info:
             handler_name = "CD0:"
+        elif rbf_info:
+            handler_name = "OD0:"
         else:
             handler_name = "DH0:"
         boot = ba.alloc_all(handler_seglist_baddr=seg_baddr, handler_seglist_bptr=seg_baddr, handler_name=handler_name)
         self._partition_index = boot["part"].num if boot.get("part") else 0
         # What name_fold() goes by.
-        self._dos_type = adf_info.dos_type if adf_info else None
-        self._first_block = None
-        if boot.get("part") and not adf_info and not iso_info:
+        self._dos_type = (adf_info.dos_type if adf_info
+                          else rbf_info.dos_type if rbf_info else None)
+        self._first_block = rbf_info.low_block if rbf_info else None
+        if boot.get("part") and not synthetic:
             dos_env = boot["part"].part_blk.dos_env
             self._dos_type = dos_env.dos_type
             self._first_block = dos_env.low_cyl * dos_env.surfaces * dos_env.blk_per_trk
@@ -651,6 +666,13 @@ class HandlerBridge:
                 print(f"[amifuse]   Volume: {escape_text(iso_info.volume_id)}")
                 print(f"[amifuse]   Block size: {iso_info.block_size}")
                 print(f"[amifuse]   Total blocks: {iso_info.total_blocks}")
+            elif rbf_info:
+                print(f"[amifuse] {rbf_info.format_name} geometry:")
+                print(f"[amifuse]   Volume: {escape_text(rbf_info.volume_name)}")
+                print(f"[amifuse]   Block size: {rbf_info.block_size}")
+                print(f"[amifuse]   First block: {rbf_info.low_block}")
+                print(f"[amifuse]   Blocks: {rbf_info.num_blocks} "
+                      f"(file system: {rbf_info.fs_blocks})")
             else:
                 dos_env = part.part_blk.dos_env
                 # Use partition geometry from DosEnvec, not disk geometry
@@ -668,7 +690,7 @@ class HandlerBridge:
         # The backend confines I/O to the partition counted in RDB blocks,
         # while the handler counts the same cylinders in de_SizeBlock units.
         # If they differ, part of a write would be rejected midway.
-        if boot.get("part") and not adf_info and not iso_info and not read_only:
+        if boot.get("part") and not synthetic and not read_only:
             sector_bytes = boot["part"].part_blk.dos_env.block_size * 4
             if sector_bytes != self.backend.block_size:
                 part_name = partition or f"#{boot['part'].num}"
@@ -679,7 +701,7 @@ class HandlerBridge:
                 )
 
         # Check that the partition data is within the image file
-        if boot.get("part") and not adf_info and not iso_info:
+        if boot.get("part") and not synthetic:
             dos_env = boot["part"].part_blk.dos_env
             blk_per_cyl = dos_env.surfaces * dos_env.blk_per_trk
             part_end_byte = (dos_env.high_cyl + 1) * blk_per_cyl * self.backend.block_size
@@ -2138,7 +2160,8 @@ class HandlerBridge:
         and reports DOS3. SmartFilesystem folds Latin-1 unless the volume was
         formatted case-sensitive, which its root block says. BFFS reports
         DOS1 too, but its partition's own type keeps it exact: a UFS volume
-        from NetBSD can hold names that differ only in case.
+        from NetBSD can hold names that differ only in case. os9-rbf-handler
+        folds a-z, as OS-9's RBF does.
         """
         dos_type = getattr(self, "_dos_type", None)
         if dos_type is None:
@@ -2152,6 +2175,9 @@ class HandlerBridge:
             return "ascii" if variant < 2 else "latin1" if variant < 8 else None
         if family in _PFS_FAMILIES:
             return "latin1"
+        if family == _OS9_FAMILY:
+            # os9-rbf-handler compares names ignoring the case of a-z.
+            return "ascii"
         if family == _SFS_FAMILY and self._first_block is not None:
             try:
                 root = self.backend.read_blocks(self._first_block, 1)
@@ -6408,12 +6434,16 @@ def resolve_driver(
     adf_info=None,
     part_info: Optional[dict] = None,
     iso_info=None,
+    rbf_info=None,
 ) -> ResolvedDriver:
-    """Pick the filesystem driver for an ADF, an ISO or an RDB partition.
+    """Pick the filesystem driver for an ADF, an ISO, an OS-9 image or an
+    RDB partition.
 
     Order: --driver; the RDB's driver for the partition's exact DOS type;
     then, for DOS0-DOS7 volumes, driver_resolver.find_folder_driver() (your
-    drivers folder, the bundled FastFileSystem). An ISO needs --driver.
+    drivers folder, the bundled FastFileSystem), and for OS-9 volumes
+    (OS9\0-OS9\2) driver_resolver.find_os9_driver() (your drivers folder).
+    An ISO needs --driver.
     part_info is get_partition_info()'s result when the caller has it.
 
     Raises PartitionNotFound or DriverNotFound. RDB read errors propagate.
@@ -6423,7 +6453,7 @@ def resolve_driver(
     # Validate an explicit RDB selector before choosing any driver. Mount
     # and format have already checked it when reading their partition info.
     if (partition is not None and adf_info is None and iso_info is None
-            and part_info is None):
+            and rbf_info is None and part_info is None):
         part_info = get_partition_info(image, block_size, partition)
     if driver is not None:
         return ResolvedDriver(Path(driver), "explicit", str(driver))
@@ -6439,6 +6469,11 @@ def resolve_driver(
             "You need to specify a filesystem handler with --driver.\n"
             "For ISO 9660, use CDFileSystem from an AmigaOS installation."
         )
+    if rbf_info is not None:
+        return driver_resolver.find_os9_driver(
+            rbf_info.dos_type,
+            f"OS-9 disk image detected ({rbf_info.format_name}, volume "
+            f"{escape_text(rbf_info.volume_name)}).")
 
     result = extract_embedded_driver(image, block_size, partition)
     if result is not None:
@@ -6450,12 +6485,17 @@ def resolve_driver(
     if part_info is None:
         part_info = get_partition_info(image, block_size, partition)
     dostype = part_info.get("dostype")
+    name = part_info.get("name") or partition
+    if is_os9_type(dostype):
+        return driver_resolver.find_os9_driver(
+            dostype,
+            f"Partition {escape_text(name)} has no filesystem driver for "
+            f"{dos_type_tag(dostype)} in its RDB.")
     if not driver_resolver.is_dos_type(dostype):
         raise DriverNotFound(
             "No embedded filesystem driver found for this partition.\n"
             "You need to specify a filesystem handler with --driver"
         )
-    name = part_info.get("name") or partition
     return driver_resolver.find_folder_driver(
         dostype,
         f"Partition {escape_text(name)} has no filesystem driver for "
@@ -6518,6 +6558,18 @@ def _fork_daemon_parent() -> int:
     os._exit(code if code >= 0 else 1)
 
 
+def _detect_rbf(image, partition) -> Optional[RBFInfo]:
+    """The OS-9 volume of an image without an RDB that partition selects
+    (rbf_image.select_rbf_volume), or None for an image that holds none.
+
+    Raises ValueError when partition names none of its volumes.
+    """
+    volumes = find_rbf_volumes(image)
+    if not volumes:
+        return None
+    return select_rbf_volume(volumes, partition)
+
+
 def _partitionless_image_error(image, partition, adf_info, iso_info):
     if partition is None:
         return None
@@ -6551,6 +6603,7 @@ def mount_fuse(
     # First, check if this is an ADF (floppy disk image)
     adf_info = detect_adf(image)
     iso_info = None
+    rbf_info = None
     part_info = None
 
     if adf_info is not None:
@@ -6569,18 +6622,27 @@ def mount_fuse(
                 raise SystemExit(f"Error: {error}")
             part_name = "CD0"
         else:
-            # HDF/RDB image - get partition info
+            # An OS-9 disk without an RDB
             try:
-                part_info = get_partition_info(image, block_size, partition, write=write)
-            except (IOError, PartitionNotFound) as e:
-                names = _entry_partitions(e, image, block_size)
-                raise SystemExit(f"Error: {e}{_entry_partitions_hint(names)}")
-            part_name = part_info["name"]
+                rbf_info = _detect_rbf(image, partition)
+            except ValueError as e:
+                raise SystemExit(f"Error: {e}")
+            if rbf_info is not None:
+                part_name = rbf_info.volume_name or "OD0"
+            else:
+                # HDF/RDB image - get partition info
+                try:
+                    part_info = get_partition_info(image, block_size, partition, write=write)
+                except (IOError, PartitionNotFound) as e:
+                    names = _entry_partitions(e, image, block_size)
+                    raise SystemExit(f"Error: {e}{_entry_partitions_hint(names)}")
+                part_name = part_info["name"]
 
     try:
         resolved = resolve_driver(
             image, driver, block_size, partition,
             adf_info=adf_info, part_info=part_info, iso_info=iso_info,
+            rbf_info=rbf_info,
         )
     except IOError as e:
         raise SystemExit(f"Error: {e}")
@@ -6642,6 +6704,11 @@ def mount_fuse(
             print(f"Mounting ADF floppy ({floppy_type}) from {image}")
         elif iso_info is not None:
             print(f"Mounting ISO 9660 image ({escape_text(iso_info.volume_id)}) from {image}")
+        elif rbf_info is not None:
+            where = rbf_info.where()
+            print(f"Mounting {rbf_info.format_name} volume "
+                  f"'{escape_text(rbf_info.volume_name)}' from {image}"
+                  + (f" ({where})" if where else ""))
         else:
             print(f"Mounting partition '{escape_text(part_name)}' from {image}")
         print(f"Filesystem driver: {driver_desc}")
@@ -6686,6 +6753,7 @@ def mount_fuse(
                 adf_info=adf_info,
                 iso_info=iso_info,
                 remove_driver=resolved.temporary,
+                rbf_info=rbf_info,
             )
         except (OSError, ValueError) as exc:
             # Lock conflicts and invalid partitions are expected refusals.
@@ -7332,14 +7400,25 @@ def _create_bridge_from_args(args, command: str, read_only: bool = True):
             sys.exit(1)
         raise SystemExit(f"Error: {error}")
 
+    rbf_info = None
+    if adf_info is None and iso_info is None:
+        try:
+            rbf_info = _detect_rbf(image, partition)
+        except ValueError as e:
+            if use_json:
+                print(_json.dumps(_json_error(command, "PARTITION_NOT_FOUND", str(e))))
+                sys.exit(1)
+            raise SystemExit(f"Error: {e}")
+
     try:
         part_info = None
-        if partition is not None and adf_info is None and iso_info is None:
+        if (partition is not None and adf_info is None and iso_info is None
+                and rbf_info is None):
             part_info = get_partition_info(
                 image, block_size, partition, write=not read_only)
         resolved = resolve_driver(
             image, driver, block_size, partition, adf_info=adf_info,
-            iso_info=iso_info, part_info=part_info)
+            iso_info=iso_info, part_info=part_info, rbf_info=rbf_info)
     except IOError as e:
         names = _entry_partitions(e, image, block_size)
         if use_json:
@@ -7377,6 +7456,7 @@ def _create_bridge_from_args(args, command: str, read_only: bool = True):
             adf_info=adf_info,
             iso_info=iso_info,
             remove_driver=resolved.temporary,
+            rbf_info=rbf_info,
         )
     except SystemExit as e:
         if temp_driver is not None:
@@ -8672,6 +8752,58 @@ def _partition_driver(image: Path, block_size: Optional[int],
     return info, resolved.description
 
 
+def _inspect_rbf(image: Path, volumes: List[RBFInfo], use_json: bool) -> None:
+    """Report the OS-9 volumes of an image without an RDB."""
+    import json as _json
+    import amitools.fs.DosType as DosType
+
+    try:
+        resolved = resolve_driver(image, None, None, None, rbf_info=volumes[0])
+        driver_error = None
+    except DriverNotFound as exc:
+        resolved = None
+        driver_error = " ".join(str(exc).splitlines()[1:])
+    if use_json:
+        envelope = _json_result("inspect",
+            image=str(image),
+            image_type="os9",
+            volumes=[{
+                "volume_name": vol.volume_name,
+                "format": vol.format_name,
+                "dos_type": DosType.num_to_tag_str(vol.dos_type),
+                "dos_type_raw": f"0x{vol.dos_type:08x}",
+                "block_size": vol.block_size,
+                "start_block": vol.low_block,
+                "num_blocks": vol.num_blocks,
+                "fs_blocks": vol.fs_blocks,
+                "mbr_partition": vol.mbr_index,
+                "boot_sector": vol.boot_sector,
+            } for vol in volumes],
+            driver=resolved.to_json() if resolved else None,
+            note=driver_error,
+        )
+        print(_json.dumps(envelope, indent=2))
+        return
+    print(f"OS-9 Disk Image: {image}")
+    for vol in volumes:
+        where = vol.where()
+        print(f"  Volume: {escape_text(vol.volume_name)}"
+              + (f" (MBR partition {vol.mbr_index})" if vol.mbr_index is not None else ""))
+        print(f"    Format: {vol.format_name}")
+        print(f"    DOS type: {DosType.num_to_tag_str(vol.dos_type)} (0x{vol.dos_type:08x})")
+        print(f"    Block size: {vol.block_size} bytes")
+        print(f"    Start block: {vol.low_block}"
+              + (" (after a PC boot sector)" if vol.boot_sector else ""))
+        print(f"    Blocks: {vol.num_blocks} (file system: {vol.fs_blocks})")
+    if len(volumes) > 1:
+        print("\nSelect a volume with --partition <MBR entry> or --partition <volume name>.")
+    print("\nNote: OS-9 disks don't contain embedded filesystem drivers.")
+    if resolved is not None:
+        print(f"Filesystem driver: {resolved.description}")
+    else:
+        print(driver_error)
+
+
 def cmd_inspect(args):
     """Handle the 'inspect' subcommand."""
     import json as _json
@@ -8758,6 +8890,12 @@ def cmd_inspect(args):
         print(f"  Volume ID: {escape_text(iso_info.volume_id)}")
         print(f"  Block size: {iso_info.block_size} bytes")
         print(f"  Total blocks: {iso_info.total_blocks}")
+        return
+
+    # Check for OS-9 disks without an RDB
+    rbf_volumes = find_rbf_volumes(args.image)
+    if rbf_volumes:
+        _inspect_rbf(args.image, rbf_volumes, use_json)
         return
 
     if use_json:

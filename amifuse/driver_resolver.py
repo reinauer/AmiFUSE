@@ -273,3 +273,35 @@ def find_folder_driver(dos_type: int, subject: str, quiet: bool = False) -> Reso
             f"in {user_dir}, or use --driver."
         )
     raise DriverNotFound(f"{subject}\n{problem or _bundled_missing()}\n{remedy}")
+
+
+def find_os9_driver(dos_type: int, subject: str) -> ResolvedDriver:
+    """Pick os9-rbf-handler for an OS-9 volume (OS9\\0-OS9\\2) that has no
+    driver of its own: the copy in the user's drivers folder.
+
+    AmiFUSE bundles no OS-9 handler. subject is the first line of the error
+    raised when there is none, naming the volume.
+
+    Raises DriverNotFound, also when the file cannot be read.
+    """
+    from .rbf_image import DRIVER_NAME, format_name
+
+    user_dir = user_driver_dir()
+    if user_dir is not None:
+        path = user_dir / DRIVER_NAME
+        if _usable(path):
+            version, digest = _identity(
+                path, f"your {DRIVER_NAME}", subject,
+                "Make it readable, remove it, or use --driver.")
+            label = version or f"sha256 {digest[:12]}"
+            return ResolvedDriver(
+                path, "user", f"{path} (your drivers folder, {label})",
+                version=version, sha256=digest,
+            )
+    where = user_dir or NO_USER_DRIVER_DIR
+    raise DriverNotFound(
+        f"{subject}\n"
+        f"{format_name(dos_type)} volumes need {DRIVER_NAME}, the OS-9 RBF "
+        f"filesystem handler for AmigaOS (https://github.com/cdhooper/amiga_os9_rbf_handler).\n"
+        f"Place {DRIVER_NAME} in {where}, or use --driver."
+    )
