@@ -6992,6 +6992,11 @@ def format_volume(
             raise SystemExit(
                 "Error: --dos-type is only for a floppy image (901120 or "
                 "1802240 bytes); a partition has its DOS type in the RDB.")
+        elif find_rbf_volumes(image):
+            raise SystemExit(
+                f"Error: {image} is an OS-9 disk without an RDB. amifuse "
+                "format formats RDB partitions only; format the disk with "
+                "OS-9 tools or from AmigaOS.")
         else:
             part_info = get_partition_info(image, block_size, partition, write=True)
     except (OSError, ValueError) as exc:
@@ -9249,7 +9254,7 @@ commands:
   mount <image>             Mount an Amiga filesystem image via FUSE.
     --driver PATH             Filesystem binary (default: RDB, your drivers
                               folder, then the bundled FastFileSystem
-                              for DOS0-7).
+                              for DOS0-7, or os9-rbf-handler for OS-9).
     --mountpoint PATH         Mount location (default: /Volumes/<partition>).
     --partition NAME          Partition name (e.g. DH0) or index (defaults to first).
     --block-size N            Override block size (defaults to auto/512).
@@ -9279,7 +9284,7 @@ commands:
                               Format an Amiga partition.
     --driver PATH             Filesystem binary (default: RDB, your drivers
                               folder, then the bundled FastFileSystem
-                              for DOS0-7).
+                              for DOS0-7, or os9-rbf-handler for OS-9).
     --block-size N            Override block size (defaults to auto/512).
     --debug                   Enable debug logging.
 
@@ -9288,7 +9293,7 @@ commands:
     --partition NAME          Partition name (e.g. DH0) or index.
     --driver PATH             Filesystem binary (default: RDB, your drivers
                               folder, then the bundled FastFileSystem
-                              for DOS0-7).
+                              for DOS0-7, or os9-rbf-handler for OS-9).
     --block-size N            Override block size (defaults to auto/512).
     --recursive               List all entries recursively.
     --json                    Output results as JSON.
@@ -9300,7 +9305,7 @@ commands:
     --partition NAME          Partition name (e.g. DH0) or index.
     --driver PATH             Filesystem binary (default: RDB, your drivers
                               folder, then the bundled FastFileSystem
-                              for DOS0-7).
+                              for DOS0-7, or os9-rbf-handler for OS-9).
     --block-size N            Override block size (defaults to auto/512).
     --json                    Output results as JSON.
     --debug                   Enable debug logging.
@@ -9311,7 +9316,7 @@ commands:
     --partition NAME          Partition name (e.g. DH0) or index.
     --driver PATH             Filesystem binary (default: RDB, your drivers
                               folder, then the bundled FastFileSystem
-                              for DOS0-7).
+                              for DOS0-7, or os9-rbf-handler for OS-9).
     --block-size N            Override block size (defaults to auto/512).
     --json                    Output results as JSON.
     --debug                   Enable debug logging.
@@ -9323,7 +9328,7 @@ commands:
     --partition NAME          Partition name (e.g. DH0) or index.
     --driver PATH             Filesystem binary (default: RDB, your drivers
                               folder, then the bundled FastFileSystem
-                              for DOS0-7).
+                              for DOS0-7, or os9-rbf-handler for OS-9).
     --block-size N            Override block size (defaults to auto/512).
     --json                    Output results as JSON.
     --debug                   Enable debug logging.
@@ -9334,7 +9339,7 @@ commands:
     --partition NAME          Partition name (e.g. DH0) or index.
     --driver PATH             Filesystem binary (default: RDB, your drivers
                               folder, then the bundled FastFileSystem
-                              for DOS0-7).
+                              for DOS0-7, or os9-rbf-handler for OS-9).
     --block-size N            Override block size (defaults to auto/512).
     --json                    Output results as JSON.
     --debug                   Enable debug logging.
@@ -9369,7 +9374,7 @@ commands:
         "mount", help="Mount an Amiga filesystem image via FUSE."
     )
     mount_parser.add_argument("image", type=Path, help="Disk image file or physical disk device")
-    mount_parser.add_argument("--driver", type=Path, help="Filesystem binary (default: RDB, your drivers folder, then the bundled FastFileSystem for DOS0-7)")
+    mount_parser.add_argument("--driver", type=Path, help="Filesystem binary (default: RDB, your drivers folder, then the bundled FastFileSystem for DOS0-7, or os9-rbf-handler for OS-9)")
     mount_parser.add_argument("--mountpoint", type=Path, help="Mount location (default: /Volumes/<partition> on macOS, first free drive letter on Windows)")
     mount_parser.add_argument(
         "--partition", type=str, help="Partition name (e.g. DH0) or index (defaults to first)."
@@ -9467,7 +9472,7 @@ commands:
         "partition", type=str,
         help="Partition name (e.g. DH0) or index; for a floppy image, the volume name.")
     format_parser.add_argument("volname", nargs="?", help="Volume name (default: Empty)")
-    format_parser.add_argument("--driver", type=Path, help="Filesystem binary (default: RDB, your drivers folder, then the bundled FastFileSystem for DOS0-7)")
+    format_parser.add_argument("--driver", type=Path, help="Filesystem binary (default: RDB, your drivers folder, then the bundled FastFileSystem for DOS0-7, or os9-rbf-handler for OS-9)")
     format_parser.add_argument(
         "--block-size", type=block_size_arg, help="Override block size (defaults to auto/512)."
     )
@@ -9498,7 +9503,8 @@ commands:
     ls_parser.add_argument(
         "--driver", type=Path,
         help="Filesystem binary (default: RDB, your drivers folder, "
-             "then the bundled FastFileSystem for DOS0-7).",
+             "then the bundled FastFileSystem for DOS0-7, or os9-rbf-handler "
+             "for OS-9).",
     )
     ls_parser.add_argument(
         "--block-size", type=block_size_arg,
@@ -9538,7 +9544,8 @@ commands:
     verify_parser.add_argument(
         "--driver", type=Path,
         help="Filesystem binary (default: RDB, your drivers folder, "
-             "then the bundled FastFileSystem for DOS0-7).",
+             "then the bundled FastFileSystem for DOS0-7, or os9-rbf-handler "
+             "for OS-9).",
     )
     verify_parser.add_argument(
         "--block-size", type=block_size_arg,
@@ -9575,7 +9582,8 @@ commands:
     hash_parser.add_argument(
         "--driver", type=Path,
         help="Filesystem binary (default: RDB, your drivers folder, "
-             "then the bundled FastFileSystem for DOS0-7).",
+             "then the bundled FastFileSystem for DOS0-7, or os9-rbf-handler "
+             "for OS-9).",
     )
     hash_parser.add_argument(
         "--block-size", type=block_size_arg,
@@ -9612,7 +9620,8 @@ commands:
     read_parser.add_argument(
         "--driver", type=Path,
         help="Filesystem binary (default: RDB, your drivers folder, "
-             "then the bundled FastFileSystem for DOS0-7).",
+             "then the bundled FastFileSystem for DOS0-7, or os9-rbf-handler "
+             "for OS-9).",
     )
     read_parser.add_argument(
         "--block-size", type=block_size_arg,
@@ -9648,7 +9657,8 @@ commands:
     write_parser.add_argument(
         "--driver", type=Path,
         help="Filesystem binary (default: RDB, your drivers folder, "
-             "then the bundled FastFileSystem for DOS0-7).",
+             "then the bundled FastFileSystem for DOS0-7, or os9-rbf-handler "
+             "for OS-9).",
     )
     write_parser.add_argument(
         "--block-size", type=block_size_arg,

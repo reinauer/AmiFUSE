@@ -284,7 +284,7 @@ def find_os9_driver(dos_type: int, subject: str) -> ResolvedDriver:
 
     Raises DriverNotFound, also when the file cannot be read.
     """
-    from .rbf_image import DRIVER_NAME, format_name
+    from .rbf_image import DRIVER_NAME, RELEASES_URL, format_name
 
     user_dir = user_driver_dir()
     if user_dir is not None:
@@ -302,6 +302,7 @@ def find_os9_driver(dos_type: int, subject: str) -> ResolvedDriver:
     raise DriverNotFound(
         f"{subject}\n"
         f"{format_name(dos_type)} volumes need {DRIVER_NAME}, the OS-9 RBF "
-        f"filesystem handler for AmigaOS (https://github.com/cdhooper/amiga_os9_rbf_handler).\n"
-        f"Place {DRIVER_NAME} in {where}, or use --driver."
+        f"filesystem handler for AmigaOS, from {RELEASES_URL}\n"
+        f"Copy it from the release archive into {where} (create the folder "
+        f"if needed), named exactly {DRIVER_NAME}, or use --driver."
     )
