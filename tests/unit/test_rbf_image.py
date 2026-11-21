@@ -7,10 +7,16 @@ volumes, and for RDB partitions of the OS-9 DOS types, goes to
 os9-rbf-handler in the user's drivers folder.
 """
 
+import json
 import struct
+from contextlib import ExitStack
 from pathlib import Path
 
 import pytest
+from amitools.fs.FSString import FSString
+from amitools.fs.blkdev.DiskGeometry import DiskGeometry
+from amitools.fs.blkdev.RawBlockDevice import RawBlockDevice
+from amitools.fs.rdb.RDisk import RDisk
 
 from amifuse import rbf_image
 from amifuse.bootstrap import SyntheticRbfDosEnv
@@ -71,6 +77,23 @@ def _with_mbr(volume: bytes, start: int = 63, ptype: int = 0x09) -> bytes:
     mbr[0x1FE:0x200] = b"\x55\xaa"
     gap = bytes((start - 1) * 512)
     return bytes(mbr) + gap + bytes(512) + volume
+
+
+def _with_mbr_entries(*volumes) -> bytes:
+    """A disk with one MBR partition per (with_boot_sector, volume), in
+    order, each starting on a 64-sector boundary."""
+    mbr = bytearray(512)
+    body = bytearray()
+    start = 64
+    for i, (boot, volume) in enumerate(volumes):
+        data = (bytes(512) if boot else b"") + volume
+        data += bytes(-len(data) % (64 * 512))
+        entry = 0x1BE + 16 * i
+        mbr[entry + 4] = 0x09
+        struct.pack_into("<II", mbr, entry + 8, start + len(body) // 512, len(data) // 512)
+        body += data
+    mbr[0x1FE:0x200] = b"\x55\xaa"
+    return bytes(mbr) + bytes(63 * 512) + bytes(body)
 
 
 def _write(tmp_path: Path, data: bytes, name: str = "disk.img") -> Path:
@@ -202,3 +225,143 @@ def test_os9_volume_folds_ascii(fuse_mock):
         bridge._first_block = 0
         bridge.get_disk_info = lambda: None
         assert bridge.name_fold() == "ascii"
+
+
+# ---------------------------------------------------------------------------
+# Without the handler: what the CLI says
+# ---------------------------------------------------------------------------
+
+def _os9_rdb(path: Path, store_driver: bool = False) -> Path:
+    """An RDB disk with one OS9\\0 partition and no driver in the RDB."""
+    raw = RawBlockDevice(str(path), read_only=False, block_bytes=512)
+    with ExitStack() as cleanup:
+        raw.create(320)
+        cleanup.callback(raw.close)
+        rdisk = RDisk(raw)
+        cleanup.callback(rdisk.close)
+        rdisk.create(DiskGeometry(10, 1, 32), rdb_cyls=1)
+        rdisk.add_partition(FSString("OS9"), (1, 9), dos_type=DOS_OS9_68K)
+        raw.flush()
+    return path
+
+
+def test_rdb_os9_partition_without_driver_in_the_rdb(user_driver_dir, tmp_path):
+    """Before OS-9 support this raised "No embedded filesystem driver found"."""
+    from amifuse.fuse_fs import resolve_driver
+
+    image = _os9_rdb(tmp_path / "disk.hdf")
+    with pytest.raises(DriverNotFound) as caught:
+        resolve_driver(image, None, None, "OS9")
+    message = str(caught.value)
+    assert "Partition OS9 has no filesystem driver for OS90" in message
+    assert rbf_image.DRIVER_NAME in message and str(user_driver_dir) in message
+    assert rbf_image.RELEASES_URL in message
+
+    handler = user_driver_dir / rbf_image.DRIVER_NAME
+    handler.write_bytes(b"\x00\x00\x03\xf3$VER: os9-rbf-handler 1.0 (1.1.2026)\x00")
+    resolved = resolve_driver(image, None, None, "OS9")
+    assert (resolved.path, resolved.source) == (handler, "user")
+
+
+def test_inspect_json_without_the_handler(user_driver_dir, tmp_path, capsys):
+    from amifuse import fuse_fs
+
+    image = _write(tmp_path, _os9k_volume(64, False))
+    fuse_fs.main(["inspect", "--json", str(image)])     # exits 0: no SystemExit
+    out = json.loads(capsys.readouterr().out)
+    assert out["status"] == "ok" and out["image_type"] == "os9"
+    assert out["driver"] is None
+    assert rbf_image.DRIVER_NAME in out["note"]
+    (vol,) = out["volumes"]
+    assert (vol["volume_name"], vol["dos_type_raw"]) == ("Vol9K", "0x4f533901")
+
+
+def test_inspect_text_without_the_handler(user_driver_dir, tmp_path, capsys):
+    from amifuse import fuse_fs
+
+    image = _write(tmp_path, _os9k_volume(64, True))
+    fuse_fs.main(["inspect", str(image)])
+    out = capsys.readouterr().out
+    assert "OS-9 Disk Image" in out and "OS-9000 (little-endian)" in out
+    assert f"Place {rbf_image.DRIVER_NAME}" not in out
+    assert f"named exactly {rbf_image.DRIVER_NAME}" in out
+
+
+def test_ls_without_the_handler(user_driver_dir, tmp_path, capsys):
+    from amifuse import fuse_fs
+
+    image = _write(tmp_path, _os9k_volume(64, True))
+    with pytest.raises(SystemExit) as caught:
+        fuse_fs.main(["ls", str(image)])
+    assert rbf_image.DRIVER_NAME in str(caught.value)
+
+    with pytest.raises(SystemExit) as caught:
+        fuse_fs.main(["ls", "--json", str(image)])
+    assert caught.value.code == 1
+    err = json.loads(capsys.readouterr().out)["error"]
+    assert err["code"] == "DRIVER_NOT_FOUND"
+    assert rbf_image.DRIVER_NAME in err["message"]
+
+
+def test_ls_with_a_volume_the_image_does_not_hold(user_driver_dir, tmp_path, capsys):
+    from amifuse import fuse_fs
+
+    image = _write(tmp_path, _with_mbr(_os9k_volume(100, True)))
+    with pytest.raises(SystemExit) as caught:
+        fuse_fs.main(["ls", str(image), "--partition", "Other"])
+    assert "No OS-9 volume 'Other'" in str(caught.value)
+
+    with pytest.raises(SystemExit) as caught:
+        fuse_fs.main(["ls", "--json", str(image), "--partition", "1"])
+    assert caught.value.code == 1
+    err = json.loads(capsys.readouterr().out)["error"]
+    assert err["code"] == "PARTITION_NOT_FOUND"
+    assert "0 (Vol9K)" in err["message"]
+
+
+def test_launcher_mounts_each_volume_of_an_mbr(tmp_path):
+    from amifuse.launcher import _enumerate_mount_units
+
+    image = _write(tmp_path, _with_mbr_entries(
+        (True, _os9k_volume(100, True, b"PcVol")),
+        (False, _os9_68k_volume(160, 512, b"M68Vol"))))
+    vols = find_rbf_volumes(image)
+    assert [(v.mbr_index, v.dos_type) for v in vols] == [(0, DOS_OS9K_LE), (1, DOS_OS9_68K)]
+    units, fallback = _enumerate_mount_units(str(image))
+    assert fallback is None
+    assert [(u.name, u.label) for u in units] == [("0", "PcVol"), ("1", "M68Vol")]
+
+
+@pytest.mark.parametrize("volume", [
+    _os9k_volume(64, True), _os9_68k_volume(160, 512)], ids=["os9000", "os9-68k"])
+def test_launcher_mounts_a_lone_volume_without_partition(tmp_path, volume):
+    from amifuse.launcher import _enumerate_mount_units
+
+    units, fallback = _enumerate_mount_units(str(_write(tmp_path, volume)))
+    assert fallback is None
+    assert [(u.name, u.label) for u in units] == [(None, "OS-9 disk")]
+
+
+def test_format_refuses_an_os9_disk_without_an_rdb(user_driver_dir, tmp_path):
+    from amifuse import fuse_fs
+
+    image = _write(tmp_path, _os9_68k_volume(160, 512))
+    before = image.read_bytes()
+    with pytest.raises(SystemExit) as caught:
+        fuse_fs.main(["format", str(image), "NewVol"])
+    assert str(caught.value) == (
+        f"Error: {image} is an OS-9 disk without an RDB. amifuse format "
+        "formats RDB partitions only; format the disk with OS-9 tools or "
+        "from AmigaOS.")
+    assert image.read_bytes() == before
+
+
+def test_format_of_an_os9_floppy_of_adf_size_asks_for_dos_type(user_driver_dir, tmp_path):
+    """An OS-9 floppy the size of an ADF keeps the floppy message."""
+    from amifuse import fuse_fs
+
+    image = _write(tmp_path, _os9_68k_volume(1760, 512))
+    assert find_rbf_volumes(image)
+    with pytest.raises(SystemExit) as caught:
+        fuse_fs.main(["format", str(image), "NewVol"])
+    assert "--dos-type" in str(caught.value)

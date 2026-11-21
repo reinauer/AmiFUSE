@@ -26,6 +26,7 @@ DOS_OS9K_BE = 0x4F533901    # "OS9\1": OS-9000 RBF, big-endian
 DOS_OS9K_LE = 0x4F533902    # "OS9\2": OS-9000 RBF, little-endian
 OS9_FAMILY = 0x4F533900
 DRIVER_NAME = "os9-rbf-handler"
+RELEASES_URL = "https://github.com/cdhooper/amiga_os9_rbf_handler/releases"
 
 # A PC boot sector comes before the ID block on PC OS-9000 disks.
 PC_BOOT_SECTOR = 512

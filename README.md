@@ -178,7 +178,7 @@ amifuse mount /path/to/disk.hdf
 | Argument | Required | Description |
 |----------|----------|-------------|
 | `image` | Yes | Path to the Amiga hard disk image file |
-| `--driver` | No | Path to filesystem handler binary (default: RDB, your drivers folder, then the bundled FastFileSystem for DOS0-7; see [Bundled FastFileSystem](#bundled-fastfilesystem)) |
+| `--driver` | No | Path to filesystem handler binary (default: RDB, your drivers folder, then the bundled FastFileSystem for DOS0-7, or os9-rbf-handler for OS-9; see [Bundled FastFileSystem](#bundled-fastfilesystem) and [OS-9 disks](#os-9-disks)) |
 | `--mountpoint` | macOS/Windows: No, Linux: Yes | Mount location (macOS: `/Volumes/<partition>`, Windows: first free drive letter) |
 | `--partition` | No | Partition name (e.g., `DH0`) or index (default: first partition). A repeated name is renamed as AmigaOS renames it, so a second `DH0` is `DH0.1`; a partition marked not to mount takes its name after those that mount |
 | `--block-size` | No | Override block size (default: auto-detect or 512) |
@@ -438,10 +438,30 @@ welcome.
 
 [`os9-rbf-handler`](https://github.com/cdhooper/amiga_os9_rbf_handler), an
 AmigaOS filesystem handler for OS-9 RBF disks, reads and writes OS-9/68k
-disks and OS-9000 disks of either byte order. AmiFUSE does not bundle it: copy it into your drivers folder
-(`~/.local/share/amifuse/drivers/` on macOS and Linux,
-`%LOCALAPPDATA%\amifuse\drivers\` on Windows) under that name, or give it
-with `--driver`.
+disks and OS-9000 disks of either byte order. AmiFUSE does not bundle it.
+To install it, download the archive of the latest release from its
+[releases page](https://github.com/cdhooper/amiga_os9_rbf_handler/releases), e.g. `os9_rbf_handler_1.0.lha`, and copy the
+handler from it into your drivers folder. The file must be named exactly
+`os9-rbf-handler`, and the folder may not exist yet:
+
+```bash
+# macOS / Linux
+7z x os9_rbf_handler_1.0.lha          # or: lha x os9_rbf_handler_1.0.lha
+mkdir -p ~/.local/share/amifuse/drivers
+cp os9_rbf_handler_1.0/os9-rbf-handler ~/.local/share/amifuse/drivers/
+```
+
+```powershell
+# Windows
+7z x os9_rbf_handler_1.0.lha
+New-Item -ItemType Directory -Force "$env:LOCALAPPDATA\amifuse\drivers"
+Copy-Item os9_rbf_handler_1.0\os9-rbf-handler "$env:LOCALAPPDATA\amifuse\drivers\"
+```
+
+The handler in release 1.0 has the SHA-256
+`5d2fd031addb2bc680c8f69b572a4195634c7cf3c9f04a951f2b8e93b00c17c6`.
+`amifuse inspect <image>` on an OS-9 disk then names the handler it found.
+Instead of installing it, you can also give the handler with `--driver`.
 
 - **RDB partitions** of DOS type `OS9\0` (OS-9/68k), `OS9\1` (OS-9000
   big-endian) or `OS9\2` (OS-9000 little-endian) use the handler stored in
@@ -461,9 +481,9 @@ amifuse mount os9000.img --mountpoint ./mnt --write
 amifuse ls os9floppy.img --driver ./os9-rbf-handler
 ```
 
-OS-9 names are case-insensitive for a-z, as on OS-9. Formatting is
-supported for RDB partitions; a disk without an RDB has to be formatted
-with OS-9 tools or from AmigaOS first.
+OS-9 names are case-insensitive for a-z, as on OS-9. `amifuse format`
+formats RDB partitions only: it refuses an OS-9 disk without an RDB, which
+has to be formatted with OS-9 tools or from AmigaOS.
 
 ## Bundled FastFileSystem
 
@@ -487,6 +507,10 @@ Without `--driver`, AmiFUSE picks the driver in this order:
    Windows, `~/.local/share/amifuse/drivers` elsewhere), for DOS0-DOS7. Place
    the one from AmigaOS 3.2 there to use it instead of the bundled one.
 3. The bundled FastFileSystem, for DOS0-DOS7.
+
+For OS-9 volumes (`OS9\0`-`OS9\2`, and OS-9 disks without an RDB), step 2
+looks for `os9-rbf-handler` in your drivers folder instead, and there is no
+step 3; see [OS-9 disks](#os-9-disks).
 
 The mount banner, `amifuse doctor` and `amifuse inspect` name the driver in use;
 `inspect` names it for an ADF and for each partition of a hard disk image.
