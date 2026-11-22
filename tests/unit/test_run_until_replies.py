@@ -226,6 +226,17 @@ def test_handler_that_never_finishes_fails_after_the_busy_cycle_limit(sleeps, cy
     assert sleeps == []
 
 
+@pytest.mark.parametrize("attempts, expected, runs", [
+    (2, ANSWER, MAX_RUNS + 5),
+    (1, None, MAX_RUNS),
+], ids=["two", "one"])
+def test_a_second_attempt_takes_the_reply(sleeps, attempts, expected, runs):
+    # The reply arrives after the first wait exhausts its busy limit.
+    launcher = ScriptedLauncher(repeat(BUSY), reply_in=MAX_RUNS + 5)
+    assert _wait(_bridge(launcher), attempts=attempts) == expected
+    assert launcher.runs == runs
+
+
 @pytest.mark.parametrize("pkt_type, to", [
     (8, " to ACTION_LOCATE_OBJECT (8)"),
     (1234, " to packet type 1234"),

@@ -14,7 +14,9 @@ import pytest
 from amitools.vamos.libstructs.dos import InfoDataStruct  # type: ignore
 
 from amifuse.fuse_fs import HandlerBridge
-from amifuse.startup_runner import ACTION_DISK_INFO, ACTION_LOCATE_OBJECT, SHARED_LOCK
+from amifuse.startup_runner import (
+    ACTION_DISK_INFO, ACTION_FREE_LOCK, ACTION_LOCATE_OBJECT, SHARED_LOCK,
+)
 from amifuse.rdb_inspect import detect_adf
 
 pytestmark = pytest.mark.integration
@@ -35,8 +37,16 @@ def sfs_bridge(fixture_root, tmp_path):
         bridge.close()
 
 
-def test_both_queued_packets_are_answered(sfs_bridge):
+def test_both_queued_packets_are_answered(sfs_bridge, monkeypatch):
     bridge = sfs_bridge
+    sent = []
+    send = bridge.dospkt._send_unwaited
+
+    def record(action, arg1):
+        sent.append((int(action), arg1))
+        return send(action, arg1)
+
+    monkeypatch.setattr(bridge.dospkt, "_send_unwaited", record)
     info = bridge.vh.alloc.alloc_memory(36, label="InfoData")
     bridge.mem.w_block(info.addr, bytes(36))
     # Both waits end before the handler runs, so both packets are queued.
@@ -49,4 +59,6 @@ def test_both_queued_packets_are_answered(sfs_bridge):
 
     # Both are answered; the late lock is given back with ACTION_FREE_LOCK.
     assert bridge.wait_for_pending() == []
+    assert [action for action, _ in sent] == [ACTION_FREE_LOCK]
+    assert sent[0][1] != 0
     assert InfoDataStruct(bridge.mem, info.addr).id_NumBlocks.val > 0
