@@ -119,7 +119,7 @@ class BlockDeviceBackend:
 
     def __init__(self, image: Path, block_size: Optional[int] = None, read_only=True,
                  adf_info=None, iso_info=None, mbr_partition_index=None,
-                 partition_scope=False, partition=None):
+                 partition_scope=False, partition=None, rbf_info=None):
         self.image = image
         # Keep the caller's request separate from the effective size:
         # None means auto-detect, which open_rdisk needs to see as None.
@@ -130,10 +130,12 @@ class BlockDeviceBackend:
         self.rdb: Optional[RDisk] = None
         self.adf_info = adf_info  # ADFInfo if this is a floppy image
         self.iso_info = iso_info  # ISOInfo if this is an ISO image
+        self.rbf_info = rbf_info  # RBFInfo if this is an OS-9 image without an RDB
         self.mbr_partition_index = mbr_partition_index  # For MBR disks with multiple 0x76 partitions
         self.mbr_context = None  # MBRContext if opened via MBR partition
         self.host_lock = HostFileLock(image, read_only=read_only)
-        self.partition_scope = partition_scope and adf_info is None and iso_info is None
+        self.partition_scope = (partition_scope and adf_info is None and iso_info is None
+                                and rbf_info is None)
         self.partition = partition
         # The partition's number in its RDB, once open() has found it, and
         # the name it mounts as there (DH0.1 for a repeated DH0; None for a
@@ -457,6 +459,22 @@ class BlockDeviceBackend:
             self.total_blocks = self.iso_info.total_blocks
             return
 
+        # For OS-9 RBF images, the handler gets the volume's blocks as
+        # cylinders of the whole image (see bootstrap.SyntheticRbfDosEnv).
+        if self.rbf_info is not None:
+            self.blkdev = RawBlockDevice(
+                str(self.image), read_only=self.read_only,
+                block_bytes=self.rbf_info.block_size
+            )
+            self.blkdev.open()
+            self.rdb = None
+            self.block_size = self.rbf_info.block_size
+            self.cyls = self.rbf_info.cylinders
+            self.heads = self.rbf_info.heads
+            self.secs = self.rbf_info.sectors_per_track
+            self.total_blocks = self.rbf_info.cylinders
+            return
+
         # RDB image (plain, Parceiro-style MBR+RDB, or inside an Emu68-style
         # 0x76 MBR partition): delegate scanning, lenient parsing, and MBR
         # handling to open_rdisk so the logic lives in one place.
@@ -570,6 +588,15 @@ class BlockDeviceBackend:
             return (
                 f"{self.image} ISO 9660 ({escape_text(self.iso_info.volume_id)}) "
                 f"blocks={self.total_blocks} block={self.block_size}"
+            )
+        if self.rbf_info is not None:
+            from .rdb_inspect import escape_text
+            where = self.rbf_info.where()
+            return (
+                f"{self.image} {self.rbf_info.format_name} "
+                f"({escape_text(self.rbf_info.volume_name)}) "
+                f"start={self.rbf_info.low_block} blocks={self.rbf_info.num_blocks} "
+                f"block={self.block_size}" + (f" [{where}]" if where else "")
             )
         assert self.rdb is not None
         pd = self.rdb.rdb.phy_drv
