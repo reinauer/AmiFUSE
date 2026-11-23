@@ -1,7 +1,8 @@
-"""`amifuse write` must not leave a file larger than 0x7FFFFFFF bytes.
+"""`amifuse write` must not leave a file larger than the volume takes.
 
 AmigaDOS file positions and sizes are signed LONGs (ACTION_SEEK, fib_Size),
-so a longer file cannot be seeked to its end.
+so without the 64 bit packets a file longer than 0x7FFFFFFF bytes cannot be
+seeked to its end (HandlerBridge.max_file_size).
 """
 
 import json
@@ -28,6 +29,7 @@ def write_context(monkeypatch, tmp_path):
                            input=str(source), json=True, debug=False)
     bridge = Mock()
     bridge.is_mounted.return_value = fs.MountState(True, None, None)
+    bridge.max_file_size.return_value = fs._MAX_FILE_SIZE
     bridge.locate_path.return_value = (0, fs.ERROR_OBJECT_NOT_FOUND, [])  # a new name
     bridge.delete_object.return_value = (-1, 0)
     bridge.open_file.return_value = (0x1000, 0x2000)
@@ -41,7 +43,7 @@ def write_context(monkeypatch, tmp_path):
         return bridge, None
 
     monkeypatch.setattr(fs, "_create_bridge_from_args", fake_create)
-    monkeypatch.setattr(fs, "_ensure_parent_dirs", lambda *a, **kw: None)
+    monkeypatch.setattr(fs, "_ensure_parent_dirs", Mock())
 
     def report_size(size):
         # cmd_write takes the size from fstat() on the source it opened.
@@ -67,8 +69,8 @@ def write_context(monkeypatch, tmp_path):
 
 @pytest.mark.parametrize("use_json", [True, False])
 @pytest.mark.parametrize("size", [0x80000000, 0x80010000, 1 << 32])
-def test_source_above_limit_refused_before_bridge(write_context, capsys,
-                                                  use_json, size):
+def test_source_above_limit_refused_before_open(write_context, capsys,
+                                                use_json, size):
     args, bridge, created, source, report_size = write_context
     args.json = use_json
     report_size(size)
@@ -80,8 +82,8 @@ def test_source_above_limit_refused_before_bridge(write_context, capsys,
         assert error["code"] == "FILE_TOO_LARGE"
         assert error["details"] == {"size": size, "max_size": 0x7FFFFFFF}
     else:
-        assert "larger than 2147483647 bytes" in str(caught.value)
-    assert created == []
+        assert "larger than 2147483647 bytes, the most the handler takes" in str(caught.value)
+    fs._ensure_parent_dirs.assert_not_called()
     bridge.open_file.assert_not_called()
     bridge.write_handle_reply.assert_not_called()
 
@@ -104,7 +106,7 @@ def test_source_growing_to_limit_still_written(write_context, monkeypatch,
     args, bridge, created, source, report_size = write_context
     source.write_bytes(b"x" * 12)
     report_size(4)
-    monkeypatch.setattr(fs, "_MAX_FILE_SIZE", 12)
+    bridge.max_file_size.return_value = 12
     monkeypatch.setattr(fs, "IO_CHUNK", 8)
     fs.cmd_write(args)
     result = json.loads(capsys.readouterr().out)
@@ -118,23 +120,33 @@ def test_source_growing_to_limit_still_written(write_context, monkeypatch,
 def test_source_growing_past_limit_stops(write_context, monkeypatch, capsys,
                                          use_json):
     """A source that grows past the limit while it is read, or a stream, is
-    refused before the image is touched."""
+    refused by the size of its copy, before the destination is touched."""
     args, bridge, created, source, report_size = write_context
     args.json = use_json
     source.write_bytes(b"x" * 20)
     report_size(4)
-    monkeypatch.setattr(fs, "_MAX_FILE_SIZE", 12)
+    bridge.max_file_size.return_value = 12
     monkeypatch.setattr(fs, "IO_CHUNK", 8)
     with pytest.raises(SystemExit) as caught:
         fs.cmd_write(args)
-    message = f"Source holds more than 12 bytes, the largest AmigaDOS file: {source}"
+    message = (f"Source file is larger than 12 bytes, the most the handler "
+               f"takes: {source} (20 bytes)")
     if use_json:
         assert caught.value.code == 1
         error = json.loads(capsys.readouterr().out)["error"]
         assert error["code"] == "FILE_TOO_LARGE"
         assert error["message"] == message
-        assert error["details"] == {"size": 4, "max_size": 12}
+        assert error["details"] == {"size": 20, "max_size": 12}
     else:
         assert str(caught.value) == f"Error: s{message[1:]}"
-    assert created == []
-    bridge.write_handle_reply.assert_not_called()
+    fs._ensure_parent_dirs.assert_not_called()
+    bridge.open_file.assert_not_called()
+
+
+def test_source_above_2_gib_written_with_the_64_bit_packets(write_context, capsys):
+    args, bridge, created, source, report_size = write_context
+    bridge.max_file_size.return_value = fs._MAX_FILE_SIZE64
+    report_size(1 << 32)
+    fs.cmd_write(args)
+    assert json.loads(capsys.readouterr().out)["status"] == "ok"
+    bridge.write_handle_reply.assert_called_once_with(0x1000, b"hello")

@@ -74,7 +74,13 @@ def fuse_mock(monkeypatch):
     _stub_module("amifuse.process_mgr", ProcessManager=dummy_cls)
     _stub_module(
         "amifuse.startup_runner",
+        ACTION_CHANGE_FILE_POSITION64=8001,
+        ACTION_CHANGE_FILE_SIZE64=8003,
         ACTION_CREATE_DIR=22,
+        ACTION_GET_FILE_POSITION64=8002,
+        ACTION_GET_FILE_SIZE64=8004,
+        DP64_INIT=-3,
+        DP64_RES1=24,
         ACTION_FINDINPUT=1005,
         ACTION_FINDOUTPUT=1006,
         ACTION_FINDUPDATE=1004,

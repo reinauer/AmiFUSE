@@ -140,12 +140,18 @@ from .rbf_image import (
 from .vamos_runner import VamosHandlerRuntime
 from .bootstrap import BootstrapAllocator
 from .startup_runner import (
+    ACTION_CHANGE_FILE_POSITION64,
+    ACTION_CHANGE_FILE_SIZE64,
     ACTION_CREATE_DIR,
+    ACTION_GET_FILE_POSITION64,
+    ACTION_GET_FILE_SIZE64,
     ACTION_FINDINPUT,
     ACTION_FINDOUTPUT,
     ACTION_FINDUPDATE,
     ACTION_LOCATE_OBJECT,
     ACTION_PARENT,
+    DP64_INIT,
+    DP64_RES1,
     HandlerLauncher,
     OFFSET_BEGINNING,
     OFFSET_CURRENT,
@@ -240,6 +246,8 @@ _LONG_MAX = 0x7FFFFFFF
 # further, but a seek could not reach its end and fib_Size, also a signed
 # LONG, could not hold its size.
 _MAX_FILE_SIZE = _LONG_MAX
+# The largest with the 64 bit packets (HandlerBridge.max_file_size).
+_MAX_FILE_SIZE64 = 2 ** 63 - 1
 
 
 class SeekResult(Enum):
@@ -494,8 +502,11 @@ def _raise_if_handler_crashed(obj, context: str):
 _FIB_SIZE = 8 + 256
 
 
-def _parse_fib(mem, fib_addr: int) -> Dict:
+def _parse_fib(mem, fib_addr: int, wide: bool = False) -> Dict:
     """Decode a FileInfoBlock into a simple dict.
+
+    With wide, size and num_blocks are the 64 bit values that the 64 bit
+    Examine packets store in fib_Reserved, at 228 and 236.
 
     Uses direct memory reads with known offsets from FileInfoBlockStruct:
       fib_DiskKey: ULONG at 0
@@ -526,6 +537,9 @@ def _parse_fib(mem, fib_addr: int) -> Dict:
     protection = mem.r32(fib_addr + 116)  # fib_Protection (LONG)
     size = mem.r32(fib_addr + 124)      # fib_Size (ULONG)
     num_blocks = mem.r32s(fib_addr + 128)      # fib_NumBlocks (LONG)
+    if wide:
+        size = (mem.r32(fib_addr + 228) << 32) | mem.r32(fib_addr + 232)
+        num_blocks = (mem.r32(fib_addr + 236) << 32) | mem.r32(fib_addr + 240)
     name_bytes = mem.r_block(fib_addr + 8, 108)  # fib_FileName starts at offset 8
     name_len = name_bytes[0]
     name = name_bytes[1 : 1 + name_len].decode("latin-1", errors="ignore")
@@ -544,6 +558,12 @@ def _parse_fib(mem, fib_addr: int) -> Dict:
 
 class HandlerBridge:
     """Maintains the handler state and issues DOS packets synchronously."""
+
+    # Whether the handler answers the 64 bit Examine packets (_examine_into)
+    # and the 64 bit position and size packets of AmigaOS 4 (_has_pos64).
+    # __init__ sets None, to be found out; a bridge without it has neither.
+    _examine64: Optional[bool] = False
+    _pos64: Optional[bool] = False
 
     def __init__(
         self,
@@ -763,6 +783,7 @@ class HandlerBridge:
         # Run the deferred initialisation: PFS3 validates the volume on a
         # timer request, which is due at once here, as every pending one.
         self._flush_pending_signals()
+        self._examine64 = self._pos64 = None
         # cache a best-effort volume name
         self._volname = None
         self._drive_name = None
@@ -1902,8 +1923,7 @@ class HandlerBridge:
                     print(f"[amifuse] list_dir: obtained root_lock=0x{root_lock:x}")
             fib_mem = self._alloc_fib()
             # First Examine returns info about the directory itself, not contents
-            pkt_addr, _ = self.launcher.send_examine(self.state, lock_bptr, fib_mem.addr)
-            reply = self._run_until_reply(pkt_addr, "examine")
+            reply = self._examine_into(lock_bptr, fib_mem.addr)
             entries: List[Dict] = []
             if reply is None or reply[0] == 0:
                 if self._debug:
@@ -1913,7 +1933,7 @@ class HandlerBridge:
                     self.free_lock(root_lock)
                 return entries
             if self._debug:
-                dir_info = _parse_fib(self.mem, fib_mem.addr)
+                dir_info = _parse_fib(self.mem, fib_mem.addr, self._examine64)
                 print(f"[amifuse] list_dir: Examine OK dir_name='{dir_info['name']}' type={dir_info['dir_type']}")
             # Don't add the first entry - it's the directory itself, not a child
             # Iterate via ExamineNext to get actual directory contents
@@ -1923,9 +1943,7 @@ class HandlerBridge:
             # (res1=0) when the directory is exhausted, which breaks the loop.
             unnamed = 0
             for iter_num in range(65536):
-                pkt_addr, _ = self.launcher.send_examine_next(
-                    self.state, lock_bptr, fib_mem.addr)
-                reply = self._run_until_reply(pkt_addr, "examine_next")
+                reply = self._examine_into(lock_bptr, fib_mem.addr, next_entry=True)
                 if reply is None or reply[0] == 0:
                     if self._debug:
                         res2 = reply[1] if reply else -1
@@ -1936,7 +1954,7 @@ class HandlerBridge:
                               f"with error {reply[1]}; it may be incomplete",
                               file=sys.stderr)
                     break
-                entry = _parse_fib(self.mem, fib_mem.addr)
+                entry = _parse_fib(self.mem, fib_mem.addr, self._examine64)
                 if self._debug:
                     print(f"[amifuse] list_dir: ExamineNext #{iter_num} name='{entry['name']}' type={entry['dir_type']}")
                 if not entry["name"]:
@@ -1996,13 +2014,12 @@ class HandlerBridge:
             if path == "/":
                 return {"dir_type": 2, "size": 0, "name": "", "protection": 0}, 0
             fib_mem = self._alloc_fib()
-            pkt_addr, _ = self.launcher.send_examine(self.state, lock, fib_mem.addr)
-            reply = self._run_until_reply(pkt_addr, "examine")
+            reply = self._examine_into(lock, fib_mem.addr)
             if reply is None or reply[0] == 0:
                 for l in reversed(locks):
                     self.free_lock(l)
                 return None, -1 if reply is None else reply[1]
-            info = _parse_fib(self.mem, fib_mem.addr)
+            info = _parse_fib(self.mem, fib_mem.addr, self._examine64)
             info["lock_key"] = self._lock_key(lock)  # see _parse_fib()
             for l in reversed(locks):
                 self.free_lock(l)
@@ -2010,11 +2027,45 @@ class HandlerBridge:
 
     def _examine_lock(self, lock: int) -> Optional[Dict]:
         fib_mem = self._alloc_fib()
-        pkt_addr, _ = self.launcher.send_examine(self.state, lock, fib_mem.addr)
-        reply = self._run_until_reply(pkt_addr, "examine")
+        reply = self._examine_into(lock, fib_mem.addr)
         if reply is None or reply[0] == 0:
             return None
-        return _parse_fib(self.mem, fib_mem.addr)
+        return _parse_fib(self.mem, fib_mem.addr, self._examine64)
+
+    def _examine_into(self, lock: int, fib_addr: int,
+                      next_entry: bool = False) -> Optional[Tuple[int, int]]:
+        """Examine lock, or ExamineNext for next_entry, into the FIB at
+        fib_addr; the reply as _run_until_reply gives it.
+
+        Once the handler has answered a 64 bit packet, only those are sent,
+        and callers pass _examine64 to _parse_fib. The first Examine that
+        succeeds decides: where the 64 bit packet fails, or succeeds
+        without storing the 64 bit size, and the classic one succeeds, only
+        classic packets follow.
+        """
+        if self._examine64 is None and not next_entry:
+            # A handler that answers an unknown packet with success leaves these.
+            self.mem.w_block(fib_addr + 228, b"\xff" * 8)
+            pkt_addr, _ = self.launcher.send_examine64(self.state, lock, fib_addr)
+            reply = self._run_until_reply(pkt_addr, "examine")
+            if reply is None:
+                return None
+            if reply[0] != 0 and bytes(self.mem.r_block(fib_addr + 228, 8)) != b"\xff" * 8:
+                self._examine64 = True
+                return reply
+            pkt_addr, _ = self.launcher.send_examine(self.state, lock, fib_addr)
+            reply = self._run_until_reply(pkt_addr, "examine")
+            if reply is not None and reply[0] != 0:
+                self._examine64 = False
+            return reply
+        if self._examine64:
+            pkt_addr, _ = self.launcher.send_examine64(
+                self.state, lock, fib_addr, next_entry)
+        elif next_entry:
+            pkt_addr, _ = self.launcher.send_examine_next(self.state, lock, fib_addr)
+        else:
+            pkt_addr, _ = self.launcher.send_examine(self.state, lock, fib_addr)
+        return self._run_until_reply(pkt_addr, "examine_next" if next_entry else "examine")
 
     def _parent_lock(self, lock: int) -> Tuple[int, int]:
         """(lock, res2) on the directory of lock's object; 0 at the root."""
@@ -2299,10 +2350,9 @@ class HandlerBridge:
                 fib_mem = self._alloc_fib()
                 # lock_bptr=0 -> current volume root
                 root_lock, _ = self.locate(0, "")
-                pkt_addr, _ = self.launcher.send_examine(self.state, root_lock, fib_mem.addr)
-                reply = self._run_until_reply(pkt_addr, "examine")
+                reply = self._examine_into(root_lock, fib_mem.addr)
                 if reply is not None and reply[0]:
-                    info = _parse_fib(self.mem, fib_mem.addr)
+                    info = _parse_fib(self.mem, fib_mem.addr, self._examine64)
                     if info.get("name"):
                         self._volname = info["name"]
                         if root_lock:
@@ -2410,8 +2460,11 @@ class HandlerBridge:
         ERROR_SEEK_ERROR is PAST_END, and any other refusal or no reply is
         FAILED; the position is then None. An offset that does not fit in a
         LONG is FAILED without reaching the handler, which would see it
-        wrapped.
+        wrapped. A handler with the 64 bit packets takes any offset.
         """
+        with self._lock:
+            if self._has_pos64():
+                return self._seek64(fh_addr, offset, mode)
         if not _LONG_MIN <= offset <= _LONG_MAX:
             return SeekResult.FAILED, None
         with self._lock:
@@ -2427,6 +2480,50 @@ class HandlerBridge:
             return SeekResult.FAILED, None
         return SeekResult.OK, res1
 
+    def _has_pos64(self) -> bool:
+        """Whether the handler answers the 64 bit packets; the first call asks.
+
+        ACTION_GET_FILE_POSITION64 on no handle is answered with DP64_INIT
+        in dp_Res0 by a handler that has the packets. Any other answer, or
+        none, is a handler without them.
+        """
+        if self._pos64 is None:
+            answer = self._packet64(ACTION_GET_FILE_POSITION64, None)
+            self._pos64 = answer is not None and answer[0] == DP64_INIT
+        return self._pos64
+
+    def _packet64(self, action: int, fh_addr: Optional[int], arg2: int = 0,
+                  arg3: int = 0, waits: int = 1) -> Optional[Tuple[int, int, int]]:
+        """Send a DosPacket64 on the handle; (dp_Res0, dp_Res1, dp_Res2) or None."""
+        fh_arg = FileHandleStruct(self.mem, fh_addr).args.val if fh_addr else 0
+        with self._lock:
+            pkt_addr, _ = self.launcher.send_packet64(
+                self.state, action, fh_arg, arg2, arg3)
+            for _ in range(waits):
+                reply = self._run_until_reply(pkt_addr, _packet_type_name(action))
+                if reply is not None:
+                    quad = (self.mem.r32(pkt_addr + DP64_RES1) << 32) | self.mem.r32(
+                        pkt_addr + DP64_RES1 + 4)
+                    return reply[0], quad - (quad >> 63 << 64), reply[1]
+        return None
+
+    def _seek64(self, fh_addr: int, offset: int, mode: int) -> Tuple[SeekResult, Optional[int]]:
+        """seek_handle through ACTION_CHANGE_FILE_POSITION64, which answers
+        DOSTRUE, so the old position comes from ACTION_GET_FILE_POSITION64."""
+        old = self._packet64(ACTION_GET_FILE_POSITION64, fh_addr)
+        if old is None or old[1] < 0:
+            return SeekResult.FAILED, None
+        answer = self._packet64(ACTION_CHANGE_FILE_POSITION64, fh_addr, offset, mode)
+        if answer is None or answer[1] == 0:
+            if answer is not None and answer[2] == ERROR_SEEK_ERROR:
+                return SeekResult.PAST_END, None
+            return SeekResult.FAILED, None
+        return SeekResult.OK, old[1]
+
+    def max_file_size(self) -> int:
+        """The largest offset and size the handler's packets can carry."""
+        return _MAX_FILE_SIZE64 if self._has_pos64() else _MAX_FILE_SIZE
+
     def handle_position(self, fh_addr: int) -> Tuple[bool, Optional[int]]:
         """Return the handler's position for the handle, without moving it.
 
@@ -2436,9 +2533,15 @@ class HandlerBridge:
         when the answer is no position from 0 to 0x7FFFFFFF. Past 2 GiB,
         pfs3aio refuses with ERROR_SEEK_ERROR, FastFileSystem v0.2 answers
         -1 with no error code, and SmartFilesystem answers with a position
-        that dp_Res1, a signed LONG, carries as negative.
+        that dp_Res1, a signed LONG, carries as negative. A handler with the
+        64 bit packets answers ACTION_GET_FILE_POSITION64 instead.
         """
         with self._lock:
+            if self._has_pos64():
+                answer = self._packet64(ACTION_GET_FILE_POSITION64, fh_addr)
+                if answer is None:
+                    return False, None
+                return True, (answer[1] if answer[1] >= 0 else None)
             pkt_addr, _ = self.launcher.send_seek_handle(
                 self.state, fh_addr, 0, OFFSET_CURRENT)
             reply = self._run_until_reply(pkt_addr, "seek")
@@ -2532,7 +2635,7 @@ class HandlerBridge:
         """Seek to offset and read up to size bytes from there.
 
         Returns b"" at or past end of file, and None when the seek or the
-        read fails or the offset does not fit in a LONG.
+        read fails or the offset is out of the handler's range.
         """
         with self._lock:
             result, _ = self.seek_handle(fh_addr, offset)
@@ -2579,7 +2682,8 @@ class HandlerBridge:
         file over old blocks. A write into a file whose end cannot be
         measured goes out without the undo. On pfs3aio and SmartFilesystem that is
         a file of 2 GiB or more, which the write cannot grow, since
-        AmigaFuseFS ends every write at or below 0x7FFFFFFF. Only when the
+        AmigaFuseFS ends every write at or below 0x7FFFFFFF without the 64
+        bit packets, which measure any end. Only when the
         seeks may have moved the handle does the write fail before sending
         any data. Inside the old end a failure cannot be undone: the
         packets before it stay written. A handler can write part of the
@@ -2668,8 +2772,8 @@ class HandlerBridge:
         """Write data at offset and return (dp_Res1, dp_Res2) like write_handle_reply().
 
         A write past end of file first fills the gap with zeros, as POSIX
-        requires. Any other failed seek, including one to an offset that
-        does not fit in a LONG, fails the write instead of writing at the
+        requires. Any other failed seek, including one to an offset out
+        of the handler's range, fails the write instead of writing at the
         handle's old position.
 
         end, when given, is the end of file the caller holds for the
@@ -2768,7 +2872,7 @@ class HandlerBridge:
         refuses every ACTION_SET_FILE_SIZE with DOSFALSE, which reads as a
         size of 0. A truncate to 0 that BFFS refuses with DOSFALSE still
         returns (0, 0) when the file is already empty. A length outside 0
-        to 0x7FFFFFFF, a failed seek or a missing reply carries 0.
+        to max_file_size(), a failed seek or a missing reply carries 0.
 
         A grow writes zeros from the old end of file, as a write past it
         does, and fails before writing anything when the volume cannot
@@ -2812,9 +2916,10 @@ class HandlerBridge:
         moves end at the first seek that fails, and the shrink is then not
         sent again. The size returned can still differ from length.
         """
-        # A fill past 0x7FFFFFFF would leave a file no seek can reach the
-        # end of, and ACTION_SET_FILE_SIZE carries the size in a LONG.
-        if not 0 <= length <= _LONG_MAX:
+        # Without the 64 bit packets, a fill past 0x7FFFFFFF would leave a
+        # file no seek can reach the end of, and ACTION_SET_FILE_SIZE carries
+        # the size in a LONG.
+        if not 0 <= length <= self.max_file_size():
             return -1, 0
         with self._lock:
             grow = False
@@ -2910,6 +3015,10 @@ class HandlerBridge:
                               mode: int = OFFSET_BEGINNING) -> Tuple[int, int]:
         """Send ACTION_SET_FILE_SIZE and return (dp_Res1, dp_Res2).
 
+        A handler with the 64 bit packets gets ACTION_CHANGE_FILE_SIZE64,
+        which answers DOSTRUE, and then ACTION_GET_FILE_SIZE64 for the size,
+        and takes any size up to max_file_size(). Otherwise:
+
         dp_Res1 is the new size, or -1 when the handler fails the change,
         and dp_Res2 then holds its AmigaDOS error code. A change that gets
         no reply returns (-1, 0). Only an integer size from 0 to 0x7FFFFFFF
@@ -2937,9 +3046,16 @@ class HandlerBridge:
             size, mode = operator.index(size), operator.index(mode)
         except TypeError:
             return -1, 0
-        if mode != OFFSET_BEGINNING or not 0 <= size <= _LONG_MAX:
+        if mode != OFFSET_BEGINNING or not 0 <= size <= self.max_file_size():
             return -1, 0
         with self._lock:
+            if self._has_pos64():
+                # ACTION_CHANGE_FILE_SIZE64 answers DOSTRUE, not the size.
+                answer = self._packet64(ACTION_CHANGE_FILE_SIZE64, fh_addr, size, mode, waits=2)
+                if answer is None or answer[1] == 0:
+                    return -1, 0 if answer is None else answer[2]
+                answer = self._packet64(ACTION_GET_FILE_SIZE64, fh_addr)
+                return (-1, 0) if answer is None or answer[1] < 0 else (answer[1], 0)
             pkt_addr, _ = self.launcher.send_set_file_size(
                 self.state, fh_addr, size, mode)
             reply = self._run_until_reply(pkt_addr, "setsize")
@@ -4288,15 +4404,15 @@ class AmigaFuseFS(_FuseOperations):
                 raise FuseOSError(errno.EIO)
             return data
 
-    @staticmethod
-    def _fit_file_size_limit(offset: int, size: int) -> int:
-        """Return how many of size bytes at offset fit within _MAX_FILE_SIZE.
+    def _fit_file_size_limit(self, offset: int, size: int) -> int:
+        """Return how many of size bytes at offset fit within the bridge's
+        max_file_size().
 
         Raises EFBIG when offset is past the limit, or at it with bytes to
         write. With size 0 this checks a file length, such as a truncate
         target.
         """
-        room = _MAX_FILE_SIZE - offset
+        room = self.bridge.max_file_size() - offset
         if room < 0 or (room == 0 and size > 0):
             raise FuseOSError(errno.EFBIG)
         return min(size, room)
@@ -4409,7 +4525,7 @@ class AmigaFuseFS(_FuseOperations):
         # so the handler sees only the low 32 bits of the length: 4 GiB + 4
         # and -4 GiB + 4 both arrive as 4. Fail a negative length with
         # EINVAL, as truncate(2) does, and one above 0x7FFFFFFF with EFBIG,
-        # as write() does.
+        # as write() does, unless the handler has the 64 bit packets.
         if length < 0:
             raise FuseOSError(errno.EINVAL)
         self._fit_file_size_limit(length, 0)
@@ -4431,6 +4547,7 @@ class AmigaFuseFS(_FuseOperations):
             temp_handle = True
         else:
             temp_handle = False
+        limit = self.bridge.max_file_size()
         try:
             with self._fh_lock:
                 entry = self._fh_cache.get(fh)
@@ -4438,12 +4555,12 @@ class AmigaFuseFS(_FuseOperations):
                 # handlers match names case-insensitively, so an entry's
                 # path does not tell which handles share its file.
                 # Directory and icon handles have no fh_addr. A handle past
-                # 0x7FFFFFFF is not moved: no seek can return it there, so
-                # its next read would fail.
+                # max_file_size() is not moved: no seek can return it there,
+                # so its next read would fail.
                 handles = [e for h, e in self._fh_cache.items()
                            if h != fh and e.get("fh_addr") and not e.get("closed")]
-                others = [e for e in handles if (e["pos"] or 0) <= _LONG_MAX]
-                far = [e for e in handles if (e["pos"] or 0) > _LONG_MAX]
+                others = [e for e in handles if (e["pos"] or 0) <= limit]
+                far = [e for e in handles if (e["pos"] or 0) > limit]
             if entry is None or entry.get("closed"):
                 raise FuseOSError(errno.EIO)
             if entry.get("deferred_read"):
@@ -8437,7 +8554,6 @@ def _spool_write_source(source, host_path: Path, host_size: int, use_json: bool)
     spool = tempfile.SpooledTemporaryFile(max_size=_WRITE_SPOOL_MAX)
     try:
         with source:
-            size = 0
             while True:
                 try:
                     data = source.read(IO_CHUNK)
@@ -8446,14 +8562,6 @@ def _spool_write_source(source, host_path: Path, host_size: int, use_json: bool)
                            f"Cannot read source file: {host_path}: {exc.strerror or exc}")
                 if not data:
                     break
-                size += len(data)
-                if size > _MAX_FILE_SIZE:
-                    # The source holds more than its fstat() size: it grew
-                    # while it was read
-                    refuse("FILE_TOO_LARGE",
-                           f"Source holds more than {_MAX_FILE_SIZE} bytes, the "
-                           f"largest AmigaDOS file: {host_path}",
-                           {"size": host_size, "max_size": _MAX_FILE_SIZE})
                 try:
                     spool.write(data)
                 except OSError as exc:
@@ -8519,21 +8627,12 @@ def cmd_write(args):
             sys.exit(1)
         raise SystemExit(f"Error: source is a directory: {host_path}")
 
-    # Refuse before the bridge exists: opening the destination with O_TRUNC
+    # Refuse before the destination is opened: opening it with O_TRUNC
     # (ACTION_FINDOUTPUT) would already empty an existing file. So the
-    # source is opened here, and a source that cannot be read fails first.
+    # source is copied here, and a source that cannot be read fails first;
+    # its size is checked against the handler's limit once the bridge runs.
     source, host_size = _open_write_source(host_path, use_json)
     try:
-        if host_size > _MAX_FILE_SIZE:
-            if use_json:
-                print(json.dumps(_json_error("write", "FILE_TOO_LARGE",
-                    f"Source file is larger than {_MAX_FILE_SIZE} bytes, the "
-                    f"largest AmigaDOS file: {host_path} ({host_size} bytes)",
-                    {"size": host_size, "max_size": _MAX_FILE_SIZE})))
-                sys.exit(1)
-            raise SystemExit(
-                f"Error: source file is larger than {_MAX_FILE_SIZE} bytes, the "
-                f"largest AmigaDOS file: {host_path} ({host_size} bytes)")
 
         # From here on, source is a copy of the whole source file, so a read
         # error fails the command before the image is touched.
@@ -8559,6 +8658,18 @@ def cmd_write(args):
         state = _check_file_command_mount(bridge, "write", use_json)
         mount_details = _mount_state_details(state)
         normalized = "/" + amiga_path.lstrip("/")
+        # Without the 64 bit packets the handler takes 2 GiB - 1 at most.
+        size = max(host_size, source.seek(0, os.SEEK_END))
+        limit = bridge.max_file_size()
+        source.seek(0)
+        if size > limit:
+            message = (f"source file is larger than {limit} bytes, the most the "
+                       f"handler takes: {host_path} ({size} bytes)")
+            if use_json:
+                print(json.dumps(_json_error("write", "FILE_TOO_LARGE",
+                    message[0].upper() + message[1:], {"size": size, "max_size": limit})))
+                sys.exit(1)
+            raise SystemExit(f"Error: {message}")
 
         # Create parent directories if needed
         write_started = True
