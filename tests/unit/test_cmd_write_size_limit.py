@@ -39,7 +39,7 @@ def write_context(monkeypatch, tmp_path):
     created = []
 
     def fake_create(*a, **kw):
-        created.append(a)
+        created.append(kw.get("read_only", True))
         return bridge, None
 
     monkeypatch.setattr(fs, "_create_bridge_from_args", fake_create)
@@ -69,13 +69,18 @@ def write_context(monkeypatch, tmp_path):
 
 @pytest.mark.parametrize("use_json", [True, False])
 @pytest.mark.parametrize("size", [0x80000000, 0x80010000, 1 << 32])
-def test_source_above_limit_refused_before_open(write_context, capsys,
+def test_source_above_limit_refused_before_open(write_context, capsys, monkeypatch,
                                                 use_json, size):
+    """A source above 2 GiB is checked against the handler through a bridge
+    that only reads, and refused before it is copied."""
     args, bridge, created, source, report_size = write_context
     args.json = use_json
     report_size(size)
+    monkeypatch.setattr(fs, "_spool_write_source",
+                        Mock(side_effect=AssertionError("copied")))
     with pytest.raises(SystemExit) as caught:
         fs.cmd_write(args)
+    assert created == [True]
     if use_json:
         assert caught.value.code == 1
         error = json.loads(capsys.readouterr().out)["error"]
@@ -149,4 +154,71 @@ def test_source_above_2_gib_written_with_the_64_bit_packets(write_context, capsy
     report_size(1 << 32)
     fs.cmd_write(args)
     assert json.loads(capsys.readouterr().out)["status"] == "ok"
+    assert created == [True, False]
     bridge.write_handle_reply.assert_called_once_with(0x1000, b"hello")
+
+
+def test_source_up_to_2_gib_asks_no_bridge_before_the_copy(write_context, capsys):
+    args, bridge, created, source, report_size = write_context
+    report_size(0x7FFFFFFF)
+    fs.cmd_write(args)
+    assert json.loads(capsys.readouterr().out)["status"] == "ok"
+    assert created == [False]
+
+
+@pytest.mark.parametrize("use_json", [True, False])
+def test_source_growing_past_the_limit_stops_the_copy(write_context, monkeypatch,
+                                                      capsys, use_json):
+    """A copy that grows past the classic limit asks the handler, and stops
+    at the limit it names, before the destination is touched."""
+    args, bridge, created, source, report_size = write_context
+    args.json = use_json
+    source.write_bytes(b"x" * 20)
+    report_size(4)
+    monkeypatch.setattr(fs, "_MAX_FILE_SIZE", 8)
+    monkeypatch.setattr(fs, "IO_CHUNK", 8)
+    bridge.max_file_size.return_value = 12
+    with pytest.raises(SystemExit) as caught:
+        fs.cmd_write(args)
+    message = (f"Source file grew past 12 bytes, the most the handler takes, "
+               f"while it was copied: {source}")
+    if use_json:
+        assert caught.value.code == 1
+        error = json.loads(capsys.readouterr().out)["error"]
+        assert error["code"] == "FILE_TOO_LARGE"
+        assert error["message"] == message
+        assert error["details"] == {"max_size": 12}
+    else:
+        assert str(caught.value) == f"Error: s{message[1:]}"
+    assert created == [True]
+    bridge.open_file.assert_not_called()
+
+
+def test_source_growing_past_2_gib_copied_on_the_64_bit_packets(write_context,
+                                                                monkeypatch, capsys):
+    """A source that grows past the classic limit while it is copied is
+    written when the handler takes more."""
+    args, bridge, created, source, report_size = write_context
+    source.write_bytes(b"x" * 20)
+    report_size(4)
+    monkeypatch.setattr(fs, "_MAX_FILE_SIZE", 8)
+    monkeypatch.setattr(fs, "IO_CHUNK", 8)
+    bridge.max_file_size.return_value = fs._MAX_FILE_SIZE64
+    fs.cmd_write(args)
+    result = json.loads(capsys.readouterr().out)
+    assert result["status"] == "ok"
+    assert result["bytes_written"] == 20
+    assert created == [True, False]
+
+
+def test_an_unusable_volume_is_not_too_large(write_context, capsys):
+    """The bridge that asks the limit refuses a volume it cannot use."""
+    args, bridge, created, source, report_size = write_context
+    report_size(1 << 32)
+    bridge.is_mounted.return_value = fs.MountState(False, "not a DOS disk", None)
+    with pytest.raises(SystemExit):
+        fs.cmd_write(args)
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert error["code"] == "NOT_MOUNTED"
+    assert created == [True]
+    bridge.max_file_size.assert_not_called()

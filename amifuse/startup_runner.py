@@ -120,10 +120,13 @@ _PACKET_TYPE_NAMES = {
     ACTION_CHANGE_FILE_SIZE64: "ACTION_CHANGE_FILE_SIZE64",
     ACTION_GET_FILE_SIZE64: "ACTION_GET_FILE_SIZE64",
 }
-# struct DosPacket64: dp_Res0 (DP64_INIT in an answer) and dp_Res2 where a
-# DosPacket has dp_Res1 and dp_Res2, then dp_Res1 and dp_Arg2 as 64 bit values.
-DP64_SIZE = 60
+# struct DosPacket64 of the AmigaOS 4 SDK: dp_Res0 and dp_Res2 where a
+# DosPacket has dp_Res1 and dp_Res2, then dp_Res1, dp_Arg2 and dp_Arg5 as 64
+# bit values. The sender sets dp_Res0 to DP64_INIT; a handler with the
+# packets leaves it, one without them writes its 32 bit result over it.
+DP64_SIZE = 64
 DP64_INIT = -3
+DP64_RES0 = 12
 DP64_RES1 = 24
 _DP64_ARG1, _DP64_ARG2, _DP64_ARG3 = 32, 40, 48
 OFFSET_BEGINNING = -1
@@ -635,12 +638,14 @@ class HandlerLauncher:
 
     def send_packet64(self, state: HandlerLaunchState, pkt_type: int, arg1: int,
                       arg2: int = 0, arg3: int = 0):
-        """Queue a DosPacket64 with dp_Arg1, the 64 bit dp_Arg2 and dp_Arg3.
+        """Queue a DosPacket64 with dp_Arg1, the 64 bit dp_Arg2 and dp_Arg3,
+        and DP64_INIT in dp_Res0.
 
         Its reply reads as (dp_Res0, dp_Res2); the 64 bit dp_Res1 is at
         DP64_RES1 in the packet.
         """
         def fill(pkt_addr):
+            self.mem.w32(pkt_addr + DP64_RES0, DP64_INIT & 0xFFFFFFFF)
             self.mem.w32(pkt_addr + _DP64_ARG1, arg1 & 0xFFFFFFFF)
             self.mem.w32(pkt_addr + _DP64_ARG2, (arg2 >> 32) & 0xFFFFFFFF)
             self.mem.w32(pkt_addr + _DP64_ARG2 + 4, arg2 & 0xFFFFFFFF)

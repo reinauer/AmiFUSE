@@ -1,8 +1,9 @@
 """Files above 4 GiB on pfs3aio's large file build, through the 64 bit packets.
 
 Runs when the fixtures hold drivers/pfs3aio-largefile, a pfs3aio built with
-LARGE_FILE_SIZE=1. The image is sparse, and the file grows through the
-handler, which writes no data for it, so the 6 GiB take little space.
+LARGE_FILE_SIZE=1. The image is a truncated file of 6 GiB, and the file grows
+through the handler, which writes no data for it. A host file system that
+keeps truncated files sparse stores little of it; NTFS stores all 6 GiB.
 """
 
 import os

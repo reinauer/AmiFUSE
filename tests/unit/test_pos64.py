@@ -1,9 +1,10 @@
 """Position and size through the AmigaOS 4 packets 8001-8004.
 
-A handler with them answers every one with DP64_INIT in dp_Res0, and
-ACTION_CHANGE_FILE_POSITION64 and ACTION_CHANGE_FILE_SIZE64 with DOSTRUE, not
-the old position or the new size. One without them answers DOSFALSE and
-ERROR_ACTION_NOT_KNOWN in a DosPacket's dp_Res1 and dp_Res2, at offset 12.
+They go out with DP64_INIT in dp_Res0, which a handler with them leaves, and
+it answers ACTION_CHANGE_FILE_POSITION64 and ACTION_CHANGE_FILE_SIZE64 with
+DOSTRUE, not the old position or the new size. One without them answers
+DOSFALSE and ERROR_ACTION_NOT_KNOWN in a DosPacket's dp_Res1 and dp_Res2, at
+offset 12, over DP64_INIT.
 """
 
 import threading
@@ -128,6 +129,23 @@ def test_set_size_answers_the_size_the_handler_reports():
     assert b.set_handle_size_reply(FH, BIG + 8192) == (-1, 221)
 
 
+class RefusesPosition(File64):
+    """A handler with the packets that fails GET_FILE_POSITION64 on the file."""
+
+    def answer(self, ptype, arg1, arg2, arg3):
+        if ptype == GET_POS and arg1 == FH_ARG:
+            self.sent.append(ptype)
+            return (DP64_INIT, -1, 211)
+        return super().answer(ptype, arg1, arg2, arg3)
+
+
+def test_a_refused_position_is_no_position():
+    """dp_Res1 -1 of a failed GET_FILE_POSITION64 reads as -1, not 2**64 - 1."""
+    b = _bridge(RefusesPosition(), pos64=True)
+    assert b.seek_handle(FH, 10) == (fs.SeekResult.FAILED, None)
+    assert b.handle_position(FH) == (True, None)
+
+
 def test_the_launcher_builds_a_dospacket64():
     from amitools.vamos.libstructs.dos import DosPacketStruct
     from amitools.vamos.libstructs.exec_ import MessageStruct, NodeStruct
@@ -158,7 +176,9 @@ def test_the_launcher_builds_a_dospacket64():
     pkt, msg = launcher.send_packet64(state, CHANGE_POS, FH_ARG, BIG, OFFSET_END)
 
     assert pkt == msg + launcher._msg_size
+    assert DP64_SIZE == 64
     assert mem.r16(msg + launcher._mn_length_offset) == launcher._msg_size + DP64_SIZE
+    assert mem.r32s(pkt + 12) == DP64_INIT
     assert mem.r32(pkt + 8) == CHANGE_POS
     assert mem.r32(pkt + 32) == FH_ARG
     assert (mem.r32(pkt + 40) << 32 | mem.r32(pkt + 44)) == BIG

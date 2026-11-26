@@ -2483,9 +2483,11 @@ class HandlerBridge:
     def _has_pos64(self) -> bool:
         """Whether the handler answers the 64 bit packets; the first call asks.
 
-        ACTION_GET_FILE_POSITION64 on no handle is answered with DP64_INIT
-        in dp_Res0 by a handler that has the packets. Any other answer, or
-        none, is a handler without them.
+        ACTION_GET_FILE_POSITION64 on no handle goes out with DP64_INIT in
+        dp_Res0. A handler that has the packets leaves it there, one without
+        them writes its 32 bit result over it. Any other answer, or none, is
+        a handler without them. Only dp_Res0 counts: a handler with the
+        packets may answer the missing handle with any dp_Res1.
         """
         if self._pos64 is None:
             answer = self._packet64(ACTION_GET_FILE_POSITION64, None)
@@ -8526,12 +8528,41 @@ def _open_write_source(host_path: Path, use_json: bool):
 _WRITE_SPOOL_MAX = 16 * 1024 * 1024
 
 
-def _spool_write_source(source, host_path: Path, host_size: int, use_json: bool):
+def _too_large(host_path: Path, size: int, limit: int, use_json: bool):
+    """Refuse a source of size bytes that the handler cannot take."""
+    import json
+
+    message = (f"source file is larger than {limit} bytes, the most the "
+               f"handler takes: {host_path} ({size} bytes)")
+    if use_json:
+        print(json.dumps(_json_error("write", "FILE_TOO_LARGE",
+            message[0].upper() + message[1:], {"size": size, "max_size": limit})))
+        sys.exit(1)
+    raise SystemExit(f"Error: {message}")
+
+
+def _grew_too_large(host_path: Path, limit: int, use_json: bool):
+    """Refuse a source that grew past limit while it was copied."""
+    import json
+
+    message = (f"source file grew past {limit} bytes, the most the handler "
+               f"takes, while it was copied: {host_path}")
+    if use_json:
+        print(json.dumps(_json_error("write", "FILE_TOO_LARGE",
+            message[0].upper() + message[1:], {"max_size": limit})))
+        sys.exit(1)
+    raise SystemExit(f"Error: {message}")
+
+
+def _spool_write_source(source, host_path: Path, host_size: int, use_json: bool,
+                        limit: int = _MAX_FILE_SIZE, handler_limit=None):
     """Copy the whole source of `amifuse write` before the image is touched.
 
     Opening the destination empties an existing file. A source that fails
     part way through, one another program has locked from some offset say,
-    would then leave the destination holding part of the new contents.
+    would then leave the destination holding part of the new contents. A
+    source that grows past limit while it is copied is refused there, once
+    handler_limit(), when given, names no larger limit.
 
     Closes source, and returns the copy positioned at its start, or exits
     with an error.
@@ -8554,6 +8585,7 @@ def _spool_write_source(source, host_path: Path, host_size: int, use_json: bool)
     spool = tempfile.SpooledTemporaryFile(max_size=_WRITE_SPOOL_MAX)
     try:
         with source:
+            size = 0
             while True:
                 try:
                     data = source.read(IO_CHUNK)
@@ -8562,6 +8594,14 @@ def _spool_write_source(source, host_path: Path, host_size: int, use_json: bool)
                            f"Cannot read source file: {host_path}: {exc.strerror or exc}")
                 if not data:
                     break
+                size += len(data)
+                if size > limit:
+                    # It holds more than its fstat() size: it grew while it
+                    # was read, and the handler may take more than limit
+                    if handler_limit is not None:
+                        limit = handler_limit()
+                    if size > limit:
+                        _grew_too_large(host_path, limit, use_json)
                 try:
                     spool.write(data)
                 except OSError as exc:
@@ -8629,14 +8669,37 @@ def cmd_write(args):
 
     # Refuse before the destination is opened: opening it with O_TRUNC
     # (ACTION_FINDOUTPUT) would already empty an existing file. So the
-    # source is copied here, and a source that cannot be read fails first;
-    # its size is checked against the handler's limit once the bridge runs.
+    # source is copied here, and a source that cannot be read fails first.
     source, host_size = _open_write_source(host_path, use_json)
     try:
+        # Past the classic limit the handler's own is asked, once, through
+        # a bridge that only reads the image, before the copy goes on.
+        asked = []
+
+        def handler_limit():
+            if not asked:
+                probe, probe_driver = _create_bridge_from_args(
+                    args, "write", read_only=True)
+                try:
+                    _check_file_command_mount(probe, "write", use_json)
+                    asked.append(probe.max_file_size())
+                finally:
+                    try:
+                        probe.close()
+                    finally:
+                        _cleanup_bridge(None, probe_driver)
+            return asked[0]
+
+        limit = _MAX_FILE_SIZE
+        if host_size > limit:
+            limit = handler_limit()
+            if host_size > limit:
+                _too_large(host_path, host_size, limit, use_json)
 
         # From here on, source is a copy of the whole source file, so a read
         # error fails the command before the image is touched.
-        source = _spool_write_source(source, host_path, host_size, use_json)
+        source = _spool_write_source(source, host_path, host_size, use_json, limit,
+                                     handler_limit)
 
         # Safety warning (stderr so it doesn't interfere with JSON output)
         print(f"WARNING: This will modify the disk image: {args.image}", file=sys.stderr)
@@ -8663,13 +8726,7 @@ def cmd_write(args):
         limit = bridge.max_file_size()
         source.seek(0)
         if size > limit:
-            message = (f"source file is larger than {limit} bytes, the most the "
-                       f"handler takes: {host_path} ({size} bytes)")
-            if use_json:
-                print(json.dumps(_json_error("write", "FILE_TOO_LARGE",
-                    message[0].upper() + message[1:], {"size": size, "max_size": limit})))
-                sys.exit(1)
-            raise SystemExit(f"Error: {message}")
+            _too_large(host_path, size, limit, use_json)
 
         # Create parent directories if needed
         write_started = True

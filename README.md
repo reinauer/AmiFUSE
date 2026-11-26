@@ -601,6 +601,12 @@ Or use the installer's uninstall mode:
   the image is touched. A temporary directory on tmpfs, as `/tmp` often is,
   also holds the copy in RAM. Setting `TMPDIR` to an existing directory on a
   larger disk gets around both.
+- Files of 2 GiB and more need a handler that answers the AmigaOS 4 64 bit
+  packets, such as pfs3aio built with `LARGE_FILE_SIZE=1`; with other
+  handlers a file ends at 2 GiB - 1. That limit is the packets', not the
+  volume's. A pfs3aio large file volume whose large file flag is off ends
+  files at 4 GiB - 1, and a larger `amifuse write` fails there with "disk
+  full", after an existing destination was emptied.
 
 ### Known Windows write limitations
 
