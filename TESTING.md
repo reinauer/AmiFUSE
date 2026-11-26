@@ -108,6 +108,9 @@ Additional explicit smoke coverage:
 
 - `fixtures/readonly/AmigaOS3.2CD.iso` with
   `~/git/xcdfs/build/amiga/ODFileSystem`
+- `drivers/pfs3aio-largefile`, pfs3aio built with `LARGE_FILE_SIZE=1`, turns
+  on `tests/integration/test_large_files.py`, files above 4 GiB through the
+  64 bit packets. Without it the test skips.
 
 ## Quick Start
 

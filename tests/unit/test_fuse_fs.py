@@ -55,6 +55,7 @@ def _make_mock_bridge():
     )
     # write opens through open_file_reply(); tests set open_file().
     bridge.open_file_reply.side_effect = lambda *a, **kw: (bridge.open_file(*a, **kw), 0)
+    bridge.max_file_size.return_value = fuse_fs_mod._MAX_FILE_SIZE
     return bridge
 
 
@@ -7795,6 +7796,7 @@ def write_fs(fuse_mock):
 
     bridge = MagicMock()
     bridge._write_enabled = True
+    bridge.max_file_size.return_value = 0x7FFFFFFF
     bridge.state = None  # _check_handler_alive treats this as "not crashed"
     # Nothing exists until a test says so: on WinFsp, create() refuses a
     # name stat_path finds (_refuse_existing).

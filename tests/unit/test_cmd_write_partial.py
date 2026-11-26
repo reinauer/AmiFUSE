@@ -29,6 +29,7 @@ def write_context(monkeypatch, tmp_path):
                            input=str(source), json=True, debug=False)
     bridge = Mock()
     bridge.is_mounted.return_value = fs.MountState(True, None, None)
+    bridge.max_file_size.return_value = fs._MAX_FILE_SIZE
     bridge.locate_path.return_value = (0, fs.ERROR_OBJECT_NOT_FOUND, [])
     bridge.open_file.return_value = (0x1000, 0x2000)
     # write opens through open_file_reply(); tests set open_file().

@@ -202,9 +202,12 @@ class TestWritePastEndOfFile:
             ops = AmigaFuseFS(bridge)
             handle = ops.open(path, os.O_RDWR)
             # Every test volume is far smaller than 100 MiB, and a file may
-            # not grow past 2 GiB - 1, the largest offset ACTION_SEEK takes.
+            # not grow past 2 GiB - 1, the largest offset ACTION_SEEK takes,
+            # unless the handler has the 64 bit packets: then the volume is
+            # full first.
+            big = errno.EFBIG if bridge.max_file_size() < 1 << 31 else errno.ENOSPC
             for offset, expected in ((100 << 20, errno.ENOSPC),
-                                     (1 << 31, errno.EFBIG)):
+                                     (1 << 31, big)):
                 with pytest.raises(FuseOSError) as exc_info:
                     ops.write(path, b"data", offset, handle)
                 assert exc_info.value.args[0] == expected
@@ -282,7 +285,8 @@ class TestTruncateLengthLimit:
         4 GiB + 4, 4 GiB and 2 GiB fail with EFBIG, and -1 and -4 GiB + 4
         with EINVAL. ACTION_SET_FILE_SIZE takes a signed 32-bit size, so
         without the checks 4 GiB + 4 and -4 GiB + 4 reached the handler as 4
-        and cut the file to 4 bytes.
+        and cut the file to 4 bytes. A handler with the 64 bit packets takes
+        the large lengths, and the small volume refuses them with ENOSPC.
         """
         image, driver, path = writable_volume
         bridge = _bridge(image, driver, read_only=False)
@@ -290,9 +294,10 @@ class TestTruncateLengthLimit:
             original = bridge.read_file(path, 1 << 20, 0)
             assert len(original) > 4
             ops = AmigaFuseFS(bridge)
-            for length, expected in (((1 << 32) + 4, errno.EFBIG),
-                                     (1 << 32, errno.EFBIG),
-                                     (0x80000000, errno.EFBIG),
+            big = errno.EFBIG if bridge.max_file_size() < 1 << 31 else errno.ENOSPC
+            for length, expected in (((1 << 32) + 4, big),
+                                     (1 << 32, big),
+                                     (0x80000000, big),
                                      (-(1 << 32) + 4, errno.EINVAL),
                                      (-1, errno.EINVAL)):
                 with pytest.raises(FuseOSError) as exc_info:

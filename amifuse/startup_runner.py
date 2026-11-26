@@ -80,6 +80,15 @@ ACTION_FLUSH = 27
 ACTION_FORMAT = 1020
 ACTION_INHIBIT = 31
 ACTION_READ_LINK = 1024
+# MorphOS: Examine and ExamineNext, plus the 64 bit size and block count in
+# fib_Reserved.
+ACTION_EXAMINE_OBJECT64 = 26408
+ACTION_EXAMINE_NEXT64 = 26409
+# AmigaOS 4: seek, position and size with 64 bit values, in a DosPacket64.
+ACTION_CHANGE_FILE_POSITION64 = 8001
+ACTION_GET_FILE_POSITION64 = 8002
+ACTION_CHANGE_FILE_SIZE64 = 8003
+ACTION_GET_FILE_SIZE64 = 8004
 # The names of the opcodes above, for messages.
 _PACKET_TYPE_NAMES = {
     ACTION_STARTUP: "ACTION_STARTUP",
@@ -104,7 +113,22 @@ _PACKET_TYPE_NAMES = {
     ACTION_FORMAT: "ACTION_FORMAT",
     ACTION_INHIBIT: "ACTION_INHIBIT",
     ACTION_READ_LINK: "ACTION_READ_LINK",
+    ACTION_EXAMINE_OBJECT64: "ACTION_EXAMINE_OBJECT64",
+    ACTION_EXAMINE_NEXT64: "ACTION_EXAMINE_NEXT64",
+    ACTION_CHANGE_FILE_POSITION64: "ACTION_CHANGE_FILE_POSITION64",
+    ACTION_GET_FILE_POSITION64: "ACTION_GET_FILE_POSITION64",
+    ACTION_CHANGE_FILE_SIZE64: "ACTION_CHANGE_FILE_SIZE64",
+    ACTION_GET_FILE_SIZE64: "ACTION_GET_FILE_SIZE64",
 }
+# struct DosPacket64 of the AmigaOS 4 SDK: dp_Res0 and dp_Res2 where a
+# DosPacket has dp_Res1 and dp_Res2, then dp_Res1, dp_Arg2 and dp_Arg5 as 64
+# bit values. The sender sets dp_Res0 to DP64_INIT; a handler with the
+# packets leaves it, one without them writes its 32 bit result over it.
+DP64_SIZE = 64
+DP64_INIT = -3
+DP64_RES0 = 12
+DP64_RES1 = 24
+_DP64_ARG1, _DP64_ARG2, _DP64_ARG3 = 32, 40, 48
 OFFSET_BEGINNING = -1
 OFFSET_CURRENT = 0
 OFFSET_END = 1
@@ -315,7 +339,8 @@ class HandlerLauncher:
         return addr, addr >> 2
 
     def _build_std_packet(
-        self, dest_port_addr: int, reply_port_addr: int, pkt_type: int, args
+        self, dest_port_addr: int, reply_port_addr: int, pkt_type: int, args,
+        pkt_size: Optional[int] = None, fill=None,
     ) -> Tuple[int, int]:
         """Allocate contiguous StandardPacket = Message + DosPacket, and queue it.
 
@@ -323,8 +348,9 @@ class HandlerLauncher:
         StandardPacket, and the old one is freed once its reply has come,
         so that no packet is built where the handler may still read
         another, and a late reply's address names one packet only.
+        A longer packet takes pkt_size bytes, and fill(pkt_addr) writes it.
         """
-        total = self._msg_size + self._pkt_size
+        total = self._msg_size + (pkt_size or self._pkt_size)
         if not self._stdpkt_ring:
             self._stdpkt_ring = [None] * self._stdpkt_ring_size
             self._stdpkt_sizes = [0] * self._stdpkt_ring_size
@@ -367,6 +393,8 @@ class HandlerLauncher:
         for val in args[:7]:
             self.mem.w32(arg_addr, val & 0xFFFFFFFF)
             arg_addr += 4
+        if fill is not None:
+            fill(pkt_addr)
         # queue message to destination port - both Python queue and Amiga memory
         self.port_mgr.put_msg(dest_port_addr, sp_addr)
         # Also link the message into the port's mp_MsgList in memory
@@ -608,6 +636,27 @@ class HandlerLauncher:
         )
         return pkt_addr, msg_addr
 
+    def send_packet64(self, state: HandlerLaunchState, pkt_type: int, arg1: int,
+                      arg2: int = 0, arg3: int = 0):
+        """Queue a DosPacket64 with dp_Arg1, the 64 bit dp_Arg2 and dp_Arg3,
+        and DP64_INIT in dp_Res0.
+
+        Its reply reads as (dp_Res0, dp_Res2); the 64 bit dp_Res1 is at
+        DP64_RES1 in the packet.
+        """
+        def fill(pkt_addr):
+            self.mem.w32(pkt_addr + DP64_RES0, DP64_INIT & 0xFFFFFFFF)
+            self.mem.w32(pkt_addr + _DP64_ARG1, arg1 & 0xFFFFFFFF)
+            self.mem.w32(pkt_addr + _DP64_ARG2, (arg2 >> 32) & 0xFFFFFFFF)
+            self.mem.w32(pkt_addr + _DP64_ARG2 + 4, arg2 & 0xFFFFFFFF)
+            self.mem.w32(pkt_addr + _DP64_ARG3, arg3 & 0xFFFFFFFF)
+
+        pkt_addr, msg_addr = self._build_std_packet(
+            state.port_addr, state.reply_port_addr, pkt_type, [],
+            pkt_size=DP64_SIZE, fill=fill)
+        self.pending[pkt_addr] = (pkt_type, ())
+        return pkt_addr, msg_addr
+
     def send_locate(
         self,
         state: HandlerLaunchState,
@@ -625,6 +674,12 @@ class HandlerLauncher:
     def send_examine_next(self, state: HandlerLaunchState, lock_bptr: int, fib_addr: int):
         """ACTION_EXAMINE_NEXT"""
         return self.send_packet(state, ACTION_EXAMINE_NEXT, [lock_bptr, fib_addr >> 2])
+
+    def send_examine64(self, state: HandlerLaunchState, lock_bptr: int, fib_addr: int,
+                       next_entry: bool = False):
+        """ACTION_EXAMINE_OBJECT64, or ACTION_EXAMINE_NEXT64 for next_entry"""
+        ptype = ACTION_EXAMINE_NEXT64 if next_entry else ACTION_EXAMINE_OBJECT64
+        return self.send_packet(state, ptype, [lock_bptr, fib_addr >> 2])
 
     def send_free_lock(self, state: HandlerLaunchState, lock_bptr: int):
         """ACTION_FREE_LOCK: release a lock returned by LOCATE."""

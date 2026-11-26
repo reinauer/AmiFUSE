@@ -19,6 +19,7 @@ def command_context(monkeypatch, tmp_path):
                            json=True, input=str(source), out=str(output))
     bridge = Mock()
     bridge.is_mounted.return_value = fs.MountState(True, None, None)
+    bridge.max_file_size.return_value = fs._MAX_FILE_SIZE
     # write's destination name is new
     bridge.locate_path.return_value = (0, fs.ERROR_OBJECT_NOT_FOUND, [])
     bridge.delete_object.return_value = (-1, 0)

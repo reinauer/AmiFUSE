@@ -182,7 +182,7 @@ def _run(fuse_fs_mod, monkeypatch, mode, table):
     # The FileInfoBlock holds whatever the last delivered reply filled in.
     monkeypatch.setattr(
         fuse_fs_mod, "_parse_fib",
-        lambda mem, addr: {"name": "", "dir_type": 0, "size": 0,
+        lambda mem, addr, wide=False: {"name": "", "dir_type": 0, "size": 0,
                            **launcher.fib})
     return bridge, launcher
 
