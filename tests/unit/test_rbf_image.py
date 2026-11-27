@@ -1,10 +1,10 @@
 """Unit tests for OS-9 RBF disk images without an RDB (amifuse.rbf_image).
 
 The images are built here: an OS-9000 ID block in either byte order, an
-OS-9/68k LSN 0 with its root directory, a PC boot sector in front of the
-ID block, and an MBR holding the volume. Driver resolution for such
-volumes, and for RDB partitions of the OS-9 DOS types, goes to
-os9-rbf-handler in the user's drivers folder.
+OS-9/68k or OS-9/6809 LSN 0 with its root directory, the CoCo half-sector
+layout, a PC boot sector in front of the ID block, and an MBR holding the
+volume. Driver resolution for such volumes, and for RDB partitions of the
+OS-9 DOS types, goes to os9-rbf-handler in the user's drivers folder.
 """
 
 import json
@@ -22,7 +22,8 @@ from amifuse import rbf_image
 from amifuse.bootstrap import SyntheticRbfDosEnv
 from amifuse.driver_resolver import DriverNotFound
 from amifuse.rbf_image import (
-    DOS_OS9_68K, DOS_OS9K_BE, DOS_OS9K_LE, find_rbf_volumes, select_rbf_volume,
+    DOS_OS9_6809, DOS_OS9_68K, DOS_OS9K_BE, DOS_OS9K_LE, find_rbf_volumes,
+    is_os9_type, select_rbf_volume,
 )
 
 
@@ -41,9 +42,11 @@ def _os9k_volume(blocks: int, little: bool, name: bytes = b"Vol9K") -> bytes:
 
 
 def _os9_68k_volume(sectors: int, ss: int = 256, name: bytes = b"Vol68k",
-                    record_size: bool = True) -> bytes:
+                    record_size: bool = True, sync: bool = False) -> bytes:
     """An OS-9/68k volume: LSN 0, a one-sector bitmap, the root FD at
-    LSN 2 and its directory at LSN 3 with ".." and "." entries."""
+    LSN 2 and its directory at LSN 3 with ".." and "." entries. Without
+    record_size and sync, LSN 0 has none of the fields OS-9/68k added, and
+    with 256-byte sectors the volume is an OS-9/6809 one."""
     img = bytearray(sectors * ss)
     lsn0 = img
     lsn0[0:3] = sectors.to_bytes(3, "big")                   # DD_TOT
@@ -53,6 +56,8 @@ def _os9_68k_volume(sectors: int, ss: int = 256, name: bytes = b"Vol68k",
     lsn0[0x1F:0x1F + len(name)] = name[:-1] + bytes([name[-1] | 0x80])
     if record_size:
         struct.pack_into(">H", lsn0, 0x68, ss)               # DD_LSNSIZE
+    if sync:
+        lsn0[0x60:0x64] = b"Cruz"                            # DD_SYNC
     fd = 2 * ss
     img[fd] = 0xBF                                           # dir, all access
     struct.pack_into(">I", img, fd + 0x09, 64)               # FD_SIZ
@@ -64,6 +69,22 @@ def _os9_68k_volume(sectors: int, ss: int = 256, name: bytes = b"Vol68k",
     img[d + 32] = 0xAE
     struct.pack_into(">I", img, d + 32 + 28, 2)
     return bytes(img)
+
+
+def _os9_6809_volume(sectors: int, name: bytes = b"Vol6809") -> bytes:
+    """An OS-9/6809 volume: 256-byte sectors, LSN 0 without the OS-9/68k
+    fields, and 3-byte FD LSNs after 29-byte names."""
+    img = bytearray(_os9_68k_volume(sectors, 256, name, record_size=False))
+    d = 3 * 256
+    for ent in (d, d + 32):                 # FD LSN in the last 3 bytes only
+        img[ent + 28:ent + 32] = b"\x00" + (2).to_bytes(3, "big")
+    return bytes(img)
+
+
+def _half_sectors(volume: bytes) -> bytes:
+    """The CoCo hard disk layout: each 256-byte sector in the first half of
+    its own 512-byte block."""
+    return b"".join(volume[i:i + 256] + bytes(256) for i in range(0, len(volume), 256))
 
 
 def _with_mbr(volume: bytes, start: int = 63, ptype: int = 0x09) -> bytes:
@@ -132,11 +153,49 @@ def test_os9000_volume_in_an_mbr_partition(tmp_path):
 @pytest.mark.parametrize("ss", [256, 512])
 @pytest.mark.parametrize("record_size", [True, False])
 def test_os9_68k_volume(tmp_path, ss, record_size):
-    vol = find_rbf_volumes(_write(tmp_path, _os9_68k_volume(80, ss, record_size=record_size)))[0]
+    # An LSN 0 with no OS-9/68k field at all (no DD_LSNSIZE, no sync code)
+    # is OS-9/6809 with 256-byte sectors, or the half-sector layout with
+    # 512-byte blocks, as the handler judges it; see the tests below.
+    vol = find_rbf_volumes(_write(tmp_path, _os9_68k_volume(
+        80, ss, record_size=record_size, sync=not record_size)))[0]
     assert (vol.dos_type, vol.volume_name) == (DOS_OS9_68K, "Vol68k")
+    assert vol.format_name == "OS-9/68k"
     # Without DD_LSNSIZE, the first size whose root directory checks out.
     assert vol.block_size == ss
-    assert vol.low_block == 0
+    assert vol.low_block == 0 and not vol.half_sectors
+
+
+def test_os9_6809_volume(tmp_path):
+    vol = find_rbf_volumes(_write(tmp_path, _os9_6809_volume(80)))[0]
+    assert (vol.dos_type, vol.volume_name) == (DOS_OS9_6809, "Vol6809")
+    assert vol.format_name == "OS-9/6809"
+    assert (vol.block_size, vol.low_block, vol.num_blocks, vol.fs_blocks) == (256, 0, 80, 80)
+    assert not vol.half_sectors
+
+
+def test_os9_6809_volume_in_half_sectors(tmp_path):
+    vol = find_rbf_volumes(_write(tmp_path, _half_sectors(_os9_6809_volume(80))))[0]
+    assert (vol.dos_type, vol.volume_name) == (DOS_OS9_6809, "Vol6809")
+    # The handler is given 512-byte blocks and finds the layout itself.
+    assert (vol.block_size, vol.low_block, vol.num_blocks, vol.fs_blocks) == (512, 0, 80, 80)
+    assert vol.half_sectors
+    assert "256-byte sectors in 512-byte blocks" in vol.where()
+    assert SyntheticRbfDosEnv(vol).block_size == 128
+
+
+def test_os9_6809_volume_in_an_mbr_partition(tmp_path):
+    img = _with_mbr_entries((False, _half_sectors(_os9_6809_volume(80))))
+    vol = find_rbf_volumes(_write(tmp_path, img))[0]
+    assert (vol.dos_type, vol.mbr_index, vol.half_sectors) == (DOS_OS9_6809, 0, True)
+    assert vol.low_block == 64
+
+
+def test_os9_dos_types_are_those_of_handler_release_1_1():
+    assert [DOS_OS9_6809, DOS_OS9_68K, DOS_OS9K_BE, DOS_OS9K_LE] == [
+        0x4F533900, 0x4F533901, 0x4F533902, 0x4F533903]
+    assert all(is_os9_type(t) for t in range(0x4F533900, 0x4F533904))
+    assert not is_os9_type(0x4F533904) and not is_os9_type(0x444F5300)
+    assert not is_os9_type(None)
 
 
 def test_os9_68k_without_dot_entries_is_not_detected(tmp_path):
@@ -219,7 +278,7 @@ def test_explicit_driver_wins(user_driver_dir, tmp_path):
 def test_os9_volume_folds_ascii(fuse_mock):
     from amifuse.fuse_fs import HandlerBridge
 
-    for dos_type in (DOS_OS9_68K, DOS_OS9K_BE, DOS_OS9K_LE):
+    for dos_type in (DOS_OS9_6809, DOS_OS9_68K, DOS_OS9K_BE, DOS_OS9K_LE):
         bridge = HandlerBridge.__new__(HandlerBridge)
         bridge._dos_type = dos_type
         bridge._first_block = 0
@@ -231,8 +290,8 @@ def test_os9_volume_folds_ascii(fuse_mock):
 # Without the handler: what the CLI says
 # ---------------------------------------------------------------------------
 
-def _os9_rdb(path: Path, store_driver: bool = False) -> Path:
-    """An RDB disk with one OS9\\0 partition and no driver in the RDB."""
+def _os9_rdb(path: Path, dos_type: int = DOS_OS9_68K) -> Path:
+    """An RDB disk with one OS-9 partition and no driver in the RDB."""
     raw = RawBlockDevice(str(path), read_only=False, block_bytes=512)
     with ExitStack() as cleanup:
         raw.create(320)
@@ -240,20 +299,21 @@ def _os9_rdb(path: Path, store_driver: bool = False) -> Path:
         rdisk = RDisk(raw)
         cleanup.callback(rdisk.close)
         rdisk.create(DiskGeometry(10, 1, 32), rdb_cyls=1)
-        rdisk.add_partition(FSString("OS9"), (1, 9), dos_type=DOS_OS9_68K)
+        rdisk.add_partition(FSString("OS9"), (1, 9), dos_type=dos_type)
         raw.flush()
     return path
 
 
-def test_rdb_os9_partition_without_driver_in_the_rdb(user_driver_dir, tmp_path):
+@pytest.mark.parametrize("dos_type", [DOS_OS9_6809, DOS_OS9_68K, DOS_OS9K_BE, DOS_OS9K_LE])
+def test_rdb_os9_partition_without_driver_in_the_rdb(user_driver_dir, tmp_path, dos_type):
     """Before OS-9 support this raised "No embedded filesystem driver found"."""
     from amifuse.fuse_fs import resolve_driver
 
-    image = _os9_rdb(tmp_path / "disk.hdf")
+    image = _os9_rdb(tmp_path / "disk.hdf", dos_type)
     with pytest.raises(DriverNotFound) as caught:
         resolve_driver(image, None, None, "OS9")
     message = str(caught.value)
-    assert "Partition OS9 has no filesystem driver for OS90" in message
+    assert f"Partition OS9 has no filesystem driver for OS9{dos_type & 0xFF}" in message
     assert rbf_image.DRIVER_NAME in message and str(user_driver_dir) in message
     assert rbf_image.RELEASES_URL in message
 
@@ -273,7 +333,8 @@ def test_inspect_json_without_the_handler(user_driver_dir, tmp_path, capsys):
     assert out["driver"] is None
     assert rbf_image.DRIVER_NAME in out["note"]
     (vol,) = out["volumes"]
-    assert (vol["volume_name"], vol["dos_type_raw"]) == ("Vol9K", "0x4f533901")
+    assert (vol["volume_name"], vol["dos_type_raw"]) == ("Vol9K", "0x4f533902")
+    assert vol["half_sectors"] is False
 
 
 def test_inspect_text_without_the_handler(user_driver_dir, tmp_path, capsys):
@@ -283,8 +344,19 @@ def test_inspect_text_without_the_handler(user_driver_dir, tmp_path, capsys):
     fuse_fs.main(["inspect", str(image)])
     out = capsys.readouterr().out
     assert "OS-9 Disk Image" in out and "OS-9000 (little-endian)" in out
+    assert "DOS type: OS93 (0x4f533903)" in out
     assert f"Place {rbf_image.DRIVER_NAME}" not in out
     assert f"named exactly {rbf_image.DRIVER_NAME}" in out
+
+
+def test_inspect_text_of_a_half_sector_disk(user_driver_dir, tmp_path, capsys):
+    from amifuse import fuse_fs
+
+    image = _write(tmp_path, _half_sectors(_os9_6809_volume(80)))
+    fuse_fs.main(["inspect", str(image)])
+    out = capsys.readouterr().out
+    assert "Format: OS-9/6809" in out and "DOS type: OS90 (0x4f533900)" in out
+    assert "Block size: 512 bytes (256-byte sectors, one in each)" in out
 
 
 def test_ls_without_the_handler(user_driver_dir, tmp_path, capsys):
