@@ -109,3 +109,48 @@ class TestSignalTask:
         launcher.mem.r32.return_value = 0x20
         assert not launcher.signal_task(0x3000, 0x100)
         launcher.mem.w32.assert_called_once_with(0x3000 + _TC_SIGRECVD, 0x120)
+
+
+class TestSignalPort:
+    """A message's arrival reaches the port's owner the way the port asks."""
+
+    def _make_launcher(self, flags, sigbit=5, task=0x3000):
+        from amifuse.startup_runner import HandlerLauncher
+
+        launcher = HandlerLauncher.__new__(HandlerLauncher)
+        launcher._emu = None
+        launcher._debug = False
+        launcher._mp_flags_offset = 14
+        launcher._mp_sigbit_offset = 15
+        launcher._mp_sigtask_offset = 16
+        launcher.mem = MagicMock()
+        fields = {0x1000 + 14: flags, 0x1000 + 15: sigbit}
+        launcher.mem.r8.side_effect = fields.__getitem__
+        launcher.mem.r32.return_value = task
+        launcher.exec_impl = MagicMock()
+        launcher.signal_task = MagicMock()
+        return launcher
+
+    def test_signal_port_signals_its_task(self):
+        from amitools.vamos.libstructs.exec_ import MsgPortFlags
+
+        launcher = self._make_launcher(MsgPortFlags.PA_SIGNAL)
+        launcher._signal_port(0x1000)
+        launcher.signal_task.assert_called_once_with(0x3000, 1 << 5)
+        launcher.exec_impl.msg_func.notify_port.assert_not_called()
+
+    def test_softint_port_goes_to_amitools_putmsg_logic(self):
+        from amitools.vamos.libstructs.exec_ import MsgPortFlags
+
+        launcher = self._make_launcher(MsgPortFlags.PA_SOFTINT)
+        launcher._signal_port(0x1000)
+        launcher.exec_impl.msg_func.notify_port.assert_called_once_with(0x1000)
+        launcher.signal_task.assert_not_called()
+
+    def test_ignore_port_tells_nobody(self):
+        from amitools.vamos.libstructs.exec_ import MsgPortFlags
+
+        launcher = self._make_launcher(MsgPortFlags.PA_IGNORE)
+        launcher._signal_port(0x1000)
+        launcher.signal_task.assert_not_called()
+        launcher.exec_impl.msg_func.notify_port.assert_not_called()

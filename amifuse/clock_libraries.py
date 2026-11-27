@@ -73,7 +73,11 @@ class AmiFuseDosLibrary(DosLibrary):
                 port = MsgPortStruct(ctx.mem, port_addr)
                 while not port_mgr.has_msg(port_addr):
                     sig_bit = port.mp_SigBit.val
-                    if port.mp_Flags.val != MsgPortFlags.PA_SIGNAL or not 0 <= sig_bit < 32:
+                    # PA_SOFTINT: the port's interrupt may send the signal
+                    if port.mp_Flags.val not in (
+                        MsgPortFlags.PA_SIGNAL,
+                        MsgPortFlags.PA_SOFTINT,
+                    ) or not 0 <= sig_bit < 32:
                         break
                     ctx.exec_lib.signal_func.wait(1 << sig_bit)
         return super().WaitPkt(ctx)

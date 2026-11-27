@@ -35,6 +35,10 @@ from amitools.vamos.libtypes import Message, MsgPort  # type: ignore
 
 from .rdb_inspect import escape_text
 
+# port modes in which a message can lead to the port's signal: the signal
+# itself, or the port's software interrupt sending it
+_WAKING_PORT_FLAGS = (MsgPortFlags.PA_SIGNAL, MsgPortFlags.PA_SOFTINT)
+
 
 class AmiFuseExecLibrary(ExecLibrary):
     """ExecLibrary whose DoIO and WaitIO have a device complete a held request,
@@ -62,13 +66,14 @@ class AmiFuseExecLibrary(ExecLibrary):
         amitools' WaitPort fails on such a port when it is empty. Wait for
         the port's signal instead, as Exec does, until a message is there;
         then amitools' WaitPort returns it without taking it off the port.
+        On a PA_SOFTINT port, the port's interrupt may send that signal.
         """
         port_mgr = self.port_mgr
         addr = msg_port.addr
         if port_mgr.has_port(addr):
             while not port_mgr.has_msg(addr):
                 sig_bit = msg_port.sig_bit.val
-                if msg_port.flags.val != MsgPortFlags.PA_SIGNAL or not 0 <= sig_bit < 32:
+                if msg_port.flags.val not in _WAKING_PORT_FLAGS or not 0 <= sig_bit < 32:
                     # nothing would ever wake us: let amitools report it
                     break
                 self.signal_func.wait(1 << sig_bit)

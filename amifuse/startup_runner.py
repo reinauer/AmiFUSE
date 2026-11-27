@@ -369,7 +369,12 @@ class HandlerLauncher:
     # ---- signals ----
 
     def _signal_port(self, port_addr: int):
-        """Signal the task of a PA_SIGNAL port, as PutMsg() does."""
+        """Tell the port's owner a message arrived, as PutMsg() does.
+
+        A PA_SIGNAL port's task gets the port's signal. A PA_SOFTINT port
+        goes to amitools' PutMsg() logic, which runs the port's mp_SoftInt
+        before returning, as exec does when called from a task.
+        """
         try:
             flags = self.mem.r8(port_addr + self._mp_flags_offset)
             sigbit = self.mem.r8(port_addr + self._mp_sigbit_offset)
@@ -377,6 +382,9 @@ class HandlerLauncher:
         except Exception as e:
             if self._debug:
                 print(f"[amifuse] WARNING: port 0x{port_addr:x} unreadable: {e}")
+            return
+        if flags == MsgPortFlags.PA_SOFTINT:
+            self.exec_impl.msg_func.notify_port(port_addr)
             return
         if flags != MsgPortFlags.PA_SIGNAL or not 0 <= sigbit < 32 or task_addr == 0:
             return
