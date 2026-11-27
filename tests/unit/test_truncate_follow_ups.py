@@ -4,8 +4,8 @@
   the new end of file until the handle moves, and a seek to where the
   handle already is does not count. truncate() through an open handle
   leaves it at the start of the file.
-- A shrink whose reply comes just after the wait runs out gets a second
-  wait for the same packet, which sends nothing.
+- A shrink gets two waits for its one packet (HandlerBridge._packet's
+  attempts), so a reply that comes just after the first wait counts.
 - AROS afs refuses a shrink past another open handle with ERROR_SEEK_ERROR
   (219), which sends the shrink again after the other handles move, as
   ERROR_OBJECT_IN_USE from SmartFilesystem does.
@@ -23,7 +23,6 @@ import pytest
 from amifuse import fuse_fs
 from tests.unit.test_fuse_fs import (
     NO_REPLY,
-    PKT,
     _FakeHandlerFile,
     _fake_write_bridge,
     _fake_write_fs,
@@ -61,23 +60,22 @@ class _SfsAfterShrink(_FakeHandlerFile):
         super().__init__(data)
         self.stuck = False
 
-    def set_size(self, state, fh_addr, size, mode):
+    def set_size(self, fh_addr, size, mode):
         self.stuck = size < len(self.data)
-        return super().set_size(state, fh_addr, size, mode)
+        super().set_size(fh_addr, size, mode)
 
-    def seek(self, state, fh_addr, offset, mode):
+    def seek(self, fh_addr, offset, mode):
         before = self._pos(fh_addr)
-        packet = super().seek(state, fh_addr, offset, mode)
+        super().seek(fh_addr, offset, mode)
         if fh_addr not in self.others and self._pos(fh_addr) != before:
             self.stuck = False
-        return packet
 
-    def write(self, state, fh_addr, addr, size):
+    def write(self, fh_addr, addr, size):
         if self.stuck and fh_addr not in self.others:
             self.writes.append(size)
             self.reply = _reply(-1, 83)
-            return PKT, 0
-        return super().write(state, fh_addr, addr, size)
+            return
+        super().write(fh_addr, addr, size)
 
 
 class _AfsFile(_FakeHandlerFile):
@@ -87,12 +85,12 @@ class _AfsFile(_FakeHandlerFile):
     other handle on the file is past the new size.
     """
 
-    def set_size(self, state, fh_addr, size, mode):
+    def set_size(self, fh_addr, size, mode):
         if any(pos > size for pos in self.others.values()):
             self.set_sizes.append(size)
             self.reply = _reply(-1, 219)
-            return PKT, 0
-        return super().set_size(state, fh_addr, size, mode)
+            return
+        super().set_size(fh_addr, size, mode)
 
 
 class TestShrinkLeavesHandleAtStart:
@@ -123,14 +121,12 @@ class TestShrinkLeavesHandleAtStart:
         else:
             _open_other(fs, handler, 2000)
 
-            def retry_seek_unanswered(state, fh_addr, offset, mode):
-                packet = seek(state, fh_addr, offset, mode)
+            def retry_seek_unanswered(fh_addr, offset, mode):
+                seek(fh_addr, offset, mode)
                 if fh_addr == OTHER and len(handler.set_sizes) == 1:
                     handler.reply = NO_REPLY
-                return packet
 
-            fs.bridge.launcher.send_seek_handle.side_effect = (
-                retry_seek_unanswered)
+            handler.seek = retry_seek_unanswered
 
         with pytest.raises(fuse_fs.FuseOSError) as exc_info:
             fs.truncate("/file", 100, handle)
@@ -140,7 +136,7 @@ class TestShrinkLeavesHandleAtStart:
 
         # The unanswered retry seek still moved the other handle to 0.
         handler.stop_at = 0
-        fs.bridge.launcher.send_seek_handle.side_effect = seek
+        handler.seek = seek
         assert fs.truncate("/file", 100, handle) == 0
         assert handler.seeks[-1] == start
 
@@ -155,52 +151,33 @@ class TestShrinkLeavesHandleAtStart:
 
 
 class TestShrinkReplyAfterWait:
-    """A shrink answered just after its wait runs out is not a failure."""
+    """A shrink answered just after its first wait is not a failure."""
 
-    def test_reply_in_second_wait_is_the_answer(self, fuse_mock):
+    def test_shrink_gets_two_waits_for_one_packet(self, fuse_mock):
         handler = _FakeHandlerFile(CONTENT)
         bridge = _fake_write_bridge(fuse_fs, handler)
-        bridge._run_until_replies = MagicMock(side_effect=[NO_REPLY, _reply(4)])
 
         assert bridge.set_handle_size_reply(FH_ADDR, 4) == (4, 0)
-        assert bridge.launcher.send_set_file_size.call_count == 1
+        assert bridge._packet.call_count == 1
+        assert bridge._packet.call_args.kwargs["attempts"] == 2
 
     def test_no_reply_in_either_wait_sends_once(self, fuse_mock):
         """The handler may still hold the packet, so it is not sent again."""
         handler = _FakeHandlerFile(CONTENT)
         bridge = _fake_write_bridge(fuse_fs, handler)
-        bridge._run_until_replies = MagicMock(side_effect=[NO_REPLY, NO_REPLY])
+        bridge._packet = MagicMock(return_value=NO_REPLY)
 
         assert bridge.set_handle_size_reply(FH_ADDR, 4) == (-1, 0)
-        assert bridge.launcher.send_set_file_size.call_count == 1
-        assert bridge._run_until_replies.call_count == 2
+        assert bridge._packet.call_count == 1
 
-    def test_late_stop_is_retried_and_pinned_size_follows(self, fuse_mock):
-        """FFS stops the shrink at a reader and the reply comes late; the
-        retry still runs, and getattr of a file open from create() reports
-        the size the handler reached."""
+    def test_stop_is_retried_and_pinned_size_follows(self, fuse_mock):
+        """FFS stops the shrink at a reader; the retry runs, and getattr of
+        a file open from create() reports the size the handler reached."""
         handler = _FakeHandlerFile(b"")
         fs = _fake_write_fs(fuse_fs, handler)
         handle = fs.create("/file", 0o644)
         assert fs.write("/file", CONTENT, 0, handle) == len(CONTENT)
         _open_other(fs, handler, 2000)
-        late = []
-        set_size = handler.set_size
-
-        def set_size_once_late(*args):
-            packet = set_size(*args)
-            if handler.set_sizes == [100]:
-                late.append(True)
-            return packet
-
-        def wait():
-            if late:
-                late.clear()
-                return NO_REPLY
-            return handler.reply
-
-        fs.bridge.launcher.send_set_file_size.side_effect = set_size_once_late
-        fs.bridge._run_until_replies = MagicMock(side_effect=wait)
 
         assert fs.truncate("/file", 100, handle) == 0
         assert handler.set_sizes == [100, 100]
@@ -271,13 +248,12 @@ class TestHandlesPastLongMax:
         far = self._open_far(fs, handler)
         seek = handler.seek
 
-        def far_seek(state, fh_addr, offset, mode):
-            packet = seek(state, fh_addr, offset, mode)
+        def far_seek(fh_addr, offset, mode):
+            seek(fh_addr, offset, mode)
             if fh_addr == FAR:
                 handler.reply = reply
-            return packet
 
-        fs.bridge.launcher.send_seek_handle.side_effect = far_seek
+        handler.seek = far_seek
 
         assert fs.truncate("/file", 100) == 0
         assert self._far_seeks(handler) == [(FAR, 0, fuse_fs.OFFSET_CURRENT)]
@@ -292,13 +268,12 @@ class TestHandlesPastLongMax:
         second = self._open_far(fs, handler, fh_addr=FAR + 1)
         seek = handler.seek
 
-        def far_seek(state, fh_addr, offset, mode):
-            packet = seek(state, fh_addr, offset, mode)
+        def far_seek(fh_addr, offset, mode):
+            seek(fh_addr, offset, mode)
             if fh_addr >= FAR:
                 handler.reply = NO_REPLY
-            return packet
 
-        fs.bridge.launcher.send_seek_handle.side_effect = far_seek
+        handler.seek = far_seek
 
         assert fs.truncate("/file", 100) == 0
         assert len(self._far_seeks(handler)) == 1
@@ -315,13 +290,12 @@ class TestHandlesPastLongMax:
         handle = fs.open("/file", os.O_RDWR)
         seek = handler.seek
 
-        def start_seek_unanswered(state, fh_addr, offset, mode):
-            packet = seek(state, fh_addr, offset, mode)
+        def start_seek_unanswered(fh_addr, offset, mode):
+            seek(fh_addr, offset, mode)
             if handler.set_sizes and fh_addr == FH_ADDR:
                 handler.reply = NO_REPLY
-            return packet
 
-        fs.bridge.launcher.send_seek_handle.side_effect = start_seek_unanswered
+        handler.seek = start_seek_unanswered
 
         assert fs.truncate("/file", 100, handle) == 0
         assert handler.seeks[-1] == (FH_ADDR, 0, fuse_fs.OFFSET_BEGINNING)

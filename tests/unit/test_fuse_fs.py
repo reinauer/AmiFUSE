@@ -655,11 +655,7 @@ class TestFormatVolume:
         mock_bridge.state.crashed = False
         mock_bridge.launcher = MagicMock()
         mock_bridge.launcher.alloc_bstr.return_value = (None, 0x1234)
-        # (pkt, msg) of each packet sent, and the reply to each.
-        mock_bridge.launcher.send_inhibit.return_value = (0x100, 0xF0)
-        mock_bridge.launcher.send_format.return_value = (0x200, 0x1F0)
-        mock_bridge.launcher.send_flush.return_value = (0x300, 0x2F0)
-        mock_bridge._run_until_reply.return_value = (1, 0)
+        mock_bridge._packet.return_value = (1, 0)
         monkeypatch.setattr(
             fuse_fs_mod, "HandlerBridge", MagicMock(return_value=mock_bridge)
         )
@@ -672,17 +668,16 @@ class TestFormatVolume:
             volname="SFSFmt",
         )
 
-        assert mock_bridge.launcher.send_inhibit.call_args_list == [
-            call(mock_bridge.state, True), call(mock_bridge.state, False)]
-        mock_bridge.launcher.send_flush.assert_called_once_with(mock_bridge.state)
-        # Each packet waits for its own reply, not for any reply.
-        assert mock_bridge._run_until_reply.call_args_list == [
-            call(0x100, "format inhibit"),
-            call(0x200, "format", max_iters=2000, cycles=2_000_000),
-            call(0x100, "format uninhibit", max_iters=500, cycles=2_000_000),
-            call(0x300, "format flush", max_iters=500, cycles=2_000_000),
+        # Each packet waits for its own reply, with the limits it needs.
+        assert mock_bridge._packet.call_args_list == [
+            call(fuse_fs_mod.ACTION_INHIBIT, [-1], "format inhibit"),
+            call(fuse_fs_mod.ACTION_FORMAT, [0x1234, 0x53465300], "format",
+                 max_iters=2000, cycles=2_000_000),
+            call(fuse_fs_mod.ACTION_INHIBIT, [0], "format uninhibit",
+                 max_iters=500, cycles=2_000_000),
+            call(fuse_fs_mod.ACTION_FLUSH, [], "format flush",
+                 max_iters=500, cycles=2_000_000),
         ]
-        mock_bridge._run_until_replies.assert_not_called()
         mock_bridge.backend.sync.assert_called_once_with()
         mock_bridge.backend.fsync.assert_called_once_with()
         mock_bridge.close.assert_called_once()
@@ -704,10 +699,7 @@ class TestFormatVolume:
         mock_bridge = MagicMock()
         mock_bridge.state.crashed = False
         mock_bridge.launcher.alloc_bstr.return_value = (None, 0x1234)
-        mock_bridge.launcher.send_inhibit.return_value = (0x100, 0xF0)
-        mock_bridge.launcher.send_format.return_value = (0x200, 0x1F0)
-        mock_bridge.launcher.send_flush.return_value = (0x300, 0x2F0)
-        mock_bridge._run_until_reply.return_value = (1, 0)
+        mock_bridge._packet.return_value = (1, 0)
         bridge_cls = MagicMock(return_value=mock_bridge)
         monkeypatch.setattr(fuse_fs_mod, "HandlerBridge", bridge_cls)
 
@@ -1770,25 +1762,64 @@ class TestHandlerBridgeReadBuf:
         mem.w_block.assert_not_called()
 
 
-PKT = 0x9999        # every packet the mock launcher sends
-STALE_PKT = 0x7777  # a packet whose request timed out earlier
+def _reply(res1, res2=0):
+    """A packet's answer as HandlerBridge._packet returns it: (res1, res2)."""
+    return (res1, res2)
 
 
-def _reply(res1, res2=0, pkt=PKT):
-    """One queued packet reply as poll_replies returns it: (msg, pkt, res1, res2)."""
-    return [(0, pkt, res1, res2)]
-
-
-# Reply lists for the read and seek tests below. dp_Res1 is a signed LONG.
+# Replies for the read and seek tests below. dp_Res1 is a signed LONG.
 READ_OK = _reply(5)                  # 5 bytes read
 READ_EOF = _reply(0)                 # end of file
 READ_ERROR = _reply(-1, 225)         # handler failed the read
 SEEK_OK = _reply(0)                  # old position 0
 SEEK_PAST_EOF = _reply(-1, 219)      # ERROR_SEEK_ERROR
 SEEK_ERROR = _reply(-1, 225)         # any other refusal is a failure
-NO_REPLY = []                        # _run_until_replies timed out
-STALE_READ = _reply(5, pkt=STALE_PKT)  # late answer to a timed-out READ
-STALE_SEEK = _reply(4, pkt=STALE_PKT)  # late answer to a timed-out SEEK
+NO_REPLY = None                      # no answer within the wait
+NOT_SENT = "not sent"                # a packet the bridge must not send
+
+
+class _Packets:
+    """Stands in for HandlerBridge._packet.
+
+    Answers each packet with the next of replies, in order, or, for a
+    callable reply, with what it returns for (action, args). Keeps
+    (action, args) of every packet in sent.
+    """
+
+    def __init__(self, *replies):
+        self.replies = list(replies)
+        self.sent = []
+
+    def __call__(self, action, args, label, *more, **limits):
+        args = list(args)
+        self.sent.append((action, args))
+        reply = self.replies.pop(0)
+        return reply(action, args) if callable(reply) else reply
+
+    def actions(self):
+        """The dp_Type of every packet sent, in order."""
+        return [action for action, _ in self.sent]
+
+    def args_of(self, action):
+        """The args of every packet of type action, in order."""
+        return [args for sent, args in self.sent if sent == action]
+
+
+def _packet_bridge(fuse_fs_mod, *replies):
+    """A bare bridge whose packets are answered by _Packets(*replies).
+
+    A FileHandle's fh_Arg1 is its address here, so a packet on a handle
+    names the handle as the old launcher calls did.
+    """
+    import threading
+
+    bridge = object.__new__(fuse_fs_mod.HandlerBridge)
+    bridge._lock = threading.RLock()
+    bridge._debug = False
+    bridge.state = MagicMock()
+    bridge._packet = _Packets(*replies)
+    bridge._fh_arg = lambda fh_addr: fh_addr
+    return bridge
 
 
 def _past_end(size):
@@ -1807,21 +1838,11 @@ class TestHandlerBridgeReadReplies:
     LOCKS = [0x10, 0x11]
 
     def _bridge(self, fuse_fs_mod, *replies):
-        """Build a bridge whose handler answers with the given reply lists in order."""
-        import threading
-
-        bridge = object.__new__(fuse_fs_mod.HandlerBridge)
-        bridge._lock = threading.RLock()
-        bridge._debug = False
-        bridge.state = MagicMock()
-        bridge.launcher = MagicMock()
-        for send in ("send_seek_handle", "send_read_handle", "send_end_handle"):
-            getattr(bridge.launcher, send).return_value = (PKT, 0)
-        bridge.launcher.send_findinput.return_value = (self.FH_ADDR, PKT, 0)
+        """Build a bridge whose handler answers with the given replies in order."""
+        bridge = _packet_bridge(fuse_fs_mod, *replies)
         bridge.mem = MagicMock()
         bridge.mem.r_block.side_effect = lambda addr, n: self.PAYLOAD[:n]
         bridge._alloc_read_buf = MagicMock(return_value=SimpleNamespace(addr=0x2000))
-        bridge._run_until_replies = MagicMock(side_effect=list(replies))
         # read_file opens the file itself: one FINDINPUT inside /dir.
         bridge._is_neg_cached = MagicMock(return_value=False)
         bridge.locate_path = MagicMock(return_value=(self.LOCKS[-1], 0, list(self.LOCKS)))
@@ -1852,21 +1873,21 @@ class TestHandlerBridgeReadReplies:
         (SEEK_OK, READ_EOF, b""),
         (SEEK_OK, READ_ERROR, None),
         (SEEK_OK, NO_REPLY, None),
-        (SEEK_ERROR, None, None),
-        (NO_REPLY, None, None),
+        (SEEK_ERROR, NOT_SENT, None),
+        (NO_REPLY, NOT_SENT, None),
     ], ids=["data", "eof", "read-error", "read-no-reply",
             "seek-error", "seek-no-reply"])
     def test_read_handle_at(self, fuse_mock, seek, read, expected):
         """read_handle_at checks the seek before it reads."""
         import amifuse.fuse_fs as fuse_fs_mod
 
-        replies = [seek] if read is None else [seek, read]
+        replies = [seek] if read is NOT_SENT else [seek, read]
         bridge = self._bridge(fuse_fs_mod, *replies)
 
         assert bridge.read_handle_at(self.FH_ADDR, 4, 8) == expected
-        bridge.launcher.send_seek_handle.assert_called_once_with(
-            bridge.state, self.FH_ADDR, 4, fuse_fs_mod.OFFSET_BEGINNING)
-        assert bridge.launcher.send_read_handle.called == (read is not None)
+        assert bridge._packet.args_of(fuse_fs_mod.ACTION_SEEK) == [
+            [self.FH_ADDR, 4, fuse_fs_mod.OFFSET_BEGINNING]]
+        assert (fuse_fs_mod.ACTION_READ in bridge._packet.actions()) == (read is not NOT_SENT)
 
     @pytest.mark.parametrize("reply, outcome, position", [
         (_reply(7), "OK", 7),
@@ -1882,8 +1903,8 @@ class TestHandlerBridgeReadReplies:
 
         result = bridge.seek_handle(self.FH_ADDR, 4, fuse_fs_mod.OFFSET_END)
         assert result == (fuse_fs_mod.SeekResult[outcome], position)
-        bridge.launcher.send_seek_handle.assert_called_once_with(
-            bridge.state, self.FH_ADDR, 4, fuse_fs_mod.OFFSET_END)
+        assert bridge._packet.args_of(fuse_fs_mod.ACTION_SEEK) == [
+            [self.FH_ADDR, 4, fuse_fs_mod.OFFSET_END]]
 
     @pytest.mark.parametrize("offset", [0x80000000, 2**32 + 4])
     def test_offset_past_long_range_is_refused(self, fuse_mock, offset):
@@ -1894,8 +1915,7 @@ class TestHandlerBridgeReadReplies:
         bridge = self._bridge(fuse_fs_mod, SEEK_OK, READ_OK)
 
         assert bridge.read_handle_at(self.FH_ADDR, offset, 8) is None
-        bridge.launcher.send_seek_handle.assert_not_called()
-        bridge._run_until_replies.assert_not_called()
+        assert bridge._packet.sent == []
 
     @pytest.mark.parametrize("probe, expected", [
         ([SEEK_OK, _reply(4)], b""),
@@ -1916,31 +1936,12 @@ class TestHandlerBridgeReadReplies:
         bridge = self._bridge(fuse_fs_mod, SEEK_PAST_EOF, *probe)
 
         assert bridge.read_handle_at(self.FH_ADDR, 4, 8) == expected
-        seeks = [c.args[1:] for c in bridge.launcher.send_seek_handle.call_args_list]
-        assert seeks == [
-            (self.FH_ADDR, 4, fuse_fs_mod.OFFSET_BEGINNING),
-            (self.FH_ADDR, 0, fuse_fs_mod.OFFSET_END),
-            (self.FH_ADDR, 0, fuse_fs_mod.OFFSET_CURRENT),
+        assert bridge._packet.args_of(fuse_fs_mod.ACTION_SEEK) == [
+            [self.FH_ADDR, 4, fuse_fs_mod.OFFSET_BEGINNING],
+            [self.FH_ADDR, 0, fuse_fs_mod.OFFSET_END],
+            [self.FH_ADDR, 0, fuse_fs_mod.OFFSET_CURRENT],
         ][:1 + len(probe)]
-        bridge.launcher.send_read_handle.assert_not_called()
-
-    @pytest.mark.parametrize("replies, expected", [
-        ([STALE_READ, SEEK_OK, READ_OK], b"hello"),
-        ([STALE_READ + SEEK_OK, READ_OK], b"hello"),
-        ([SEEK_OK, STALE_SEEK, READ_OK], b"hello"),
-        ([STALE_READ, NO_REPLY], None),
-        ([STALE_READ] * 9, None),
-    ], ids=["alone", "with-answer", "before-read", "then-timeout", "endless"])
-    def test_late_reply_is_not_taken_as_the_answer(self, fuse_mock, replies, expected):
-        """A reply to an earlier packet is dropped, not read as this packet's answer."""
-        import amifuse.fuse_fs as fuse_fs_mod
-
-        # Taken as the seek's answer, a late READ byte count would pass for
-        # the old position; taken as the read's, a seek position would pass
-        # for a byte count.
-        bridge = self._bridge(fuse_fs_mod, *replies)
-
-        assert bridge.read_handle_at(self.FH_ADDR, 4, 8) == expected
+        assert fuse_fs_mod.ACTION_READ not in bridge._packet.actions()
 
     @pytest.mark.parametrize("offset, seeks, read, expected", [
         (0, [], READ_OK, b"hello"),
@@ -1948,9 +1949,9 @@ class TestHandlerBridgeReadReplies:
         (0, [], READ_ERROR, None),
         (0, [], NO_REPLY, None),
         (4, [SEEK_OK], READ_OK, b"hello"),
-        (4, _past_end(4), None, b""),
-        (4, [SEEK_ERROR], None, None),
-        (4, [NO_REPLY], None, None),
+        (4, _past_end(4), NOT_SENT, b""),
+        (4, [SEEK_ERROR], NOT_SENT, None),
+        (4, [NO_REPLY], NOT_SENT, None),
     ], ids=["data", "eof", "read-error", "read-no-reply",
             "seek-data", "seek-past-eof", "seek-error", "seek-no-reply"])
     def test_read_file_result_and_cleanup(self, fuse_mock, offset, seeks, read, expected):
@@ -1960,18 +1961,19 @@ class TestHandlerBridgeReadReplies:
         findinput = _reply(-1)  # DOSTRUE
         end = _reply(-1)
         replies = [findinput, *seeks]
-        if read is not None:
+        if read is not NOT_SENT:
             replies.append(read)
         replies.append(end)
         bridge = self._bridge(fuse_fs_mod, *replies)
 
         assert bridge.read_file("/dir/file", 8, offset) == expected
-        assert bridge.launcher.send_seek_handle.called == bool(seeks)
-        assert bridge.launcher.send_read_handle.called == (read is not None)
-        bridge.launcher.send_end_handle.assert_called_once_with(bridge.state, self.FH_ADDR)
+        actions = bridge._packet.actions()
+        assert (fuse_fs_mod.ACTION_SEEK in actions) == bool(seeks)
+        assert (fuse_fs_mod.ACTION_READ in actions) == (read is not NOT_SENT)
+        assert bridge._packet.args_of(fuse_fs_mod.ACTION_END) == [[self.FH_ADDR]]
         bridge._free_fh.assert_called_once_with(self.FH_ADDR)
         assert [c.args[0] for c in bridge.free_lock.call_args_list] == self.LOCKS[::-1]
-        assert bridge._run_until_replies.call_count == len(replies)
+        assert len(actions) == len(replies)
 
     @pytest.mark.parametrize("findinput, expected", [
         (_reply(0, 205), b""),
@@ -1987,7 +1989,7 @@ class TestHandlerBridgeReadReplies:
 
         assert bridge.read_file("/dir/file", 8, 0) == expected
         assert bridge._set_neg_cached.called == (expected is not None)
-        bridge.launcher.send_read_handle.assert_not_called()
+        assert bridge._packet.actions() == [fuse_fs_mod.ACTION_FINDINPUT]
         bridge._free_fh.assert_called_once_with(self.FH_ADDR)
         assert [c.args[0] for c in bridge.free_lock.call_args_list] == self.LOCKS[::-1]
 
@@ -2002,35 +2004,22 @@ class TestHandlerBridgeReadReplies:
 
         assert bridge.read_file("/dir/file", 8, 0) == expected
         assert bridge._set_neg_cached.called == (expected is not None)
-        bridge.launcher.send_findinput.assert_not_called()
-
-
-STALE_WRITE = _reply(4096, pkt=STALE_PKT)  # late answer to a timed-out WRITE
+        assert bridge._packet.sent == []
 
 
 class TestHandlerBridgeLookupReplies:
-    """LOCATE, EXAMINE, FREE_LOCK and RENAME_OBJECT take only their own replies.
+    """LOCATE, EXAMINE, FREE_LOCK and RENAME_OBJECT report their own replies.
 
-    A write that timed out is answered later, while the next lookup waits.
-    Its late byte count must not pass for a lock, which would be examined
-    and freed instead of the real one, or for a rename's DOSTRUE.
+    stat_path examines the lock it located and frees every lock it took,
+    and a failed EXAMINE still frees them.
     """
 
     DIR_LOCK = 0x10
     FILE_LOCK = 0x11
 
     def _bridge(self, fuse_fs_mod, *replies):
-        """Build a bridge whose handler answers with the given reply lists in order."""
-        import threading
-
-        bridge = object.__new__(fuse_fs_mod.HandlerBridge)
-        bridge._lock = threading.RLock()
-        bridge._debug = False
-        bridge.state = MagicMock()
-        bridge.launcher = MagicMock()
-        for send in ("send_locate", "send_examine", "send_free_lock", "send_rename_object"):
-            getattr(bridge.launcher, send).return_value = (PKT, 0)
-        bridge._run_until_replies = MagicMock(side_effect=list(replies))
+        """Build a bridge whose handler answers with the given replies in order."""
+        bridge = _packet_bridge(fuse_fs_mod, *replies)
         bridge._is_neg_cached = MagicMock(return_value=False)
         bridge._set_neg_cached = MagicMock()
         bridge._alloc_bstr = MagicMock(return_value=(0x4000, 0x1000))
@@ -2042,78 +2031,58 @@ class TestHandlerBridgeLookupReplies:
         bridge.mem.r_block.return_value = b"\x04file" + bytes(103)
         return bridge
 
-    def _freed(self, bridge):
-        return [c.args[1] for c in bridge.launcher.send_free_lock.call_args_list]
+    def _freed(self, fuse_fs_mod, bridge):
+        return [args[0] for args in bridge._packet.args_of(fuse_fs_mod.ACTION_FREE_LOCK)]
 
-    @pytest.mark.parametrize("replies", [
-        [STALE_WRITE, _reply(DIR_LOCK), _reply(FILE_LOCK), _reply(-1),
-         _reply(-1), _reply(-1)],
-        [_reply(DIR_LOCK), STALE_WRITE + _reply(FILE_LOCK), _reply(-1),
-         _reply(-1), _reply(-1)],
-        [_reply(DIR_LOCK), _reply(FILE_LOCK), _reply(-1), STALE_WRITE,
-         _reply(-1), _reply(-1)],
-    ], ids=["before-locate", "with-locate", "before-examine"])
-    def test_stat_path_uses_and_frees_the_real_locks(self, fuse_mock, replies):
+    def test_stat_path_uses_and_frees_the_real_locks(self, fuse_mock):
         import amifuse.fuse_fs as fuse_fs_mod
 
-        bridge = self._bridge(fuse_fs_mod, *replies)
+        bridge = self._bridge(
+            fuse_fs_mod, _reply(self.DIR_LOCK), _reply(self.FILE_LOCK), _reply(-1),
+            _reply(-1), _reply(-1))
 
         info = bridge.stat_path("/dir/file")
 
         assert info is not None and info["size"] == 3000
-        locked = [c.args[1] for c in bridge.launcher.send_locate.call_args_list]
+        locked = [args[0] for args in bridge._packet.args_of(fuse_fs_mod.ACTION_LOCATE_OBJECT)]
         assert locked == [0, self.DIR_LOCK]
-        bridge.launcher.send_examine.assert_called_once_with(
-            bridge.state, self.FILE_LOCK, 0x5000)
-        assert self._freed(bridge) == [self.DIR_LOCK, self.FILE_LOCK]
-        assert bridge._run_until_replies.call_count == len(replies)
+        assert bridge._packet.args_of(fuse_fs_mod.ACTION_EXAMINE_OBJECT) == [
+            [self.FILE_LOCK, 0x5000 >> 2]]
+        assert self._freed(fuse_fs_mod, bridge) == [self.DIR_LOCK, self.FILE_LOCK]
 
-    def test_examine_failure_is_not_hidden_by_a_late_reply(self, fuse_mock):
-        """A late nonzero res1 must not pass for EXAMINE's DOSTRUE."""
+    def test_examine_failure_frees_the_lock(self, fuse_mock):
         import amifuse.fuse_fs as fuse_fs_mod
 
         bridge = self._bridge(
-            fuse_fs_mod, _reply(self.FILE_LOCK), STALE_WRITE, _reply(0, 205), _reply(-1))
+            fuse_fs_mod, _reply(self.FILE_LOCK), _reply(0, 205), _reply(-1))
 
         assert bridge.stat_path("/file") is None
-        assert self._freed(bridge) == [self.FILE_LOCK]
+        assert self._freed(fuse_fs_mod, bridge) == [self.FILE_LOCK]
 
-    @pytest.mark.parametrize("replies, expected", [
-        ([STALE_WRITE, _reply(FILE_LOCK, 0)], (FILE_LOCK, 0, [FILE_LOCK])),
-        ([STALE_WRITE, _reply(0, 202)], (0, 202, [])),
-        ([STALE_WRITE, NO_REPLY], (0, -1, [])),
+    @pytest.mark.parametrize("reply, expected", [
+        (_reply(FILE_LOCK, 0), (FILE_LOCK, 0, [FILE_LOCK])),
+        (_reply(0, 202), (0, 202, [])),
+        (NO_REPLY, (0, -1, [])),
     ], ids=["located", "in-use", "no-reply"])
-    def test_locate_path_reports_its_own_reply(self, fuse_mock, replies, expected):
-        """The lock and res2 come from the LOCATE reply, not a late one."""
+    def test_locate_path_reports_its_reply(self, fuse_mock, reply, expected):
         import amifuse.fuse_fs as fuse_fs_mod
 
-        bridge = self._bridge(fuse_fs_mod, *replies)
+        bridge = self._bridge(fuse_fs_mod, reply)
 
         assert bridge.locate_path("/file") == expected
 
-    def test_free_lock_waits_for_its_own_reply(self, fuse_mock):
-        """Otherwise FREE_LOCK's reply would be left for the next packet."""
-        import amifuse.fuse_fs as fuse_fs_mod
-
-        bridge = self._bridge(fuse_fs_mod, STALE_WRITE, _reply(-1))
-
-        bridge.free_lock(self.FILE_LOCK)
-
-        assert bridge._run_until_replies.call_count == 2
-
-    @pytest.mark.parametrize("replies, expected", [
-        ([STALE_WRITE, _reply(0, 203)], (0, 203)),
-        ([STALE_WRITE, NO_REPLY], (0, -1)),
-        ([STALE_WRITE, _reply(-1, 0)], (-1, 0)),
+    @pytest.mark.parametrize("reply, expected", [
+        (_reply(0, 203), (0, 203)),
+        (NO_REPLY, (0, -1)),
+        (_reply(-1, 0), (-1, 0)),
     ], ids=["refused", "no-reply", "renamed"])
-    def test_rename_object_reports_its_own_reply(self, fuse_mock, replies, expected):
-        """A late byte count must not pass for DOSTRUE: rename() would
-        report success for a rename the handler refused, here with
-        ERROR_OBJECT_EXISTS, or never answered.
+    def test_rename_object_reports_its_reply(self, fuse_mock, reply, expected):
+        """rename() reports success only for the handler's DOSTRUE: not for
+        a rename it refused, here with ERROR_OBJECT_EXISTS, or never answered.
         """
         import amifuse.fuse_fs as fuse_fs_mod
 
-        bridge = self._bridge(fuse_fs_mod, *replies)
+        bridge = self._bridge(fuse_fs_mod, reply)
 
         assert bridge.rename_object(0, "a", 0, "b") == expected
 
@@ -2198,6 +2167,11 @@ class TestFuseReadErrors:
         assert exc_info.value.args[0] == errno.EIO
 
 
+# A reply option of _FakeHandlerFile left at this answers as the handler
+# would; NO_REPLY leaves the packet unanswered.
+_ANSWER = object()
+
+
 class _FakeHandlerFile:
     """One open file with the seek, read and write behaviour of a real handler.
 
@@ -2212,9 +2186,10 @@ class _FakeHandlerFile:
     A shrink models FastFileSystem only: it leaves the handle at the new
     end of file even from a position below it, where pfs3aio and SFS leave
     the handle in place. seek_reply, write_reply and set_size_reply, when
-    set, answer every seek, write or size change instead, and
+    set, answer every seek, write or size change instead (NO_REPLY: none
+    gets an answer), and
     seek_mode_reply, a (mode, reply) pair, answers every seek from that
-    mode. Each send returns the packet address its reply carries.
+    mode. packet() stands in for HandlerBridge._packet.
 
     others maps the address of each other handle on the file to its
     position. Any address not in it is the handle at pos, which makes every
@@ -2227,9 +2202,9 @@ class _FakeHandlerFile:
 
     STALE = b"\xa5"
 
-    def __init__(self, data, capacity=1 << 20, seek_reply=None,
-                 set_size_reply=None, seek_past_end=False,
-                 seek_mode_reply=None, write_reply=None, read_replies=None,
+    def __init__(self, data, capacity=1 << 20, seek_reply=_ANSWER,
+                 set_size_reply=_ANSWER, seek_past_end=False,
+                 seek_mode_reply=None, write_reply=_ANSWER, read_replies=None,
                  write_replies=None):
         self.data = bytearray(data)
         self.pos = 0
@@ -2268,7 +2243,20 @@ class _FakeHandlerFile:
     def r_block(self, addr, size):
         return self.buf[:size]
 
-    def read(self, state, fh_addr, addr, size):
+    def packet(self, action, args, label, *more, **limits):
+        """Answer a READ, SEEK, WRITE or SET_FILE_SIZE as the handler would."""
+        import amifuse.fuse_fs as fuse_fs_mod
+
+        handle = {
+            fuse_fs_mod.ACTION_READ: self.read,
+            fuse_fs_mod.ACTION_SEEK: self.seek,
+            fuse_fs_mod.ACTION_WRITE: self.write,
+            fuse_fs_mod.ACTION_SET_FILE_SIZE: self.set_size,
+        }[action]
+        handle(*args)
+        return self.reply
+
+    def read(self, fh_addr, addr, size):
         """ACTION_READ reads from the handle's position up to end of file."""
         if len(self.reads) in self.read_replies:
             self.reply = self.read_replies[len(self.reads)]
@@ -2278,14 +2266,13 @@ class _FakeHandlerFile:
             self._move(fh_addr, pos + len(self.buf))
             self.reply = _reply(len(self.buf))
         self.reads.append(size)
-        return PKT, 0
 
-    def seek(self, state, fh_addr, offset, mode):
+    def seek(self, fh_addr, offset, mode):
         self.seeks.append((fh_addr, offset, mode))
         pos = self._pos(fh_addr)
         # OFFSET_BEGINNING, OFFSET_CURRENT, OFFSET_END
         base = {-1: 0, 0: pos, 1: len(self.data)}[mode]
-        if self.seek_reply is not None:
+        if self.seek_reply is not _ANSWER:
             self.reply = self.seek_reply
         elif self.seek_mode_reply and self.seek_mode_reply[0] == mode:
             self.reply = self.seek_mode_reply[1]
@@ -2295,16 +2282,15 @@ class _FakeHandlerFile:
             self._move(fh_addr, base + offset)
         else:
             self.reply = _reply(-1, 219)
-        return PKT, 0
 
-    def write(self, state, fh_addr, addr, size):
+    def write(self, fh_addr, addr, size):
         if len(self.writes) in self.write_replies:
             self.reply = self.write_replies[len(self.writes)]
             self.writes.append(size)
-            return PKT, 0
+            return
         self.writes.append(size)
         pos = self._pos(fh_addr)
-        if self.write_reply is not None:
+        if self.write_reply is not _ANSWER:
             self.reply = self.write_reply
         elif pos + size > self.capacity:
             self.reply = _reply(-1, 221)
@@ -2312,11 +2298,10 @@ class _FakeHandlerFile:
             self.data[pos:pos + size] = self.buf[:size]
             self._move(fh_addr, pos + size)
             self.reply = _reply(size)
-        return PKT, 0
 
-    def set_size(self, state, fh_addr, size, mode):
+    def set_size(self, fh_addr, size, mode):
         self.set_sizes.append(size)
-        if self.set_size_reply is not None:
+        if self.set_size_reply is not _ANSWER:
             self.reply = self.set_size_reply
         else:
             shrink = size < len(self.data)
@@ -2331,7 +2316,6 @@ class _FakeHandlerFile:
             for other, pos in self.others.items():
                 self.others[other] = min(pos, size)
             self.reply = _reply(size)
-        return PKT, 0
 
 
 def _answer_open_file_reply(bridge):
@@ -2358,17 +2342,14 @@ def _fake_write_bridge(fuse_fs_mod, handler, free_blocks=2048):
     bridge._debug = False
     bridge._unwritten_outputs = set()
     bridge.state = MagicMock()
-    bridge.launcher = MagicMock()
-    bridge.launcher.send_seek_handle.side_effect = handler.seek
-    bridge.launcher.send_read_handle.side_effect = handler.read
-    bridge.launcher.send_write_handle.side_effect = handler.write
-    bridge.launcher.send_set_file_size.side_effect = handler.set_size
+    bridge._packet = MagicMock(side_effect=handler.packet)
+    # fh_Arg1 is the handle's address, as the fake file keys its handles.
+    bridge._fh_arg = lambda fh_addr: fh_addr
     bridge.mem = MagicMock()
     bridge.mem.w_block.side_effect = handler.w_block
     bridge.mem.r_block.side_effect = handler.r_block
     bridge._alloc_read_buf = MagicMock(return_value=SimpleNamespace(addr=0x2000))
     bridge._alloc_empty_buf = MagicMock(return_value=SimpleNamespace(addr=0x2000))
-    bridge._run_until_replies = MagicMock(side_effect=lambda: handler.reply)
     info = None
     if free_blocks is not None:
         info = {"num_blocks": 4096, "num_blocks_used": 4096 - free_blocks,
@@ -2471,8 +2452,7 @@ class TestHandlerBridgeReadChunks:
 
         offset, size = 10, 2 * chunk + 5
         assert bridge.read_handle_at(self.FH_ADDR, offset, size) == content[offset:offset + size]
-        seeks = [c.args[1:] for c in bridge.launcher.send_seek_handle.call_args_list]
-        assert seeks == [(self.FH_ADDR, offset, fuse_fs_mod.OFFSET_BEGINNING)]
+        assert handler.seeks == [(self.FH_ADDR, offset, fuse_fs_mod.OFFSET_BEGINNING)]
         assert handler.reads == [chunk, chunk, 5]
 
     def _open(self, fuse_fs_mod, fs_with_mock_bridge, handler):
@@ -2498,7 +2478,7 @@ class TestHandlerBridgeReadChunks:
 
         assert fs.read("/big.bin", 8 << 20, 0, handle) == content
         assert fs.read("/big.bin", 4096, len(content), handle) == b""
-        assert fake.launcher.send_seek_handle.call_count == 1
+        assert len(handler.seeks) == 1
         assert max(handler.reads) == fuse_fs_mod.IO_CHUNK
 
     def test_fuse_read_with_failed_chunk_is_eio(self, fs_with_mock_bridge):
@@ -2515,7 +2495,7 @@ class TestHandlerBridgeReadChunks:
         assert exc_info.value.args[0] == errno.EIO
         # The handle moved by the chunk that arrived; the retry seeks back.
         assert fs.read("/big.bin", 3 * chunk, 0, handle) == content
-        assert fake.launcher.send_seek_handle.call_count == 2
+        assert len(handler.seeks) == 2
 
 
 class TestHandlerBridgeWriteChunks:
@@ -2557,8 +2537,7 @@ class TestHandlerBridgeWriteChunks:
 
         assert bridge.write_handle_reply(self.FH_ADDR, one) == (chunk, 0)
         assert bridge.write_handle_reply(self.FH_ADDR, two) == (chunk + 1, 0)
-        seeks = [c.args[1:] for c in bridge.launcher.send_seek_handle.call_args_list]
-        assert seeks == [(self.FH_ADDR, 0, fuse_fs_mod.OFFSET_END),
+        assert handler.seeks == [(self.FH_ADDR, 0, fuse_fs_mod.OFFSET_END),
                          (self.FH_ADDR, 3, fuse_fs_mod.OFFSET_BEGINNING),
                          (self.FH_ADDR, 0, fuse_fs_mod.OFFSET_END),
                          (self.FH_ADDR, 3 + chunk, fuse_fs_mod.OFFSET_BEGINNING)]
@@ -2579,17 +2558,18 @@ class TestHandlerBridgeWriteChunks:
         handler = _FakeHandlerFile(self.ORIGINAL)
         handler.pos = 3
         bridge = _fake_write_bridge(fuse_fs_mod, handler)
-        seeks = bridge.launcher.send_seek_handle
+        seeks = []
 
-        def seek(state, fh_addr, offset, mode):
-            if seeks.call_count == failed_seek:
-                handler.reply = seek_reply
-                return PKT, 0
-            return handler.seek(state, fh_addr, offset, mode)
+        def packet(action, args, *more, **limits):
+            if action == fuse_fs_mod.ACTION_SEEK:
+                seeks.append(args)
+                if len(seeks) == failed_seek:
+                    return seek_reply
+            return handler.packet(action, args, *more, **limits)
 
-        seeks.side_effect = seek
+        bridge._packet.side_effect = packet
         assert bridge.write_handle_reply(self.FH_ADDR, _pattern(2 * chunk)) == (-1, 0)
-        assert seeks.call_count == failed_seek
+        assert len(seeks) == failed_seek
         assert handler.writes == []
         assert handler.set_sizes == []
         assert handler.data == self.ORIGINAL
@@ -2618,22 +2598,22 @@ class TestHandlerBridgeWriteChunks:
             original, write_replies={1: _reply(-1, 221)} if fails else None)
         handler.pos = 3
         bridge = _fake_write_bridge(fuse_fs_mod, handler)
-        seeks = bridge.launcher.send_seek_handle
+        seeks = []
 
-        def seek(state, fh_addr, offset, mode):
+        def packet(action, args, *more, **limits):
+            if action != fuse_fs_mod.ACTION_SEEK:
+                return handler.packet(action, args, *more, **limits)
+            seeks.append(args)
             if unmeasured == "past-end":
-                handler.reply = SEEK_PAST_EOF
-                return PKT, 0
-            sent = handler.seek(state, fh_addr, offset, mode)
-            if seeks.call_count == 2:
-                handler.reply = _reply(self.WRAPPED_END)
-            return sent
+                return SEEK_PAST_EOF
+            reply = handler.packet(action, args, *more, **limits)
+            return _reply(self.WRAPPED_END) if len(seeks) == 2 else reply
 
-        seeks.side_effect = seek
+        bridge._packet.side_effect = packet
         data = _pattern(2 * chunk)
         expected = (-1, 221) if fails else (len(data), 0)
         assert bridge.write_handle_reply(self.FH_ADDR, data) == expected
-        assert seeks.call_count == (1 if unmeasured == "past-end" else 2)
+        assert len(seeks) == (1 if unmeasured == "past-end" else 2)
         assert handler.set_sizes == []
         written = data[:chunk] if fails else data
         assert handler.data == original[:3] + written + original[3 + len(written):]
@@ -2665,50 +2645,6 @@ class TestHandlerBridgeWriteChunks:
         assert bridge.write_handle_reply(self.FH_ADDR, _pattern(3 * chunk)) == expected
         assert handler.writes == [chunk] * (failed + 1)
         assert handler.set_sizes == [len(self.ORIGINAL)]
-        assert handler.data == self.ORIGINAL
-
-    @pytest.mark.parametrize("with_answer", [False, True],
-                             ids=["before-answer", "with-answer"])
-    def test_late_chunk_reply_is_not_the_shrink_answer(self, fuse_mock,
-                                                       with_answer):
-        """After a chunk that got no reply, the shrink back takes the answer
-        to its own packet, not the chunk's late reply.
-
-        A handler still answers a packet that timed out while the bridge
-        waits on the next packet, in a round of its own or in one with the
-        next packet's answer.
-        """
-        import amifuse.fuse_fs as fuse_fs_mod
-
-        chunk = fuse_fs_mod.IO_CHUNK
-        handler = _FakeHandlerFile(self.ORIGINAL, write_replies={1: NO_REPLY})
-        handler.pos = len(self.ORIGINAL)
-        bridge = _fake_write_bridge(fuse_fs_mod, handler)
-        late = []
-
-        def run():
-            if handler.reply is NO_REPLY:
-                # The chunk's byte count arrives in the next round.
-                late.append(_reply(chunk, pkt=STALE_PKT))
-                return NO_REPLY
-            if not late:
-                return handler.reply
-            if with_answer:
-                return handler.reply + late.pop()
-            return late.pop()
-
-        bridge._run_until_replies.side_effect = run
-        answers = []  # what each shrink took for its answer
-        set_size = bridge.set_handle_size
-
-        def spy(*args):
-            answers.append(set_size(*args))
-            return answers[-1]
-
-        bridge.set_handle_size = spy
-        assert bridge.write_handle_reply(self.FH_ADDR, _pattern(3 * chunk)) == (-1, 0)
-        assert handler.set_sizes == [len(self.ORIGINAL)]
-        assert answers == [len(self.ORIGINAL)]
         assert handler.data == self.ORIGINAL
 
     def test_failed_chunk_past_old_end_cuts_back_to_it(self, fuse_mock):
@@ -2748,10 +2684,9 @@ class TestHandlerBridgeWriteChunks:
 
         assert result == (-1, 221)
         assert handler.set_sizes == [len(self.ORIGINAL)]
-        sent = [name for name, _, _ in bridge.launcher.method_calls]
-        assert sent[-2:] == ["send_set_file_size", "send_seek_handle"]
-        assert bridge.launcher.send_seek_handle.call_args.args[1:] == (
-            self.FH_ADDR, 0, fuse_fs_mod.OFFSET_BEGINNING)
+        sent = [c.args[0] for c in bridge._packet.call_args_list]
+        assert sent[-2:] == [fuse_fs_mod.ACTION_SET_FILE_SIZE, fuse_fs_mod.ACTION_SEEK]
+        assert handler.seeks[-1] == (self.FH_ADDR, 0, fuse_fs_mod.OFFSET_BEGINNING)
         assert handler.pos == 0
 
     def test_failed_chunk_inside_file_is_kept(self, fuse_mock):
@@ -2843,9 +2778,9 @@ class TestHandlerBridgeWriteChunks:
         data = _pattern(9 << 20)
 
         assert fs.write("/big.bin", data, 0, handle) == len(data)
-        seeks = fake.launcher.send_seek_handle.call_count
+        seeks = len(handler.seeks)
         assert fs.write("/big.bin", b"tail", len(data), handle) == 4
-        assert fake.launcher.send_seek_handle.call_count == seeks + 2
+        assert len(handler.seeks) == seeks + 2
         assert handler.data == data + b"tail"
         assert max(handler.writes) == fuse_fs_mod.IO_CHUNK
 
@@ -2864,10 +2799,10 @@ class TestHandlerBridgeWriteChunks:
         assert exc_info.value.args[0] == errno.ENOSPC
         assert handler.writes == [chunk, chunk]
         assert handler.data == b""
-        seeks = fake.launcher.send_seek_handle.call_count
+        seeks = len(handler.seeks)
         assert fs.write("/big.bin", b"x", 0, handle) == 1
         # The seek to 0, then the two that measure the end.
-        assert fake.launcher.send_seek_handle.call_count == seeks + 3
+        assert len(handler.seeks) == seeks + 3
         assert handler.data == b"x"
 
     def test_fuse_failed_write_keeps_created_size(self, write_fs):
@@ -3034,13 +2969,11 @@ class TestHandlerBridgeWriteAt:
         assert handler.set_sizes == [len(self.ORIGINAL)]
         assert handler.data == self.ORIGINAL + bytes(chunk)
 
-    # A late READ reply in the same batch must not pass for the write's.
     @pytest.mark.parametrize("reply, expected", [
         (_reply(4), (4, 0)),
         (_reply(-1, 221), (-1, 221)),
         (NO_REPLY, (-1, 0)),
-        (_reply(-1, 221) + STALE_READ, (-1, 221)),
-    ], ids=["written", "handler-error", "no-reply", "stale-reply"])
+    ], ids=["written", "handler-error", "no-reply"])
     def test_write_handle_reply_keeps_res2(self, fuse_mock, reply, expected):
         import amifuse.fuse_fs as fuse_fs_mod
 
@@ -3064,9 +2997,6 @@ class TestHandlerBridgeSetSize:
 
     FH_ADDR = 0x3000
     ORIGINAL = b"0123456789"
-
-    # A late answer to a timed-out 64 KiB ACTION_WRITE: dp_Res1 is its count.
-    LATE_WRITE = _reply(65536, pkt=STALE_PKT)
 
     # A mode given by name is the startup_runner constant; any other is sent
     # as is.
@@ -3099,8 +3029,7 @@ class TestHandlerBridgeSetSize:
 
         assert bridge.set_handle_size(self.FH_ADDR, size, mode) == -1
         assert bridge.set_handle_size_reply(self.FH_ADDR, size, mode) == (-1, 0)
-        bridge.launcher.send_set_file_size.assert_not_called()
-        bridge._run_until_replies.assert_not_called()
+        bridge._packet.assert_not_called()
         assert handler.data == self.ORIGINAL
 
     @pytest.mark.parametrize("size", [0, 0x7FFFFFFF],
@@ -3113,8 +3042,9 @@ class TestHandlerBridgeSetSize:
         bridge = _fake_write_bridge(fuse_fs_mod, handler)
 
         assert bridge.set_handle_size(self.FH_ADDR, size) == 7
-        bridge.launcher.send_set_file_size.assert_called_once_with(
-            bridge.state, self.FH_ADDR, size, fuse_fs_mod.OFFSET_BEGINNING)
+        assert [c.args[:2] for c in bridge._packet.call_args_list] == [
+            (fuse_fs_mod.ACTION_SET_FILE_SIZE,
+             [self.FH_ADDR, size, fuse_fs_mod.OFFSET_BEGINNING])]
 
     @pytest.mark.parametrize("reply, expected", [
         (_reply(4), (4, 0)),
@@ -3130,22 +3060,6 @@ class TestHandlerBridgeSetSize:
 
         assert bridge.set_handle_size_reply(self.FH_ADDR, 4) == expected
         assert bridge.set_handle_size(self.FH_ADDR, 4) == expected[0]
-
-    @pytest.mark.parametrize("rounds, expected", [
-        ([LATE_WRITE, _reply(4)], 4),
-        ([_reply(4) + LATE_WRITE], 4),
-        ([LATE_WRITE, NO_REPLY, NO_REPLY], -1),
-    ], ids=["before-answer", "with-answer", "then-timeout"])
-    def test_late_reply_is_not_the_answer(self, fuse_mock, rounds, expected):
-        """A reply to an earlier packet is dropped, not read as the new size."""
-        import amifuse.fuse_fs as fuse_fs_mod
-
-        handler = _FakeHandlerFile(self.ORIGINAL)
-        bridge = _fake_write_bridge(fuse_fs_mod, handler)
-        bridge._run_until_replies = MagicMock(side_effect=rounds)
-
-        assert bridge.set_handle_size(self.FH_ADDR, 4) == expected
-
 
 class TestFuseWriteErrors:
     """AmigaFuseFS.write reports a failed write with the closest errno.
@@ -3526,7 +3440,7 @@ class TestHandlerBridgeTruncate:
         assert bridge.truncate_handle(self.FH_ADDR, 0) == (0, 0)
         assert handler.data == b""
         assert handler.set_sizes == [0]
-        bridge.launcher.send_seek_handle.assert_not_called()
+        assert handler.seeks == []
 
     @pytest.mark.parametrize("length", [-1, 0x80000000])
     def test_length_outside_long_sends_nothing(self, fuse_mock, length):
@@ -3538,7 +3452,7 @@ class TestHandlerBridgeTruncate:
         bridge = _fake_write_bridge(fuse_fs_mod, handler)
 
         assert bridge.truncate_handle(self.FH_ADDR, length) == (-1, 0)
-        bridge.launcher.send_seek_handle.assert_not_called()
+        assert handler.seeks == []
         assert handler.writes == []
         assert handler.set_sizes == []
         assert handler.data == self.ORIGINAL
@@ -3846,9 +3760,8 @@ class TestFuseTruncateWithOtherHandles:
         assert handler.data[2000:2002] == b"xy"
 
     def test_unanswered_shrink_with_seven_others_is_sent_once(self, fuse_mock):
-        """The bridge builds packets in a ring of eight, so seven seeks and
-        a second shrink would rebuild the unanswered shrink's packet while
-        the handler may still hold it."""
+        """A shrink with no reply may still be with the handler, so no seek
+        moves the other handles and no second shrink follows it."""
         import amifuse.fuse_fs as fuse_fs_mod
 
         handler = _FakeHandlerFile(self.CONTENT, set_size_reply=NO_REPLY)
@@ -3865,9 +3778,8 @@ class TestFuseTruncateWithOtherHandles:
 
     def test_unanswered_seek_in_retry_stops_sending(self, fuse_mock):
         """A seek in the retry that gets no reply may still be with the
-        handler. With nine other handles, eight more seeks and the second
-        shrink would follow it, and the eighth would rebuild its packet in
-        the bridge's ring of eight, so nothing more is sent."""
+        handler, so nothing more is sent: neither the seeks for the other
+        eight handles nor the second shrink."""
         import amifuse.fuse_fs as fuse_fs_mod
 
         handler = _FakeHandlerFile(self.CONTENT)
@@ -3875,15 +3787,13 @@ class TestFuseTruncateWithOtherHandles:
         others = [self.OTHER + i for i in range(9)]
         for fh_addr in others:
             self._open_other(fs, handler, 2000, fh_addr=fh_addr)
-        seek = handler.seek
+        def seek_unanswered(action, args, *more, **limits):
+            reply = handler.packet(action, args, *more, **limits)
+            if action == fuse_fs_mod.ACTION_SEEK and args[0] == others[0]:
+                return NO_REPLY
+            return reply
 
-        def seek_unanswered(state, fh_addr, offset, mode):
-            packet = seek(state, fh_addr, offset, mode)
-            if fh_addr == others[0]:
-                handler.reply = NO_REPLY
-            return packet
-
-        fs.bridge.launcher.send_seek_handle.side_effect = seek_unanswered
+        fs.bridge._packet.side_effect = seek_unanswered
 
         with pytest.raises(fuse_fs_mod.FuseOSError) as exc_info:
             fs.truncate("/file", 100)
@@ -3924,15 +3834,13 @@ class TestFuseTruncateWithOtherHandles:
         big = self._open_other(fs, handler, 0, fh_addr=self.BIG,
                                path="/big.hdf")
         fs._fh_cache[big]["pos"] = 0x80000000
-        seek = handler.seek
+        def big_file_seek(action, args, *more, **limits):
+            reply = handler.packet(action, args, *more, **limits)
+            if action == fuse_fs_mod.ACTION_SEEK and args[0] == self.BIG:
+                return _reply(-1, 219)
+            return reply
 
-        def big_file_seek(state, fh_addr, offset, mode):
-            packet = seek(state, fh_addr, offset, mode)
-            if fh_addr == self.BIG:
-                handler.reply = _reply(-1, 219)
-            return packet
-
-        fs.bridge.launcher.send_seek_handle.side_effect = big_file_seek
+        fs.bridge._packet.side_effect = big_file_seek
 
         assert fs.truncate("/file", 100) == 0
         assert handler.data == self.CONTENT[:100]
@@ -5090,15 +4998,12 @@ class TestQueryDiskInfo:
         "id_InUse": 1,  # decoy for volume_node
     }
 
-    def _query(self, fuse_fs_mod, monkeypatch, replies, fields=None, rounds=None):
+    def _query(self, fuse_fs_mod, monkeypatch, reply, fields=None):
         """Run _query_disk_info() against a bridge backed by MockMemory.
 
-        Every wait for replies returns replies, or the next batch from
-        rounds when given. The handler fills the buffer only in a batch
-        that answers the DISK_INFO packet.
+        The DISK_INFO packet gets reply, (res1, res2) or NO_REPLY. A
+        handler that answers fills the buffer with fields first.
         """
-        import threading
-
         if _RealMockMemory is None:
             pytest.skip("amitools not installed")
         MockMemory = _RealMockMemory
@@ -5108,23 +5013,12 @@ class TestQueryDiskInfo:
         monkeypatch.setattr(fuse_fs_mod, "InfoDataStruct", InfoDataStruct)
 
         mem = MockMemory(size_kib=64)
-        bridge = object.__new__(fuse_fs_mod.HandlerBridge)
-        bridge._lock = threading.RLock()
-        bridge._debug = False
-        bridge.mem = mem
-        bridge.state = MagicMock()
-        bridge.launcher = MagicMock()
-        bridge.launcher.send_disk_info.return_value = (PKT, 0)
-        bridge.vh = MagicMock()
-        info_mem = SimpleNamespace(addr=self.INFO_ADDR)
-        bridge.vh.alloc.alloc_memory.return_value = info_mem
-        batches = iter(rounds) if rounds is not None else None
 
-        def fake_run_until_replies():
-            batch = next(batches) if batches is not None else replies
+        def disk_info(action, args):
+            assert (action, args) == (fuse_fs_mod.ACTION_DISK_INFO, [self.INFO_ADDR >> 2])
             # The real handler fills InfoData in place before replying, so
             # plant the fields here -- the buffer is zeroed before the send.
-            if fields and any(reply[1] == PKT for reply in batch):
+            if fields and reply is not NO_REPLY:
                 info = InfoDataStruct(mem, self.INFO_ADDR)
                 for name, value in fields.items():
                     # Write through the field's own address rather than .val:
@@ -5132,19 +5026,23 @@ class TestQueryDiskInfo:
                     # raw int. The address still comes from the real struct,
                     # so a production offset mistake still fails the test.
                     mem.w32(getattr(info, name).addr, value)
-            return batch
+            return reply
 
-        bridge._run_until_replies = fake_run_until_replies
+        # is_mounted() queries again, and gets the same answer.
+        bridge = _packet_bridge(fuse_fs_mod, disk_info, disk_info)
+        bridge.mem = mem
+        bridge.vh = MagicMock()
+        info_mem = SimpleNamespace(addr=self.INFO_ADDR)
+        bridge.vh.alloc.alloc_memory.return_value = info_mem
         result = bridge._query_disk_info()
         return result, bridge, info_mem
 
     def test_success_reads_every_field_from_its_own_offset(self, fuse_mock, monkeypatch):
         import amifuse.fuse_fs as fuse_fs_mod
 
-        # (msg, pkt_addr, res1, res2) -- res1 nonzero means DOSTRUE
-        replies = [(0, 0x9999, 1, 0)]
+        # res1 nonzero means DOSTRUE
         (info, res2), bridge, info_mem = self._query(
-            fuse_fs_mod, monkeypatch, replies, self.PLANTED)
+            fuse_fs_mod, monkeypatch, _reply(1), self.PLANTED)
 
         assert res2 is None
         assert info == {
@@ -5159,63 +5057,33 @@ class TestQueryDiskInfo:
         assert 7 not in info.values()
         bridge.vh.alloc.free_memory.assert_called_once_with(info_mem)
 
-    def test_dosfalse_reply_yields_res2_not_the_packet_address(self, fuse_mock, monkeypatch):
-        """res2 is slot 3 of the reply; slot 1 is the packet address."""
+    def test_dosfalse_reply_yields_res2(self, fuse_mock, monkeypatch):
         import amifuse.fuse_fs as fuse_fs_mod
 
-        replies = [(0, 0x9999, 0, 225)]
         (info, res2), bridge, info_mem = self._query(
-            fuse_fs_mod, monkeypatch, replies, self.PLANTED)
+            fuse_fs_mod, monkeypatch, _reply(0, 225), self.PLANTED)
 
         # res1 == 0 means the buffer is not trustworthy even though this
         # test planted values in it
         assert info is None
         assert res2 == 225
-        assert res2 != 0x9999
         bridge.vh.alloc.free_memory.assert_called_once_with(info_mem)
 
     def test_no_reply_is_silence_not_refusal(self, fuse_mock, monkeypatch):
         import amifuse.fuse_fs as fuse_fs_mod
 
-        (info, res2), bridge, info_mem = self._query(fuse_fs_mod, monkeypatch, [])
+        (info, res2), bridge, info_mem = self._query(fuse_fs_mod, monkeypatch, NO_REPLY)
 
         assert info is None
         assert res2 is None
         # The handler can still answer and fill the buffer, so it stays.
         bridge.vh.alloc.free_memory.assert_not_called()
 
-    # A late answer to a timed-out 64 KiB ACTION_WRITE: dp_Res1 is its count.
-    LATE_WRITE = [(0, STALE_PKT, 65536, 0)]
-
-    def test_late_reply_to_another_packet_is_not_the_answer(self, fuse_mock, monkeypatch):
-        """Read as DOSTRUE, it would give all-zero disk info."""
-        import amifuse.fuse_fs as fuse_fs_mod
-
-        (info, res2), bridge, _ = self._query(
-            fuse_fs_mod, monkeypatch, None, self.PLANTED,
-            rounds=[self.LATE_WRITE, []])
-
-        assert info is None
-        assert res2 is None
-        bridge.vh.alloc.free_memory.assert_not_called()
-
-    def test_answer_after_a_late_reply_is_read(self, fuse_mock, monkeypatch):
-        import amifuse.fuse_fs as fuse_fs_mod
-
-        (info, res2), bridge, info_mem = self._query(
-            fuse_fs_mod, monkeypatch, None, self.PLANTED,
-            rounds=[self.LATE_WRITE, [(0, PKT, 1, 0)]])
-
-        assert res2 is None
-        assert info["bytes_per_block"] == 512
-        assert info["num_blocks"] == 12288
-        bridge.vh.alloc.free_memory.assert_called_once_with(info_mem)
-
     def test_zeroed_buffer_when_handler_fills_nothing(self, fuse_mock, monkeypatch):
         """A handler that replies DOSTRUE but fills nothing reads back zeros."""
         import amifuse.fuse_fs as fuse_fs_mod
 
-        (info, res2), _, _ = self._query(fuse_fs_mod, monkeypatch, [(0, 0x9999, 1, 0)])
+        (info, res2), _, _ = self._query(fuse_fs_mod, monkeypatch, _reply(1))
 
         assert res2 is None
         assert info == {
@@ -5230,7 +5098,7 @@ class TestQueryDiskInfo:
         """The offsets and the decision table agree on a real refusal."""
         import amifuse.fuse_fs as fuse_fs_mod
 
-        mem_bridge = self._query(fuse_fs_mod, monkeypatch, [(0, 0x9999, 0, 225)])[1]
+        mem_bridge = self._query(fuse_fs_mod, monkeypatch, _reply(0, 225))[1]
         state = mem_bridge.is_mounted()
 
         assert state.mounted is False
@@ -5242,7 +5110,7 @@ class TestQueryDiskInfo:
         import amifuse.fuse_fs as fuse_fs_mod
 
         fields = dict(self.PLANTED, id_DiskType=0x4E444F53)
-        mem_bridge = self._query(fuse_fs_mod, monkeypatch, [(0, 0x9999, 1, 0)], fields)[1]
+        mem_bridge = self._query(fuse_fs_mod, monkeypatch, _reply(1), fields)[1]
         state = mem_bridge.is_mounted()
 
         assert state.mounted is False

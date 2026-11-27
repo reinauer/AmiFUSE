@@ -30,7 +30,6 @@ from amitools.vamos.lib.DosLibrary import DosLibrary  # type: ignore
 from amitools.vamos.lib.IntuitionLibrary import IntuitionLibrary  # type: ignore
 from amitools.vamos.libstructs.dos import DateStampStruct, ProcessStruct  # type: ignore
 from amitools.vamos.libstructs.exec_ import MsgPortFlags, MsgPortStruct  # type: ignore
-from amitools.vamos.machine.regs import REG_D1  # type: ignore
 
 from amifuse.amiga_time import sys_time, to_datestamp
 from amifuse.handler_process import HandlerProcess
@@ -45,12 +44,11 @@ class AmiFuseDosLibrary(DosLibrary):
     # as amitools' does.
     delay_timer = None
 
-    def Delay(self, ctx):
-        ticks = ctx.cpu.r_reg(REG_D1)
+    def Delay(self, ctx, ticks):
         timer = self.delay_timer
         task = ctx.exec_lib.exec_lib.this_task.aptr
         if timer is None or ticks <= 0 or task == 0:
-            return super().Delay(ctx)
+            return super().Delay(ctx, ticks)
         # one tick is 1/50 s
         timer.add_delay(task, timer.clock() + ticks / 50.0)
         ctx.exec_lib.signal_func.wait(SIGF_SINGLE)
@@ -60,8 +58,7 @@ class AmiFuseDosLibrary(DosLibrary):
         """A child of the handler serves DOS calls like the handler itself."""
         return HandlerProcess(ctx, ctx.machine, ctx.alloc, name, **kw_args)
 
-    def DateStamp(self, ctx):
-        ds_ptr = ctx.cpu.r_reg(REG_D1)
+    def DateStamp(self, ctx, ds_ptr):
         ds = DateStampStruct(ctx.mem, ds_ptr)
         ds.ds_Days.val, ds.ds_Minute.val, ds.ds_Tick.val = to_datestamp(time.time())
         return ds_ptr
@@ -76,7 +73,11 @@ class AmiFuseDosLibrary(DosLibrary):
                 port = MsgPortStruct(ctx.mem, port_addr)
                 while not port_mgr.has_msg(port_addr):
                     sig_bit = port.mp_SigBit.val
-                    if port.mp_Flags.val != MsgPortFlags.PA_SIGNAL or not 0 <= sig_bit < 32:
+                    # PA_SOFTINT: the port's interrupt may send the signal
+                    if port.mp_Flags.val not in (
+                        MsgPortFlags.PA_SIGNAL,
+                        MsgPortFlags.PA_SOFTINT,
+                    ) or not 0 <= sig_bit < 32:
                         break
                     ctx.exec_lib.signal_func.wait(1 << sig_bit)
         return super().WaitPkt(ctx)

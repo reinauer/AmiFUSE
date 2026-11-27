@@ -2,12 +2,12 @@
 
 ## Windows physical-disk release checks
 
-AmiFUSE requires upstream amitools 0.9.1 or later, which includes the
+AmiFUSE requires upstream amitools 0.10.0 or later, which includes the
 physical-disk support, partition range locks, and scheduler changes
 AmiFUSE needs.
 
 The installed-wheel CI job checks ordinary-image commands with the
-declared minimums `amitools[vamos]==0.9.1` and `machine68k==0.5.2`. It
+declared minimums `amitools[vamos]==0.10.0` and `machine68k==0.5.2`. It
 installs the AmiFUSE wheel with dependency resolution enabled, checks the
 resulting dependencies, and exercises the installed package outside the
 checkout.

@@ -23,8 +23,11 @@ class TestProcessStackBase:
         assert "proc.stack_base.bptr = stack.get_lower() >> 2" not in source
 
 
-class TestStdpktRingBuffer:
-    """Verify stdpkt ring buffer frees old allocation on growth."""
+class TestStartupPacket:
+    """The startup packet is the one StandardPacket the launcher builds.
+
+    Every later packet goes through DosPktHandler.
+    """
 
     def _make_launcher(self):
         from amifuse.startup_runner import HandlerLauncher
@@ -34,12 +37,6 @@ class TestStdpktRingBuffer:
         launcher.alloc = MagicMock()
         launcher.mem = MagicMock()
         launcher.port_mgr = MagicMock()
-        launcher._stdpkt_ring = []
-        launcher._stdpkt_sizes = []
-        launcher._stdpkt_ring_size = 8
-        launcher._stdpkt_index = 0
-        launcher.pending = {}
-        launcher._stdpkt_retired = []
         # Minimal field offsets (actual values don't matter for allocation tests)
         launcher._msg_size = 20
         launcher._pkt_size = 48
@@ -59,56 +56,30 @@ class TestStdpktRingBuffer:
         launcher._signal_port = lambda *args, **kwargs: None
         return launcher
 
-    def test_stdpkt_first_alloc(self):
+    def test_packet_is_allocated_and_queued(self):
         launcher = self._make_launcher()
         new_mem = SimpleNamespace(addr=0x5000, size=68)
         launcher.alloc.alloc_memory.return_value = new_mem
 
-        launcher._build_std_packet(0x1000, 0x2000, 1, [])
+        pkt_addr, msg_addr = launcher._build_std_packet(0x1000, 0x2000, 1, [7, 8])
 
-        launcher.alloc.alloc_memory.assert_called_once()
+        assert launcher.alloc.alloc_memory.call_args.args[0] == 68
         launcher.alloc.free_memory.assert_not_called()
-        assert launcher._stdpkt_ring[0] is new_mem
+        assert (pkt_addr, msg_addr) == (0x5000 + 20, 0x5000)
         launcher.port_mgr.put_msg.assert_called_once_with(0x1000, 0x5000)
+        # dp_Type, then the args from dp_Arg1
+        launcher.mem.w32.assert_any_call(0x5014 + 8, 1)
+        launcher.mem.w32.assert_any_call(0x5014 + 12, 7)
+        launcher.mem.w32.assert_any_call(0x5014 + 16, 8)
 
-    def test_stdpkt_reuses_existing_slot(self):
+    def test_failed_allocation_queues_nothing(self):
         launcher = self._make_launcher()
-        existing = SimpleNamespace(addr=0x5000, size=68)
-        launcher._stdpkt_ring = [existing] + [None] * 7
-        launcher._stdpkt_sizes = [68] + [0] * 7
-
-        launcher._build_std_packet(0x1000, 0x2000, 1, [])
-
-        launcher.alloc.alloc_memory.assert_not_called()
-        launcher.alloc.free_memory.assert_not_called()
-
-    def test_stdpkt_grows_and_frees_old_slot(self):
-        launcher = self._make_launcher()
-        old_mem = SimpleNamespace(addr=0x5000, size=32)
-        new_mem = SimpleNamespace(addr=0x6000, size=68)
-        launcher._stdpkt_ring = [old_mem] + [None] * 7
-        launcher._stdpkt_sizes = [32] + [0] * 7
-        launcher.alloc.alloc_memory.return_value = new_mem
-
-        launcher._build_std_packet(0x1000, 0x2000, 1, [])
-
-        launcher.alloc.alloc_memory.assert_called_once()
-        launcher.alloc.free_memory.assert_called_once_with(old_mem)
-        assert launcher._stdpkt_ring[0] is new_mem
-
-    def test_stdpkt_failed_growth_keeps_old_slot(self):
-        launcher = self._make_launcher()
-        old_mem = SimpleNamespace(addr=0x5000, size=32)
-        launcher._stdpkt_ring = [old_mem] + [None] * 7
-        launcher._stdpkt_sizes = [32] + [0] * 7
         launcher.alloc.alloc_memory.side_effect = RuntimeError("oom")
 
         with pytest.raises(RuntimeError, match="oom"):
             launcher._build_std_packet(0x1000, 0x2000, 1, [])
 
-        assert launcher._stdpkt_ring[0] is old_mem
-        assert launcher._stdpkt_sizes[0] == 32
-        launcher.alloc.free_memory.assert_not_called()
+        launcher.port_mgr.put_msg.assert_not_called()
 
 
 class TestSignalTask:
@@ -138,3 +109,48 @@ class TestSignalTask:
         launcher.mem.r32.return_value = 0x20
         assert not launcher.signal_task(0x3000, 0x100)
         launcher.mem.w32.assert_called_once_with(0x3000 + _TC_SIGRECVD, 0x120)
+
+
+class TestSignalPort:
+    """A message's arrival reaches the port's owner the way the port asks."""
+
+    def _make_launcher(self, flags, sigbit=5, task=0x3000):
+        from amifuse.startup_runner import HandlerLauncher
+
+        launcher = HandlerLauncher.__new__(HandlerLauncher)
+        launcher._emu = None
+        launcher._debug = False
+        launcher._mp_flags_offset = 14
+        launcher._mp_sigbit_offset = 15
+        launcher._mp_sigtask_offset = 16
+        launcher.mem = MagicMock()
+        fields = {0x1000 + 14: flags, 0x1000 + 15: sigbit}
+        launcher.mem.r8.side_effect = fields.__getitem__
+        launcher.mem.r32.return_value = task
+        launcher.exec_impl = MagicMock()
+        launcher.signal_task = MagicMock()
+        return launcher
+
+    def test_signal_port_signals_its_task(self):
+        from amitools.vamos.libstructs.exec_ import MsgPortFlags
+
+        launcher = self._make_launcher(MsgPortFlags.PA_SIGNAL)
+        launcher._signal_port(0x1000)
+        launcher.signal_task.assert_called_once_with(0x3000, 1 << 5)
+        launcher.exec_impl.msg_func.notify_port.assert_not_called()
+
+    def test_softint_port_goes_to_amitools_putmsg_logic(self):
+        from amitools.vamos.libstructs.exec_ import MsgPortFlags
+
+        launcher = self._make_launcher(MsgPortFlags.PA_SOFTINT)
+        launcher._signal_port(0x1000)
+        launcher.exec_impl.msg_func.notify_port.assert_called_once_with(0x1000)
+        launcher.signal_task.assert_not_called()
+
+    def test_ignore_port_tells_nobody(self):
+        from amitools.vamos.libstructs.exec_ import MsgPortFlags
+
+        launcher = self._make_launcher(MsgPortFlags.PA_IGNORE)
+        launcher._signal_port(0x1000)
+        launcher.signal_task.assert_not_called()
+        launcher.exec_impl.msg_func.notify_port.assert_not_called()

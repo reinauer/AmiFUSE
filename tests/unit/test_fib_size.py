@@ -20,7 +20,6 @@ def _bridge():
     b.vh = SimpleNamespace(alloc=MemoryAlloc(mem, addr=0x1000))
     b.mem = mem
     b._fib_mem = None
-    b._held_args = set
     return b
 
 

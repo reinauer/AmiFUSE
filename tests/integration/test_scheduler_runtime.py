@@ -16,6 +16,7 @@ import pytest
 from amitools.vamos.schedule import RunResult, TaskState
 
 from amifuse.fuse_fs import HandlerBridge
+from amifuse.startup_runner import ACTION_DISK_INFO
 from amifuse.rdb_inspect import detect_adf
 
 pytestmark = pytest.mark.integration
@@ -41,14 +42,12 @@ def test_handler_waits_for_a_packet_and_is_resumed_with_it(pfs3_bridge):
     def disk_info():
         info = bridge.vh.alloc.alloc_memory(36, label="InfoData")
         try:
-            pkt_addr, _ = bridge.launcher.send_disk_info(bridge.state, info.addr)
-            replies = bridge._run_until_replies()
+            return bridge._packet(ACTION_DISK_INFO, [info.addr >> 2], "disk_info")
         finally:
             bridge.vh.alloc.free_memory(info)
-        return pkt_addr, replies
 
-    pkt_addr, replies = bridge._emu.call(disk_info)
-    assert [(pkt, res1) for _, pkt, res1, _ in replies] == [(pkt_addr, -1)]
+    reply = bridge._emu.call(disk_info)
+    assert reply is not None and reply[0] == -1
     assert task.get_state() == TaskState.TS_WAIT
 
 

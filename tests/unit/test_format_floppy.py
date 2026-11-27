@@ -173,10 +173,7 @@ def stub_bridge(monkeypatch):
     bridge = MagicMock()
     bridge.state.crashed = False
     bridge.launcher.alloc_bstr.return_value = (None, 0x1234)
-    bridge.launcher.send_inhibit.return_value = (0x100, 0)
-    bridge.launcher.send_format.return_value = (0x200, 0)
-    bridge.launcher.send_flush.return_value = (0x300, 0)
-    bridge._run_until_reply.return_value = (-1, 0)
+    bridge._packet.return_value = (-1, 0)
     constructor = MagicMock(return_value=bridge)
     constructor.bridge = bridge
     monkeypatch.setattr(fuse_fs, "HandlerBridge", constructor)
@@ -207,10 +204,13 @@ def test_a_floppy_formats_with_its_geometry_and_no_partition(
     assert kwargs["partition"] is None
     assert kwargs["read_only"] is False
     assert (kwargs["adf_info"].dos_type, kwargs["adf_info"].is_hd) == (DOS3, True)
-    launcher = stub_bridge.bridge.launcher
-    assert [c.args[1] for c in launcher.send_inhibit.call_args_list] == [True, False]
-    assert launcher.alloc_bstr.call_args.args[0] == "Fresh"
-    assert launcher.send_format.call_args.args[2] == DOS3
+    packets = [c.args[:2] for c in stub_bridge.bridge._packet.call_args_list]
+    assert packets[:3] == [
+        (fuse_fs.ACTION_INHIBIT, [-1]),        # DOSTRUE: inhibit
+        (fuse_fs.ACTION_FORMAT, [0x1234, DOS3]),
+        (fuse_fs.ACTION_INHIBIT, [0]),         # DOSFALSE: uninhibit
+    ]
+    assert stub_bridge.bridge.launcher.alloc_bstr.call_args.args[0] == "Fresh"
     stub_bridge.bridge.backend.fsync.assert_called_once_with()
     out = capsys.readouterr().out
     assert f"Formatting HD floppy image {image}" in out

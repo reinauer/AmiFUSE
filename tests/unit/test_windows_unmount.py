@@ -217,26 +217,26 @@ def test_mount_owner_is_process_behind_venv_launcher(monkeypatch):
     assert platform._find_mount_owner_pids(Path("J:")) == [200]
 
 
-@pytest.mark.parametrize("replies", [[], [(0, 0, 0, 209)], [(0, 0, -1, 0)]])
-def test_flush_requires_handler_acknowledgement(replies):
-    from amifuse.fuse_fs import HandlerBridge
+@pytest.mark.parametrize("reply", [None, (0, 209), (-1, 0)],
+                         ids=["no-reply", "refused", "acknowledged"])
+def test_flush_requires_handler_acknowledgement(reply):
+    from amifuse.fuse_fs import ACTION_FLUSH, HandlerBridge
 
     bridge = HandlerBridge.__new__(HandlerBridge)
     bridge._closed = True
     bridge._lock = threading.RLock()
     bridge.state = SimpleNamespace(crashed=False)
     bridge._debug = False
-    bridge.launcher = Mock()
-    # The flush packet's address, 0, is the one the replies carry.
-    bridge.launcher.send_flush.return_value = (0, 0)
+    # No packet is out, so the flush goes out at once.
+    bridge.dospkt = None
     bridge.backend = Mock()
-    bridge._run_until_replies = lambda: replies
-    bridge._log_replies = Mock()
-    if replies and replies[-1][2]:
+    bridge._packet = Mock(return_value=reply)
+    if reply is not None and reply[0]:
         bridge.flush_volume()
     else:
         with pytest.raises(OSError, match="ACTION_FLUSH"):
             bridge.flush_volume()
+    assert bridge._packet.call_args.args[:2] == (ACTION_FLUSH, [])
     bridge.backend.sync.assert_called_once()
 
 

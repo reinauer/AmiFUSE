@@ -43,15 +43,10 @@ def test_idle_mount_finishes_a_delete_whose_wait_ran_out(fixture_root, tmp_path,
             if lock:
                 bridge.free_lock(lock)
         root, _ = bridge.locate(0, "")
-        run_until_replies = HandlerBridge._run_until_replies
-
-        def one_short_burst(self, **wait):
-            # The delete gets a single burst of 10,000 cycles.
-            return run_until_replies(self, **{**wait, "cycles": 10_000})
-
         with monkeypatch.context() as m:
+            # The delete gets a single burst of 10,000 cycles.
             m.setattr(HandlerBridge, "_MAX_BUSY_CYCLES", 1)
-            m.setattr(HandlerBridge, "_run_until_replies", one_short_burst)
+            m.setattr(HandlerBridge, "_RUN_CHUNK_CYCLES", 10_000)
             assert bridge.delete_object(root, "big.bin") == (0, -1)  # no reply
         assert bridge._busy_ran_out
 

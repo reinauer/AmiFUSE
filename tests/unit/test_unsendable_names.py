@@ -129,7 +129,6 @@ def test_alloc_bstr_composes_a_name_and_refuses_the_rest():
     bridge._bstr_sizes = [0] * 8
     bridge._bstr_ring_size = 8
     bridge._bstr_index = 0
-    bridge._held_args = lambda: set()
 
     bridge._alloc_bstr("cafe\u0301")
 
