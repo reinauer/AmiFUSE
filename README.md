@@ -460,7 +460,7 @@ Copy-Item os9_rbf_handler_1.1\os9-rbf-handler "$env:LOCALAPPDATA\amifuse\drivers
 ```
 
 The handler in release 1.1 has the SHA-256
-`0241593786dd48819167abf88165a2f0651ed8773f2d16bcd9e2da47777c866e`.
+`85412c9a9b1692ddb9d77a06eb4a5619e96c013b8bffbabc794f4f1be7fcade0`.
 `amifuse inspect <image>` on an OS-9 disk then names the handler it found.
 Instead of installing it, you can also give the handler with `--driver`.
 
