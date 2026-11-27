@@ -17,6 +17,12 @@ are not held up by it; after the last queued call it runs in any case.
 A caller waits in short slices, so that it notices when the thread has
 ended (its call then fails with RuntimeError), and so that Ctrl+C reaches
 it on Windows, where a wait without a timeout cannot be interrupted.
+
+It waits on a plain lock that the thread releases, not on an Event. A
+lock's acquire() is one call that a signal interrupts cleanly. An Event
+waits in Condition.wait(), and a Ctrl+C that lands just after a slice
+times out, while it takes its lock back, turns into "RuntimeError:
+release unlocked lock" instead of KeyboardInterrupt.
 """
 
 import functools
@@ -70,11 +76,13 @@ class EmuThread:
             return fn(*args, **kwargs)
         if self._stopped or not self._thread.is_alive():
             raise RuntimeError("the emulation thread has stopped")
-        done = threading.Event()
+        # held until the thread has put the result in box
+        done = threading.Lock()
+        done.acquire()
         box: list = []
         self._queue.put((fn, args, kwargs, done, box))
-        while not done.wait(self.WAIT_SLICE):
-            if not self._thread.is_alive() and not done.is_set():
+        while not done.acquire(timeout=self.WAIT_SLICE):
+            if not self._thread.is_alive() and not box:
                 raise RuntimeError("the emulation thread has stopped")
         ok, value = box[0]
         if ok:
@@ -142,7 +150,7 @@ class EmuThread:
             box.append((True, fn(*args, **kwargs)))
         except BaseException as exc:  # handed to the caller
             box.append((False, exc))
-        done.set()
+        done.release()
 
     def _fail_queued(self):
         while True:
@@ -154,7 +162,7 @@ class EmuThread:
                 continue
             _, _, _, done, box = item
             box.append((False, RuntimeError("the emulation thread has stopped")))
-            done.set()
+            done.release()
 
 
 def on_emu_thread(method):
