@@ -276,7 +276,7 @@ def find_folder_driver(dos_type: int, subject: str, quiet: bool = False) -> Reso
 
 
 def find_os9_driver(dos_type: int, subject: str) -> ResolvedDriver:
-    """Pick os9-rbf-handler for an OS-9 volume (OS9\\0-OS9\\2) that has no
+    """Pick os9-rbf-handler for an OS-9 volume (OS9\\0-OS9\\3) that has no
     driver of its own: the copy in the user's drivers folder.
 
     AmiFUSE bundles no OS-9 handler. subject is the first line of the error

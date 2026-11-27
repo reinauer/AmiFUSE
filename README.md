@@ -417,7 +417,7 @@ driver-info --base 0x200000 pfs3aio
 
 - **HDF/RDB** - Hard disk images with Rigid Disk Block. Filesystem drivers can be embedded in the RDB or specified via `--driver`. An FFS/OFS partition whose RDB has no driver for its DOS type uses the [bundled FastFileSystem](#bundled-fastfilesystem).
 - **Emu68-style MBR images** - Disk images with MBR partition table containing an RDB partition, as used by Emu68 on Raspberry Pi.
-- **OS-9 RBF disks** - OS-9/68k and OS-9000 disks and floppies without an RDB, including PC OS-9000 disks with a boot sector or an MBR; see [OS-9 disks](#os-9-disks).
+- **OS-9 RBF disks** - OS-9/6809, OS-9/68k and OS-9000 disks and floppies without an RDB, including CoCo hard disks in the half-sector layout and PC OS-9000 disks with a boot sector or an MBR; see [OS-9 disks](#os-9-disks).
 - **ADF** - Amiga Disk File floppy images (DD and HD). ADFs contain no driver, so DOS0-7 floppies use the [bundled FastFileSystem](#bundled-fastfilesystem) unless your drivers folder holds your own. A blank file of a floppy's size can be [formatted](#formatting) into one.
 
 ## Supported Filesystems
@@ -429,7 +429,7 @@ Currently tested with:
 - **SFS** (Smart File System 1.279) via [SmartFileSystem](https://aminet.net/package/disk/misc/SFS) handler
 - **BFFS** (Berkeley Fast File System) via Chris Hooper's [BFFSFilesystem](https://github.com/cdhooper/bffs) handler
 - **ODFileSystem** (Optical Disc Filesystem) via Stefan Reinauer's [ODFileSystem](https://github.com/reinauer/ODFileSystem) handler
-- **OS-9 RBF** (OS-9/68k and OS-9000, both byte orders) via Chris Hooper's [os9-rbf-handler](https://github.com/cdhooper/amiga_os9_rbf_handler); see [OS-9 disks](#os-9-disks)
+- **OS-9 RBF** (OS-9/6809, OS-9/68k and OS-9000, both byte orders) via Chris Hooper's [os9-rbf-handler](https://github.com/cdhooper/amiga_os9_rbf_handler); see [OS-9 disks](#os-9-disks)
 
 Other Amiga filesystem handlers may work but have not been tested. Reports are
 welcome.
@@ -437,43 +437,49 @@ welcome.
 ## OS-9 disks
 
 [`os9-rbf-handler`](https://github.com/cdhooper/amiga_os9_rbf_handler), an
-AmigaOS filesystem handler for OS-9 RBF disks, reads and writes OS-9/68k
-disks and OS-9000 disks of either byte order. AmiFUSE does not bundle it.
-To install it, download the archive of the latest release from its
-[releases page](https://github.com/cdhooper/amiga_os9_rbf_handler/releases), e.g. `os9_rbf_handler_1.0.lha`, and copy the
+AmigaOS filesystem handler for OS-9 RBF disks, reads and writes OS-9/6809
+(including NitrOS-9), OS-9/68k and OS-9000 disks of either byte order.
+AmiFUSE does not bundle it, and needs release 1.1 or later. To install it,
+download the archive of the latest release from its
+[releases page](https://github.com/cdhooper/amiga_os9_rbf_handler/releases), e.g. `os9_rbf_handler_1.1.lha`, and copy the
 handler from it into your drivers folder. The file must be named exactly
 `os9-rbf-handler`, and the folder may not exist yet:
 
 ```bash
 # macOS / Linux
-7z x os9_rbf_handler_1.0.lha          # or: lha x os9_rbf_handler_1.0.lha
+7z x os9_rbf_handler_1.1.lha          # or: lha x os9_rbf_handler_1.1.lha
 mkdir -p ~/.local/share/amifuse/drivers
-cp os9_rbf_handler_1.0/os9-rbf-handler ~/.local/share/amifuse/drivers/
+cp os9_rbf_handler_1.1/os9-rbf-handler ~/.local/share/amifuse/drivers/
 ```
 
 ```powershell
 # Windows
-7z x os9_rbf_handler_1.0.lha
+7z x os9_rbf_handler_1.1.lha
 New-Item -ItemType Directory -Force "$env:LOCALAPPDATA\amifuse\drivers"
-Copy-Item os9_rbf_handler_1.0\os9-rbf-handler "$env:LOCALAPPDATA\amifuse\drivers\"
+Copy-Item os9_rbf_handler_1.1\os9-rbf-handler "$env:LOCALAPPDATA\amifuse\drivers\"
 ```
 
-The handler in release 1.0 has the SHA-256
-`5d2fd031addb2bc680c8f69b572a4195634c7cf3c9f04a951f2b8e93b00c17c6`.
+The handler in release 1.1 has the SHA-256
+`85412c9a9b1692ddb9d77a06eb4a5619e96c013b8bffbabc794f4f1be7fcade0`.
 `amifuse inspect <image>` on an OS-9 disk then names the handler it found.
 Instead of installing it, you can also give the handler with `--driver`.
 
-- **RDB partitions** of DOS type `OS9\0` (OS-9/68k), `OS9\1` (OS-9000
-  big-endian) or `OS9\2` (OS-9000 little-endian) use the handler stored in
-  the RDB, or else the one in your drivers folder. The handler detects the
-  format of the disk when it mounts it; the DOS type only chooses what
-  `amifuse format` writes.
-- **Disks without an RDB** are recognized by their contents: an OS-9/68k
-  identification sector or an OS-9000 ID block at the start of the image,
-  an OS-9000 ID block after a PC boot sector (PC OS-9000 floppies), or
-  either one in an MBR partition (PC OS-9000 hard disks). `inspect` lists
-  what it finds. When an MBR holds several OS-9 volumes, choose one with
-  `--partition` and its MBR entry number (0-3) or its volume name.
+- **RDB partitions** of DOS type `OS9\0` (OS-9/6809), `OS9\1` (OS-9/68k),
+  `OS9\2` (OS-9000 big-endian) or `OS9\3` (OS-9000 little-endian) use the
+  handler stored in the RDB, or else the one in your drivers folder. The
+  handler detects the format of the disk when it mounts it; the DOS type
+  only chooses what `amifuse format` writes. These are the numbers of
+  handler release 1.1; release 1.0 numbered OS-9/68k `OS9\0` and OS-9000
+  `OS9\1` (big-endian) and `OS9\2` (little-endian), so give a partition
+  made for 1.0 its new DOS type before formatting it.
+- **Disks without an RDB** are recognized by their contents: an OS-9/6809
+  or OS-9/68k identification sector or an OS-9000 ID block at the start of
+  the image, an OS-9/6809 disk in the CoCo half-sector layout (each
+  256-byte sector in the first half of a 512-byte block), an OS-9000 ID
+  block after a PC boot sector (PC OS-9000 floppies), or any of these in
+  an MBR partition (PC OS-9000 hard disks). `inspect` lists what it finds.
+  When an MBR holds several OS-9 volumes, choose one with `--partition`
+  and its MBR entry number (0-3) or its volume name.
 
 ```bash
 amifuse inspect os9000.img
@@ -508,7 +514,7 @@ Without `--driver`, AmiFUSE picks the driver in this order:
    the one from AmigaOS 3.2 there to use it instead of the bundled one.
 3. The bundled FastFileSystem, for DOS0-DOS7.
 
-For OS-9 volumes (`OS9\0`-`OS9\2`, and OS-9 disks without an RDB), step 2
+For OS-9 volumes (`OS9\0`-`OS9\3`, and OS-9 disks without an RDB), step 2
 looks for `os9-rbf-handler` in your drivers folder instead, and there is no
 step 3; see [OS-9 disks](#os-9-disks).
 

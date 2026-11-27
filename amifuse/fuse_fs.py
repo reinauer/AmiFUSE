@@ -6442,7 +6442,7 @@ def resolve_driver(
     Order: --driver; the RDB's driver for the partition's exact DOS type;
     then, for DOS0-DOS7 volumes, driver_resolver.find_folder_driver() (your
     drivers folder, the bundled FastFileSystem), and for OS-9 volumes
-    (OS9\0-OS9\2) driver_resolver.find_os9_driver() (your drivers folder).
+    (OS9\0-OS9\3) driver_resolver.find_os9_driver() (your drivers folder).
     An ISO needs --driver.
     part_info is get_partition_info()'s result when the caller has it.
 
@@ -8783,6 +8783,7 @@ def _inspect_rbf(image: Path, volumes: List[RBFInfo], use_json: bool) -> None:
                 "fs_blocks": vol.fs_blocks,
                 "mbr_partition": vol.mbr_index,
                 "boot_sector": vol.boot_sector,
+                "half_sectors": vol.half_sectors,
             } for vol in volumes],
             driver=resolved.to_json() if resolved else None,
             note=driver_error,
@@ -8796,7 +8797,8 @@ def _inspect_rbf(image: Path, volumes: List[RBFInfo], use_json: bool) -> None:
               + (f" (MBR partition {vol.mbr_index})" if vol.mbr_index is not None else ""))
         print(f"    Format: {vol.format_name}")
         print(f"    DOS type: {DosType.num_to_tag_str(vol.dos_type)} (0x{vol.dos_type:08x})")
-        print(f"    Block size: {vol.block_size} bytes")
+        print(f"    Block size: {vol.block_size} bytes"
+              + (" (256-byte sectors, one in each)" if vol.half_sectors else ""))
         print(f"    Start block: {vol.low_block}"
               + (" (after a PC boot sector)" if vol.boot_sector else ""))
         print(f"    Blocks: {vol.num_blocks} (file system: {vol.fs_blocks})")
